@@ -167,6 +167,21 @@ def _dash_data():
     )
 
 
+def test_render_jira_text_inline_attachments_and_links():
+    from rich.text import Text as RText
+
+    from jwu.cli.dashboard import render_jira_text
+
+    body = "см [^app.log] и !shot.png! ссылка [тут|http://e.com] голая http://bare.io"
+    parts = render_jira_text(body, attach_map={"app.log": 0})
+    plain = "".join(p.plain for p in parts if isinstance(p, RText))
+    assert "📄 app.log" in plain          # чип вложения как в правом блоке
+    assert "🖼 shot.png" in plain         # встроенная !картинка!
+    assert "тут" in plain and "http://e.com" not in plain  # ссылка показана лейблом
+    assert "http://bare.io" in plain      # голый URL остаётся (лейбл = url)
+    assert "[^app.log]" not in plain      # сырой маркер вложения убран
+
+
 def test_deltas_by_section_and_tab_badge():
     from jwu.core.models import Delta
 
@@ -1051,6 +1066,181 @@ def test_local_detail_refresh_off_without_auto_update():
             assert isinstance(app.screen, JobDetailScreen)
             assert app.screen._refresh_interval == 0.0
             await pilot.press("escape")
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+# --- поиск по задаче ------------------------------------------------------- #
+
+
+def test_normalize_issue_key():
+    """Ключ обрезается по краям и приводится к верхнему регистру."""
+    from jwu.cli.dashboard import normalize_issue_key
+
+    assert normalize_issue_key("  proj-25  ") == "PROJ-25"
+    assert normalize_issue_key("PROJ-1") == "PROJ-1"
+    assert normalize_issue_key("") == ""
+    assert normalize_issue_key("   ") == ""
+
+
+def test_linked_issue_click_opens_card_and_back():
+    """Клик по связанной задаче (секция «Связи») открывает её карточку, Esc — назад."""
+    from jwu.cli.dashboard import IssueDetailScreen
+    from jwu.core.models import Issue, IssueLink
+
+    main = Issue(key="A-1", summary="main")
+    main.links = [IssueLink(type="blocks", direction="outward", key="B-2",
+                            summary="linked", status="Open")]
+    linked = Issue(key="B-2", summary="linked full")
+
+    data = DashboardData(user="alice", last_sync={"mine": None}, mine=[main])
+    app = JwuDashboard(data, issue_get_fn=lambda k: {"A-1": main, "B-2": linked}[k],
+                       jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("enter")  # открыть A-1
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await app.screen.run_action("app.open_issue('B-2')")  # клик по связи
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, IssueDetailScreen)
+            assert app.screen.issue.key == "B-2"
+            await pilot.press("escape")  # назад к A-1
+            await pilot.pause()
+            assert app.screen.issue.key == "A-1"
+            await pilot.press("escape")
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_search_opens_issue_detail_for_normalized_key():
+    """Enter в поле поиска тянет задачу по нормализованному ключу и открывает карточку."""
+    from textual.widgets import Input
+
+    from jwu.cli.dashboard import IssueDetailScreen
+
+    calls = []
+
+    def get(key):
+        calls.append(key)
+        return _issue(key)
+
+    data = DashboardData(user="alice", last_sync={"mine": None}, mine=[_issue("A-1")])
+    app = JwuDashboard(data, issue_get_fn=get, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            inp = app.query_one("#search", Input)
+            inp.focus()
+            await pilot.pause()
+            inp.value = "  proj-25 "
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert calls == ["PROJ-25"]
+            assert isinstance(app.screen, IssueDetailScreen)
+            assert app.screen.issue.key == "PROJ-25"
+            assert inp.value == ""  # поле очищено после сабмита
+            await pilot.press("escape")
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_search_opens_card_immediately_then_loads():
+    """Enter сразу открывает карточку (loading), данные подтягиваются уже на экране."""
+    import threading
+
+    from textual.widgets import Input
+
+    from jwu.cli.dashboard import IssueDetailScreen
+
+    gate = threading.Event()
+
+    def get(key):
+        gate.wait(2)  # держим воркер, пока тест проверяет состояние загрузки
+        return _issue(key)
+
+    data = DashboardData(user="alice", last_sync={"mine": None}, mine=[_issue("A-1")])
+    app = JwuDashboard(data, issue_get_fn=get, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            inp = app.query_one("#search", Input)
+            inp.focus()
+            await pilot.pause()
+            inp.value = "B-2"
+            await pilot.press("enter")
+            await pilot.pause()
+            # карточка уже на экране и грузится — ДО ответа сети
+            assert isinstance(app.screen, IssueDetailScreen)
+            assert app.screen.issue.key == "B-2"
+            assert app.screen._loading is True
+            gate.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.screen._loading is False
+            assert app.screen.issue.summary == "summary B-2"  # данные наполнились
+            await pilot.press("escape")
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_search_empty_input_does_not_fetch():
+    """Пустой/пробельный ввод не дёргает issue_get_fn."""
+    from textual.widgets import Input
+
+    calls = []
+
+    def get(key):
+        calls.append(key)
+        return _issue(key)
+
+    data = DashboardData(user="alice", last_sync={"mine": None}, mine=[_issue("A-1")])
+    app = JwuDashboard(data, issue_get_fn=get, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            inp = app.query_one("#search", Input)
+            inp.focus()
+            await pilot.pause()
+            inp.value = "   "
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert calls == []
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_search_missing_issue_notifies_and_survives():
+    """Исключение из issue_get_fn (нет задачи/доступа) не открывает карточку и не роняет app."""
+    from textual.widgets import Input
+
+    from jwu.cli.dashboard import IssueDetailScreen
+
+    def get(key):
+        raise RuntimeError("404")
+
+    data = DashboardData(user="alice", last_sync={"mine": None}, mine=[_issue("A-1")])
+    app = JwuDashboard(data, issue_get_fn=get, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            inp = app.query_one("#search", Input)
+            inp.focus()
+            await pilot.pause()
+            inp.value = "NOPE-1"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, IssueDetailScreen)
             await pilot.press("q")
 
     asyncio.run(run())

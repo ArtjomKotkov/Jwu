@@ -113,7 +113,11 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError("tomllib недоступен — нужен Python 3.11+ для чтения config.toml")
     with path.open("rb") as fh:
         raw = tomllib.load(fh)
+    return _apply_raw(cfg, raw)
 
+
+def _apply_raw(cfg: Config, raw: dict) -> Config:
+    """Наложить разобранный TOML (dict) на Config. Общая логика load_config и import_bundle."""
     j = raw.get("jira", {}) or {}
     cfg.jira.base_url = j.get("base_url", cfg.jira.base_url).rstrip("/")
     cfg.jira.project = j.get("project", cfg.jira.project)
@@ -207,3 +211,82 @@ def jira_proxy_basic(cfg: Config) -> tuple[str, str] | None:
         return None
     pw = secrets.get_secret(cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user)
     return (cfg.jira.proxy_basic_user, pw) if pw else None
+
+
+def secret_slots(cfg: Config) -> list[tuple[str, str]]:
+    """Все (service, account) секретов, известных по конфигу (с пустым account отброшены).
+
+    Единый источник правды о том, какие секреты у jwu есть: PAT Jira, сессионный
+    пароль Jira, пароль nginx-гейта, PAT Bitbucket.
+    """
+    pairs = [
+        (cfg.jira.token_service, cfg.jira.token_account),
+        (cfg.jira.login_service, cfg.jira.username),
+        (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user),
+        (cfg.bitbucket.token_service, cfg.bitbucket.token_account),
+    ]
+    return [(s, a) for (s, a) in pairs if s and a]
+
+
+def export_bundle(cfg: Config, path: Path) -> int:
+    """Записать переносимый бандл: несекретные поля + СЕКРЕТЫ из keyring (плайнтекст).
+
+    Возвращает число выгруженных секретов. Файл содержит пароли в открытом виде —
+    предназначен для переноса между машинами, хранить безопасно.
+    """
+    raw: dict = {
+        "jira": {
+            "base_url": cfg.jira.base_url,
+            "username": cfg.jira.username,
+            "project": cfg.jira.project,
+        },
+        "bitbucket": {
+            "base_url": cfg.bitbucket.base_url,
+            "project": cfg.bitbucket.project,
+            "repo": cfg.bitbucket.repo,
+        },
+        "storage": {"db_path": cfg.storage.db_path},
+    }
+    if cfg.jira.proxy_basic_user:
+        raw["jira"]["proxy_basic_user"] = cfg.jira.proxy_basic_user
+
+    sec_list: list[dict] = []
+    for service, account in secret_slots(cfg):
+        val = secrets.get_secret(service, account)
+        if val:
+            sec_list.append({"service": service, "account": account, "value": val})
+    raw["secrets"] = sec_list
+
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        tomli_w.dump(raw, fh)
+    return len(sec_list)
+
+
+def import_bundle(path: Path) -> tuple[Config, int]:
+    """Прочитать бандл: применить конфиг (в config.toml) и записать секреты в keyring.
+
+    Возвращает (cfg, число записанных секретов). KeyringError при записи секрета
+    пробрасывается наверх — обработает CLI.
+    """
+    path = Path(path).expanduser()
+    if not path.exists():
+        raise ConfigError(f"Файл бандла не найден: {path}")
+    if tomllib is None:  # pragma: no cover
+        raise ConfigError("tomllib недоступен — нужен Python 3.11+ для чтения бандла")
+    with path.open("rb") as fh:
+        raw = tomllib.load(fh)
+
+    cfg = _apply_raw(Config(), raw)
+    save_config(cfg)
+
+    written = 0
+    for entry in raw.get("secrets", []) or []:
+        service = entry.get("service")
+        account = entry.get("account")
+        value = entry.get("value")
+        if service and account and value:
+            secrets.set_secret(service, account, value)
+            written += 1
+    return cfg, written

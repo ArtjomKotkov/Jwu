@@ -26,9 +26,18 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
+from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
-from ..core.models import JOB_RECORD_BADGES, Analysis, Issue, Job, PR, PRComment
+from ..core.models import (
+    JOB_RECORD_BADGES,
+    Analysis,
+    Comment,
+    Issue,
+    Job,
+    PR,
+    PRComment,
+    classify_attachment,
+)
 from ..core.service import DashboardData, PRDetail
 
 DELTA_ICON = {
@@ -43,10 +52,13 @@ DELTA_ICON = {
     "resolved": "✅",
 }
 
+# Иконка по виду вложения (Attachment.kind) — для правой колонки карточки задачи.
+ATTACH_ICON = {"image": "🖼", "log": "📄", "doc": "📕", "archive": "🗜", "video": "🎬", "other": "📎"}
+
 # pane id -> (table id, kind, section-токен)
 TABS = {
     "tab-mine": ("t-mine", "issue", "mine"),
-    "tab-mentions": ("t-mentions", "issue", "mentions"),
+    "tab-mentions": ("t-mentions", "mention", "mentions"),
     "tab-prs-mine": ("t-prs-mine", "pr", "prs_mine"),
     "tab-prs-review": ("t-prs-review", "pr", "prs_review"),
     "tab-analysis": ("t-analysis", "analysis", "analysis"),
@@ -54,6 +66,7 @@ TABS = {
 }
 
 ISSUE_COLUMNS = ["Key", "Статус", "Приоритет", "Summary"]
+MENTION_COLUMNS = ["Когда", "Задача", "Упоминание"]
 PR_COLUMNS = ["PR", "Repo", "Конфликт", "Title", "Ревью"]
 ANALYSIS_COLUMNS = ["ID", "Дата/время", "Заголовок"]
 JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Задача", "PR", "Title"]
@@ -89,6 +102,15 @@ def _fmt_dt(iso: str | None) -> str:
     return ts.strftime("%d.%m.%Y %H:%M")
 
 
+def _human_size(n: int) -> str:
+    size = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{int(n)} Б"
+
+
 def _fmt_dur(secs: float) -> str:
     secs = max(0, int(secs))
     m, s = divmod(secs, 60)
@@ -106,11 +128,69 @@ _JIRA_BLOCK_RE = re.compile(
 )
 
 
-def render_jira_text(text: str, *, highlight: bool = False) -> list[RenderableType]:
+# Инлайн-разметка Jira внутри прозы: упоминания [~login], вложения [^файл],
+# встроенные картинки !img.png!, ссылки [текст|url] / [url] и голые http(s)-ссылки.
+# Порядок важен (упоминание/вложение раньше ссылки — у них тоже скобка `[`).
+_INLINE_RE = re.compile(
+    r"\[~(?P<user>[^\]\r\n]+)\]"
+    r"|\[\^(?P<file>[^\]\r\n]+)\]"
+    r"|!(?P<img>[^!\r\n|\s]+\.[A-Za-z0-9]+)(?:\|[^!\r\n]*)?!"
+    r"|\[(?:(?P<ltext>[^\]|\r\n]*)\|)?(?P<lurl>https?://[^\]\r\n]+)\]"
+    r"|(?P<bare>https?://[^\s\]]+)"
+)
+
+
+def _attachment_chip(filename: str, attach_map: Optional[dict[str, int]]) -> Text:
+    """Чип вложения «🖼 имя» как в правом блоке; кликабелен, если файл есть в attach_map."""
+    icon = ATTACH_ICON.get(classify_attachment(filename), "📎")
+    idx = attach_map.get(filename) if attach_map else None
+    if idx is not None:
+        return Text.from_markup(
+            f"{icon} [@click=screen.open_attachment({idx})][cyan u]{escape(filename)}[/cyan u][/]")
+    return Text.from_markup(f"{icon} [cyan]{escape(filename)}[/cyan]")
+
+
+def _inline_segments(
+    chunk: str, style: str, attach_map: Optional[dict[str, int]], *, clickable: bool = True
+) -> Text:
+    """Собрать строку прозы в rich.Text: обычный текст без интерпретации разметки,
+    а вложения/ссылки — отдельными оформленными спанами (вложения как в правом блоке,
+    ссылки — кликабельным [link]). При clickable=False — то же оформление, но без
+    действий и гиперссылок (для ячеек таблицы).
+    """
+    t = Text()
+    pos = 0
+    for m in _INLINE_RE.finditer(chunk):
+        if m.start() > pos:
+            t.append(chunk[pos:m.start()], style=style)
+        if m.group("user"):  # упоминание [~login] → @login, жирным цветом пользователя
+            user = m.group("user")
+            t.append(f"@{user}", style=f"bold {author_color(user)}")
+        elif m.group("file") or m.group("img"):
+            fname = m.group("file") or m.group("img")
+            t.append_text(_attachment_chip(fname, attach_map if clickable else None))
+        else:  # ссылка
+            url = m.group("lurl") or m.group("bare")
+            label = (m.group("ltext") or "").strip() or url
+            if clickable:
+                t.append_text(Text.from_markup(
+                    f"[link={url}][cyan u]{escape(label)}[/cyan u][/link]"))
+            else:
+                t.append(label, style="cyan underline")
+        pos = m.end()
+    if pos < len(chunk):
+        t.append(chunk[pos:], style=style)
+    return t
+
+
+def render_jira_text(
+    text: str, *, highlight: bool = False, attach_map: Optional[dict[str, int]] = None
+) -> list[RenderableType]:
     """Разбить Jira-вики текст на куски: прозу (как есть) и код-блоки в панелях.
 
     Текст вставляется через rich.Text (без интерпретации разметки), чтобы '[', '{' и т.п.
     из контента не ломали рендер. Код-блоки {code}/{noformat} → обособлённая панель.
+    Внутри прозы вложения [^файл]/!img! и ссылки [url] оформляются (см. _inline_segments).
     """
     parts: list[RenderableType] = []
     style = "yellow" if highlight else ""
@@ -118,7 +198,7 @@ def render_jira_text(text: str, *, highlight: bool = False) -> list[RenderableTy
     def add_prose(chunk: str) -> None:
         chunk = chunk.strip("\n")
         if chunk:
-            parts.append(Text(chunk, style=style))
+            parts.append(_inline_segments(chunk, style, attach_map))
 
     pos = 0
     for m in _JIRA_BLOCK_RE.finditer(text or ""):
@@ -274,6 +354,11 @@ def parse_pr_url(url: str) -> Optional[tuple[str, str, int]]:
     return (m.group(1), m.group(2), int(m.group(3))) if m else None
 
 
+def normalize_issue_key(value: str) -> str:
+    """Нормализовать ввод поиска в ключ задачи: обрезать пробелы, в верхний регистр."""
+    return (value or "").strip().upper()
+
+
 def _msafe(s: str) -> str:
     """Жёстко экранировать текст под markup: каждую `[` → `\\[`.
 
@@ -402,6 +487,7 @@ class IssueDetailScreen(Screen):
         job_get_fn: Optional[Callable[[int], Optional[Job]]] = None,
         issue_get_fn: Optional[Callable[[str], Issue]] = None,
         refresh_interval: float = 0.0,
+        loading: bool = False,
     ) -> None:
         super().__init__()
         self.issue = issue
@@ -412,6 +498,8 @@ class IssueDetailScreen(Screen):
         self._job_get_fn = job_get_fn
         self._issue_get_fn = issue_get_fn
         self._refresh_interval = refresh_interval
+        # loading → задача открыта по ключу (поиск), данные ещё тянутся из сети
+        self._loading = loading
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -432,14 +520,43 @@ class IssueDetailScreen(Screen):
                 yield Static(self._branches_markup(), id="branches")
                 yield Static(Rule("PR", align="left", style="cyan"), classes="sec")
                 yield Static(self._prs_markup(), id="prs")
+                yield Static(Rule("Вложения", align="left", style="cyan"), classes="sec")
+                yield Static(self._attachments_markup(), id="attachments")
                 yield Static(Rule("Работы", align="left", style="cyan"), classes="sec")
                 yield Static(self._jobs_markup(), id="jobs")
         yield Footer()
 
     def on_mount(self) -> None:
-        # авто-дотягивание открытой задачи из сети (раз в self._refresh_interval сек)
+        if self._issue_get_fn is not None:
+            # поиск (loading) — данных ещё нет, тянем с заглушкой «загрузка…».
+            # открыли из таблицы — кэш из памяти неполный (часто без комментов/вложений),
+            # поэтому разово дотягиваем свежую карточку из сети поверх показанного.
+            if self._loading:
+                self._initial_load()
+            else:
+                self._refresh()
+        # периодическое авто-дотягивание открытой задачи из сети (раз в self._refresh_interval сек)
         if self._issue_get_fn is not None and self._refresh_interval:
             self.set_interval(self._refresh_interval, self._refresh)
+
+    @work(thread=True, exclusive=True, group="issue-load")
+    def _initial_load(self) -> None:
+        """Первичная загрузка задачи по ключу (поиск): экран уже на экране, тут наполняем."""
+        try:
+            issue = self._issue_get_fn(self.issue.key)  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001 — нет задачи / доступа / сеть
+            self.app.call_from_thread(self._load_failed, str(exc))
+            return
+        self.app.call_from_thread(self._apply_loaded, issue)
+
+    def _load_failed(self, msg: str) -> None:
+        """Задачу не достать — сообщить и закрыть карточку (вернуться к списку)."""
+        self.notify(f"Не открыть {self.issue.key}: {msg}", severity="error")
+        self.app.pop_screen()
+
+    def _apply_loaded(self, issue: Issue) -> None:
+        self._loading = False
+        self._apply_issue(issue)
 
     @work(thread=True, exclusive=True)
     def _refresh(self) -> None:
@@ -460,20 +577,28 @@ class IssueDetailScreen(Screen):
         self.query_one("#links", Static).update(self._links_markup())
         self.query_one("#branches", Static).update(self._branches_markup())
         self.query_one("#prs", Static).update(self._prs_markup())
+        self.query_one("#attachments", Static).update(self._attachments_markup())
 
     # --- рендер динамических секций (compose + рефреш) ------------------- #
 
     def _title_renderable(self) -> RenderableType:
         it = self.issue
+        summary = (f"[b]{escape(it.summary)}[/b]" if it.summary
+                   else "[dim]⏳ загрузка…[/dim]" if self._loading else "")
         return Group(
-            Text.from_markup(f"[b cyan]{escape(it.key)}[/b cyan]   [b]{escape(it.summary)}[/b]"),
+            Text.from_markup(f"[b cyan]{escape(it.key)}[/b cyan]   {summary}"),
             Rule(style="cyan"),
         )
 
+    def _attach_index_map(self) -> dict[str, int]:
+        """Имя файла → индекс вложения (для кликабельных чипов в тексте описания/комментов)."""
+        return {a.filename: i for i, a in enumerate(self.issue.attachments)}
+
     def _descr_renderable(self) -> RenderableType:
         it = self.issue
-        return (Group(*render_jira_text(it.description))
-                if it.description else Text.from_markup("[dim]—[/dim]"))
+        if it.description:
+            return Group(*render_jira_text(it.description, attach_map=self._attach_index_map()))
+        return Text.from_markup("[dim]⏳ загрузка задачи…[/dim]" if self._loading else "[dim]—[/dim]")
 
     def _comments_head(self) -> RenderableType:
         return Rule(f"Комментарии ({len(self.issue.comments)})", align="left", style="cyan")
@@ -503,11 +628,13 @@ class IssueDetailScreen(Screen):
     def _links_markup(self) -> str:
         if not self.issue.links:
             return "[dim]нет[/dim]"
-        return "\n".join(
-            f"[cyan]{escape(ln.key)}[/cyan] [dim]{escape(ln.type)}[/dim] "
-            f"{_msafe(ln.summary[:40])} [dim]({escape(ln.status)})[/dim]"
-            for ln in self.issue.links
-        )
+        lines = []
+        for ln in self.issue.links:
+            key = (f"[@click=app.open_issue('{escape(ln.key)}')][cyan u]{escape(ln.key)}[/cyan u][/]"
+                   if self._issue_get_fn is not None else f"[cyan]{escape(ln.key)}[/cyan]")
+            lines.append(f"{key} [dim]{escape(ln.type)}[/dim] "
+                         f"{_msafe(ln.summary[:40])} [dim]({escape(ln.status)})[/dim]")
+        return "\n".join(lines)
 
     def _branches_markup(self) -> str:
         if not self.issue.branches:
@@ -542,6 +669,19 @@ class IssueDetailScreen(Screen):
             lines.append(f"{link} {badge}")
         return "\n".join(lines)
 
+    def _attachments_markup(self) -> str:
+        atts = self.issue.attachments
+        if not atts:
+            return "[dim]нет[/dim]"
+        lines = []
+        for i, a in enumerate(atts):
+            icon = ATTACH_ICON.get(a.kind, "📎")
+            name = _msafe(a.filename[:36])
+            label = (f"[@click=screen.open_attachment({i})][cyan u]{name}[/cyan u][/]"
+                     if a.url else f"[cyan]{name}[/cyan]")
+            lines.append(f"{icon} {label} [dim]{_human_size(a.size)}[/dim]")
+        return "\n".join(lines)
+
     def _jobs_markup(self) -> str:
         if not self.jobs:
             return "[dim]нет[/dim]"
@@ -559,6 +699,7 @@ class IssueDetailScreen(Screen):
 
     def _comment_parts(self, marker: Optional[str]) -> list[RenderableType]:
         parts: list[RenderableType] = []
+        attach_map = self._attach_index_map()
         for i, c in enumerate(self.issue.comments):
             if i:
                 parts.append(Rule(style="grey30"))
@@ -569,7 +710,7 @@ class IssueDetailScreen(Screen):
                 f"[b {color}]{escape(c.author)}[/b {color}] "
                 f"[dim]{escape(c.created[:16])}[/dim]{tag}"
             ))
-            parts += render_jira_text(c.body or "", highlight=mine)
+            parts += render_jira_text(c.body or "", highlight=mine, attach_map=attach_map)
         return parts
 
     # --- действия ------------------------------------------------------- #
@@ -588,6 +729,12 @@ class IssueDetailScreen(Screen):
 
     def action_open_job(self, job_id: int) -> None:
         self.app.push_screen(JobDetailScreen(job_id, get_fn=self._job_get_fn))
+
+    def action_open_attachment(self, idx: int) -> None:
+        """Клик по вложению → открыть его в браузере (скачивание идёт через jwu attachments)."""
+        atts = self.issue.attachments
+        if 0 <= idx < len(atts) and atts[idx].url:
+            webbrowser.open(atts[idx].url)
 
     def action_open_first_pr(self) -> None:
         for pr in self.issue.pull_requests:
@@ -878,7 +1025,8 @@ class JwuDashboard(App):
     #splitter { width: 1; height: 1fr; background: $panel; }
     #splitter:hover { background: $accent; }
     #changes-col { width: 42; height: 1fr; border: round $accent; }
-    #changes-pane { height: 3fr; padding: 0 1; }
+    #search { height: 3; margin: 0 1; }
+    #changes-pane { width: 100%; height: 3fr; padding: 0 1; border-top: solid $accent; }
     #changes { height: auto; }
     #status { height: 1fr; padding: 0 1; color: $text-muted; border-top: solid $accent; }
     TabbedContent { height: 1fr; }
@@ -974,6 +1122,7 @@ class JwuDashboard(App):
                     yield DataTable(id="t-jobs")
             yield Splitter()
             with Vertical(id="changes-col"):
+                yield Input(id="search", placeholder="Поиск: KEY-123 → Enter")
                 # верх (≈3/4) — уведомления, низ (≈1/4) — статус-строка (раньше была отдельным баром)
                 yield VerticalScroll(Static(id="changes"), id="changes-pane")
                 yield Static(id="status")
@@ -986,7 +1135,7 @@ class JwuDashboard(App):
             table = self.query_one(f"#{table_id}", DataTable)
             table.cursor_type = "row"
             table.zebra_stripes = True
-            cols = {"issue": ISSUE_COLUMNS, "pr": PR_COLUMNS,
+            cols = {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS, "pr": PR_COLUMNS,
                     "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS}[kind]
             for col in cols:
                 table.add_column(col, key=col)
@@ -1058,6 +1207,8 @@ class JwuDashboard(App):
             items = self._sorted(table_id, kind, self._data_for(section))
             if kind == "issue":
                 self._fill_issues(table_id, items)
+            elif kind == "mention":
+                self._fill_mentions(table_id, items)
             elif kind == "pr":
                 self._fill_prs(table_id, items)
             elif kind == "job":
@@ -1137,7 +1288,9 @@ class JwuDashboard(App):
         for d in deltas[:12]:
             icon = DELTA_ICON.get(d.kind, "•")
             detail = f" [dim]{escape(d.detail)}[/dim]" if d.detail else ""
-            lines.append(f"{icon} [cyan]{escape(d.key)}[/cyan]{detail}  {_msafe(d.summary[:50])}")
+            label = f"[cyan u]{escape(d.key)}[/cyan u]{detail}  {_msafe(d.summary[:50])}"
+            # вся строка кликабельна → открыть карточку задачи/PR, к которому относится изменение
+            lines.append(f"{icon} [@click=app.open_delta('{escape(d.key)}')]{label}[/]")
         if len(deltas) > 12:
             lines.append(f"[dim]…ещё {len(deltas) - 12}[/dim]")
         panel.update("\n".join(lines))
@@ -1149,6 +1302,12 @@ class JwuDashboard(App):
         col, reverse = state
         if kind == "issue":
             keyfns = [lambda i: i.key, lambda i: i.status, lambda i: i.priority, lambda i: i.summary]
+        elif kind == "mention":  # Когда · Задача · Упоминание
+            keyfns = [
+                lambda i: getattr(self._mention_comment(i), "created", "") or "",
+                lambda i: i.key,
+                lambda i: (getattr(self._mention_comment(i), "body", "") or "").lower(),
+            ]
         elif kind == "pr":
             keyfns = [
                 lambda p: p.id,
@@ -1199,6 +1358,43 @@ class JwuDashboard(App):
                 Text(it.priority, style=priority_color(it.priority)),
                 Text(it.summary, style="yellow" if changed else ""),
             )
+        self._rows[table_id] = list(issues)
+        self._restore_cursor(table, cur)
+
+    def _mention_comment(self, issue: Issue) -> Optional[Comment]:
+        """Последний коммент задачи, где упомянут текущий пользователь ([~login])."""
+        user = self._user or self.data.user
+        if not user:
+            return None
+        marker = f"[~{user}]"
+        hits = [c for c in issue.comments if marker in (c.body or "")]
+        return hits[-1] if hits else None
+
+    @staticmethod
+    def _mention_text(comment: Comment) -> str:
+        """Тело коммента-упоминания одной строкой (схлопнуть переводы/пробелы).
+
+        Упоминания [~login], вложения и ссылки оформляются дальше в _inline_segments.
+        """
+        return " ".join((comment.body or "").split())
+
+    def _fill_mentions(self, table_id: str, issues: list[Issue]) -> None:
+        """Вкладка «Упоминания»: когда упомянули · задача · текст коммента (обрезанный)."""
+        table = self.query_one(f"#{table_id}", DataTable)
+        cur = table.cursor_row
+        table.clear()
+        for it in issues:
+            changed = it.key in self._changed_issue_keys
+            c = self._mention_comment(it)
+            when = _fmt_dt(c.created) if c else "—"
+            base = "yellow" if changed else ""
+            if c:
+                # вложения/картинки/ссылки в тексте упоминания оформляем (некликабельно)
+                cell = _inline_segments(self._mention_text(c), base, None, clickable=False)
+            else:
+                cell = Text(it.summary or "—", style=base)
+            cell.truncate(80, overflow="ellipsis")
+            table.add_row(Text(when, style="dim"), self._key_cell(it.key, changed), cell)
         self._rows[table_id] = list(issues)
         self._restore_cursor(table, cur)
 
@@ -1296,6 +1492,59 @@ class JwuDashboard(App):
         elif isinstance(obj, Job):
             self.push_screen(JobDetailScreen(
                 obj.id, get_fn=self._job_get_fn, refresh_interval=local_iv))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Поиск по ключу задачи: Enter в поле #search сразу открывает карточку (с загрузкой)."""
+        if event.input.id != "search":
+            return
+        key = normalize_issue_key(event.value)
+        event.input.value = ""
+        if not key or self._issue_get_fn is None:
+            return
+        self._open_issue_loading(key)
+
+    def _open_issue_loading(self, key: str) -> None:
+        """Сразу показать карточку задачи по ключу; данные подтянет сам экран (loading)."""
+        detail_iv = self.detail_interval if self.auto_update else 0.0
+        jobs = [j for j in self.data.jobs if j.task_key == key]
+        self.push_screen(IssueDetailScreen(
+            Issue(key=key), jira_base=self.jira_base, user=self.data.user,
+            pr_detail_fn=self._pr_detail_fn, jobs=jobs, job_get_fn=self._job_get_fn,
+            issue_get_fn=self._issue_get_fn, refresh_interval=detail_iv, loading=True,
+        ))
+
+    def action_open_issue(self, key: str) -> None:
+        """Клик по связанной задаче (секция «Связи») → открыть её карточку, Esc — назад."""
+        if self._issue_get_fn is not None:
+            self._open_issue_loading(key)
+
+    def action_open_delta(self, key: str) -> None:
+        """Клик по строке в «Изменениях» → открыть карточку задачи/PR, где произошло изменение."""
+        m = re.match(r"^([^/]+)/([^/]+)#(\d+)$", key)
+        if m:  # PR-дельта: project/repo#id
+            project, repo, pr_id = m.group(1), m.group(2), int(m.group(3))
+            pr = next(
+                (p for p in (*self.data.prs_mine, *self.data.prs_review)
+                 if p.id == pr_id and p.project == project and p.repository == repo),
+                None,
+            )
+            if pr is not None:
+                self._open_detail(pr)
+            elif self._pr_detail_fn is not None:
+                self.push_screen(PRDetailScreen(
+                    PR(id=pr_id, project=project, repository=repo),
+                    detail_fn=self._pr_detail_fn,
+                    refresh_interval=self.detail_interval if self.auto_update else 0.0,
+                ))
+            return
+        # иначе — задача по ключу: берём из текущих данных или дотягиваем из сети
+        issue = next(
+            (i for i in (*self.data.mine, *self.data.mentions) if i.key == key), None
+        )
+        if issue is not None:
+            self._open_detail(issue)
+        elif self._issue_get_fn is not None:
+            self._open_issue_loading(key)
 
     def _object_delta_pairs(self, obj) -> list[tuple[str, str]]:
         """(key, kind) накопленных изменений, относящихся к объекту (для очистки пометки)."""

@@ -56,6 +56,27 @@ def test_jira_issue_with_dev_status():
 
 
 @respx.mock
+def test_jira_download_attachment_streams_to_file(tmp_path):
+    url = f"{JIRA}/secure/attachment/9/bug.png"
+    respx.get(url).mock(return_value=httpx.Response(200, content=b"\x89PNG\r\nDATA"))
+    dest = tmp_path / "sub" / "bug.png"
+    with JiraClient(JIRA, "tok") as jira:
+        out = jira.download_attachment(url, dest)
+    assert out == dest
+    assert dest.read_bytes() == b"\x89PNG\r\nDATA"  # каталог создан, файл записан
+
+
+@respx.mock
+def test_jira_download_attachment_error_raises(tmp_path):
+    url = f"{JIRA}/secure/attachment/9/missing.png"
+    respx.get(url).mock(return_value=httpx.Response(404, text="gone"))
+    with JiraClient(JIRA, "tok") as jira:
+        with pytest.raises(JiraError) as exc:
+            jira.download_attachment(url, tmp_path / "x.png")
+    assert exc.value.status_code == 404
+
+
+@respx.mock
 def test_jira_401_raises():
     respx.get(f"{JIRA}/rest/api/2/myself").mock(return_value=httpx.Response(401, text="nope"))
     with JiraClient(JIRA, "bad") as jira:

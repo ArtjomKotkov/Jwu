@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 def _get(d: Any, *path: str, default: Any = None) -> Any:
@@ -45,6 +45,63 @@ class Comment(BaseModel):
             body=raw.get("body", "") or "",
             created=raw.get("created", "") or "",
             updated=raw.get("updated", "") or "",
+        )
+
+
+# Расширение → вид вложения (фильтр «что качать» + иконки). Видео мы не качаем.
+_ATTACH_EXTS: dict[str, set[str]] = {
+    "image": {"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tiff", "tif", "ico", "heic"},
+    "log": {"log", "txt", "out", "json", "har", "xml", "csv", "yaml", "yml", "md",
+            "ini", "conf", "properties", "trace", "tsv"},
+    "doc": {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf", "odt", "ods"},
+    "archive": {"zip", "tar", "gz", "tgz", "rar", "7z", "bz2", "xz"},
+    "video": {"mp4", "mov", "avi", "mkv", "webm", "wmv", "flv", "m4v", "mpg", "mpeg"},
+}
+_EXT_TO_KIND: dict[str, str] = {ext: k for k, exts in _ATTACH_EXTS.items() for ext in exts}
+
+# Виды, которые имеет смысл скачивать для анализа (видео и прочее — мимо).
+DOWNLOADABLE_ATTACH_KINDS = ("image", "log", "doc", "archive")
+
+
+def classify_attachment(filename: str, mime: str = "") -> str:
+    """Вид вложения по расширению, с откатом на mime: image|log|doc|archive|video|other."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext in _EXT_TO_KIND:
+        return _EXT_TO_KIND[ext]
+    m = (mime or "").lower()
+    if m.startswith("image/"):
+        return "image"
+    if m.startswith("video/"):
+        return "video"
+    if m.startswith("text/"):
+        return "log"
+    return "other"
+
+
+class Attachment(BaseModel):
+    id: str = ""
+    filename: str = ""
+    mime: str = ""
+    size: int = 0          # байты
+    created: str = ""
+    author: str = ""
+    url: str = ""          # абсолютный URL контента на хосте Jira
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def kind(self) -> str:
+        return classify_attachment(self.filename, self.mime)
+
+    @classmethod
+    def from_jira(cls, raw: dict) -> "Attachment":
+        return cls(
+            id=str(raw.get("id", "")),
+            filename=raw.get("filename", "") or "",
+            mime=raw.get("mimeType", "") or "",
+            size=int(raw.get("size", 0) or 0),
+            created=raw.get("created", "") or "",
+            author=_get(raw, "author", "displayName", default="") or "",
+            url=raw.get("content", "") or "",
         )
 
 
@@ -106,6 +163,7 @@ class Issue(BaseModel):
     resolution: str = ""
     description: str = ""
     comments: list[Comment] = Field(default_factory=list)
+    attachments: list[Attachment] = Field(default_factory=list)
     links: list[IssueLink] = Field(default_factory=list)
     branches: list[DevBranch] = Field(default_factory=list)
     commits: list[DevCommit] = Field(default_factory=list)
@@ -124,6 +182,7 @@ class Issue(BaseModel):
             Comment.from_jira(c)
             for c in _get(f, "comment", "comments", default=[]) or []
         ]
+        attachments = [Attachment.from_jira(a) for a in f.get("attachment", []) or []]
         return cls(
             key=raw.get("key", ""),
             summary=f.get("summary", "") or "",
@@ -136,6 +195,7 @@ class Issue(BaseModel):
             resolution=_get(f, "resolution", "name", default="") or "",
             description=f.get("description", "") or "",
             comments=comments,
+            attachments=attachments,
             links=links,
         )
 

@@ -1,4 +1,6 @@
-from jwu.core.models import Issue, Job, JobPRLink, JobRecord, PR
+import pytest
+
+from jwu.core.models import Issue, Job, JobPRLink, JobRecord, PR, classify_attachment
 
 from .fixtures import (
     bitbucket_merge_raw,
@@ -19,6 +21,38 @@ def test_issue_from_jira_parses_core_fields_and_comments():
     assert issue.priority == "High"
     # комментарии задач — в хронологическом порядке (старые сверху)
     assert [c.body for c in issue.comments] == ["первый", "второй"]
+
+
+def test_issue_parses_attachments_with_kind_and_url():
+    raw = jira_issue_raw(attachments=[
+        {"id": 1, "filename": "bug.PNG", "mime": "image/png", "size": 2048},
+        {"id": 2, "filename": "server.log", "size": 100},
+        {"id": 3, "filename": "demo.mp4", "mime": "video/mp4"},
+        {"id": 4, "filename": "report.pdf"},
+        {"id": 5, "filename": "dump.zip"},
+    ])
+    issue = Issue.from_jira(raw)
+    assert [a.kind for a in issue.attachments] == ["image", "log", "video", "doc", "archive"]
+    img = issue.attachments[0]
+    assert img.filename == "bug.PNG" and img.size == 2048
+    assert img.url.endswith("/1/bug.PNG")
+    # computed field попадает в JSON для скилла
+    assert img.model_dump()["kind"] == "image"
+
+
+@pytest.mark.parametrize("filename,mime,expected", [
+    ("a.jpeg", "", "image"),
+    ("trace.TXT", "", "log"),
+    ("data.json", "", "log"),
+    ("clip.mov", "", "video"),
+    ("doc.docx", "", "doc"),
+    ("src.tar.gz", "", "archive"),
+    ("weird", "image/gif", "image"),
+    ("weird", "text/plain", "log"),
+    ("weird", "", "other"),
+])
+def test_classify_attachment(filename, mime, expected):
+    assert classify_attachment(filename, mime) == expected
 
 
 def test_issue_links_direction():

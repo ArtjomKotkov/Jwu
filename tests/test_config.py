@@ -106,3 +106,56 @@ def test_jira_login_none_without_password(monkeypatch):
     cfg = Config()
     cfg.jira.username = "alice"
     assert cfgmod.jira_login(cfg) is None
+
+
+def test_export_import_bundle_roundtrip(tmp_path, monkeypatch):
+    """export → import переносит config + ВСЕ секреты (включая гейт) в чистую среду."""
+    from jwu.core import secrets
+    from jwu.core.config import export_bundle, import_bundle
+
+    _mem(monkeypatch)
+    cfg_path = tmp_path / "config.toml"
+    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
+
+    cfg = Config()
+    cfg.jira.base_url = "https://jira.acme.com"
+    cfg.jira.username = "alice"
+    cfg.jira.project = "ACME"
+    cfg.jira.proxy_basic_user = "gateuser"
+    cfg.bitbucket.base_url = "https://git.acme.com"
+    cfg.bitbucket.repo = "server"
+    cfg.storage.db_path = str(tmp_path / "jwu.db")
+    secrets.set_secret(cfg.jira.token_service, cfg.jira.token_account, "JTOK")
+    secrets.set_secret(cfg.jira.login_service, "alice", "JPW")
+    secrets.set_secret(cfg.jira.proxy_basic_service, "gateuser", "GPW")
+    secrets.set_secret(cfg.bitbucket.token_service, cfg.bitbucket.token_account, "BTOK")
+
+    bundle = tmp_path / "bundle.toml"
+    n = export_bundle(cfg, bundle)
+    assert n == 4
+    text = bundle.read_text()
+    assert "JPW" in text and "GPW" in text  # секреты в бандле (плайнтекст)
+
+    # «новая машина»: пустой keyring + нет config.toml
+    m2 = _mem(monkeypatch)
+    if cfg_path.exists():
+        cfg_path.unlink()
+
+    cfg2, written = import_bundle(bundle)
+    assert written == 4
+    assert cfg2.jira.proxy_basic_user == "gateuser"
+
+    loaded = load_config(cfg_path)
+    assert loaded.jira.base_url == "https://jira.acme.com"
+    assert loaded.jira.proxy_basic_user == "gateuser"
+    assert m2.get_password("jira-login", "alice") == "JPW"
+    assert m2.get_password("jira-proxy-basic", "gateuser") == "GPW"
+    assert m2.get_password("bitbucket-pat", "bitbucket") == "BTOK"
+
+
+def test_import_bundle_missing_file_raises(tmp_path):
+    from jwu.core.config import ConfigError, import_bundle
+
+    import pytest
+    with pytest.raises(ConfigError):
+        import_bundle(tmp_path / "nope.toml")

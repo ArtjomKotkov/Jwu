@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
 from .bitbucket import BitbucketClient
 from .config import (
@@ -19,8 +23,28 @@ from .config import (
     load_config,
 )
 from .jira import JiraClient
-from .models import Analysis, Delta, Issue, Job, Note, PR, PRComment
+from .models import (
+    Analysis,
+    Attachment,
+    DOWNLOADABLE_ATTACH_KINDS,
+    Delta,
+    Issue,
+    Job,
+    Note,
+    PR,
+    PRComment,
+)
 from .store import Store
+
+_UNSAFE_NAME_RE = re.compile(r"[^\w.\- ]+", re.UNICODE)
+
+
+def _safe_filename(name: str) -> str:
+    """Обезвредить имя файла под запись на диск: убрать пути и спецсимволы."""
+    name = (name or "").replace("\\", "/").split("/")[-1].strip()
+    name = _UNSAFE_NAME_RE.sub("_", name)
+    return name[:120]
+
 
 # токены секций в sync_runs.views (для last_sync по вкладке)
 SECTION_TOKEN = {
@@ -263,6 +287,40 @@ class Service:
 
     def issue(self, key: str) -> Issue:
         return self.jira.issue(key, with_dev=True)
+
+    def attachments_dir(self, key: str) -> Path:
+        """Каталог по умолчанию для скачанных вложений задачи: <tmp>/jwu/<KEY>."""
+        return Path(tempfile.gettempdir()) / "jwu" / key
+
+    def download_attachments(
+        self,
+        key: str,
+        *,
+        kinds: Optional[list[str]] = None,
+        dest: Optional[Path] = None,
+        issue: Optional[Issue] = None,
+    ) -> list[tuple[Attachment, Path]]:
+        """Скачать вложения задачи выбранных видов в каталог dest.
+
+        kinds — какие виды качать (по умолчанию image/log/doc/archive; видео никогда).
+        Возвращает пары (вложение, локальный путь). Имена санитизируются, коллизии
+        разводятся префиксом id вложения.
+        """
+        wanted = set(kinds) if kinds is not None else set(DOWNLOADABLE_ATTACH_KINDS)
+        issue = issue or self.jira.issue(key, with_dev=False)
+        dest = Path(dest) if dest is not None else self.attachments_dir(key)
+        results: list[tuple[Attachment, Path]] = []
+        used: set[str] = set()
+        for att in issue.attachments:
+            if att.kind not in wanted or not att.url:
+                continue
+            name = _safe_filename(att.filename) or f"attachment-{att.id}"
+            if name in used:  # коллизия имён → развести префиксом id
+                name = f"{att.id}-{name}"
+            used.add(name)
+            path = self.jira.download_attachment(att.url, dest / name)
+            results.append((att, path))
+        return results
 
     # --- Bitbucket ------------------------------------------------------ #
 

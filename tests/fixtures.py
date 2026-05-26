@@ -8,8 +8,10 @@ def jira_issue_raw(
     resolution=None,
     comments=None,
     summary="Тестовая задача",
+    attachments=None,
 ):
     comments = comments if comments is not None else []
+    attachments = attachments if attachments is not None else []
     return {
         "id": issue_id,
         "key": key,
@@ -43,6 +45,19 @@ def jira_issue_raw(
                         "fields": {"summary": "Связанная", "status": {"name": "Open"}},
                     },
                 }
+            ],
+            "attachment": [
+                {
+                    "id": str(a["id"]),
+                    "filename": a.get("filename", "file.bin"),
+                    "mimeType": a.get("mime", "application/octet-stream"),
+                    "size": a.get("size", 0),
+                    "created": a.get("created", "2026-05-10T12:00:00.000+0300"),
+                    "author": {"displayName": a.get("author", "Кто-то")},
+                    "content": a.get("content", "https://jira.test/secure/attachment/"
+                                      f"{a['id']}/{a.get('filename', 'file.bin')}"),
+                }
+                for a in attachments
             ],
         },
     }

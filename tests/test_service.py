@@ -26,6 +26,42 @@ def _service(tmp_path):
 
 
 @respx.mock
+def test_download_attachments_filters_kinds_and_writes(tmp_path):
+    atts = [
+        {"id": 1, "filename": "bug.png", "mime": "image/png", "size": 3},
+        {"id": 2, "filename": "app.log", "size": 4},
+        {"id": 3, "filename": "demo.mp4", "mime": "video/mp4"},  # видео — не качаем
+    ]
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(attachments=atts))
+    )
+    respx.get(f"{JIRA}/secure/attachment/1/bug.png").mock(
+        return_value=httpx.Response(200, content=b"img"))
+    respx.get(f"{JIRA}/secure/attachment/2/app.log").mock(
+        return_value=httpx.Response(200, content=b"logs"))
+
+    svc = _service(tmp_path)
+    dest = tmp_path / "dl"
+    got = svc.download_attachments("PROJ-1", kinds=["image", "log"], dest=dest)
+    svc.close()
+
+    assert sorted(p.name for _, p in got) == ["app.log", "bug.png"]  # mp4 отфильтрован
+    assert (dest / "bug.png").read_bytes() == b"img"
+    assert (dest / "app.log").read_bytes() == b"logs"
+
+
+@respx.mock
+def test_download_attachments_default_dir_under_tmp(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw())  # без вложений
+    )
+    svc = _service(tmp_path)
+    assert svc.attachments_dir("PROJ-1").name == "PROJ-1"
+    assert svc.download_attachments("PROJ-1") == []  # нечего качать
+    svc.close()
+
+
+@respx.mock
 def test_sync_detects_new_comment_across_runs(tmp_path):
     respx.get(f"{JIRA}/rest/api/2/search").mock(
         return_value=httpx.Response(200, json=jira_search_raw([jira_issue_raw()]))

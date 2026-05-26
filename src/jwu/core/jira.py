@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -12,7 +13,7 @@ import httpx
 from .models import Issue
 
 DEFAULT_FIELDS = "summary,status,assignee,reporter,priority,created,updated,resolution"
-DETAIL_FIELDS = DEFAULT_FIELDS + ",description,comment,issuelinks"
+DETAIL_FIELDS = DEFAULT_FIELDS + ",description,comment,issuelinks,attachment"
 
 
 class JiraError(RuntimeError):
@@ -144,6 +145,27 @@ class JiraClient:
                 detail = self._dev_status(str(issue_id))
                 issue.apply_dev_status(detail)
         return issue
+
+    def download_attachment(self, url: str, dest: Path) -> Path:
+        """Скачать файл вложения по абсолютному content-URL в dest (стримингом).
+
+        URL — абсолютный (на хосте Jira), а у клиента base_url указывает на /rest;
+        httpx при абсолютном URL игнорирует base_url, но заголовки авторизации/куки
+        сессии остаются на клиенте и применяются. Каталог dest.parent создаётся.
+        """
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self._client.stream("GET", url) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    raise JiraError(f"{resp.status_code}: не скачать вложение {url}",
+                                    resp.status_code)
+                with dest.open("wb") as fh:
+                    for chunk in resp.iter_bytes():
+                        fh.write(chunk)
+        except httpx.HTTPError as exc:
+            raise JiraError(f"Сеть/Jira недоступна при скачивании вложения: {exc}") from exc
+        return dest
 
     def _dev_status(self, issue_id: str) -> dict:
         """Слить ветки (dataType=branch), коммиты (repository) и PR (pullrequest).

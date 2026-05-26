@@ -76,6 +76,41 @@ def _emit_json(payload: object) -> None:
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+_ATTACH_ICON = {"image": "🖼", "log": "📄", "doc": "📕", "archive": "🗜", "video": "🎬", "other": "📎"}
+_ATTACH_RU = {"image": "изображения", "log": "логи/текст", "doc": "документы",
+              "archive": "архивы", "video": "видео", "other": "прочие"}
+
+
+def _human_size(n: int) -> str:
+    size = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{int(n)} Б"
+
+
+def _attach_counts(attachments: list) -> dict[str, int]:
+    """Сводка количества вложений по видам (image/log/doc/archive/video/other)."""
+    counts: dict[str, int] = {}
+    for a in attachments:
+        counts[a.kind] = counts.get(a.kind, 0) + 1
+    return counts
+
+
+def _render_attachments(attachments: list) -> None:
+    """Секция «Вложения» в выводе jwu task / jwu attachments."""
+    if not attachments:
+        return
+    counts = _attach_counts(attachments)
+    summary = ", ".join(f"{_ATTACH_RU.get(k, k)}: {n}" for k, n in sorted(counts.items()))
+    console.print(f"\n[bold]Вложения ({len(attachments)})[/bold]  [dim]{summary}[/dim]")
+    for a in attachments:
+        icon = _ATTACH_ICON.get(a.kind, "📎")
+        console.print(f"  {icon} {a.filename} [dim]{_human_size(a.size)} · {a.kind}"
+                      f" · {a.author} · {a.created[:16]}[/dim]")
+
+
 # --------------------------------------------------------------------------- #
 # auth
 # --------------------------------------------------------------------------- #
@@ -111,8 +146,32 @@ def _prompt_default(label: str, current: str, *, secret: bool = False) -> str:
     return typer.prompt(label, default=current)
 
 
-@app.command()
-def configure(
+configure_app = typer.Typer(
+    invoke_without_command=True,
+    help="Настройка jwu: хосты/логины в config.toml, секреты в keyring. "
+         "Без подкоманды — интерактивный визард. export/import — перенос между машинами.",
+)
+app.add_typer(configure_app, name="configure")
+
+
+def _auth_check_report() -> None:
+    """Проверить связь по текущему конфигу и напечатать ✓/✗ по Jira и Bitbucket."""
+    try:
+        with Service.from_config(load_config()) as svc:
+            res = svc.auth_check()
+        for name in ("jira", "bitbucket"):
+            r = res[name]
+            mark = "[green]✓[/green]" if r["ok"] else "[red]✗[/red]"
+            extra = f" {r.get('error')}" if not r["ok"] else (
+                f" ({r.get('name')})" if r.get("name") else "")
+            console.print(f"{mark} {name}{extra}")
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[yellow]Проверка связи не удалась:[/yellow] {exc}")
+
+
+@configure_app.callback(invoke_without_command=True)
+def configure_main(
+    ctx: typer.Context,
     non_interactive: bool = typer.Option(False, "--non-interactive",
         help="Не спрашивать; брать значения только из флагов."),
     jira_host: Optional[str] = typer.Option(None, "--jira-host"),
@@ -130,7 +189,9 @@ def configure(
     bitbucket_token_opt: Optional[str] = typer.Option(None, "--bitbucket-token"),
     db_path_opt: Optional[str] = typer.Option(None, "--db-path"),
 ) -> None:
-    """Настроить jwu: хосты/логины в config.toml, секреты в keyring. Файл руками не правится."""
+    """Визард настройки (когда вызвано без подкоманды export/import)."""
+    if ctx.invoked_subcommand is not None:
+        return  # вызвана подкоманда (export/import) — визард не запускаем
     cfg = load_config()
 
     if non_interactive:
@@ -156,6 +217,12 @@ def configure(
             "Jira PAT-токен", "", secret=True)
         jpw = jira_password if jira_password is not None else _prompt_default(
             "Jira пароль (сессия)", "", secret=True)
+        # nginx Basic-гейт перед Jira (опционально): логин в config, пароль в keyring
+        cfg.jira.proxy_basic_user = gate_user or _prompt_default(
+            "Логин nginx-гейта (Enter — без гейта)", cfg.jira.proxy_basic_user)
+        gpw = gate_password if gate_password is not None else (
+            _prompt_default("Пароль nginx-гейта", "", secret=True)
+            if cfg.jira.proxy_basic_user else "")
         cfg.bitbucket.base_url = (bitbucket_host or _prompt_default(
             "Bitbucket host", cfg.bitbucket.base_url)).rstrip("/")
         cfg.bitbucket.project = bitbucket_project or _prompt_default(
@@ -169,6 +236,7 @@ def configure(
         new_secrets = {
             (cfg.jira.token_service, cfg.jira.token_account): jtok,
             (cfg.jira.login_service, cfg.jira.username): jpw,
+            (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gpw,
             (cfg.bitbucket.token_service, cfg.bitbucket.token_account): btok,
         }
 
@@ -185,18 +253,41 @@ def configure(
         raise typer.Exit(code=1)
 
     console.print(f"[green]Конфиг сохранён[/green]: {path}  (секретов записано: {saved})")
+    _auth_check_report()
+
+
+@configure_app.command("export")
+def configure_export(
+    path: str = typer.Argument(..., help="Куда записать бандл (.toml)."),
+) -> None:
+    """Выгрузить config + СЕКРЕТЫ в переносимый файл (плайнтекст — храните безопасно)."""
+    from ..core.config import export_bundle
+
+    n = export_bundle(load_config(), Path(path))
+    console.print(f"[green]Бандл записан[/green]: {path}  (секретов: {n})")
+    err.print("[yellow]Внимание:[/yellow] файл содержит пароли в открытом виде — "
+              "не коммить и храни безопасно.")
+
+
+@configure_app.command("import")
+def configure_import(
+    path: str = typer.Argument(..., help="Файл бандла (.toml) из `configure export`."),
+) -> None:
+    """Применить бандл: записать config.toml и секреты в keyring, затем проверить связь."""
+    from ..core.config import import_bundle
 
     try:
-        with Service.from_config(load_config()) as svc:
-            res = svc.auth_check()
-        for name in ("jira", "bitbucket"):
-            r = res[name]
-            mark = "[green]✓[/green]" if r["ok"] else "[red]✗[/red]"
-            extra = f" {r.get('error')}" if not r["ok"] else (
-                f" ({r.get('name')})" if r.get("name") else "")
-            console.print(f"{mark} {name}{extra}")
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[yellow]Конфиг записан, но проверка связи не удалась:[/yellow] {exc}")
+        _cfg, n = import_bundle(Path(path))
+    except ConfigError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    except Exception as exc:  # noqa: BLE001 — keyring недоступен
+        err.print(f"[red]Не удалось записать секрет в keyring:[/red] {exc}\n"
+                  f"Задай токен через переменную окружения (JIRA_TOKEN/BITBUCKET_TOKEN).")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]Импортировано[/green]: config + секретов {n}")
+    _auth_check_report()
 
 
 @app.command("install-claude-skills")
@@ -277,6 +368,7 @@ def task(
         console.print(f"\n[bold]Комментарии ({len(issue.comments)})[/bold]")
         for c in issue.comments:
             console.print(f"[dim]{c.created} · {c.author}[/dim]\n{c.body}\n")
+    _render_attachments(issue.attachments)
     if issue.pull_requests or issue.branches:
         console.print("[bold]Development[/bold]")
         for b in issue.branches:
@@ -293,6 +385,90 @@ def task(
         console.print(f"\n[bold]Заметки[/bold]")
         for n in notes:
             console.print(f"[dim]{n.ts} · {n.author}[/dim] {n.text}")
+
+
+def _extract_archive(path: Path) -> list[Path]:
+    """Распаковать zip/tar* в <path>.extracted/. Вернуть извлечённые файлы (rar/7z — мимо)."""
+    import tarfile
+    import zipfile
+
+    out = path.with_name(path.name + ".extracted")
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                z.extractall(out)
+        elif tarfile.is_tarfile(path):
+            with tarfile.open(path) as t:
+                t.extractall(out, filter="data")  # filter='data' — защита от path traversal
+        else:
+            return []
+    except Exception:  # noqa: BLE001 — битый архив не должен ронять команду
+        return []
+    return sorted(p for p in out.rglob("*") if p.is_file())
+
+
+@app.command()
+def attachments(
+    key: str = typer.Argument(..., help="Ключ задачи, напр. PROJ-5525."),
+    download: bool = typer.Option(False, "--download", "-d", help="Скачать вложения в tmp."),
+    kind: Optional[list[str]] = typer.Option(
+        None, "--kind", "-k",
+        help="Какие виды качать (повторяй -k): image|log|doc|archive. По умолчанию все, кроме видео."),
+    dest: Optional[str] = typer.Option(
+        None, "--dest", help="Каталог для скачивания (по умолчанию <tmp>/jwu/<KEY>)."),
+    extract: bool = typer.Option(True, "--extract/--no-extract", help="Распаковывать архивы."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Вложения задачи: список с видами/счётчиками; с --download — скачать в tmp для анализа.
+
+    Видео всегда только в списке (не качаются). Для Claude: --download качает файлы,
+    печатает локальные пути — изображения/логи/pdf затем читаются через Read.
+    """
+    with _service() as svc:
+        issue = svc.issue(key)
+        dest_dir = Path(dest) if dest else svc.attachments_dir(key)
+        downloaded: list[tuple] = []
+        if download:
+            downloaded = svc.download_attachments(
+                key, kinds=kind or None, dest=dest_dir, issue=issue)
+    atts = issue.attachments
+
+    extracted_map: dict[str, list[str]] = {}
+    if download and extract:
+        for att, path in downloaded:
+            if att.kind == "archive":
+                ex = _extract_archive(path)
+                if ex:
+                    extracted_map[str(path)] = [str(p) for p in ex]
+
+    if json_out:
+        payload: dict = {
+            "key": key,
+            "counts": _attach_counts(atts),
+            "attachments": [a.model_dump() for a in atts],
+        }
+        if download:
+            payload["dest"] = str(dest_dir)
+            payload["downloaded"] = [
+                {"filename": att.filename, "kind": att.kind, "path": str(path),
+                 "extracted": extracted_map.get(str(path), [])}
+                for att, path in downloaded
+            ]
+        _emit_json(payload)
+        return
+
+    if not atts:
+        console.print(f"[dim]У {key} вложений нет.[/dim]")
+        return
+    _render_attachments(atts)
+    if download:
+        console.print(f"\n[bold]Скачано ({len(downloaded)})[/bold] → [cyan]{dest_dir}[/cyan]")
+        for att, path in downloaded:
+            console.print(f"  {path}")
+            for ex in extracted_map.get(str(path), []):
+                console.print(f"      [dim]↳ {ex}[/dim]")
+        if not downloaded:
+            console.print("  [dim]нет вложений выбранных видов[/dim]")
 
 
 # --------------------------------------------------------------------------- #

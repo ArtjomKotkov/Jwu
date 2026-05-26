@@ -292,3 +292,82 @@ def test_install_claude_skills_to_custom_dest(tmp_path):
     assert (tmp_path / "jwu-resume-job" / "SKILL.md").is_file()
     assert (tmp_path / "jwu-start-job" / "SKILL.md").is_file()
     assert "Готово" in res.output
+
+
+def _fake_authcheck(monkeypatch):
+    class _FakeSvc:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def auth_check(self): return {"jira": {"ok": True}, "bitbucket": {"ok": True}}
+    monkeypatch.setattr(cli.Service, "from_config", classmethod(lambda cls, c: _FakeSvc()))
+
+
+def test_configure_interactive_prompts_for_gate(monkeypatch, tmp_path):
+    """Интерактивный визард спрашивает логин/пароль гейта и пишет proxy_basic."""
+    import keyring
+
+    from jwu.core import config as cfgmod
+
+    cfg_path = tmp_path / "config.toml"
+    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
+    store = {}
+    monkeypatch.setattr(keyring, "set_password",
+                        lambda s, a, p: store.__setitem__((s, a), p))
+    monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
+    _fake_authcheck(monkeypatch)
+
+    # порядок промптов: host, user, project, PAT, session-pw, gate-login, gate-pw,
+    # bb-host, bb-project, bb-repo, bb-PAT, db-path
+    answers = "\n".join([
+        "https://jira.x", "alice", "ACME", "", "",
+        "gw", "GPW",
+        "https://git.x", "ACME", "server", "", str(tmp_path / "x.db"),
+    ]) + "\n"
+    res = runner.invoke(cli.app, ["configure"], input=answers)
+    assert res.exit_code == 0, res.output
+
+    loaded = cfgmod.load_config(cfg_path)
+    assert loaded.jira.proxy_basic_user == "gw"
+    assert store[("jira-proxy-basic", "gw")] == "GPW"
+    assert ("jira-login", "alice") not in store  # пустой сессионный пароль не пишется
+
+
+def test_configure_export_then_import_cli(monkeypatch, tmp_path):
+    """configure export пишет бандл, configure import восстанавливает config + секреты."""
+    import keyring
+
+    from jwu.core import config as cfgmod
+
+    cfg_path = tmp_path / "config.toml"
+    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
+    store = {}
+    monkeypatch.setattr(keyring, "set_password",
+                        lambda s, a, p: store.__setitem__((s, a), p))
+    monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
+    _fake_authcheck(monkeypatch)
+
+    res = runner.invoke(cli.app, [
+        "configure", "--non-interactive",
+        "--jira-host", "https://jira.acme.com", "--jira-user", "alice",
+        "--jira-project", "ACME", "--jira-password", "JPW",
+        "--gate-user", "gw", "--gate-password", "GPW",
+        "--bitbucket-token", "BTOK",
+    ])
+    assert res.exit_code == 0, res.output
+    assert store[("jira-login", "alice")] == "JPW"
+    assert store[("jira-proxy-basic", "gw")] == "GPW"
+
+    bundle = tmp_path / "b.toml"
+    res = runner.invoke(cli.app, ["configure", "export", str(bundle)])
+    assert res.exit_code == 0, res.output
+    assert bundle.exists()
+
+    # «новая машина»: чистый keyring + нет config
+    store.clear()
+    cfg_path.unlink()
+    res = runner.invoke(cli.app, ["configure", "import", str(bundle)])
+    assert res.exit_code == 0, res.output
+    assert store[("jira-login", "alice")] == "JPW"
+    assert store[("jira-proxy-basic", "gw")] == "GPW"
+    assert store[("bitbucket-pat", "bitbucket")] == "BTOK"
+    assert cfgmod.load_config(cfg_path).jira.proxy_basic_user == "gw"
