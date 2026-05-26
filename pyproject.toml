@@ -1,0 +1,37 @@
+[project]
+name = "jwu"
+version = "0.1.0"
+description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
+authors = [
+    {name = "alice",email = "alice@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.7",
+    "textual>=0.80",
+    "keyring>=25.0",
+    "tomli-w>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+jwu = "jwu.cli.main:app"
+
+[tool.poetry]
+packages = [{include = "jwu", from = "src"}]
+include = [{ path = "src/jwu/skills/**/*.md", format = ["sdist", "wheel"] }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+respx = ">=0.21"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

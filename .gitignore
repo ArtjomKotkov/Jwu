@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Тесты/кэши
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Локальные данные/секреты (не коммитим!)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+config.toml
+.env
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
