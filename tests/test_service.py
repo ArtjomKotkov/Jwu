@@ -1,0 +1,145 @@
+import httpx
+import respx
+
+from jwu.core.bitbucket import BitbucketClient
+from jwu.core.config import Config
+from jwu.core.jira import JiraClient
+from jwu.core.service import Service
+from jwu.core.store import Store
+
+from .fixtures import bitbucket_dashboard_raw, jira_issue_raw, jira_search_raw
+
+JIRA = "https://jira.test"
+BB = "https://git.test"
+
+
+def _service(tmp_path):
+    cfg = Config()
+    cfg.jira.base_url = JIRA
+    cfg.bitbucket.base_url = BB
+    return Service(
+        cfg,
+        JiraClient(JIRA, "tok"),
+        BitbucketClient(BB, "tok"),
+        Store(tmp_path / "state.db"),
+    )
+
+
+@respx.mock
+def test_sync_detects_new_comment_across_runs(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/search").mock(
+        return_value=httpx.Response(200, json=jira_search_raw([jira_issue_raw()]))
+    )
+    issue_route = respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1")
+    issue_route.side_effect = [
+        httpx.Response(200, json=jira_issue_raw(comments=[{"id": 1, "body": "первый"}])),
+        httpx.Response(200, json=jira_issue_raw(comments=[{"id": 1, "body": "первый"}, {"id": 2, "body": "новый"}])),
+    ]
+    respx.get(f"{JIRA}/rest/dev-status/1.0/issue/detail").mock(
+        return_value=httpx.Response(200, json={"detail": []})
+    )
+    respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
+        return_value=httpx.Response(200, json=bitbucket_dashboard_raw([]))
+    )
+
+    svc = _service(tmp_path)
+    try:
+        r1 = svc.sync_section("mine")
+        assert any(d.kind == "new_issue" for d in r1.deltas)
+        assert r1.counts["tasks:mine"] == 1
+
+        r2 = svc.sync_section("mine")
+        assert any(d.kind == "new_comment" for d in r2.deltas)
+        assert not any(d.kind == "new_issue" for d in r2.deltas)
+        # посекционный синк не теряет вкладку mine в памяти
+        assert [i.key for i in svc.store.latest_issues("mine")] == ["PROJ-1"]
+    finally:
+        svc.close()
+
+
+@respx.mock
+def test_auth_check_reports_both(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/myself").mock(
+        return_value=httpx.Response(200, json={"name": "alice", "displayName": "Alice"})
+    )
+    respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
+        return_value=httpx.Response(200, json=bitbucket_dashboard_raw([]))
+    )
+    svc = _service(tmp_path)
+    try:
+        result = svc.auth_check()
+    finally:
+        svc.close()
+    assert result["jira"]["ok"] is True
+    assert result["jira"]["user"] == "alice"
+    assert result["bitbucket"]["ok"] is True
+
+
+def _stub_creds(monkeypatch, token="tok"):
+    """Детерминированные креды без обращения к keychain."""
+    import jwu.core.service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "jira_token", lambda cfg: token)
+    monkeypatch.setattr(svc_mod, "jira_login", lambda cfg: None)
+    monkeypatch.setattr(svc_mod, "jira_proxy_basic", lambda cfg: None)
+
+
+@respx.mock
+def test_identity_cached_across_restart_without_refetch(tmp_path, monkeypatch):
+    _stub_creds(monkeypatch)
+    route = respx.get(f"{JIRA}/rest/api/2/myself").mock(
+        return_value=httpx.Response(200, json={
+            "name": "alice", "displayName": "Alice", "emailAddress": "a@example.com"})
+    )
+
+    svc = _service(tmp_path)
+    try:
+        d = svc.dashboard()
+    finally:
+        svc.close()
+    assert (d.user, d.display_name, d.email) == ("alice", "Alice", "a@example.com")
+    assert route.call_count == 1
+
+    # «перезапуск»: новый сервис на той же БД, креды те же → сеть не трогаем
+    svc2 = _service(tmp_path)
+    try:
+        d2 = svc2.dashboard()
+    finally:
+        svc2.close()
+    assert (d2.user, d2.display_name, d2.email) == ("alice", "Alice", "a@example.com")
+    assert route.call_count == 1  # /myself повторно не дёрнули
+
+
+@respx.mock
+def test_identity_refetched_when_creds_change(tmp_path, monkeypatch):
+    _stub_creds(monkeypatch, token="tok-A")
+    route = respx.get(f"{JIRA}/rest/api/2/myself").mock(
+        return_value=httpx.Response(200, json={"name": "alice", "displayName": "Alice"})
+    )
+    svc = _service(tmp_path)
+    try:
+        svc.dashboard()
+    finally:
+        svc.close()
+    assert route.call_count == 1
+
+    _stub_creds(monkeypatch, token="tok-B")  # креды сменились → другой отпечаток
+    svc2 = _service(tmp_path)
+    try:
+        svc2.dashboard()
+    finally:
+        svc2.close()
+    assert route.call_count == 2
+
+
+def test_dashboard_from_memory_reads_cached_identity(tmp_path):
+    import json
+
+    from jwu.core.service import _IDENTITY_META, dashboard_from_memory
+
+    store = Store(tmp_path / "state.db")
+    store.set_meta(_IDENTITY_META, json.dumps({
+        "fp": "x", "user": "alice", "display_name": "Alice", "email": "a@example.com"}))
+    d = dashboard_from_memory(store)
+    store.close()
+    assert (d.user, d.display_name, d.email) == ("alice", "Alice", "a@example.com")

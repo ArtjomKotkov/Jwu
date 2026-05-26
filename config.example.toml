@@ -1,0 +1,25 @@
+# Конфиг пишется командой `jwu configure` — руками править не нужно.
+# Секреты (пароли/токены) здесь НЕ хранятся: они в системном keyring.
+# Файл необязателен — без него используются дефолты (jira.example.com / git.example.com).
+
+[jira]
+base_url = "https://jira.example.com"
+project = "PROJ"
+# username: логин для @mention-матчинга и account для login/proxy-секретов.
+# Если пусто — берётся из /myself при синке.
+username = ""
+# proxy_basic_user = ""  # логин nginx-гейта перед Jira, если он есть
+
+# «Ждут моего ревью» — это PR в Bitbucket: `jwu prs --view review`.
+# Для задач Jira вью review не задаём (на инстансе нет поля reviewer).
+[jira.views]
+mine = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
+mentions = "(comment ~ currentUser() OR watcher = currentUser()) AND updated >= -14d ORDER BY updated DESC"
+
+[bitbucket]
+base_url = "https://git.example.com"
+project = "PROJ"
+repo = "repo"
+
+[storage]
+# db_path = "/custom/path/state.db"   # по умолчанию ~/.local/share/jwu/state.db
