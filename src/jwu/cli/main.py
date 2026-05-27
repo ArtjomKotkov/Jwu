@@ -615,13 +615,6 @@ def _full_sync_dashboard() -> DashboardData:
         return svc.dashboard()
 
 
-def _section_sync_dashboard(section: str) -> DashboardData:
-    """Синк одной секции + снимок (для refresh активной вкладки в TUI)."""
-    with _service() as svc:
-        svc.sync_section(section)
-        return svc.dashboard()
-
-
 def _memory_dashboard() -> DashboardData:
     """Снимок из памяти без сети (для быстрого авто-обновления локальных вкладок)."""
     with _store() as store:
@@ -676,7 +669,6 @@ def dashboard(
 
     JwuDashboard(
         data,
-        refresh_section_fn=_section_sync_dashboard,
         memory_fn=_memory_dashboard,
         full_sync_fn=_full_sync_dashboard,
         pr_detail_fn=_pr_detail,

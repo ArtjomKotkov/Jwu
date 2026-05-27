@@ -1,6 +1,6 @@
 [project]
 name = "jwu"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
 authors = [
     {name = "alice",email = "alice@example.com"}
@@ -9,6 +9,7 @@ readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "httpx>=0.27",
+    "click>=8.0",
     "typer>=0.12",
     "rich>=13.7",
     "pydantic>=2.7",

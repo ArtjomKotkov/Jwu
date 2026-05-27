@@ -190,7 +190,7 @@ def test_deltas_by_section_and_tab_badge():
         Delta(key="A-1", kind="new_comment", summary="s"),
         Delta(key="P/r#5", kind="new_conflict", summary="t"),
     ]
-    app = JwuDashboard(data, refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test():
@@ -218,7 +218,7 @@ def test_changes_panel_survives_bracket_in_truncated_summary():
         Delta(key="A-1", kind="new_comment", summary=long_with_bracket),
         Delta(key="A-2", kind="status_change", summary="Проблема [client]", detail="A → B"),
     ]
-    app = JwuDashboard(data, refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test():
@@ -239,7 +239,7 @@ def test_scoped_changes_panel_shows_only_active_section():
     data.mentions = [mention_issue]
     # дельта относится только к упоминаниям, не к активной вкладке «Мои задачи»
     data.deltas = [Delta(key="X-1", kind="new_comment", summary="s")]
-    app = JwuDashboard(data, refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test():
@@ -250,35 +250,53 @@ def test_scoped_changes_panel_shows_only_active_section():
     asyncio.run(run())
 
 
-def test_refresh_routing_local_vs_network():
+def test_refresh_all_is_only_manual_sync():
+    """R запускает полный синк; обновления одной вкладки (action_refresh/r) больше нет."""
     data = _dash_data()
     calls = []
     app = JwuDashboard(
         data,
-        refresh_section_fn=lambda s: data,
         memory_fn=lambda: data,
         full_sync_fn=lambda: data,
         jira_base="https://jira.test",
     )
 
     async def run() -> None:
-        async with app.run_test() as pilot:
-            app._run_memory_refresh = lambda: calls.append("mem")
-            app._run_refresh = lambda s: calls.append(("sync", s))
+        async with app.run_test():
             app._run_full_sync = lambda: calls.append("full")
-            # сетевая вкладка (mine) → section sync
-            app.query_one("#tabs", TabbedContent).active = "tab-mine"
-            await pilot.pause()
-            app.action_refresh()
-            # локальная вкладка (jobs) → memory
-            app.query_one("#tabs", TabbedContent).active = "tab-jobs"
-            await pilot.pause()
-            app.action_refresh()
-            # обновить всё → full sync
             app.action_refresh_all()
-            assert ("sync", "mine") in calls
-            assert "mem" in calls
-            assert "full" in calls
+            assert calls == ["full"]
+            # частичного обновления вкладки больше нет — ни метода, ни биндинга r
+            assert not hasattr(app, "action_refresh")
+            assert "r" not in {b.key for b in app.BINDINGS}
+            assert "R" in {b.key for b in app.BINDINGS}
+
+    asyncio.run(run())
+
+
+def test_failed_sync_marks_status_and_notifies():
+    """Упавший синк: уведомление + метка [неудачно] и след. попытка в строке; успех её снимает."""
+    data = _dash_data()
+    app = JwuDashboard(
+        data, memory_fn=lambda: data, full_sync_fn=lambda: data,
+        jira_base="https://jira.test", auto_update=True, slow_interval=600,
+    )
+
+    async def run() -> None:
+        async with app.run_test():
+            notes = []
+            app.notify = lambda *a, **k: notes.append((a, k))  # type: ignore[method-assign]
+            app.query_one("#tabs", TabbedContent).active = "tab-mine"
+            app._after_refresh(None, "Jira недоступна")
+            assert app._sync_failed is True
+            assert notes and notes[0][1].get("severity") == "error"
+            line = app._sync_line("mine")
+            assert "[неудачно]" in line
+            assert "след. попытка через" in line
+            # успешный синк снимает метку
+            app._after_refresh(data, None)
+            assert app._sync_failed is False
+            assert "[неудачно]" not in app._sync_line("mine")
 
     asyncio.run(run())
 
@@ -381,7 +399,7 @@ def test_tui_job_close_and_delete():
     data.jobs = [Job(id=7, task_key="A-1", status="active", title="dev")]
     calls: dict = {}
     app = JwuDashboard(
-        data, refresh_section_fn=None, memory_fn=lambda: data,
+        data, memory_fn=lambda: data,
         job_delete_fn=lambda i: calls.__setitem__("del", i),
         job_status_fn=lambda i, s: calls.__setitem__("status", (i, s)),
         jira_base="https://jira.test",
@@ -408,7 +426,7 @@ def test_tui_job_close_and_delete():
 def test_check_action_scopes_job_buttons():
     data = _dash_data()
     data.jobs = []
-    app = JwuDashboard(data, refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test() as pilot:
@@ -440,7 +458,7 @@ def test_opening_object_clears_its_change_mark():
         fresh.deltas = [Delta(key="A-2", kind="status_change", summary="s2")]  # A-1 «прочитан»
         return fresh
 
-    app = JwuDashboard(data, refresh_section_fn=None, clear_changes_fn=clear,
+    app = JwuDashboard(data, clear_changes_fn=clear,
                        jira_base="https://jira.test")
 
     async def run() -> None:
@@ -466,7 +484,7 @@ def test_pressing_enter_clears_change_mark_end_to_end():
         fresh.deltas = []
         return fresh
 
-    app = JwuDashboard(data, refresh_section_fn=None, clear_changes_fn=clear,
+    app = JwuDashboard(data, clear_changes_fn=clear,
                        pr_detail_fn=_pr_detail_stub, jira_base="https://jira.test")
 
     async def run() -> None:
@@ -484,7 +502,7 @@ def test_status_lives_inside_changes_column():
 
     data = _dash_data()
     data.deltas = []  # изменений нет
-    app = JwuDashboard(data, refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test():
@@ -506,7 +524,7 @@ def test_splitter_drag_resizes_changes_column():
         def __init__(self, x): self.screen_x = x
         def stop(self): pass
 
-    app = JwuDashboard(_dash_data(), refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test(size=(80, 24)):
@@ -523,7 +541,7 @@ def test_splitter_drag_resizes_changes_column():
 def test_sort_analysis_and_jobs():
     from jwu.core.models import Analysis, Job
 
-    app = JwuDashboard(_dash_data(), refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
 
     analyses = [
         Analysis(id=1, created_at="2026-05-20T10:00", title="b"),
@@ -559,7 +577,7 @@ def test_tui_ack_changes_clears_panel():
         fresh.deltas = []
         return fresh
 
-    app = JwuDashboard(data, refresh_section_fn=None, ack_changes_fn=ack,
+    app = JwuDashboard(data, ack_changes_fn=ack,
                        jira_base="https://jira.test")
 
     async def run() -> None:
@@ -574,14 +592,14 @@ def test_tui_ack_changes_clears_panel():
 
 
 def test_tui_smoke_renders_and_quits():
-    app = JwuDashboard(_dash_data(), refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test() as pilot:
             assert app.query_one("#t-mine", DataTable).row_count == 2
             assert app.query_one("#t-prs-review", DataTable).row_count == 1
             # refresh без доступа не роняет приложение
-            await pilot.press("r")
+            await pilot.press("R")
             await pilot.press("q")
 
     asyncio.run(run())
@@ -693,7 +711,7 @@ def test_tui_clear_section_clears_only_active_tab():
         fresh.deltas = [Delta(key="P/r#5", kind="new_conflict", summary="t")]
         return fresh
 
-    app = JwuDashboard(data, refresh_section_fn=None, clear_changes_fn=clear,
+    app = JwuDashboard(data, clear_changes_fn=clear,
                        jira_base="https://jira.test")
 
     async def run() -> None:
@@ -712,7 +730,7 @@ def test_changed_rows_marked():
 
     data = _dash_data()
     data.deltas = [Delta(key="A-1", kind="new_comment", summary="s")]
-    app = JwuDashboard(data, refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test():
@@ -741,7 +759,7 @@ def _pr_detail_stub(project, repo, pr_id):
 
 
 def test_tui_pr_tab_enter_opens_pr_detail():
-    app = JwuDashboard(_dash_data(), refresh_section_fn=None,
+    app = JwuDashboard(_dash_data(),
                        pr_detail_fn=_pr_detail_stub, jira_base="https://jira.test")
 
     async def run() -> None:
@@ -769,7 +787,7 @@ def test_tui_issue_to_pr_navigation_via_p():
         url="https://git.example.com/projects/PROJ/repos/repo/pull-requests/10564",
     )]
     data = DashboardData(user="alice", last_sync={"mine": None}, mine=[issue])
-    app = JwuDashboard(data, refresh_section_fn=None,
+    app = JwuDashboard(data,
                        pr_detail_fn=_pr_detail_stub, jira_base="https://jira.test")
 
     async def run() -> None:
@@ -815,7 +833,7 @@ def test_tui_analysis_tab_opens_screen():
     data = _dash_data()
     data.analyses = [Analysis(id=1, created_at="2026-05-21T10:00", title="День 1")]
     full = Analysis(id=1, created_at="2026-05-21T10:00", title="День 1", content="# План\n- пункт")
-    app = JwuDashboard(data, refresh_section_fn=None,
+    app = JwuDashboard(data,
                        analysis_get_fn=lambda i: full, jira_base="https://jira.test")
 
     async def run() -> None:
@@ -852,7 +870,7 @@ def test_issue_detail_two_column_layout():
     it.branches = [DevBranch(name="feature/A-1", repository="r")]
     data.jobs = [Job(id=1, task_key="A-1", status="active", title="dev",
                      prs=[JobPRLink(pr_id=10)])]
-    app = JwuDashboard(data, refresh_section_fn=None, pr_detail_fn=lambda *a: None,
+    app = JwuDashboard(data, pr_detail_fn=lambda *a: None,
                        job_get_fn=lambda i: None, jira_base="https://jira.test")
 
     async def run() -> None:
@@ -876,7 +894,7 @@ def test_issue_detail_two_column_layout():
 
 
 def test_tui_enter_opens_issue_detail():
-    app = JwuDashboard(_dash_data(), refresh_section_fn=None, jira_base="https://jira.test")
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test() as pilot:

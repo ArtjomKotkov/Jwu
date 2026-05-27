@@ -74,7 +74,7 @@ JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Задача", "PR",
 
 def _fmt_ago(iso: str | None) -> str:
     if not iso:
-        return "не синкано — нажми r"
+        return "не синкано — нажми R"
     try:
         ts = datetime.fromisoformat(iso)
     except ValueError:
@@ -1037,7 +1037,6 @@ class JwuDashboard(App):
 
     BINDINGS = [
         Binding("q", "quit", "Выход"),
-        Binding("r", "refresh", "Обновить вкладку"),
         Binding("R", "refresh_all", "Обновить всё"),
         Binding("o", "open", "В браузере"),
         Binding("c", "clear_section", "Очистить"),
@@ -1050,7 +1049,6 @@ class JwuDashboard(App):
         self,
         data: DashboardData,
         *,
-        refresh_section_fn: Optional[Callable[[str], DashboardData]] = None,
         memory_fn: Optional[Callable[[], DashboardData]] = None,
         full_sync_fn: Optional[Callable[[], DashboardData]] = None,
         pr_detail_fn: Optional[Callable[[str, str, int], PRDetail]] = None,
@@ -1075,7 +1073,6 @@ class JwuDashboard(App):
         self._user = data.user or ""
         self._display_name = data.display_name or ""
         self._email = data.email or ""
-        self._refresh_section_fn = refresh_section_fn
         self._memory_fn = memory_fn
         self._full_sync_fn = full_sync_fn
         self._pr_detail_fn = pr_detail_fn
@@ -1103,6 +1100,10 @@ class JwuDashboard(App):
         self._sync_label = ""
         self._last_fast_mono = monotonic()
         self._last_slow_mono = monotonic()
+        # последняя сетевая синхронизация: упала ли, когда (ISO) и текст ошибки
+        self._sync_failed = False
+        self._fail_at: Optional[str] = None
+        self._sync_error = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1222,7 +1223,7 @@ class JwuDashboard(App):
             self.query_one("#tabs", TabbedContent).get_tab(pane_id).label = label
         self._update_status()
 
-    def _next_sync_hint(self, section: str) -> str:
+    def _next_sync_hint(self, section: str, *, label: str = "след.") -> str:
         """Сколько осталось до ближайшего авто-тика активной вкладки."""
         if not self.auto_update:
             return ""
@@ -1230,15 +1231,19 @@ class JwuDashboard(App):
             rem = self._last_fast_mono + self.fast_interval - monotonic()
         else:
             rem = self._last_slow_mono + self.slow_interval - monotonic()
-        return f"   ·   след. через {_fmt_dur(rem)}"
+        return f"   ·   {label} через {_fmt_dur(rem)}"
 
     def _sync_line(self, section: str) -> str:
         """Первая строка статуса — информация о синхронизации активной вкладки."""
-        nxt = self._next_sync_hint(section)
         if section in self.LOCAL_SECTIONS:
-            return f"[dim]🗂  из памяти{nxt}[/dim]"
+            return f"[dim]🗂  из памяти{self._next_sync_hint(section)}[/dim]"
+        if self._sync_failed:
+            # последняя сетевая синхронизация упала: когда пытались + след. авто-попытка
+            ago = _fmt_ago(self._fail_at)
+            nxt = self._next_sync_hint(section, label="след. попытка")
+            return f"[red]🔄 последний синк: {ago} \\[неудачно][/red][dim]{nxt}[/dim]"
         ago = _fmt_ago(self.data.last_sync.get(section))
-        return f"[dim]🔄 последний синк: {ago}{nxt}[/dim]"
+        return f"[dim]🔄 последний синк: {ago}{self._next_sync_hint(section)}[/dim]"
 
     def _user_block(self) -> str:
         """Кто смотрит дашборд: имя/логин, почта и окружение (1–2 строки)."""
@@ -1665,36 +1670,14 @@ class JwuDashboard(App):
         self._begin_sync("всё (авто)")
         self._run_full_sync()
 
-    def action_refresh(self) -> None:
-        """r — обновить активную вкладку: локальную из памяти, сетевую — синком."""
-        _, _, section = self._active()
-        if section in self.LOCAL_SECTIONS:
-            self._last_fast_mono = monotonic()
-            self._run_memory_refresh()
-            return
-        if self._refresh_section_fn is None:
-            self.query_one("#status", Static).update("обновление недоступно (нет доступа)")
-            return
-        self._begin_sync(f"[{section}]")
-        self._run_refresh(section)
-
     def action_refresh_all(self) -> None:
-        """R — полный синк всех сетевых вкладок."""
+        """R — полный синк всех вкладок (единственный ручной способ обновления)."""
         if self._full_sync_fn is None:
             self.query_one("#status", Static).update("полный синк недоступен (нет доступа)")
             return
         self._last_slow_mono = monotonic()
         self._begin_sync("всё")
         self._run_full_sync()
-
-    @work(thread=True, exclusive=True, group="sync")
-    def _run_refresh(self, section: str) -> None:
-        try:
-            data = self._refresh_section_fn(section)  # type: ignore[misc]
-        except Exception as exc:  # noqa: BLE001
-            self.call_from_thread(self._after_refresh, None, str(exc))
-            return
-        self.call_from_thread(self._after_refresh, data, None)
 
     @work(thread=True, exclusive=True, group="sync")
     def _run_full_sync(self) -> None:
@@ -1732,10 +1715,21 @@ class JwuDashboard(App):
     def _after_refresh(self, data: Optional[DashboardData], error: Optional[str]) -> None:
         self._end_sync()
         if error is not None:
-            self.query_one("#status", Static).update(f"[red]ошибка синка:[/red] {escape(error)}")
+            # синк упал: запомнить момент и ошибку (статус-строка покажет [неудачно]
+            # до следующего успеха), плюс показать всплывающее уведомление.
+            self._sync_failed = True
+            self._fail_at = datetime.now(timezone.utc).isoformat()
+            self._sync_error = error
+            self.notify(error, title="Синхронизация не удалась",
+                        severity="error", timeout=10)
+            self._update_status()
             return
+        self._sync_failed = False
+        self._sync_error = ""
         if data is not None:
             self._apply_data(data)
+        else:
+            self._update_status()
 
 
 _TAB_TITLE = {
