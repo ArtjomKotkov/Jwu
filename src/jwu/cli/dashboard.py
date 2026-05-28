@@ -39,6 +39,7 @@ from ..core.models import (
     classify_attachment,
 )
 from ..core.service import DashboardData, PRDetail
+from ..core.ui_prefs import UIPrefs, load_ui_prefs, save_ui_prefs
 
 DELTA_ICON = {
     "new_issue": "🆕",
@@ -67,7 +68,7 @@ TABS = {
 
 ISSUE_COLUMNS = ["Key", "Статус", "Приоритет", "Summary"]
 MENTION_COLUMNS = ["Когда", "Задача", "Упоминание"]
-PR_COLUMNS = ["PR", "Repo", "Конфликт", "Title", "Ревью"]
+PR_COLUMNS = ["PR", "Конфликт", "Title", "Ревью"]
 ANALYSIS_COLUMNS = ["ID", "Дата/время", "Заголовок"]
 JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Задача", "PR", "Title"]
 
@@ -305,6 +306,8 @@ def status_color(status: str) -> str:
         return "yellow"
     if "done" in s or "closed" in s or "resolved" in s or "готов" in s or "закрыт" in s:
         return "green"
+    if "cancel" in s or "отмен" in s:
+        return "grey50"
     if "pause" in s or "hold" in s or "пауз" in s:
         return "grey50"
     if "test" in s or "stand" in s or "qa" in s or "стенд" in s:
@@ -327,21 +330,38 @@ def priority_color(priority: str) -> str:
     return "white"
 
 
+REVIEWER_SLOT_WIDTH = 25
+
+
+def _fit_slot(value: str, width: int = REVIEWER_SLOT_WIDTH) -> str:
+    """Подогнать строку под фиксированную ширину слота: обрезать с «…» либо паддить пробелами."""
+    if len(value) > width:
+        return value[: max(0, width - 3)] + "..."
+    return value.ljust(width)
+
+
 def reviewers_cell(reviewers) -> Text:
-    """Компактная колонка ревью: A (зел.) / NW (жёлт.) / N (серое) по каждому ревьюеру."""
+    """Колонка ревью: по каждому — [A]/[NW]/[N] + имя, окрашенные по статусу.
+
+    Ревьюверы отсортированы по имени (display_name) без учёта регистра. Каждый слот —
+    ровно REVIEWER_SLOT_WIDTH символов: длиннее обрезаем с многоточием, короче — паддим
+    пробелами, чтобы следующий ревьювер начинался точно через 25 символов.
+    """
     if not reviewers:
         return Text("—", style="dim")
+    def _sort_key(rv):
+        return (rv.display_name or rv.name or "").casefold()
+    ordered = sorted(reviewers, key=_sort_key)
     t = Text()
-    for i, r in enumerate(reviewers):
-        if r.approved:
-            letter, color = "A", "green"
-        elif (r.status or "") == "NEEDS_WORK":
-            letter, color = "NW", "yellow"
+    for rev in ordered:
+        if rev.approved:
+            code, color = "A", "green"
+        elif (rev.status or "") == "NEEDS_WORK":
+            code, color = "NW", "yellow"
         else:
-            letter, color = "N", "grey50"
-        if i:
-            t.append(" ")
-        t.append(letter, style=color)
+            code, color = "N", "grey50"
+        name = rev.display_name or rev.name or "—"
+        t.append(_fit_slot(f"[{code}] {name}"), style=color)
     return t
 
 
@@ -1094,10 +1114,9 @@ class JwuDashboard(App):
         self._changed_issue_keys: set[str] = set()
         self._changed_pr_ids: set[int] = set()
         self._deltas_by_section: dict[str, list] = {}
-        # состояние авто-обновления (для живой статус-строки)
-        self._syncing = False
-        self._sync_started = 0.0
-        self._sync_label = ""
+        # состояние авто-обновления (для живой статус-строки) — независимо по каждому виду:
+        # "memory" (быстрый рефреш из локальной БД) и "network" (полный синк по сети).
+        self._sync_running: dict[str, float] = {}  # kind → monotonic-стартa, если идёт
         self._last_fast_mono = monotonic()
         self._last_slow_mono = monotonic()
         # последняя сетевая синхронизация: упала ли, когда (ISO) и текст ошибки
@@ -1132,6 +1151,10 @@ class JwuDashboard(App):
     def on_mount(self) -> None:
         self.title = "jwu"
         self.sub_title = self._user
+        # применяем сохранённую тему (если есть и доступна в текущей сборке Textual)
+        saved = load_ui_prefs().theme
+        if saved and saved in self.available_themes:
+            self.theme = saved
         for table_id, kind, _ in TABS.values():
             table = self.query_one(f"#{table_id}", DataTable)
             table.cursor_type = "row"
@@ -1148,6 +1171,11 @@ class JwuDashboard(App):
                 self.set_interval(self.fast_interval, self._auto_fast_refresh)
             if self._full_sync_fn is not None:
                 self.set_interval(self.slow_interval, self._auto_slow_sync)
+
+    def watch_theme(self, old: Optional[str], new: Optional[str]) -> None:
+        """Текстуалевский watcher реактивного поля `theme` — сохраняем выбор пользователя."""
+        if new and new != old:
+            save_ui_prefs(UIPrefs(theme=new))
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         """При смене вкладки — фокус на её таблицу, обновить статус и панель изменений."""
@@ -1223,27 +1251,42 @@ class JwuDashboard(App):
             self.query_one("#tabs", TabbedContent).get_tab(pane_id).label = label
         self._update_status()
 
-    def _next_sync_hint(self, section: str, *, label: str = "след.") -> str:
-        """Сколько осталось до ближайшего авто-тика активной вкладки."""
+    def _next_memory_hint(self, *, label: str = "след.") -> str:
         if not self.auto_update:
             return ""
-        if section in self.LOCAL_SECTIONS:
-            rem = self._last_fast_mono + self.fast_interval - monotonic()
-        else:
-            rem = self._last_slow_mono + self.slow_interval - monotonic()
+        rem = self._last_fast_mono + self.fast_interval - monotonic()
         return f"   ·   {label} через {_fmt_dur(rem)}"
 
-    def _sync_line(self, section: str) -> str:
-        """Первая строка статуса — информация о синхронизации активной вкладки."""
-        if section in self.LOCAL_SECTIONS:
-            return f"[dim]🗂  из памяти{self._next_sync_hint(section)}[/dim]"
+    def _next_network_hint(self, *, label: str = "след.") -> str:
+        if not self.auto_update:
+            return ""
+        rem = self._last_slow_mono + self.slow_interval - monotonic()
+        return f"   ·   {label} через {_fmt_dur(rem)}"
+
+    def _memory_line(self) -> str:
+        """Строка состояния быстрого рефреша из памяти.
+
+        Сам факт «идёт синк памяти» не показываем — рефреш слишком частый и
+        мозолил бы глаза; таймер просто стартует с нуля после очередного тика.
+        """
+        return f"[dim]🗂  из памяти{self._next_memory_hint()}[/dim]"
+
+    def _network_line(self) -> str:
+        """Строка состояния сетевого синка (всегда показывается)."""
+        started = self._sync_running.get("network")
+        if started is not None:
+            return f"[yellow]⟳ синхронизация с сетью… {_fmt_dur(monotonic() - started)}[/yellow]"
         if self._sync_failed:
-            # последняя сетевая синхронизация упала: когда пытались + след. авто-попытка
             ago = _fmt_ago(self._fail_at)
-            nxt = self._next_sync_hint(section, label="след. попытка")
+            nxt = self._next_network_hint(label="след. попытка")
             return f"[red]🔄 последний синк: {ago} \\[неудачно][/red][dim]{nxt}[/dim]"
-        ago = _fmt_ago(self.data.last_sync.get(section))
-        return f"[dim]🔄 последний синк: {ago}{self._next_sync_hint(section)}[/dim]"
+        last_network = max(
+            (v for k, v in self.data.last_sync.items()
+             if k not in self.LOCAL_SECTIONS and v),
+            default=None,
+        )
+        ago = _fmt_ago(last_network)
+        return f"[dim]🔄 последний синк: {ago}{self._next_network_hint()}[/dim]"
 
     def _user_block(self) -> str:
         """Кто смотрит дашборд: имя/логин, почта и окружение (1–2 строки)."""
@@ -1262,18 +1305,11 @@ class JwuDashboard(App):
     def _update_status(self) -> None:
         status = self.query_one("#status", Static)
         user_block = self._user_block()
-        if self._syncing:
-            el = _fmt_dur(monotonic() - self._sync_started)
-            status.update(
-                f"[yellow]⟳ идёт синхронизация {self._sync_label}… {el}[/yellow]\n{user_block}"
-            )
-            return
-        try:
-            active = self.query_one("#tabs", TabbedContent).active
-        except Exception:  # noqa: BLE001
-            return
-        section = TABS.get(active, (None, None, "mine"))[2]
-        status.update(f"{self._sync_line(section)}\n{user_block}")
+        # Две строки состояния показываются всегда — состояние памяти и состояние сети
+        # независимы. Если идёт один из синков — подменяется только его строка.
+        status.update(
+            f"{self._network_line()}\n{self._memory_line()}\n{user_block}"
+        )
 
     def _render_changes(self) -> None:
         """Панель «Изменения» — только дельты активной вкладки."""
@@ -1409,15 +1445,9 @@ class JwuDashboard(App):
         table.clear()
         for pr in prs:
             changed = pr.id in self._changed_pr_ids
-            if pr.conflicted is None:
-                conflict = Text("—", style="dim")
-            elif pr.conflicted:
-                conflict = Text("⚠ да", style="red")
-            else:
-                conflict = Text("нет", style="green")
+            conflict = Text("⚠", style="dark_orange") if pr.conflicted else Text("")
             table.add_row(
                 self._key_cell(str(pr.id), changed),
-                Text(f"{pr.project}/{pr.repository}"),
                 conflict,
                 Text(pr.title, style="yellow" if changed else ""),
                 reviewers_cell(pr.reviewers),
@@ -1652,14 +1682,12 @@ class JwuDashboard(App):
         self.push_screen(ConfirmScreen(
             f"Удалить работу #{job.id} «{job.title or ''}» безвозвратно?", do))
 
-    def _begin_sync(self, label: str) -> None:
-        self._syncing = True
-        self._sync_started = monotonic()
-        self._sync_label = label
+    def _begin_sync(self, kind: str) -> None:
+        self._sync_running[kind] = monotonic()
         self._update_status()
 
-    def _end_sync(self) -> None:
-        self._syncing = False
+    def _end_sync(self, kind: str) -> None:
+        self._sync_running.pop(kind, None)
 
     def _auto_fast_refresh(self) -> None:
         self._last_fast_mono = monotonic()
@@ -1667,7 +1695,7 @@ class JwuDashboard(App):
 
     def _auto_slow_sync(self) -> None:
         self._last_slow_mono = monotonic()
-        self._begin_sync("всё (авто)")
+        self._begin_sync("network")
         self._run_full_sync()
 
     def action_refresh_all(self) -> None:
@@ -1676,12 +1704,13 @@ class JwuDashboard(App):
             self.query_one("#status", Static).update("полный синк недоступен (нет доступа)")
             return
         self._last_slow_mono = monotonic()
-        self._begin_sync("всё")
+        self._begin_sync("network")
         self._run_full_sync()
 
     @work(thread=True, exclusive=True, group="sync")
     def _run_full_sync(self) -> None:
         if self._full_sync_fn is None:
+            self.call_from_thread(self._end_sync, "network")
             return
         try:
             data = self._full_sync_fn()
@@ -1713,7 +1742,7 @@ class JwuDashboard(App):
         self._render()
 
     def _after_refresh(self, data: Optional[DashboardData], error: Optional[str]) -> None:
-        self._end_sync()
+        self._end_sync("network")
         if error is not None:
             # синк упал: запомнить момент и ошибку (статус-строка покажет [неудачно]
             # до следующего успеха), плюс показать всплывающее уведомление.

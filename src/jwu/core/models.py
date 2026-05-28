@@ -365,7 +365,7 @@ class Analysis(BaseModel):
 # Типы записей работы (jwu job add --kind) — единый источник для CLI-валидации и рендера.
 JOB_RECORD_KINDS = [
     "phase", "note", "decision", "remark", "constraint", "warning",
-    "bug", "bug-resolved", "test-pass", "test-fail", "todo",
+    "bug", "bug-resolved", "test-pass", "test-fail", "todo", "review",
 ]
 
 # kind -> (бейдж, цвет rich) для выделения в выводе (CLI + TUI).
@@ -379,6 +379,7 @@ JOB_RECORD_BADGES: dict[str, tuple[str, str]] = {
     "test-pass":    ("🧪 ТЕСТЫ OK", "green"),
     "test-fail":    ("🧪 ТЕСТЫ УПАЛИ", "red"),
     "todo":         ("📌 TODO", "magenta"),
+    "review":       ("🔍 РЕВЬЮ", "blue"),
 }
 
 

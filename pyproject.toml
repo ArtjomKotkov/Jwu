@@ -1,6 +1,6 @@
 [project]
 name = "jwu"
-version = "0.2.0"
+version = "0.3.0"
 description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
 authors = [
     {name = "alice",email = "alice@example.com"}
@@ -24,7 +24,10 @@ jwu = "jwu.cli.main:app"
 
 [tool.poetry]
 packages = [{include = "jwu", from = "src"}]
-include = [{ path = "src/jwu/skills/**/*.md", format = ["sdist", "wheel"] }]
+include = [
+    { path = "src/jwu/skills/**/*.md", format = ["sdist", "wheel"] },
+    { path = "src/jwu/agents/*.md", format = ["sdist", "wheel"] },
+]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"
