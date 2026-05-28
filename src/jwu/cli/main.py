@@ -17,7 +17,12 @@ from ..core.bitbucket import BitbucketError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
 from ..core.maintenance import ensure_db_available, run_daily_maintenance
-from ..skills_install import default_dest as _skills_dest, install_skills
+from ..skills_install import (
+    default_agents_dest as _agents_dest,
+    default_dest as _skills_dest,
+    install_agents,
+    install_skills,
+)
 from ..core.jira import JiraError
 from ..core.models import JOB_RECORD_BADGES, JOB_RECORD_KINDS, Delta, Issue, Job, Note, PR
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
@@ -294,8 +299,12 @@ def configure_import(
 def install_claude_skills(
     dest: Optional[str] = typer.Option(
         None, "--dest", help="Каталог скиллов (по умолчанию ~/.claude/skills)."),
+    agents_dest: Optional[str] = typer.Option(
+        None, "--agents-dest", help="Каталог субагентов (по умолчанию ~/.claude/agents)."),
+    skip_agents: bool = typer.Option(
+        False, "--skip-agents", help="Не ставить забандленных субагентов."),
 ) -> None:
-    """Развернуть jwu-скиллы Claude Code из пакета (свежие; существующие заменяются)."""
+    """Развернуть jwu-скиллы и субагенты Claude Code из пакета (свежие; существующие заменяются)."""
     target = Path(dest).expanduser() if dest else _skills_dest()
     try:
         results = install_skills(target)
@@ -306,6 +315,19 @@ def install_claude_skills(
         color = "yellow" if action == "обновлён" else "green"
         console.print(f"[{color}]{action}[/{color}]: {name}")
     console.print(f"Готово: {len(results)} скиллов → {target}")
+
+    if skip_agents:
+        return
+    agents_target = Path(agents_dest).expanduser() if agents_dest else _agents_dest()
+    try:
+        agent_results = install_agents(agents_target)
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[red]Не удалось установить субагентов:[/red] {exc}")
+        raise typer.Exit(code=1)
+    for name, action in agent_results:
+        color = "yellow" if action == "обновлён" else "green"
+        console.print(f"[{color}]{action}[/{color}]: агент {name}")
+    console.print(f"Готово: {len(agent_results)} субагентов → {agents_target}")
 
 
 # --------------------------------------------------------------------------- #

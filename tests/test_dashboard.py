@@ -290,13 +290,13 @@ def test_failed_sync_marks_status_and_notifies():
             app._after_refresh(None, "Jira недоступна")
             assert app._sync_failed is True
             assert notes and notes[0][1].get("severity") == "error"
-            line = app._sync_line("mine")
+            line = app._network_line()
             assert "[неудачно]" in line
             assert "след. попытка через" in line
             # успешный синк снимает метку
             app._after_refresh(data, None)
             assert app._sync_failed is False
-            assert "[неудачно]" not in app._sync_line("mine")
+            assert "[неудачно]" not in app._network_line()
 
     asyncio.run(run())
 
@@ -342,11 +342,17 @@ def test_status_shows_syncing_then_countdown():
 
     async def run() -> None:
         async with app.run_test():
-            app._begin_sync("[mine]")
-            assert "идёт синхронизация" in str(app.query_one("#status", Static).render())
-            app._end_sync()
+            # сетевой синк — подменяет только свою (сетевую) строку
+            app._begin_sync("network")
+            rendered = str(app.query_one("#status", Static).render())
+            assert "синхронизация с сетью" in rendered
+            assert "🗂  из памяти" in rendered  # строка памяти остаётся
+            app._end_sync("network")
             app._update_status()
-            assert "след. через" in str(app.query_one("#status", Static).render())
+            rendered = str(app.query_one("#status", Static).render())
+            assert "след. через" in rendered
+            # синк памяти НЕ показывается — он слишком частый
+            assert "обновление из памяти" not in rendered
 
     asyncio.run(run())
 
@@ -680,16 +686,44 @@ def test_inline_thread_panel_inserts_comment_after_anchored_line():
     assert "Bob" in lines[2] and "вопрос" in lines[2]
 
 
-def test_reviewers_cell_letters():
-    from jwu.cli.dashboard import reviewers_cell
+def test_reviewers_cell_slots_and_sorting():
+    from jwu.cli.dashboard import REVIEWER_SLOT_WIDTH, reviewers_cell
     from jwu.core.models import Reviewer
 
     cell = reviewers_cell([
-        Reviewer(name="a", approved=True),
-        Reviewer(name="b", status="NEEDS_WORK"),
-        Reviewer(name="c"),
+        # умышленно не по алфавиту — должен отсортироваться
+        Reviewer(name="ckotkov", display_name="Сергей Петров"),                  # N (без статуса)
+        Reviewer(name="akotkov", display_name="Artjom Kotkov", approved=True),    # A
+        Reviewer(name="obogim", display_name="Oleg Bogimirky", status="NEEDS_WORK"),  # NW
     ])
-    assert cell.plain == "A NW N"
+    plain = cell.plain
+    # ровно три слота по 25 символов = 75
+    assert len(plain) == 3 * REVIEWER_SLOT_WIDTH
+    # порядок: Artjom (A) → Oleg (NW) → Сергей (N), отсортированы по имени без регистра
+    assert plain[:REVIEWER_SLOT_WIDTH] == "[A] Artjom Kotkov".ljust(REVIEWER_SLOT_WIDTH)
+    assert plain[REVIEWER_SLOT_WIDTH:2 * REVIEWER_SLOT_WIDTH] == "[NW] Oleg Bogimirky".ljust(REVIEWER_SLOT_WIDTH)
+    assert plain[2 * REVIEWER_SLOT_WIDTH:] == "[N] Сергей Петров".ljust(REVIEWER_SLOT_WIDTH)
+    # цвета по статусу прокинуты на весь слот (бейдж + имя)
+    spans = {s.start: s.style for s in cell.spans}
+    assert spans[0] == "green"
+    assert spans[REVIEWER_SLOT_WIDTH] == "yellow"
+    assert spans[2 * REVIEWER_SLOT_WIDTH] == "grey50"
+
+
+def test_reviewers_cell_truncation():
+    from jwu.cli.dashboard import REVIEWER_SLOT_WIDTH, reviewers_cell
+    from jwu.core.models import Reviewer
+
+    cell = reviewers_cell([
+        Reviewer(name="x", display_name="A" * 100, approved=True),
+    ])
+    assert len(cell.plain) == REVIEWER_SLOT_WIDTH
+    assert cell.plain.endswith("...")
+
+
+def test_reviewers_cell_empty():
+    from jwu.cli.dashboard import reviewers_cell
+
     assert reviewers_cell([]).plain == "—"
 
 

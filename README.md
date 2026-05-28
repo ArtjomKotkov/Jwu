@@ -15,7 +15,7 @@ CLI для **Jira Server / Data Center** + **Bitbucket Server** с локаль�
 
 ```bash
 # из git
-pipx install git+https://<твой-git>/jwu.git
+pipx install git+https://github.com/ArtjomKotkov/jwu.git
 
 # или из локальной копии репозитория
 cd jwu && pipx install .
