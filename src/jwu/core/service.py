@@ -37,6 +37,23 @@ from .models import (
 from .store import Store
 
 _UNSAFE_NAME_RE = re.compile(r"[^\w.\- ]+", re.UNICODE)
+# Ключ Jira-задачи в имени ветки/заголовке PR (PROJ-123 / CORE-12508).
+_PR_TASK_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-[0-9]+)\b")
+# Алиасы «ключ из ветки PR → канонический ключ задачи в Jira» — лежат одним JSON
+# в meta под этим ключом. Нужны, когда Jira слила старую задачу в новый ключ
+# (PR ссылается на старый, а snapshot пишется под канонический).
+_PR_TASK_ALIAS_META = "pr_task_aliases"
+
+
+def _load_pr_task_aliases(store: Store) -> dict[str, str]:
+    raw = store.get_meta(_PR_TASK_ALIAS_META)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _safe_filename(name: str) -> str:
@@ -101,6 +118,10 @@ class DashboardData:
     prs_review: list[PR] = field(default_factory=list)
     analyses: list[Analysis] = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
+    # key задачи → её последний известный статус и текущий assignee;
+    # для колонок «Назначен» / «Статус» в PR-таблицах.
+    task_status: dict[str, str] = field(default_factory=dict)
+    task_assignee: dict[str, str] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict:
         return {
@@ -115,6 +136,8 @@ class DashboardData:
             "prs_review": [p.model_dump() for p in self.prs_review],
             "analyses": [a.model_dump() for a in self.analyses],
             "jobs": [j.model_dump() for j in self.jobs],
+            "task_status": self.task_status,
+            "task_assignee": self.task_assignee,
         }
 
 
@@ -140,6 +163,18 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
     после перезапуска, до первого синка.
     """
     ident = _read_identity(store)
+    # Все известные задачи по ключу → статус (для колонки «Статус задачи» в PR-таблицах).
+    # Берём из всех вью разом, чтобы статус был и для PR с чужой задачей (review).
+    all_issues = store.latest_issues(None)
+    task_status = {i.key: i.status for i in all_issues if i.key}
+    task_assignee = {i.key: i.assignee for i in all_issues if i.key}
+    # Алиасы из ключей в ветках PR → канонические ключи Jira (см. _snapshot_pr_tasks):
+    # дублируем статус/assignee, чтобы lookup по pr_task_key(pr) сработал.
+    for branch_key, canonical_key in _load_pr_task_aliases(store).items():
+        if canonical_key in task_status and branch_key not in task_status:
+            task_status[branch_key] = task_status[canonical_key]
+        if canonical_key in task_assignee and branch_key not in task_assignee:
+            task_assignee[branch_key] = task_assignee[canonical_key]
     return DashboardData(
         user=user or ident.get("user", ""),
         display_name=ident.get("display_name", ""),
@@ -154,6 +189,8 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
         prs_review=store.latest_prs("review"),
         analyses=store.list_analyses(),
         jobs=store.list_jobs(),  # все работы (включая закрытые/завершённые)
+        task_status=task_status,
+        task_assignee=task_assignee,
     )
 
 
@@ -396,7 +433,44 @@ class Service:
                 except Exception:  # noqa: BLE001
                     pass
             self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(pr.id, [])))
+        # Подтянуть статус/assignee задач, на которые ссылаются PR — нужно для
+        # колонок «Назначен»/«Статус» в дашборде. PR на чужой релизной задаче
+        # никогда не попадёт в mine/mentions, но ключ в branch/title есть.
+        self._snapshot_pr_tasks(run_id, list(pr_seen.values()))
         return counts
+
+    def _snapshot_pr_tasks(self, run_id: int, prs: list[PR]) -> None:
+        """Снапшотим задачи, упомянутые в branch/title PR, если их ещё нет в этом run.
+
+        Jira может прислать другой канонический ключ (старый ключ замёрджен в новый),
+        в этом случае запоминаем алиас requested_key → full.key в meta-таблице,
+        чтобы дашборд разрезолвил статус/assignee по ключу из ветки PR.
+        """
+        keys: set[str] = set()
+        for pr in prs:
+            for src in (pr.source_branch, pr.title):
+                m = _PR_TASK_KEY_RE.search(src or "")
+                if m:
+                    keys.add(m.group(1))
+                    break
+        aliases = _load_pr_task_aliases(self.store)
+        changed = False
+        for key in keys:
+            try:
+                full = self.jira.issue(key, with_dev=False)
+            except Exception:  # noqa: BLE001 — отсутствующая/недоступная задача не валит синк
+                continue
+            self.store.save_issue_snapshot(run_id, full, ["pr_link"])
+            if full.key and full.key != key:
+                if aliases.get(key) != full.key:
+                    aliases[key] = full.key
+                    changed = True
+            elif key in aliases:
+                # ключ снова совпадает сам с собой — алиас устарел
+                aliases.pop(key, None)
+                changed = True
+        if changed:
+            self.store.set_meta(_PR_TASK_ALIAS_META, json.dumps(aliases, ensure_ascii=False))
 
     def sync(self) -> SyncResult:
         """Полный синк всех секций в одном прогоне (для `jwu sync`)."""

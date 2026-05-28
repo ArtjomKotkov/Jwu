@@ -670,7 +670,7 @@ def dashboard(
     fast_interval: float = typer.Option(
         5.0, "--fast-interval", help="Интервал авто-обновления локальных вкладок (Работы/Анализ), сек."),
     slow_interval: float = typer.Option(
-        600.0, "--slow-interval", help="Интервал авто-синка сетевых таблиц (задачи/PR), сек."),
+        900.0, "--slow-interval", help="Интервал авто-синка сетевых таблиц (задачи/PR), сек. Отсчёт ведётся от ОКОНЧАНИЯ предыдущего синка."),
     detail_interval: float = typer.Option(
         60.0, "--detail-interval", help="Интервал авто-дотягивания открытой задачи/PR из сети, сек."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON вместо TUI (для Claude)."),

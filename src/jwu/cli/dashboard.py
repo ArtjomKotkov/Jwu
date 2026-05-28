@@ -68,7 +68,9 @@ TABS = {
 
 ISSUE_COLUMNS = ["Key", "Статус", "Приоритет", "Summary"]
 MENTION_COLUMNS = ["Когда", "Задача", "Упоминание"]
-PR_COLUMNS = ["PR", "Конфликт", "Title", "Ревью"]
+# «Мои PR» — с контекстом задачи (кому уже не моя, кому ушла), на ревью — без него.
+PR_MINE_COLUMNS = ["PR", "Конфликт", "Задача", "Назначен", "Статус", "Title", "Ревью"]
+PR_REVIEW_COLUMNS = ["PR", "Конфликт", "Title", "Ревью"]
 ANALYSIS_COLUMNS = ["ID", "Дата/время", "Заголовок"]
 JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Задача", "PR", "Title"]
 
@@ -290,16 +292,20 @@ def status_color(status: str) -> str:
 
 def priority_color(priority: str) -> str:
     s = (priority or "").lower()
-    if "block" in s or "highest" in s or "critical" in s or "крит" in s:
-        return "bright_red"
-    if "high" in s or "выс" in s:
+    # blocker → красный, critical → розоватый, major/high → жёлтый,
+    # minor/low → светло-зелёный, trivial/lowest → серый.
+    if "block" in s or "блок" in s:
         return "red"
-    if "medium" in s or "normal" in s or "сред" in s:
+    if "highest" in s or "critical" in s or "крит" in s:
+        return "light_pink3"
+    if "major" in s or "high" in s or "выс" in s:
         return "yellow"
     if "lowest" in s or "trivial" in s:
         return "grey50"
-    if "low" in s or "низ" in s:
-        return "green"
+    if "minor" in s or "low" in s or "низ" in s:
+        return "bright_green"
+    if "medium" in s or "normal" in s or "сред" in s:
+        return "yellow"
     return "white"
 
 
@@ -313,12 +319,15 @@ def _fit_slot(value: str, width: int = REVIEWER_SLOT_WIDTH) -> str:
     return value.ljust(width)
 
 
-def reviewers_cell(reviewers) -> Text:
+def reviewers_cell(reviewers, current_user: str = "") -> Text:
     """Колонка ревью: по каждому — [A]/[NW]/[N] + имя, окрашенные по статусу.
 
     Ревьюверы отсортированы по имени (display_name) без учёта регистра. Каждый слот —
     ровно REVIEWER_SLOT_WIDTH символов: длиннее обрезаем с многоточием, короче — паддим
     пробелами, чтобы следующий ревьювер начинался точно через 25 символов.
+
+    Если ``current_user`` совпадает с `name` ревьювера — слот рендерится **жирным**
+    (цвет статуса не меняется), чтобы пользователь сразу видел себя в списке.
     """
     if not reviewers:
         return Text("—", style="dim")
@@ -326,6 +335,7 @@ def reviewers_cell(reviewers) -> Text:
         return (rv.display_name or rv.name or "").casefold()
     ordered = sorted(reviewers, key=_sort_key)
     t = Text()
+    me = (current_user or "").casefold()
     for rev in ordered:
         if rev.approved:
             code, color = "A", "green"
@@ -334,17 +344,29 @@ def reviewers_cell(reviewers) -> Text:
         else:
             code, color = "N", "grey50"
         name = rev.display_name or rev.name or "—"
-        t.append(_fit_slot(f"[{code}] {name}"), style=color)
+        is_me = me and (rev.name or "").casefold() == me
+        style = f"bold {color}" if is_me else color
+        t.append(_fit_slot(f"[{code}] {name}"), style=style)
     return t
 
 
 _PR_URL_RE = re.compile(r"/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)")
+_TASK_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-[0-9]+)\b")
 
 
 def parse_pr_url(url: str) -> Optional[tuple[str, str, int]]:
     """Достать (project, repo, id) из ссылки на PR Bitbucket."""
     m = _PR_URL_RE.search(url or "")
     return (m.group(1), m.group(2), int(m.group(3))) if m else None
+
+
+def pr_task_key(pr: PR) -> str:
+    """Извлечь ключ задачи из PR: сначала из source_branch, иначе из title. Пусто — не нашли."""
+    for src in (pr.source_branch, pr.title):
+        m = _TASK_KEY_RE.search(src or "")
+        if m:
+            return m.group(1)
+    return ""
 
 
 def normalize_issue_key(value: str) -> str:
@@ -1060,7 +1082,7 @@ class JwuDashboard(App):
         env_label: str = "",
         auto_update: bool = False,
         fast_interval: float = 5.0,
-        slow_interval: float = 600.0,
+        slow_interval: float = 900.0,
         detail_interval: float = 60.0,
     ) -> None:
         super().__init__()
@@ -1136,8 +1158,11 @@ class JwuDashboard(App):
             table = self.query_one(f"#{table_id}", DataTable)
             table.cursor_type = "row"
             table.zebra_stripes = True
-            cols = {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS, "pr": PR_COLUMNS,
-                    "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS}[kind]
+            if kind == "pr":
+                cols = PR_MINE_COLUMNS if table_id == "t-prs-mine" else PR_REVIEW_COLUMNS
+            else:
+                cols = {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS,
+                        "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS}[kind]
             for col in cols:
                 table.add_column(col, key=col)
         self._render()
@@ -1147,7 +1172,10 @@ class JwuDashboard(App):
             if self._memory_fn is not None:
                 self.set_interval(self.fast_interval, self._auto_fast_refresh)
             if self._full_sync_fn is not None:
-                self.set_interval(self.slow_interval, self._auto_slow_sync)
+                # Сетевой синк — one-shot таймером: отсчёт начнётся в _after_refresh
+                # ОТ ОКОНЧАНИЯ предыдущего синка, чтобы длинные синки не «съедали»
+                # следующий интервал.
+                self._schedule_next_slow_sync()
 
     def watch_theme(self, old: Optional[str], new: Optional[str]) -> None:
         """Текстуалевский watcher реактивного поля `theme` — сохраняем выбор пользователя."""
@@ -1327,13 +1355,29 @@ class JwuDashboard(App):
                 lambda i: (getattr(self._mention_comment(i), "body", "") or "").lower(),
             ]
         elif kind == "pr":
-            keyfns = [
-                lambda p: p.id,
-                lambda p: f"{p.project}/{p.repository}",
-                lambda p: (p.conflicted is True, p.conflicted is None),
-                lambda p: p.title.lower(),
-                lambda p: sum(1 for r in p.reviewers if r.approved),
-            ]
+            # Колонки разные для «PR: мои» (7) и «PR: на ревью» (4) — см. PR_MINE_COLUMNS / PR_REVIEW_COLUMNS.
+            conflict_key = lambda p: 1 if p.conflicted else 0  # noqa: E731
+            reviewers_approved = lambda p: sum(1 for r in p.reviewers if r.approved)  # noqa: E731
+            title_key = lambda p: p.title.lower()  # noqa: E731
+            if table_id == "t-prs-mine":
+                task_status = self.data.task_status or {}
+                task_assignee = self.data.task_assignee or {}
+                keyfns = [
+                    lambda p: p.id,
+                    conflict_key,
+                    lambda p: pr_task_key(p),
+                    lambda p: task_assignee.get(pr_task_key(p), ""),
+                    lambda p: task_status.get(pr_task_key(p), ""),
+                    title_key,
+                    reviewers_approved,
+                ]
+            else:  # t-prs-review
+                keyfns = [
+                    lambda p: p.id,
+                    conflict_key,
+                    title_key,
+                    reviewers_approved,
+                ]
         elif kind == "analysis":  # ID · Дата/время · Заголовок
             keyfns = [lambda a: a.id, lambda a: a.created_at, lambda a: a.title.lower()]
         elif kind == "job":       # ID · Обновлено · Статус · Задача · PR · Title
@@ -1420,15 +1464,48 @@ class JwuDashboard(App):
         table = self.query_one(f"#{table_id}", DataTable)
         cur = table.cursor_row
         table.clear()
+        with_task_cols = table_id == "t-prs-mine"  # колонки задачи/назначен/статус только в «Мои PR»
+        task_status = self.data.task_status or {}
+        task_assignee = self.data.task_assignee or {}
         for pr in prs:
             changed = pr.id in self._changed_pr_ids
             conflict = Text("⚠", style="dark_orange") if pr.conflicted else Text("")
-            table.add_row(
-                self._key_cell(str(pr.id), changed),
-                conflict,
-                Text(pr.title, style="yellow" if changed else ""),
-                reviewers_cell(pr.reviewers),
-            )
+            title_cell = Text(pr.title, style="yellow" if changed else "")
+            review_cell = reviewers_cell(pr.reviewers, current_user=self._user)
+            if with_task_cols:
+                key = pr_task_key(pr)
+                if key:
+                    task_cell = Text.from_markup(
+                        f"[@click=app.open_issue('{escape(key)}')][cyan u]{escape(key)}[/cyan u][/]"
+                    )
+                else:
+                    task_cell = Text("—", style="dim")
+                assignee = task_assignee.get(key, "") if key else ""
+                assignee_cell = (
+                    Text(assignee, style=author_color(assignee)) if assignee
+                    else Text("—", style="dim")
+                )
+                status = task_status.get(key, "") if key else ""
+                status_cell = (
+                    Text(status, style=status_color(status)) if status
+                    else Text("—", style="dim")
+                )
+                table.add_row(
+                    self._key_cell(str(pr.id), changed),
+                    conflict,
+                    task_cell,
+                    assignee_cell,
+                    status_cell,
+                    title_cell,
+                    review_cell,
+                )
+            else:
+                table.add_row(
+                    self._key_cell(str(pr.id), changed),
+                    conflict,
+                    title_cell,
+                    review_cell,
+                )
         self._rows[table_id] = list(prs)
         self._restore_cursor(table, cur)
 
@@ -1596,7 +1673,34 @@ class JwuDashboard(App):
         cur = self._sort.get(table_id)
         reverse = (cur is not None and cur[0] == col and not cur[1])
         self._sort[table_id] = (col, reverse)
+        self._apply_sort_indicators(table_id)
         self._render()
+
+    def _apply_sort_indicators(self, table_id: str) -> None:
+        """Подставить «↑»/«↓» к заголовку отсортированной колонки в указанной таблице."""
+        try:
+            table = self.query_one(f"#{table_id}", DataTable)
+        except Exception:  # noqa: BLE001
+            return
+        base = self._base_column_labels(table_id)
+        sort_col, sort_reverse = self._sort.get(table_id, (-1, False))
+        for idx, col_key in enumerate(table.columns):
+            label = base[idx] if idx < len(base) else str(col_key.value or "")
+            if idx == sort_col:
+                label = f"{label} {'↓' if sort_reverse else '↑'}"
+            table.columns[col_key].label = Text(label)
+        table.refresh()
+
+    def _base_column_labels(self, table_id: str) -> list[str]:
+        """Базовые (без индикатора сортировки) заголовки колонок для таблицы."""
+        for tab_id, (tid, kind, _) in TABS.items():  # noqa: B007
+            if tid != table_id:
+                continue
+            if kind == "pr":
+                return PR_MINE_COLUMNS if table_id == "t-prs-mine" else PR_REVIEW_COLUMNS
+            return {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS,
+                    "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS}.get(kind, [])
+        return []
 
     def action_open(self) -> None:
         obj = self._selected_obj()
@@ -1671,7 +1775,8 @@ class JwuDashboard(App):
         self._run_memory_refresh()
 
     def _auto_slow_sync(self) -> None:
-        self._last_slow_mono = monotonic()
+        # Отсчёт следующего тика — от ОКОНЧАНИЯ синка (см. _after_refresh),
+        # а не от его старта, чтобы долгий синк не съедал интервал.
         self._begin_sync("network")
         self._run_full_sync()
 
@@ -1680,9 +1785,15 @@ class JwuDashboard(App):
         if self._full_sync_fn is None:
             self.query_one("#status", Static).update("полный синк недоступен (нет доступа)")
             return
-        self._last_slow_mono = monotonic()
         self._begin_sync("network")
         self._run_full_sync()
+
+    def _schedule_next_slow_sync(self) -> None:
+        """One-shot таймер на следующий авто-синк (через self.slow_interval секунд)."""
+        if not self.auto_update or self._full_sync_fn is None:
+            return
+        self._last_slow_mono = monotonic()  # точка отсчёта countdown в статус-строке
+        self.set_timer(self.slow_interval, self._auto_slow_sync)
 
     @work(thread=True, exclusive=True, group="sync")
     def _run_full_sync(self) -> None:
@@ -1720,22 +1831,26 @@ class JwuDashboard(App):
 
     def _after_refresh(self, data: Optional[DashboardData], error: Optional[str]) -> None:
         self._end_sync("network")
-        if error is not None:
-            # синк упал: запомнить момент и ошибку (статус-строка покажет [неудачно]
-            # до следующего успеха), плюс показать всплывающее уведомление.
-            self._sync_failed = True
-            self._fail_at = datetime.now(timezone.utc).isoformat()
-            self._sync_error = error
-            self.notify(error, title="Синхронизация не удалась",
-                        severity="error", timeout=10)
-            self._update_status()
-            return
-        self._sync_failed = False
-        self._sync_error = ""
-        if data is not None:
-            self._apply_data(data)
-        else:
-            self._update_status()
+        try:
+            if error is not None:
+                # синк упал: запомнить момент и ошибку (статус-строка покажет [неудачно]
+                # до следующего успеха), плюс показать всплывающее уведомление.
+                self._sync_failed = True
+                self._fail_at = datetime.now(timezone.utc).isoformat()
+                self._sync_error = error
+                self.notify(error, title="Синхронизация не удалась",
+                            severity="error", timeout=10)
+                self._update_status()
+                return
+            self._sync_failed = False
+            self._sync_error = ""
+            if data is not None:
+                self._apply_data(data)
+            else:
+                self._update_status()
+        finally:
+            # Следующий авто-синк отсчитывается от КОНЦА текущего, а не от старта.
+            self._schedule_next_slow_sync()
 
 
 _TAB_TITLE = {

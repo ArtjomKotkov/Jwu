@@ -309,12 +309,16 @@ def test_auto_update_starts_timers():
         jira_base="https://jira.test", auto_update=True, fast_interval=99, slow_interval=999,
     )
     intervals = []
+    timers = []
     app.set_interval = lambda *a, **k: intervals.append(a)  # type: ignore[method-assign]
+    app.set_timer = lambda *a, **k: timers.append(a)  # type: ignore[method-assign]
 
     async def run() -> None:
         async with app.run_test():
-            # статус-тикер (1с) + быстрый (память) + медленный (синк)
-            assert len(intervals) >= 3
+            # set_interval — статус-тикер (1с) + быстрый рефреш памяти
+            assert len(intervals) >= 2
+            # set_timer — one-shot слот следующего сетевого синка
+            assert any(a[0] == 999 for a in timers)
 
     asyncio.run(run())
 
@@ -626,9 +630,16 @@ def test_status_priority_colors():
     assert status_color("In Progress") == "blue"
     assert status_color("In Review") == "yellow"
     assert status_color("Done") == "green"
-    assert priority_color("High") == "red"
+    # blocker → красный, critical → розоватый, major/high → жёлтый,
+    # minor/low → светло-зелёный, trivial/lowest → серый.
+    assert priority_color("Blocker") == "red"
+    assert priority_color("Critical") == "light_pink3"
+    assert priority_color("Major") == "yellow"
+    assert priority_color("High") == "yellow"
     assert priority_color("Medium") == "yellow"
-    assert priority_color("Low") == "green"
+    assert priority_color("Minor") == "bright_green"
+    assert priority_color("Low") == "bright_green"
+    assert priority_color("Trivial") == "grey50"
 
 
 def test_group_threads():
