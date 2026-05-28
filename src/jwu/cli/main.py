@@ -16,6 +16,7 @@ from rich.table import Table
 from ..core.bitbucket import BitbucketError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
+from ..core.dates import fmt_dt
 from ..core.maintenance import ensure_db_available, run_daily_maintenance
 from ..skills_install import (
     default_agents_dest as _agents_dest,
@@ -113,7 +114,7 @@ def _render_attachments(attachments: list) -> None:
     for a in attachments:
         icon = _ATTACH_ICON.get(a.kind, "📎")
         console.print(f"  {icon} {a.filename} [dim]{_human_size(a.size)} · {a.kind}"
-                      f" · {a.author} · {a.created[:16]}[/dim]")
+                      f" · {a.author} · {fmt_dt(a.created)}[/dim]")
 
 
 # --------------------------------------------------------------------------- #
@@ -389,7 +390,7 @@ def task(
     if issue.comments:
         console.print(f"\n[bold]Комментарии ({len(issue.comments)})[/bold]")
         for c in issue.comments:
-            console.print(f"[dim]{c.created} · {c.author}[/dim]\n{c.body}\n")
+            console.print(f"[dim]{fmt_dt(c.created)} · {c.author}[/dim]\n{c.body}\n")
     _render_attachments(issue.attachments)
     if issue.pull_requests or issue.branches:
         console.print("[bold]Development[/bold]")
@@ -561,7 +562,8 @@ def pr(
     for c in detail.comments:
         loc = f"[dim]{c.file}:{c.line}[/dim] " if c.file else ""
         indent = "  " + "    " * c.depth
-        console.print(f"{indent}{loc}[bold]{c.author}[/bold]: {(c.text or '').strip()}")
+        ts = f"[dim]{fmt_dt(c.created)}[/dim] " if c.created else ""
+        console.print(f"{indent}{ts}{loc}[bold]{c.author}[/bold]: {(c.text or '').strip()}")
     if jobs_list:
         console.print(f"[bold]Работы ({len(jobs_list)})[/bold]")
         for j in jobs_list:
@@ -869,7 +871,7 @@ def analysis_list(json_out: bool = typer.Option(False, "--json", help="Выве�
     table.add_column("Дата")
     table.add_column("Заголовок")
     for a in items:
-        table.add_row(str(a.id), a.created_at[:16], a.title)
+        table.add_row(str(a.id), fmt_dt(a.created_at), a.title)
     console.print(table)
 
 
@@ -887,7 +889,7 @@ def analysis_show(
     if json_out:
         _emit_json(a.model_dump())
         return
-    console.print(f"[bold cyan]#{a.id}[/bold cyan] [dim]{a.created_at[:16]}[/dim]  {a.title}\n")
+    console.print(f"[bold cyan]#{a.id}[/bold cyan] [dim]{fmt_dt(a.created_at)}[/dim]  {a.title}\n")
     console.print(a.content)
 
 
@@ -1074,7 +1076,7 @@ def job_show(
         _emit_json(job.model_dump())
         return
     console.print(f"[bold cyan]Работа #{job.id}[/bold cyan] [{job.status}]  {job.title or '—'}")
-    console.print(f"[dim]задача:[/dim] {job.task_key}   [dim]обновлена:[/dim] {job.updated_at[:16]}")
+    console.print(f"[dim]задача:[/dim] {job.task_key}   [dim]обновлена:[/dim] {fmt_dt(job.updated_at)}")
     if job.prs:
         prs = ", ".join(f"{p.project}/{p.repo}#{p.pr_id}" if p.project else f"#{p.pr_id}" for p in job.prs)
         console.print(f"[dim]PR:[/dim] {prs}")
@@ -1086,10 +1088,10 @@ def job_show(
             if badge:
                 label, color = badge
                 console.print(
-                    f"[dim]{r.ts[:16]}[/dim] [bold {color}]{label}[/bold {color}]{st} "
+                    f"[dim]{fmt_dt(r.ts)}[/dim] [bold {color}]{label}[/bold {color}]{st} "
                     f"[{color}]{r.text}[/{color}]")
             else:
-                console.print(f"[dim]{r.ts[:16]} · {r.kind}{st}[/dim] {r.text}")
+                console.print(f"[dim]{fmt_dt(r.ts)} · {r.kind}{st}[/dim] {r.text}")
 
 
 @app.command()

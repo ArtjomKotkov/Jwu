@@ -108,8 +108,9 @@ def test_dashboard_shows_all_jobs_including_closed(tmp_path):
 
 
 def test_fmt_ago():
+    # пусто → фоллбэк, невалидный ввод тоже → фоллбэк (наружу ISO/мусор не пускаем)
     assert "синк" in _fmt_ago(None)
-    assert _fmt_ago("not-a-date") == "not-a-date"
+    assert "синк" in _fmt_ago("not-a-date")
 
 
 def test_render_jira_code_block():

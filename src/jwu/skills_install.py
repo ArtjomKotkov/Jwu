@@ -17,6 +17,7 @@ EXPECTED_SKILLS = {
     "jwu-resume-job",
     "jwu-track-job",
     "jwu-job-review",
+    "jwu-commit-message",
     "jwu-analyze-day",
     "jwu-post-analyze-day",
 }

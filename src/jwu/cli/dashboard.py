@@ -73,34 +73,7 @@ ANALYSIS_COLUMNS = ["ID", "Дата/время", "Заголовок"]
 JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Задача", "PR", "Title"]
 
 
-def _fmt_ago(iso: str | None) -> str:
-    if not iso:
-        return "не синкано — нажми R"
-    try:
-        ts = datetime.fromisoformat(iso)
-    except ValueError:
-        return iso
-    mins = int((datetime.now(timezone.utc) - ts).total_seconds() // 60)
-    if mins < 1:
-        return "только что"
-    if mins < 60:
-        return f"{mins} мин назад"
-    if mins < 60 * 24:
-        return f"{mins // 60} ч назад"
-    return f"{mins // 1440} дн назад"
-
-
-def _fmt_dt(iso: str | None) -> str:
-    """ISO-метку → локальное «ДД.ММ.ГГГГ ЧЧ:ММ» (для колонок таблиц)."""
-    if not iso:
-        return "—"
-    try:
-        ts = datetime.fromisoformat(iso)
-    except ValueError:
-        return iso[:16].replace("T", " ")
-    if ts.tzinfo is not None:
-        ts = ts.astimezone()  # привести к локальному времени
-    return ts.strftime("%d.%m.%Y %H:%M")
+from ..core.dates import fmt_ago as _fmt_ago, fmt_dt as _fmt_dt  # noqa: E402
 
 
 def _human_size(n: int) -> str:
@@ -406,7 +379,10 @@ def _append_comment(body: Text, c: PRComment) -> None:
     pad = "  " + "    " * c.depth
     marker = "↳ " if c.depth else "💬 "
     body.append(f"{pad}{marker}", style="bright_cyan")
-    body.append(f"{c.author}: ", style=f"bold {author_color(c.author)}")
+    body.append(f"{c.author}", style=f"bold {author_color(c.author)}")
+    if c.created:
+        body.append(f"  {_fmt_dt(c.created)}", style="dim")
+    body.append(": ", style=f"bold {author_color(c.author)}")
     body.append(f"{(c.text or '').strip()}\n")
 
 
@@ -435,12 +411,13 @@ def _general_thread(thread: list[PRComment]) -> list[RenderableType]:
     for c in thread:
         pad = "    " * c.depth          # сдвиг ответа вправо по уровню вложенности
         author = f"[b {author_color(c.author)}]{escape(c.author)}[/]"
+        when = f"  [dim]{_fmt_dt(c.created)}[/dim]" if c.created else ""
         if c.depth:
             # ответ: вертикаль и угол (box-drawing) образуют единую линию-продолжение к автору
-            parts.append(Text.from_markup(f"{pad}[dim]│[/dim]\n{pad}[dim]╰▶[/dim] {author}"))
+            parts.append(Text.from_markup(f"{pad}[dim]│[/dim]\n{pad}[dim]╰▶[/dim] {author}{when}"))
             text_pad = pad + "   "       # текст — под «╰▶ »
         else:
-            parts.append(Text.from_markup(author))
+            parts.append(Text.from_markup(f"{author}{when}"))
             text_pad = ""
         # проза + ```fenced```-блоки кода; прозу сдвигаем под автора, блоки — как есть
         parts += _indent_renderables(render_md_text(c.text or ""), text_pad)
@@ -638,8 +615,8 @@ class IssueDetailScreen(Screen):
             f"[dim]Приоритет:[/dim] [{pc}]{escape(it.priority or '—')}[/{pc}]",
             f"[dim]Назначена:[/dim] {escape(it.assignee or '—')}",
             f"[dim]Автор:[/dim] {escape(it.reporter or '—')}",
-            f"[dim]Обновлено:[/dim] {escape(it.updated[:16])}",
-            f"[dim]Создана:[/dim] {escape(it.created[:16])}",
+            f"[dim]Обновлено:[/dim] {escape(_fmt_dt(it.updated))}",
+            f"[dim]Создана:[/dim] {escape(_fmt_dt(it.created))}",
         ]
         if it.resolution:
             lines.append(f"[dim]Резолюция:[/dim] {escape(it.resolution)}")
@@ -728,7 +705,7 @@ class IssueDetailScreen(Screen):
             tag = " [yellow]● упоминание[/yellow]" if mine else ""
             parts.append(Text.from_markup(
                 f"[b {color}]{escape(c.author)}[/b {color}] "
-                f"[dim]{escape(c.created[:16])}[/dim]{tag}"
+                f"[dim]{escape(_fmt_dt(c.created))}[/dim]{tag}"
             ))
             parts += render_jira_text(c.body or "", highlight=mine, attach_map=attach_map)
         return parts
@@ -905,7 +882,7 @@ class AnalysisScreen(Screen):
             return
         self.sub_title = a.title or f"#{a.id}"
         body.update(Group(
-            Text.from_markup(f"[b cyan]#{a.id}[/b cyan] [dim]{escape(a.created_at[:16])}[/dim]  {escape(a.title)}"),
+            Text.from_markup(f"[b cyan]#{a.id}[/b cyan] [dim]{escape(_fmt_dt(a.created_at))}[/dim]  {escape(a.title)}"),
             Rule(style="cyan"),
             Markdown(a.content or ""),
         ))
@@ -969,7 +946,7 @@ class JobDetailScreen(Screen):
                 f"[b cyan]Работа #{job.id}[/b cyan]  [b {sc}]{escape(job.status)}[/b {sc}]  "
                 f"{escape(job.title or '—')}\n"
                 f"[dim]задача:[/dim] [cyan]{escape(job.task_key)}[/cyan]   "
-                f"[dim]обновлена:[/dim] {escape(job.updated_at[:16])}"
+                f"[dim]обновлена:[/dim] {escape(_fmt_dt(job.updated_at))}"
             )
         ]
         if job.prs:
@@ -990,13 +967,13 @@ class JobDetailScreen(Screen):
                 label, color = badge
                 st = f" [{color}]{escape(r.status)}[/{color}]" if r.status else ""
                 parts.append(Text.from_markup(
-                    f"[dim]{escape(r.ts[:16])}[/dim] [b {color}]{escape(label)}[/b {color}]{st}"
+                    f"[dim]{escape(_fmt_dt(r.ts))}[/dim] [b {color}]{escape(label)}[/b {color}]{st}"
                 ))
                 parts.append(Text.from_markup(f"[{color}]{escape((r.text or '').strip())}[/{color}]"))
             else:
                 st = f" [{escape(r.status)}]" if r.status else ""
                 parts.append(Text.from_markup(
-                    f"[dim]{escape(r.ts[:16])} · {escape(r.kind)}{st}[/dim]"
+                    f"[dim]{escape(_fmt_dt(r.ts))} · {escape(r.kind)}{st}[/dim]"
                 ))
                 parts.append(Text((r.text or "").strip()))
         body.update(Group(*parts))
