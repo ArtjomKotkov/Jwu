@@ -91,6 +91,7 @@ class DayContext:
     """Расширенный контекст дня для анализа Claude Code (после фулл-синка)."""
 
     user: str = ""
+    me_display: str = ""  # отображаемое имя (для матчинга «на мне» / «ждёт ответа»)
     synced_at: str | None = None
     deltas: list[Delta] = field(default_factory=list)
     mine: list[Issue] = field(default_factory=list)
@@ -525,8 +526,9 @@ class Service:
     def collect_day_context(self, *, max_pr_comments: int = 8) -> DayContext:
         """Фулл-синк + расширенный контекст для дневного анализа Claude Code."""
         self.sync()
-        d = dashboard_from_memory(self.store, self.cfg.jira.username)
-        user = self.cfg.jira.username
+        login, display, _ = self._identity()
+        d = dashboard_from_memory(self.store, login or self.cfg.jira.username)
+        user = login or self.cfg.jira.username
         marker = f"[~{user}]" if user else None
 
         mentions: list[tuple[Issue, list[str]]] = []
@@ -554,6 +556,7 @@ class Service:
                     pass
         return DayContext(
             user=user,
+            me_display=display,
             synced_at=self.store.last_sync_at(),
             deltas=d.deltas,
             mine=d.mine,

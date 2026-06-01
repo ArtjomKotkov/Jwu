@@ -16,7 +16,7 @@ from rich.table import Table
 from ..core.bitbucket import BitbucketError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
-from ..core.dates import fmt_dt
+from ..core.dates import fmt_ago, fmt_dt
 from ..core.maintenance import ensure_db_available, run_daily_maintenance
 from ..skills_install import (
     default_agents_dest as _agents_dest,
@@ -753,13 +753,30 @@ def _job_set_status(job_id: int, status: str) -> None:
 # --------------------------------------------------------------------------- #
 
 _DAY_PROMPT = """## Что нужно сделать
-Составь КРАТКУЮ сводку-план рабочего дня по данным ниже (без глубокого погружения — только суть, я разберусь сам):
-1. Что изменилось с прошлого синка.
-2. Какие PR посмотреть (на ревью) — по строке, почему.
-3. Где у моих PR конфликты или замечания (NEEDS_WORK) — что поправить.
-4. Где упоминания требуют ответа/правки.
-Пиши сжато, маркерами, без воды. Затем сохрани план:
+Составь КРАТКУЮ сводку-план рабочего дня по данным ниже (без глубокого погружения — только суть, я разберусь сам).
+Сочетай ДВА среза: дельты (что изменилось) И текущее состояние PR/задач (даже без свежей дельты состояние может требовать действия).
+Для каждого моего PR/задачи — конкретный следующий шаг. Ориентиры:
+- PR `состояние: конфликт` → поправить merge-конфликт (приоритет, если апрувы собраны).
+- PR `апрувы собраны`, без NEEDS_WORK/конфликта, а задача не на тестах → перевести задачу на тесты.
+- PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
+- PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
+- Упоминание (не на мне), особенно `· ждёт ответа` → уточнить, что от меня хотят, и ответить.
+- База — дельты: новые комменты, смена статуса, апрувы, новые PR; `resolved` → закрыть работу.
+Пиши сжато, маркерами, без воды; группируй по действиям. Затем сохрани план:
 `jwu analysis save --title "День <дата>"` — передав текст плана в stdin."""
+
+
+def _pr_state(pr: PR) -> str:
+    """Короткая готовность PR для эвристик: что мешает мержу прямо сейчас."""
+    if pr.conflicted:
+        return "конфликт"
+    if any((r.status or "") == "NEEDS_WORK" for r in pr.reviewers):
+        return "есть NEEDS_WORK"
+    if not pr.reviewers:
+        return "нет ревьюверов"
+    if all(r.approved for r in pr.reviewers):
+        return "апрувы собраны"
+    return "ждёт апрувов"
 
 
 def _pr_line(pr: PR) -> str:
@@ -769,13 +786,14 @@ def _pr_line(pr: PR) -> str:
     ) or "—"
     conflict = "КОНФЛИКТ" if pr.conflicted else ("ok" if pr.conflicted is False else "?")
     return (f'- {pr.project}/{pr.repository}#{pr.id} "{pr.title}" — {conflict}; '
-            f"ревью: {revs}; комментов: {pr.comment_count}")
+            f"состояние: {_pr_state(pr)}; ревью: {revs}; комментов: {pr.comment_count}; "
+            f"обновлён: {fmt_ago(pr.updated)}")
 
 
 def _render_day_context_md(ctx: DayContext) -> str:
     L: list[str] = [
         "# Контекст дневного анализа (jwu)",
-        f"Пользователь: {ctx.user or '—'}. Синк: {ctx.synced_at or '—'}.",
+        f"Пользователь: {ctx.me_display or '—'} ({ctx.user or '—'}). Синк: {ctx.synced_at or '—'}.",
         "",
         _DAY_PROMPT,
         "",
@@ -784,7 +802,10 @@ def _render_day_context_md(ctx: DayContext) -> str:
     L += [f"- [{d.kind}] {d.key} {d.detail} — {d.summary}" for d in ctx.deltas] or ["- нет"]
 
     L.append(f"\n## Мои задачи ({len(ctx.mine)})")
-    L += [f"- {it.key} [{it.status}] ({it.priority}) {it.summary}" for it in ctx.mine] or ["- нет"]
+    L += [
+        f"- {it.key} [{it.status}] ({it.priority}) assignee: {it.assignee or '—'} — {it.summary}"
+        for it in ctx.mine
+    ] or ["- нет"]
 
     for header, prs in (("Мои PR", ctx.prs_mine), ("PR на ревью", ctx.prs_review)):
         L.append(f"\n## {header} ({len(prs)})")
@@ -801,7 +822,16 @@ def _render_day_context_md(ctx: DayContext) -> str:
     if not ctx.mentions:
         L.append("- нет")
     for issue, texts in ctx.mentions:
-        L.append(f"- {issue.key} [{issue.status}] {issue.summary}")
+        # ждёт ответа: последний комментарий не мой (мяч на моей стороне)
+        last = issue.comments[-1] if issue.comments else None
+        awaiting = (
+            " · ждёт ответа"
+            if last and ctx.me_display and last.author and last.author != ctx.me_display
+            else ""
+        )
+        L.append(
+            f"- {issue.key} [{issue.status}] assignee: {issue.assignee or '—'}{awaiting} — {issue.summary}"
+        )
         for t in texts:
             L.append(f"  > {' '.join((t or '').split())[:300]}")
     return "\n".join(L)
@@ -810,6 +840,7 @@ def _render_day_context_md(ctx: DayContext) -> str:
 def _day_context_json(ctx: DayContext) -> dict:
     return {
         "user": ctx.user,
+        "me_display": ctx.me_display,
         "synced_at": ctx.synced_at,
         "deltas": [d.model_dump() for d in ctx.deltas],
         "mine": [i.model_dump() for i in ctx.mine],
