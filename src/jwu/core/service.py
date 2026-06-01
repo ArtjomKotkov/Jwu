@@ -454,13 +454,22 @@ class Service:
                     keys.add(m.group(1))
                     break
         aliases = _load_pr_task_aliases(self.store)
+        # Уже снапшотнутые в этом прогоне задачи (из mine/mentions) трогать нельзя:
+        # их снапшот богаче (with_dev=True, есть pr_ids/branches), а pr_link-дубль
+        # обеднён (pr_ids=[]). Два разных снапшота одного ключа в одном прогоне ломают
+        # сравнение в compute_changes — каждый синк заново плодит ложные new_pr.
+        existing = self.store.snapshotted_issue_keys(run_id)
         changed = False
         for key in keys:
+            if key in existing or aliases.get(key) in existing:
+                continue
             try:
                 full = self.jira.issue(key, with_dev=False)
             except Exception:  # noqa: BLE001 — отсутствующая/недоступная задача не валит синк
                 continue
-            self.store.save_issue_snapshot(run_id, full, ["pr_link"])
+            if full.key not in existing:
+                self.store.save_issue_snapshot(run_id, full, ["pr_link"])
+                existing.add(full.key)
             if full.key and full.key != key:
                 if aliases.get(key) != full.key:
                     aliases[key] = full.key

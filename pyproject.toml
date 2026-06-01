@@ -1,6 +1,6 @@
 [project]
 name = "jwu"
-version = "0.3.1"
+version = "0.3.2"
 description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
 authors = [
     {name = "Artem Kotkov", email = "ArtjomKotkov@users.noreply.github.com"}

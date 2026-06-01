@@ -7,7 +7,15 @@ from jwu.core.jira import JiraClient
 from jwu.core.service import Service
 from jwu.core.store import Store
 
-from .fixtures import bitbucket_dashboard_raw, jira_issue_raw, jira_search_raw
+from .fixtures import (
+    bitbucket_commits_raw,
+    bitbucket_dashboard_raw,
+    bitbucket_merge_raw,
+    bitbucket_pr_raw,
+    dev_status_pr_raw,
+    jira_issue_raw,
+    jira_search_raw,
+)
 
 JIRA = "https://jira.test"
 BB = "https://git.test"
@@ -89,6 +97,56 @@ def test_sync_detects_new_comment_across_runs(tmp_path):
         assert not any(d.kind == "new_issue" for d in r2.deltas)
         # посекционный синк не теряет вкладку mine в памяти
         assert [i.key for i in svc.store.latest_issues("mine")] == ["PROJ-1"]
+    finally:
+        svc.close()
+
+
+@respx.mock
+def test_full_sync_idempotent_no_phantom_new_pr(tmp_path):
+    """Задача из mine, чей PR ссылается на неё веткой, не должна на КАЖДОМ синке
+    давать ложный new_pr. Раньше _snapshot_pr_tasks досохранял обеднённый дубль
+    (with_dev=False, pr_ids=[]) того же ключа в том же прогоне, и сравнение в
+    compute_changes сравнивало богатый снапшот с пустым → new_pr заново всякий раз.
+    """
+    # mine/mentions отдают одну и ту же задачу PROJ-1
+    respx.get(f"{JIRA}/rest/api/2/search").mock(
+        return_value=httpx.Response(200, json=jira_search_raw([jira_issue_raw()]))
+    )
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw())
+    )
+    # dev-панель: у задачи есть PR #42
+    respx.get(f"{JIRA}/rest/dev-status/1.0/issue/detail").mock(
+        return_value=httpx.Response(200, json=dev_status_pr_raw())
+    )
+    # PR, чья ветка ссылается на PROJ-1 (триггерит _snapshot_pr_tasks по ключу из ветки)
+    pr = bitbucket_pr_raw(pr_id=42)
+    pr["fromRef"]["displayId"] = "PROJ-1-fix"
+    respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
+        return_value=httpx.Response(200, json=bitbucket_dashboard_raw([pr]))
+    )
+    respx.get(
+        f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/42/merge"
+    ).mock(return_value=httpx.Response(200, json=bitbucket_merge_raw()))
+    respx.get(
+        f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/42/commits"
+    ).mock(return_value=httpx.Response(200, json=bitbucket_commits_raw()))
+
+    svc = _service(tmp_path)
+    try:
+        svc.sync()  # первый синк — здесь new_issue/new_pr ожидаемы
+        # ровно один снапшот PROJ-1 в прогоне — без обеднённого pr_link-дубля
+        run1 = svc.store.latest_run_id()
+        n = svc.store.conn.execute(
+            "SELECT COUNT(*) c FROM issue_snapshots WHERE sync_run_id=? AND key='PROJ-1'",
+            (run1,),
+        ).fetchone()["c"]
+        assert n == 1
+
+        r2 = svc.sync()  # второй синк без реальных изменений — должен быть тихим
+        assert not any(d.kind == "new_pr" for d in r2.deltas), \
+            [(d.kind, d.key) for d in r2.deltas]
+        assert r2.deltas == []
     finally:
         svc.close()
 

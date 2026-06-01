@@ -256,6 +256,13 @@ class Store:
         prs.sort(key=lambda p: p.updated, reverse=True)
         return prs
 
+    def snapshotted_issue_keys(self, run_id: int) -> set[str]:
+        """Ключи задач, уже снапшотнутые в этом прогоне (чтобы не плодить дубли)."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT key FROM issue_snapshots WHERE sync_run_id = ?", (run_id,)
+        ).fetchall()
+        return {r["key"] for r in rows}
+
     def _prev_issue_signature(self, key: str, before_run: int) -> dict | None:
         row = self.conn.execute(
             "SELECT signature FROM issue_snapshots WHERE key = ? AND sync_run_id < ?"
