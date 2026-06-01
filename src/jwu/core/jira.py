@@ -142,8 +142,13 @@ class JiraClient:
         if with_dev:
             issue_id = raw.get("id")
             if issue_id:
-                detail = self._dev_status(str(issue_id))
+                detail, ok = self._dev_status(str(issue_id))
                 issue.apply_dev_status(detail)
+                issue.dev_ok = ok
+            else:
+                issue.dev_ok = False
+        else:
+            issue.dev_ok = False  # dev-панель не запрашивали — pr/branches недостоверны
         return issue
 
     def download_attachment(self, url: str, dest: Path) -> Path:
@@ -167,13 +172,16 @@ class JiraClient:
             raise JiraError(f"Сеть/Jira недоступна при скачивании вложения: {exc}") from exc
         return dest
 
-    def _dev_status(self, issue_id: str) -> dict:
+    def _dev_status(self, issue_id: str) -> tuple[dict, bool]:
         """Слить ветки (dataType=branch), коммиты (repository) и PR (pullrequest).
 
         Jira отдаёт ветки отдельным dataType=branch — у repository только коммиты.
-        Ошибки dev-status не критичны (плагин может быть недоступен) — глотаем.
+        Ошибки dev-status не критичны (плагин может быть недоступен) — глотаем, но
+        возвращаем ok=False, если хоть один запрос упал: иначе пустой из-за сбоя
+        список PR неотличим от «PR реально нет» и порождает фантомные дельты.
         """
         merged: dict = {"branches": [], "repositories": [], "pullRequests": []}
+        ok = True
         for data_type in ("branch", "repository", "pullrequest"):
             try:
                 data = self._get(
@@ -185,6 +193,7 @@ class JiraClient:
                     },
                 )
             except JiraError:
+                ok = False
                 continue
             for entry in data.get("detail", []) or []:
                 # dataType=branch кладёт ветки прямо в detail[] (repository вложен в ветку),
@@ -192,4 +201,4 @@ class JiraClient:
                 merged["branches"].extend(entry.get("branches", []) or [])
                 merged["repositories"].extend(entry.get("repositories", []) or [])
                 merged["pullRequests"].extend(entry.get("pullRequests", []) or [])
-        return merged
+        return merged, ok

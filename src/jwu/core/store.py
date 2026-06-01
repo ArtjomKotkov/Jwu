@@ -110,6 +110,8 @@ def _issue_signature(issue: Issue) -> dict:
         "comment_ids": [c.id for c in issue.comments],
         "pr_ids": [pr.id for pr in issue.pull_requests],
         "branches": [b.name for b in issue.branches],
+        # достоверны ли pr_ids/branches (см. Issue.dev_ok)
+        "dev_ok": issue.dev_ok,
     }
 
 
@@ -271,6 +273,22 @@ class Store:
         ).fetchone()
         return json.loads(row["signature"]) if row else None
 
+    def _prev_reliable_pr_ids(self, key: str, before_run: int) -> list | None:
+        """pr_ids из последнего снапшота с достоверной dev-панелью (dev_ok != False).
+
+        Пустой pr-список из-за сбоя dev-status (dev_ok=False) как базу сравнения не
+        берём — иначе вернувшиеся на следующем синке PR выглядят «новыми». Старые
+        строки без поля dev_ok считаем достоверными (COALESCE → 1)."""
+        row = self.conn.execute(
+            "SELECT signature FROM issue_snapshots WHERE key = ? AND sync_run_id < ?"
+            " AND COALESCE(json_extract(signature, '$.dev_ok'), 1) = 1"
+            " ORDER BY sync_run_id DESC LIMIT 1",
+            (key, before_run),
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["signature"]).get("pr_ids", [])
+
     def _prev_pr_signature(self, pr_id: int, before_run: int) -> dict | None:
         row = self.conn.execute(
             "SELECT signature FROM pr_snapshots WHERE pr_id = ? AND sync_run_id < ?"
@@ -320,12 +338,18 @@ class Store:
                     key=key, kind="new_comment", summary=summary,
                     detail=f"+{len(new_comments)} комм.",
                 ))
-            new_prs = set(cur.get("pr_ids", [])) - set(prev.get("pr_ids", []))
-            if new_prs:
-                deltas.append(Delta(
-                    key=key, kind="new_pr", summary=summary,
-                    detail=", ".join(map(str, sorted(new_prs))),
-                ))
+            # new_pr — только если dev-панель текущего снапшота достоверна, и
+            # сравниваем с последним ДОСТОВЕРНЫМ снапшотом (сбойные пустые пропускаем),
+            # иначе вернувшиеся после сбоя dev-status PR выглядели бы «новыми».
+            if cur.get("dev_ok", True):
+                base_pr_ids = self._prev_reliable_pr_ids(key, run_id)
+                if base_pr_ids is not None:
+                    new_prs = set(cur.get("pr_ids", [])) - set(base_pr_ids)
+                    if new_prs:
+                        deltas.append(Delta(
+                            key=key, kind="new_pr", summary=summary,
+                            detail=", ".join(map(str, sorted(new_prs))),
+                        ))
 
         # PR: новые комменты/коммиты, апрувы, конфликт
         pr_rows = self.conn.execute(

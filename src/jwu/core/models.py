@@ -168,6 +168,10 @@ class Issue(BaseModel):
     branches: list[DevBranch] = Field(default_factory=list)
     commits: list[DevCommit] = Field(default_factory=list)
     pull_requests: list[DevPullRequest] = Field(default_factory=list)
+    # Достоверны ли dev-данные (ветки/PR): False, если dev-status не запрашивался
+    # (with_dev=False) или запрос упал. Нужно, чтобы пустой pr-список из-за сбоя не
+    # затирал реально известные PR и не плодил фантомные new_pr на следующем синке.
+    dev_ok: bool = True
 
     @classmethod
     def from_jira(cls, raw: dict) -> "Issue":

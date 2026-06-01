@@ -11,7 +11,7 @@ def store(tmp_path):
     s.close()
 
 
-def _issue(key="PROJ-1", status="Open", resolution="", comments=(), prs=()):
+def _issue(key="PROJ-1", status="Open", resolution="", comments=(), prs=(), dev_ok=True):
     return Issue(
         key=key,
         summary="S",
@@ -19,6 +19,7 @@ def _issue(key="PROJ-1", status="Open", resolution="", comments=(), prs=()):
         resolution=resolution,
         comments=[Comment(id=str(c)) for c in comments],
         pull_requests=[DevPullRequest(id=str(p)) for p in prs],
+        dev_ok=dev_ok,
     )
 
 
@@ -54,6 +55,30 @@ def test_resolved_and_new_pr_deltas(store):
     kinds = {d.kind for d in deltas}
     assert "resolved" in kinds
     assert "new_pr" in kinds
+
+
+def test_dev_status_failure_does_not_emit_phantom_new_pr(store):
+    """Сбой dev-status (dev_ok=False, pr_ids пусты) не должен порождать new_pr ни на
+    сбойном синке, ни на восстановлении: PR уже видели, они не новые."""
+    run1 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run1, _issue(prs=["#42"]))
+    store.compute_changes(run1)
+
+    # синк со сбоем dev-status: pr_ids схлопнулись, но снапшот помечен недостоверным
+    run2 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run2, _issue(prs=[], dev_ok=False))
+    assert not any(d.kind == "new_pr" for d in store.compute_changes(run2))
+
+    # dev-status восстановился: тот же #42 не должен выглядеть новым
+    run3 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run3, _issue(prs=["#42"]))
+    assert not any(d.kind == "new_pr" for d in store.compute_changes(run3))
+
+    # а вот реально новый PR после восстановления — ловим
+    run4 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run4, _issue(prs=["#42", "#99"]))
+    new_pr = [d for d in store.compute_changes(run4) if d.kind == "new_pr"]
+    assert len(new_pr) == 1 and new_pr[0].detail == "#99"
 
 
 def test_new_conflict_delta(store):

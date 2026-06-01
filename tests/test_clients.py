@@ -53,6 +53,7 @@ def test_jira_issue_with_dev_status():
     assert issue.comments[0].body == "c"
     assert [b.name for b in issue.branches] == ["PROJ-1-fix"]
     assert [p.id for p in issue.pull_requests] == ["#42"]
+    assert issue.dev_ok is True  # все три dataType ответили — dev-данные достоверны
 
 
 @respx.mock
@@ -96,6 +97,7 @@ def test_jira_dev_status_failure_is_non_fatal():
     with JiraClient(JIRA, "tok") as jira:
         issue = jira.issue("PROJ-1")  # не должно падать
     assert issue.pull_requests == []
+    assert issue.dev_ok is False  # dev-status упал → pr/branches недостоверны
 
 
 @respx.mock
