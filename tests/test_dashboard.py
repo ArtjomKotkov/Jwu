@@ -853,15 +853,22 @@ def test_render_day_context_md():
     from jwu.core.models import Delta, Reviewer
     from jwu.core.service import DayContext
 
+    from jwu.core.models import Comment
+
     issue = _issue("WM-1")
     issue.comments = []
+    issue.assignee = "Alice"
     pr = PR(id=7, project="P", repository="r", title="fix", conflicted=True,
             reviewers=[Reviewer(name="rev", status="NEEDS_WORK")], comment_count=2)
+    # упоминание, где последний коммент НЕ мой → должно пометиться «ждёт ответа»
+    mention = _issue("WM-2")
+    mention.assignee = "Боб"
+    mention.comments = [Comment(id="1", author="Боб", body="эй [~alice] глянь")]
     ctx = DayContext(
-        user="alice", synced_at="2026-05-21T10:00",
+        user="alice", me_display="Alice", synced_at="2026-05-21T10:00",
         deltas=[Delta(key="WM-1", kind="new_comment", summary="s", detail="+1")],
         mine=[issue], prs_mine=[pr], prs_review=[],
-        mentions=[(_issue("WM-2"), ["эй [~alice] глянь\nвторая строка"])],
+        mentions=[(mention, ["эй [~alice] глянь\nвторая строка"])],
         pr_comments={7: []},
     )
     md = _render_day_context_md(ctx)
@@ -869,6 +876,11 @@ def test_render_day_context_md():
     assert "## Мои задачи (1)" in md
     assert "КОНФЛИКТ" in md and "NEEDS_WORK" in md
     assert "## Упоминания (1)" in md
+    # новые обогащения контекста
+    assert "состояние: конфликт" in md         # готовность PR (конфликт приоритетнее)
+    assert "обновлён:" in md                    # возраст PR
+    assert "assignee: Alice" in md              # assignee задачи
+    assert "· ждёт ответа" in md                # последний коммент не мой
     # перенос строки в упоминании схлопнут в пробел
     assert "вторая строка" in md and "глянь\nвторая" not in md
 
