@@ -110,6 +110,81 @@ def test_pr_signature_deltas(store):
     assert {"new_pr_comment", "new_pr_commit", "reviewer_approved"} <= kinds
 
 
+def test_closed_issue_disappears_and_emits_gone(store):
+    """Задача, переставшая приходить из Jira (закрыта/сменила статус), уходит из
+    списка вкладки и порождает дельту gone — а не висит по устаревшему снапшоту."""
+    run1 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run1, _issue("PROJ-1"), ["mine"])
+    store.finish_sync_run(run1, {"tasks:mine": 1})
+    store.compute_changes(run1)
+    assert [i.key for i in store.latest_issues("mine")] == ["PROJ-1"]
+
+    # следующий синк mine: PROJ-1 больше не пришёл (вкладка надёжно пуста)
+    run2 = store.start_sync_run(["mine"])
+    store.finish_sync_run(run2, {"tasks:mine": 0})
+    deltas = store.compute_changes(run2)
+    gone = [d for d in deltas if d.kind == "gone"]
+    assert len(gone) == 1
+    assert gone[0].key == "PROJ-1" and gone[0].section == "mine"
+    assert store.latest_issues("mine") == []  # пропала из списка
+
+
+def test_merged_pr_disappears_and_emits_pr_gone(store):
+    pr = PR(id=5, project="P", repository="r", title="фикс")
+    run1 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run1, pr, ["mine"])
+    store.finish_sync_run(run1, {"prs:mine": 1})
+    store.compute_changes(run1)
+    assert [p.id for p in store.latest_prs("mine")] == [5]
+
+    run2 = store.start_sync_run(["prs:mine"])
+    store.finish_sync_run(run2, {"prs:mine": 0})
+    deltas = store.compute_changes(run2)
+    gone = [d for d in deltas if d.kind == "pr_gone"]
+    assert len(gone) == 1
+    assert gone[0].key == "P/r#5" and gone[0].section == "prs_mine"
+    assert store.latest_prs("mine") == []
+
+
+def test_fetch_failure_does_not_wipe_tab_or_emit_gone(store):
+    """Сбой фетча вкладки (нет ключа в counts) не должен затирать список и не должен
+    порождать ложный gone — членство откатывается к прошлому надёжному синку."""
+    run1 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run1, _issue("PROJ-1"), ["mine"])
+    store.finish_sync_run(run1, {"tasks:mine": 1})
+    store.compute_changes(run1)
+
+    # синк, где фетч mine упал: прогон записан, но counts без tasks:mine и снапшота нет
+    run2 = store.start_sync_run(["mine"])
+    store.finish_sync_run(run2, {})
+    deltas = store.compute_changes(run2)
+    assert not any(d.kind == "gone" for d in deltas)
+    assert [i.key for i in store.latest_issues("mine")] == ["PROJ-1"]  # не затёрли
+
+
+def test_issue_still_in_other_view_is_not_gone(store):
+    """Задача, ушедшая из mine, но оставшаяся в mentions, не считается исчезнувшей."""
+    run1 = store.start_sync_run(["mine", "mentions"])
+    store.save_issue_snapshot(run1, _issue("PROJ-1"), ["mine", "mentions"])
+    store.finish_sync_run(run1, {"tasks:mine": 1, "tasks:mentions": 1})
+    store.compute_changes(run1)
+
+    run2 = store.start_sync_run(["mine", "mentions"])
+    store.save_issue_snapshot(run2, _issue("PROJ-1"), ["mentions"])
+    store.finish_sync_run(run2, {"tasks:mine": 0, "tasks:mentions": 1})
+    deltas = store.compute_changes(run2)
+    assert not any(d.kind == "gone" for d in deltas)  # ещё видна в mentions
+    assert store.latest_issues("mine") == []
+    assert [i.key for i in store.latest_issues("mentions")] == ["PROJ-1"]
+
+
+def test_gone_delta_survives_pending_roundtrip(store):
+    """section дельты gone не теряется при сохранении в накопитель."""
+    store.add_pending_changes(1, [Delta(key="A-1", kind="gone", section="mine")])
+    restored = store.pending_changes()
+    assert restored[0].kind == "gone" and restored[0].section == "mine"
+
+
 def test_analyses_roundtrip(store):
     a1 = store.save_analysis("план 1", "День 1")
     a2 = store.save_analysis("план 2", "День 2")

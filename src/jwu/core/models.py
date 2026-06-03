@@ -342,9 +342,15 @@ class PR(BaseModel):
 
 class Delta(BaseModel):
     key: str
-    kind: str  # new_issue | status_change | new_comment | new_pr | new_conflict | resolved
+    # new_issue | status_change | new_comment | new_pr | new_conflict | resolved
+    # | gone (задача ушла из выборки) | pr_gone (PR смержен/отклонён) | new_pr_comment …
+    kind: str
     summary: str = ""
     detail: str = ""
+    # Для дельт исчезновения (gone/pr_gone) — вкладка, из которой ушла сущность
+    # (mine|mentions|prs_mine|prs_review): сама сущность уже не в списке вкладки,
+    # поэтому маршрутизировать её в TUI можно только по этой подсказке.
+    section: str = ""
 
 
 class Note(BaseModel):

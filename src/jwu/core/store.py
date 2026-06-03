@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS pending_changes (
     kind    TEXT NOT NULL,
     summary TEXT NOT NULL DEFAULT '',
     detail  TEXT NOT NULL DEFAULT '',
+    section TEXT NOT NULL DEFAULT '',
     ts      TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
@@ -145,6 +146,11 @@ class Store:
         if "signature" not in pr_cols:
             self.conn.execute(
                 "ALTER TABLE pr_snapshots ADD COLUMN signature TEXT NOT NULL DEFAULT '{}'"
+            )
+        pc_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(pending_changes)")}
+        if "section" not in pc_cols:
+            self.conn.execute(
+                "ALTER TABLE pending_changes ADD COLUMN section TEXT NOT NULL DEFAULT ''"
             )
 
     def close(self) -> None:
@@ -228,31 +234,103 @@ class Store:
                 return row["started_at"]
         return None
 
+    def _membership_run(
+        self, token: str, count_key: str, before: int | None = None
+    ) -> int | None:
+        """Последний прогон, надёжно синкавший вкладку ``token``.
+
+        Надёжный = ``token`` есть в ``views`` прогона И ``count_key`` есть в его
+        ``counts`` (фетч не упал — при ошибке ключ в counts не пишется, см.
+        ``_sync_tasks``/``_sync_prs``). Это отделяет «вкладка реально опустела»
+        от «синк вкладки упал»: на сбое мы откатываемся к прошлому надёжному
+        прогону и не затираем таб.
+
+        Фолбэк: если ни одного прогона с заполненным counts нет (напр. в юнит-тестах
+        без ``finish_sync_run``), берём последний прогон, где ``token`` есть в views.
+        ``before`` — рассматривать только прогоны строго раньше указанного id.
+        """
+        fallback: int | None = None
+        for row in self.conn.execute(
+            "SELECT id, views, counts FROM sync_runs ORDER BY id DESC"
+        ):
+            if before is not None and row["id"] >= before:
+                continue
+            if token not in json.loads(row["views"]):
+                continue
+            if fallback is None:
+                fallback = row["id"]
+            if count_key in json.loads(row["counts"] or "{}"):
+                return row["id"]
+        return fallback
+
+    def _issue_members_in_run(self, run_id: int, view: str) -> set[str]:
+        """Ключи задач, попавшие во вкладку ``view`` в конкретном прогоне."""
+        return {
+            r["key"]
+            for r in self.conn.execute(
+                "SELECT key, views FROM issue_snapshots WHERE sync_run_id = ?", (run_id,)
+            )
+            if view in json.loads(r["views"])
+        }
+
+    def _pr_members_in_run(self, run_id: int, view: str) -> set[int]:
+        """id PR, попавшие во вкладку ``view`` в конкретном прогоне."""
+        return {
+            r["pr_id"]
+            for r in self.conn.execute(
+                "SELECT pr_id, views FROM pr_snapshots WHERE sync_run_id = ?", (run_id,)
+            )
+            if view in json.loads(r["views"])
+        }
+
     def latest_issues(self, view: str | None = None) -> list[Issue]:
         """Свежайший снапшот по каждой задаче (опц. фильтр по вью), updated DESC.
 
-        Берём именно последний снапшот *по ключу*, а не по последнему run —
-        чтобы посекционный синк не «терял» вкладки, синканные в других прогонах.
+        Поля берём из последнего снапшота *по ключу* (свежайшие данные), но для
+        вкладок mine/mentions состав фильтруем по членству в последнем надёжном
+        синке этой вкладки — иначе закрытые/переназначенные задачи, переставшие
+        приходить из Jira, висели бы в списке вечно (их снапшот не обновляется).
         """
+        live: set[str] | None = None
+        if view in ("mine", "mentions"):
+            run_id = self._membership_run(view, f"tasks:{view}")
+            if run_id is not None:
+                live = self._issue_members_in_run(run_id, view)
         rows = self.conn.execute(
-            "SELECT fields, views, MAX(sync_run_id) FROM issue_snapshots GROUP BY key"
+            "SELECT key, fields, views, MAX(sync_run_id) FROM issue_snapshots GROUP BY key"
         ).fetchall()
         issues: list[Issue] = []
         for row in rows:
-            if view is not None and view not in json.loads(row["views"]):
+            if live is not None:
+                if row["key"] not in live:
+                    continue
+            elif view is not None and view not in json.loads(row["views"]):
                 continue
             issues.append(Issue.model_validate_json(row["fields"]))
         issues.sort(key=lambda i: i.updated, reverse=True)
         return issues
 
     def latest_prs(self, view: str | None = None) -> list[PR]:
-        """Свежайший снапшот по каждому PR (опц. фильтр по вью: mine|review)."""
+        """Свежайший снапшот по каждому PR (опц. фильтр по вью: mine|review).
+
+        Состав mine/review фильтруется по членству в последнем надёжном синке
+        вкладки — смерженные/отклонённые PR, переставшие приходить из Bitbucket,
+        пропадают из списка (а не висят по устаревшему снапшоту).
+        """
+        live: set[int] | None = None
+        if view in ("mine", "review"):
+            run_id = self._membership_run(f"prs:{view}", f"prs:{view}")
+            if run_id is not None:
+                live = self._pr_members_in_run(run_id, view)
         rows = self.conn.execute(
-            "SELECT fields, views, MAX(sync_run_id) FROM pr_snapshots GROUP BY pr_id"
+            "SELECT pr_id, fields, views, MAX(sync_run_id) FROM pr_snapshots GROUP BY pr_id"
         ).fetchall()
         prs: list[PR] = []
         for row in rows:
-            if view is not None and view not in json.loads(row["views"]):
+            if live is not None:
+                if row["pr_id"] not in live:
+                    continue
+            elif view is not None and view not in json.loads(row["views"]):
                 continue
             prs.append(PR.model_validate_json(row["fields"]))
         prs.sort(key=lambda p: p.updated, reverse=True)
@@ -386,7 +464,84 @@ class Store:
                     key=pr_key, kind="new_conflict", summary=title,
                     detail="появился merge-конфликт",
                 ))
+
+        deltas.extend(self._gone_deltas(run_id))
         return deltas
+
+    def _last_issue_summary(self, key: str) -> str:
+        row = self.conn.execute(
+            "SELECT fields FROM issue_snapshots WHERE key = ?"
+            " ORDER BY sync_run_id DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        return json.loads(row["fields"]).get("summary", "") if row else ""
+
+    def _last_pr_ref(self, pr_id: int) -> tuple[str, str]:
+        row = self.conn.execute(
+            "SELECT project, repo, fields FROM pr_snapshots WHERE pr_id = ?"
+            " ORDER BY sync_run_id DESC LIMIT 1",
+            (pr_id,),
+        ).fetchone()
+        if not row:
+            return "", f"#{pr_id}"
+        title = json.loads(row["fields"]).get("title", "")
+        return title, f"{row['project']}/{row['repo']}#{pr_id}"
+
+    def _gone_deltas(self, run_id: int) -> list[Delta]:
+        """Дельты об исчезновении: задача ушла из выборки / PR смержен-отклонён.
+
+        Сравниваем состав вкладки в текущем прогоне с прошлым надёжным прогоном
+        той же вкладки. Шумим только по вкладкам, которые в этом синке надёжно
+        обновились (есть в counts) — иначе сбой фетча выглядел бы как «всё ушло».
+        Если сущность всё ещё видна в другой вкладке — не считаем её исчезнувшей.
+        """
+        run = self.conn.execute(
+            "SELECT views, counts FROM sync_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if run is None:
+            return []
+        cur_views = set(json.loads(run["views"]))
+        cur_counts = json.loads(run["counts"] or "{}")
+        out: list[Delta] = []
+
+        live_issues: set[str] = set()
+        for v in ("mine", "mentions"):
+            r = self._membership_run(v, f"tasks:{v}")
+            if r is not None:
+                live_issues |= self._issue_members_in_run(r, v)
+        for v in ("mine", "mentions"):
+            if v not in cur_views or f"tasks:{v}" not in cur_counts:
+                continue
+            prev_run = self._membership_run(v, f"tasks:{v}", before=run_id)
+            if prev_run is None:
+                continue
+            gone = self._issue_members_in_run(prev_run, v) - self._issue_members_in_run(run_id, v)
+            for key in sorted(gone - live_issues):
+                out.append(Delta(
+                    key=key, kind="gone", summary=self._last_issue_summary(key), section=v,
+                    detail="ушла из выборки (закрыта / сменила статус / переназначена)",
+                ))
+
+        live_prs: set[int] = set()
+        for v in ("mine", "review"):
+            r = self._membership_run(f"prs:{v}", f"prs:{v}")
+            if r is not None:
+                live_prs |= self._pr_members_in_run(r, v)
+        for v, section in (("mine", "prs_mine"), ("review", "prs_review")):
+            token = f"prs:{v}"
+            if token not in cur_views or token not in cur_counts:
+                continue
+            prev_run = self._membership_run(token, token, before=run_id)
+            if prev_run is None:
+                continue
+            gone = self._pr_members_in_run(prev_run, v) - self._pr_members_in_run(run_id, v)
+            for pid in sorted(gone - live_prs):
+                title, pr_key = self._last_pr_ref(pid)
+                out.append(Delta(
+                    key=pr_key, kind="pr_gone", summary=title, section=section,
+                    detail="пропал из списка (вероятно смержен / отклонён)",
+                ))
+        return out
 
     # --- накопленные изменения (копятся, пока не закрыты явно) ----------- #
 
@@ -394,18 +549,19 @@ class Store:
         """Дописать дельты синка в накопитель (показываются, пока не очистят)."""
         ts = _now()
         self.conn.executemany(
-            "INSERT INTO pending_changes (run_id, key, kind, summary, detail, ts)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            [(run_id, d.key, d.kind, d.summary, d.detail, ts) for d in deltas],
+            "INSERT INTO pending_changes (run_id, key, kind, summary, detail, section, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(run_id, d.key, d.kind, d.summary, d.detail, d.section, ts) for d in deltas],
         )
         self.conn.commit()
 
     def pending_changes(self) -> list[Delta]:
         rows = self.conn.execute(
-            "SELECT key, kind, summary, detail FROM pending_changes ORDER BY id"
+            "SELECT key, kind, summary, detail, section FROM pending_changes ORDER BY id"
         ).fetchall()
         return [
-            Delta(key=r["key"], kind=r["kind"], summary=r["summary"], detail=r["detail"])
+            Delta(key=r["key"], kind=r["kind"], summary=r["summary"], detail=r["detail"],
+                  section=r["section"])
             for r in rows
         ]
 

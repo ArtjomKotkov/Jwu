@@ -206,6 +206,25 @@ def test_deltas_by_section_and_tab_badge():
     asyncio.run(run())
 
 
+def test_gone_delta_routed_to_section_even_when_absent_from_list():
+    """gone/pr_gone попадают в свою вкладку по d.section, хотя сущности в списке уже нет."""
+    from jwu.core.models import Delta
+
+    data = _dash_data()  # mine=[A-1, A-2], prs_review=[#5]
+    data.deltas = [
+        Delta(key="GONE-9", kind="gone", summary="ушла", section="mine"),
+        Delta(key="P/r#77", kind="pr_gone", summary="смержен", section="prs_review"),
+    ]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test():
+            assert [d.key for d in app._deltas_by_section["mine"]] == ["GONE-9"]
+            assert [d.key for d in app._deltas_by_section["prs_review"]] == ["P/r#77"]
+
+    asyncio.run(run())
+
+
 def test_changes_panel_survives_bracket_in_truncated_summary():
     """Регресс: `summary[:50]`, обрезанный внутри `[тег]`, ронял рендер панели."""
     from textual.widgets import Static

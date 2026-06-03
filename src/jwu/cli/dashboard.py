@@ -51,6 +51,8 @@ DELTA_ICON = {
     "reviewer_approved": "✅",
     "new_conflict": "⚠",
     "resolved": "✅",
+    "gone": "🚪",
+    "pr_gone": "🏁",
 }
 
 # Иконка по виду вложения (Attachment.kind) — для правой колонки карточки задачи.
@@ -1219,6 +1221,10 @@ class JwuDashboard(App):
         by: dict[str, list] = {s: [] for s in
                                ("mine", "mentions", "prs_mine", "prs_review", "analysis", "jobs")}
         for d in deltas:
+            if d.section:  # дельта исчезновения (gone/pr_gone) — сущности в списке уже нет
+                if d.section in by:
+                    by[d.section].append(d)
+                continue
             m = re.search(r"#(\d+)$", d.key)
             if m:
                 pid = int(m.group(1))
