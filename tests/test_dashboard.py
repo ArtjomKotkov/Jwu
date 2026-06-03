@@ -1339,3 +1339,53 @@ def test_search_missing_issue_notifies_and_survives():
             await pilot.press("q")
 
     asyncio.run(run())
+
+
+def test_hjkl_moves_table_cursor():
+    """hjkl на таблице двигают курсор; в поле поиска h/j/k/l — обычный ввод."""
+    from textual.widgets import Input
+
+    data = _dash_data()  # mine=[A-1, A-2]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            table = app.query_one("#t-mine", DataTable)
+            assert table.cursor_row == 0
+            await pilot.press("j")
+            assert table.cursor_row == 1
+            await pilot.press("k")
+            assert table.cursor_row == 0
+
+            inp = app.query_one("#search", Input)
+            inp.focus()
+            await pilot.pause()
+            await pilot.press("j")
+            assert inp.value == "j"
+            assert table.cursor_row == 0
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_bracket_keys_switch_tabs():
+    """[ и ] переключают вкладки по кругу."""
+    from jwu.cli.dashboard import _TAB_ORDER
+
+    data = _dash_data()
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            tabs = app.query_one("#tabs", TabbedContent)
+            assert tabs.active == "tab-mine"
+            await pilot.press("]")
+            assert tabs.active == "tab-mentions"
+            await pilot.press("[")
+            assert tabs.active == "tab-mine"
+            for _ in range(len(_TAB_ORDER)):
+                await pilot.press("]")
+            assert tabs.active == "tab-mine"
+            await pilot.press("q")
+
+    asyncio.run(run())

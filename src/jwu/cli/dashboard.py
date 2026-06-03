@@ -67,6 +67,17 @@ TABS = {
     "tab-analysis": ("t-analysis", "analysis", "analysis"),
     "tab-jobs": ("t-jobs", "job", "jobs"),
 }
+_TAB_ORDER = tuple(TABS.keys())
+
+
+class DashboardTable(DataTable):
+    BINDINGS = [
+        *DataTable.BINDINGS,
+        Binding("h", "cursor_left", show=False),
+        Binding("j", "cursor_down", show=False),
+        Binding("k", "cursor_up", show=False),
+        Binding("l", "cursor_right", show=False),
+    ]
 
 ISSUE_COLUMNS = ["Key", "Статус", "Приоритет", "Summary"]
 MENTION_COLUMNS = ["Когда", "Задача", "Упоминание"]
@@ -1064,6 +1075,8 @@ class JwuDashboard(App):
         Binding("C", "ack_changes", "Очистить всё"),
         Binding("x", "close_job", "Закрыть работу"),
         Binding("d", "delete_job", "✕ Удалить работу"),
+        Binding("[", "tab_prev", "← вкладка"),
+        Binding("]", "tab_next", "→ вкладка"),
     ]
 
     def __init__(
@@ -1130,17 +1143,17 @@ class JwuDashboard(App):
         with Horizontal(id="body"):
             with TabbedContent(id="tabs"):
                 with TabPane("Мои задачи", id="tab-mine"):
-                    yield DataTable(id="t-mine")
+                    yield DashboardTable(id="t-mine")
                 with TabPane("Упоминания", id="tab-mentions"):
-                    yield DataTable(id="t-mentions")
+                    yield DashboardTable(id="t-mentions")
                 with TabPane("PR: мои", id="tab-prs-mine"):
-                    yield DataTable(id="t-prs-mine")
+                    yield DashboardTable(id="t-prs-mine")
                 with TabPane("PR: на ревью", id="tab-prs-review"):
-                    yield DataTable(id="t-prs-review")
+                    yield DashboardTable(id="t-prs-review")
                 with TabPane("Анализ", id="tab-analysis"):
-                    yield DataTable(id="t-analysis")
+                    yield DashboardTable(id="t-analysis")
                 with TabPane("Работы", id="tab-jobs"):
-                    yield DataTable(id="t-jobs")
+                    yield DashboardTable(id="t-jobs")
             yield Splitter()
             with Vertical(id="changes-col"):
                 yield Input(id="search", placeholder="Поиск: KEY-123 → Enter")
@@ -1546,6 +1559,18 @@ class JwuDashboard(App):
         self._restore_cursor(table, cur)
 
     # --- взаимодействие ------------------------------------------------- #
+
+    def action_tab_next(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        order = _TAB_ORDER
+        idx = order.index(tabs.active) if tabs.active in order else 0
+        tabs.active = order[(idx + 1) % len(order)]
+
+    def action_tab_prev(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        order = _TAB_ORDER
+        idx = order.index(tabs.active) if tabs.active in order else 0
+        tabs.active = order[(idx - 1) % len(order)]
 
     def _active(self) -> tuple[str, str, str]:
         active = self.query_one("#tabs", TabbedContent).active
