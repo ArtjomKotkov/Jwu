@@ -487,9 +487,12 @@ class Service:
         run_id = self.store.start_sync_run(["mine", "mentions", "prs:mine", "prs:review"])
         counts = self._sync_tasks(run_id, ["mine", "mentions"])
         counts |= self._sync_prs(run_id, ["mine", "review"])
+        # counts фиксируем ДО compute_changes: детекция исчезновения (gone/pr_gone)
+        # опирается на надёжность прогона по counts, а ради «вкладка реально пуста»
+        # vs «фетч упал» это должно быть видно уже для текущего прогона.
+        self.store.finish_sync_run(run_id, counts)
         deltas = self.store.compute_changes(run_id)
         self.store.add_pending_changes(run_id, deltas)  # копим до явного закрытия
-        self.store.finish_sync_run(run_id, counts)
         return SyncResult(run_id=run_id, counts=counts, deltas=deltas)
 
     def sync_section(self, section: str) -> SyncResult:
@@ -503,9 +506,9 @@ class Service:
             counts = self._sync_prs(run_id, [view])
         else:
             raise ValueError(f"Неизвестная секция: {section!r}")
+        self.store.finish_sync_run(run_id, counts)  # counts до compute_changes (см. sync())
         deltas = self.store.compute_changes(run_id)
         self.store.add_pending_changes(run_id, deltas)  # копим до явного закрытия
-        self.store.finish_sync_run(run_id, counts)
         return SyncResult(run_id=run_id, counts=counts, deltas=deltas)
 
     def pr_detail(self, project: str | None, repo: str | None, pr_id: int) -> "PRDetail":
