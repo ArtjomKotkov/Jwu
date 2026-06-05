@@ -1389,3 +1389,61 @@ def test_bracket_keys_switch_tabs():
             await pilot.press("q")
 
     asyncio.run(run())
+
+
+def test_y_copies_issue_key_from_list(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.dashboard.copy_to_clipboard", copied.append)
+
+    data = _dash_data()
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            notes = []
+            app.notify = lambda *a, **k: notes.append((a, k))  # type: ignore[method-assign]
+            await pilot.press("y")
+            assert copied == ["A-1"]
+            assert notes and notes[0][0][0] == "Скопировано: A-1"
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_y_copies_issue_key_from_detail(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.dashboard.copy_to_clipboard", copied.append)
+
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            notes = []
+            app.screen.notify = lambda *a, **k: notes.append((a, k))  # type: ignore[method-assign]
+            await pilot.press("y")
+            assert copied == ["A-1"]
+            assert notes and notes[0][0][0] == "Скопировано: A-1"
+            await pilot.press("escape")
+
+    asyncio.run(run())
+
+
+def test_y_ignored_on_pr_tab(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.dashboard.copy_to_clipboard", copied.append)
+
+    data = _dash_data()
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            for _ in range(3):  # mine → mentions → prs-mine → prs-review
+                await pilot.press("]")
+            assert app.query_one("#tabs", TabbedContent).active == "tab-prs-review"
+            await pilot.press("y")
+            assert copied == []
+            await pilot.press("q")
+
+    asyncio.run(run())

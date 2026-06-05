@@ -17,6 +17,7 @@ dependencies = [
     "keyring>=25.0",
     "tomli-w>=1.0",
     "tomli>=2.0; python_version < '3.11'",
+    "pyperclip (>=1.11.0,<2.0.0)",
 ]
 
 [project.scripts]

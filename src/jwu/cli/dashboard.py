@@ -28,6 +28,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
+from ..core.clipboard import copy_to_clipboard
 from ..core.models import (
     JOB_RECORD_BADGES,
     Analysis,
@@ -98,6 +99,14 @@ def _human_size(n: int) -> str:
             return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{int(n)} Б"
+
+
+def _notify_copy_issue_key(screen, key: str) -> None:
+    try:
+        copy_to_clipboard(key)
+        screen.notify(f"Скопировано: {key}")
+    except Exception as exc:  # noqa: BLE001 — pyperclip / системный буфер
+        screen.notify(f"Не скопировать: {exc}", severity="error")
 
 
 def _fmt_dur(secs: float) -> str:
@@ -506,6 +515,7 @@ class IssueDetailScreen(Screen):
         Binding("escape,backspace", "app.pop_screen", "← Назад"),
         Binding("o", "open", "В браузере"),
         Binding("p", "open_first_pr", "Открыть PR"),
+        Binding("y", "copy_issue_key", "Копировать ключ"),
     ]
 
     def __init__(
@@ -750,6 +760,9 @@ class IssueDetailScreen(Screen):
     def action_open(self) -> None:
         if self.jira_base:
             webbrowser.open(f"{self.jira_base}/browse/{self.issue.key}")
+
+    def action_copy_issue_key(self) -> None:
+        _notify_copy_issue_key(self, self.issue.key)
 
     def action_open_pr(self, project: str, repo: str, pr_id: int) -> None:
         """Клик по PR / клавиша p → экран PR (с возвратом по Esc)."""
@@ -1077,6 +1090,7 @@ class JwuDashboard(App):
         Binding("d", "delete_job", "✕ Удалить работу"),
         Binding("[", "tab_prev", "← вкладка"),
         Binding("]", "tab_next", "→ вкладка"),
+        Binding("y", "copy_issue_key", "Копировать ключ"),
     ]
 
     def __init__(
@@ -1740,6 +1754,11 @@ class JwuDashboard(App):
         elif isinstance(obj, PR) and obj.url:
             webbrowser.open(obj.url)
 
+    def action_copy_issue_key(self) -> None:
+        obj = self._selected_obj()
+        if isinstance(obj, Issue):
+            _notify_copy_issue_key(self, obj.key)
+
     def action_ack_changes(self) -> None:
         """C / «очистить всё» — убрать ВСЕ накопленные изменения."""
         if self._ack_changes_fn is None:
@@ -1769,6 +1788,11 @@ class JwuDashboard(App):
         if action in ("delete_job", "close_job"):
             try:
                 return True if self._active()[2] == "jobs" else None
+            except Exception:  # noqa: BLE001
+                return None
+        if action == "copy_issue_key":
+            try:
+                return True if isinstance(self._selected_obj(), Issue) else None
             except Exception:  # noqa: BLE001
                 return None
         return True
