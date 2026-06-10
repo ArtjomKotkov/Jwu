@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import click
 import typer
-from rich.console import Console
+from rich.console import Console, Group
 from rich.table import Table
 
 from ..core.bitbucket import BitbucketError
@@ -27,6 +27,7 @@ from ..skills_install import (
 from ..core.jira import JiraError
 from ..core.models import JOB_RECORD_BADGES, JOB_RECORD_KINDS, Delta, Issue, Job, Note, PR
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
+from .dashboard import render_jira_text
 from ..core.store import Store
 
 app = typer.Typer(
@@ -386,11 +387,14 @@ def task(
     console.print(f"[bold cyan]{issue.key}[/bold cyan]  [{issue.status}]  {issue.summary}")
     console.print(f"[dim]assignee:[/dim] {issue.assignee or '—'}   [dim]priority:[/dim] {issue.priority or '—'}")
     if issue.description:
-        console.print(f"\n[bold]Описание[/bold]\n{issue.description}")
+        console.print("\n[bold]Описание[/bold]")
+        console.print(Group(*render_jira_text(issue.description)))
     if issue.comments:
         console.print(f"\n[bold]Комментарии ({len(issue.comments)})[/bold]")
         for c in issue.comments:
-            console.print(f"[dim]{fmt_dt(c.created)} · {c.author}[/dim]\n{c.body}\n")
+            console.print(f"[dim]{fmt_dt(c.created)} · {c.author}[/dim]")
+            console.print(Group(*render_jira_text(c.body or "")))
+            console.print()
     _render_attachments(issue.attachments)
     if issue.pull_requests or issue.branches:
         console.print("[bold]Development[/bold]")

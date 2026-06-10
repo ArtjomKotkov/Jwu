@@ -119,9 +119,12 @@ def _conflict_cell(pr: PR) -> str:
     return "—" if pr.conflicted is None else ("⚠ да" if pr.conflicted else "нет")
 
 
-# Jira wiki: {code:lang}...{code}, {code}...{code}, {noformat}...{noformat}
+# Jira wiki блоки кода: {code:lang}...{code}, {noformat}...{noformat}, а также
+# ```fenced``` (так оформляют код в комментах) — все идут отдельной панелью.
 _JIRA_BLOCK_RE = re.compile(
-    r"\{code(?::([^}]*))?\}\n?(.*?)\{code\}|\{noformat\}\n?(.*?)\{noformat\}",
+    r"\{code(?::([^}]*))?\}\n?(.*?)\{code\}"
+    r"|\{noformat\}\n?(.*?)\{noformat\}"
+    r"|```[ \t]*([\w.+#-]*)[ \t]*\n?(.*?)```",
     re.DOTALL,
 )
 
@@ -138,6 +141,35 @@ _INLINE_RE = re.compile(
 )
 
 
+# Цветовое выделение Jira: {color:#hex|name}...{color}.
+_COLOR_RE = re.compile(r"\{color:([^}\r\n]*)\}(.*?)\{color\}", re.DOTALL)
+
+# Эмфаза Jira: жирный *…* и {*}…{*}, курсив _…_, моноширинный {{…}}.
+# Жёсткие границы у *…*/_…_ — разделитель примыкает к не-пробелу и не к слову/самому
+# себе, чтобы '*'/'_' в обычном тексте и коде не давали ложного оформления.
+_EMPH_RE = re.compile(
+    r"\{\*\}(?P<bbody>.*?)\{\*\}"                          # {*}…{*} (пустой → ничего)
+    r"|(?<![\w*])\*(?!\s)(?P<bold>.+?)(?<!\s)\*(?![\w*])"  # *bold*
+    r"|(?<![\w_])_(?!\s)(?P<ital>.+?)(?<!\s)_(?![\w_])"    # _italic_
+    r"|\{\{(?P<mono>.*?)\}\}",                             # {{mono}}
+    re.DOTALL,
+)
+
+# Имя цвета rich: #hex (3–8) или простое слово. Иначе цвет игнорируем.
+_COLOR_VAL_RE = re.compile(r"#[0-9A-Fa-f]{3,8}|[A-Za-z][A-Za-z0-9_]*")
+
+
+def _join(a: str, b: str) -> str:
+    """Склейка rich-стилей пробелом (последний цвет в строке у rich побеждает)."""
+    return f"{a} {b}".strip() if a and b else (a or b)
+
+
+def _color_style(val: str) -> str:
+    """Валидный rich-цвет из значения {color:…} либо '' (тогда цвет не применяем)."""
+    m = _COLOR_VAL_RE.fullmatch((val or "").strip())
+    return m.group(0) if m else ""
+
+
 def _attachment_chip(filename: str, attach_map: Optional[dict[str, int]]) -> Text:
     """Чип вложения «🖼 имя» как в правом блоке; кликабелен, если файл есть в attach_map."""
     icon = ATTACH_ICON.get(classify_attachment(filename), "📎")
@@ -148,15 +180,12 @@ def _attachment_chip(filename: str, attach_map: Optional[dict[str, int]]) -> Tex
     return Text.from_markup(f"{icon} [cyan]{escape(filename)}[/cyan]")
 
 
-def _inline_segments(
-    chunk: str, style: str, attach_map: Optional[dict[str, int]], *, clickable: bool = True
-) -> Text:
-    """Собрать строку прозы в rich.Text: обычный текст без интерпретации разметки,
-    а вложения/ссылки — отдельными оформленными спанами (вложения как в правом блоке,
-    ссылки — кликабельным [link]). При clickable=False — то же оформление, но без
-    действий и гиперссылок (для ячеек таблицы).
-    """
-    t = Text()
+def _emit_leaf(
+    chunk: str, style: str, attach_map: Optional[dict[str, int]], clickable: bool, t: Text
+) -> None:
+    """Дописать в t прозу с лист-разметкой: обычный текст без интерпретации,
+    а упоминания/вложения/ссылки — отдельными оформленными спанами. base-style style
+    сохраняется на обычном тексте (несёт унаследованные цвет/жирный/курсив)."""
     pos = 0
     for m in _INLINE_RE.finditer(chunk):
         if m.start() > pos:
@@ -178,6 +207,50 @@ def _inline_segments(
         pos = m.end()
     if pos < len(chunk):
         t.append(chunk[pos:], style=style)
+
+
+def _emit_emph(
+    chunk: str, style: str, attach_map: Optional[dict[str, int]], clickable: bool, t: Text
+) -> None:
+    """Дописать прозу, разбирая эмфазу (*жирный*, _курсив_, {{mono}}, {*}…{*}).
+    Внутри эмфазы рекурсивно разбираем вложенную эмфазу и лист-разметку."""
+    pos = 0
+    for m in _EMPH_RE.finditer(chunk):
+        if m.start() > pos:
+            _emit_leaf(chunk[pos:m.start()], style, attach_map, clickable, t)
+        if m.group("bbody") is not None:      # {*}…{*}
+            inner, delta = m.group("bbody"), "bold"
+        elif m.group("bold") is not None:     # *жирный*
+            inner, delta = m.group("bold"), "bold"
+        elif m.group("ital") is not None:     # _курсив_
+            inner, delta = m.group("ital"), "italic"
+        else:                                 # {{mono}}
+            inner, delta = m.group("mono") or "", "dim"
+        if inner:
+            _emit_emph(inner, _join(style, delta), attach_map, clickable, t)
+        pos = m.end()
+    if pos < len(chunk):
+        _emit_leaf(chunk[pos:], style, attach_map, clickable, t)
+
+
+def _inline_segments(
+    chunk: str, style: str, attach_map: Optional[dict[str, int]], *, clickable: bool = True
+) -> Text:
+    """Собрать строку прозы в rich.Text. Каскад: цвет → эмфаза → лист-разметка.
+
+    Обычный текст идёт без интерпретации разметки; {color:…} даёт цвет, *…*/_…_/{{…}}
+    — жирный/курсив/моно, а упоминания/вложения/ссылки — отдельными спанами (ссылки
+    кликабельны при clickable=True; для ячеек таблицы — clickable=False)."""
+    t = Text()
+    pos = 0
+    for m in _COLOR_RE.finditer(chunk):
+        if m.start() > pos:
+            _emit_emph(chunk[pos:m.start()], style, attach_map, clickable, t)
+        _emit_emph(m.group(2), _join(style, _color_style(m.group(1))),
+                   attach_map, clickable, t)
+        pos = m.end()
+    if pos < len(chunk):
+        _emit_emph(chunk[pos:], style, attach_map, clickable, t)
     return t
 
 
@@ -204,9 +277,12 @@ def render_jira_text(
         if m.group(2) is not None:  # {code(:lang)?}
             lang = (m.group(1) or "").split("|")[0].strip() or "code"
             code = m.group(2)
-        else:  # {noformat}
+        elif m.group(3) is not None:  # {noformat}
             lang = "noformat"
             code = m.group(3)
+        else:  # ```fenced```
+            lang = (m.group(4) or "").strip() or "code"
+            code = m.group(5)
         parts.append(
             Panel(
                 Text(code.strip("\n") or " "),
