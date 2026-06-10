@@ -183,6 +183,63 @@ def test_render_jira_text_inline_attachments_and_links():
     assert "[^app.log]" not in plain      # сырой маркер вложения убран
 
 
+def _spans_with(text, needle):
+    """Стили всех спанов rich.Text, содержащие подстроку needle."""
+    return [str(sp.style) for sp in text.spans if needle in str(sp.style)]
+
+
+def test_render_jira_color_and_bold():
+    from rich.text import Text as RText
+
+    from jwu.cli.dashboard import render_jira_text
+
+    # цвет + жирный (как в WMDJANGOCHAT-25), плюс «пустой» {*}{*}
+    parts = render_jira_text("{color:#de350b}*Сервер*{color}{*}{*}")
+    text = next(p for p in parts if isinstance(p, RText))
+    assert "Сервер" in text.plain
+    # сырые маркеры убраны
+    assert "{color" not in text.plain and "*" not in text.plain and "{*}" not in text.plain
+    # есть спан со стилем, несущим и цвет, и жирный
+    assert any("#de350b" in s and "bold" in s for s in _spans_with(text, "#de350b"))
+
+
+def test_render_jira_italic_mono_and_nested_link():
+    from rich.text import Text as RText
+
+    from jwu.cli.dashboard import render_jira_text
+
+    parts = render_jira_text("_курсив_ и {{mono}} текст")
+    text = next(p for p in parts if isinstance(p, RText))
+    assert "курсив" in text.plain and "mono" in text.plain
+    assert "_" not in text.plain and "{{" not in text.plain
+    assert any("italic" in str(sp.style) for sp in text.spans)
+
+    # вложенность цвет → жирный → ссылка: ссылка показана лейблом, маркеры убраны
+    parts2 = render_jira_text("{color:#de350b}*[https://e.com]*{color}")
+    text2 = next(p for p in parts2 if isinstance(p, RText))
+    assert "https://e.com" in text2.plain
+    assert "{color" not in text2.plain and "*" not in text2.plain
+
+
+def test_render_jira_fenced_block_and_no_false_bold():
+    from rich.panel import Panel
+    from rich.text import Text as RText
+
+    from jwu.cli.dashboard import render_jira_text
+
+    # ```fenced``` в Jira-прозе → отдельная панель; '*' внутри не даёт жирного
+    parts = render_jira_text("до\n```\nrequest, *args, **kwargs\n```\nпосле")
+    assert [type(p).__name__ for p in parts] == ["Text", "Panel", "Text"]
+    panel = next(p for p in parts if isinstance(p, Panel))
+    assert "*args, **kwargs" in panel.renderable.plain
+
+    # одиночные '*' в обычной прозе не оформляются как жирный
+    plain = render_jira_text("умножение 2 * 2 = 4")
+    text = next(p for p in plain if isinstance(p, RText))
+    assert "2 * 2 = 4" in text.plain
+    assert not any("bold" in str(sp.style) for sp in text.spans)
+
+
 def test_deltas_by_section_and_tab_badge():
     from jwu.core.models import Delta
 
