@@ -21,14 +21,20 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
-from textual import events, work
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
-from ..core.clipboard import copy_to_clipboard
+from .copy_modal import (
+    copy_items_for_issue,
+    copy_items_for_job,
+    copy_items_for_pr,
+    notify_copied,
+    open_copy_modal,
+)
 from ..core.models import (
     JOB_RECORD_BADGES,
     Analysis,
@@ -99,14 +105,6 @@ def _human_size(n: int) -> str:
             return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{int(n)} Б"
-
-
-def _notify_copy_issue_key(screen, key: str) -> None:
-    try:
-        copy_to_clipboard(key)
-        screen.notify(f"Скопировано: {key}")
-    except Exception as exc:  # noqa: BLE001 — pyperclip / системный буфер
-        screen.notify(f"Не скопировать: {exc}", severity="error")
 
 
 def _fmt_dur(secs: float) -> str:
@@ -592,6 +590,7 @@ class IssueDetailScreen(Screen):
         Binding("o", "open", "В браузере"),
         Binding("p", "open_first_pr", "Открыть PR"),
         Binding("y", "copy_issue_key", "Копировать ключ"),
+        Binding("Y", "copy_menu", "Копировать…"),
     ]
 
     def __init__(
@@ -838,7 +837,11 @@ class IssueDetailScreen(Screen):
             webbrowser.open(f"{self.jira_base}/browse/{self.issue.key}")
 
     def action_copy_issue_key(self) -> None:
-        _notify_copy_issue_key(self, self.issue.key)
+        notify_copied(self, self.issue.key)
+
+    def action_copy_menu(self) -> None:
+        open_copy_modal(self, copy_items_for_issue(
+            self.issue, self.jira_base, user=self.user))
 
     def action_open_pr(self, project: str, repo: str, pr_id: int) -> None:
         """Клик по PR / клавиша p → экран PR (с возвратом по Esc)."""
@@ -870,6 +873,7 @@ class PRDetailScreen(Screen):
     BINDINGS = [
         Binding("escape,backspace", "app.pop_screen", "← Назад"),
         Binding("o", "open", "В браузере"),
+        Binding("Y", "copy_menu", "Копировать…"),
     ]
 
     def __init__(
@@ -976,6 +980,9 @@ class PRDetailScreen(Screen):
         if self.pr.url:
             webbrowser.open(self.pr.url)
 
+    def action_copy_menu(self) -> None:
+        open_copy_modal(self, copy_items_for_pr(self.pr))
+
 
 class AnalysisScreen(Screen):
     CSS = "VerticalScroll { padding: 1 2; }"
@@ -1018,15 +1025,25 @@ class JobDetailScreen(Screen):
         Binding("escape,backspace,q", "app.pop_screen", "← Назад"),
         Binding("x", "close_job", "Закрыть (неактуальна)"),
         Binding("d", "delete_job", "✕ Удалить"),
+        Binding("y", "copy_issue_key", "Копировать ключ"),
+        Binding("Y", "copy_menu", "Копировать…"),
     ]
 
-    def __init__(self, job_id: int, *, get_fn: Optional[Callable[[int], Optional[Job]]],
-                 refresh_interval: float = 0.0) -> None:
+    def __init__(
+        self,
+        job_id: int,
+        *,
+        get_fn: Optional[Callable[[int], Optional[Job]]],
+        jira_base: str = "",
+        refresh_interval: float = 0.0,
+    ) -> None:
         super().__init__()
         self.job_id = job_id
         self._get_fn = get_fn
+        self.jira_base = jira_base.rstrip("/")
         self._refresh_interval = refresh_interval
         self._title = ""
+        self._job: Optional[Job] = None
 
     def action_close_job(self) -> None:
         fn = getattr(self.app, "_job_status_fn", None)
@@ -1056,12 +1073,26 @@ class JobDetailScreen(Screen):
         if self._refresh_interval:
             self.set_interval(self._refresh_interval, self._reload)
 
+    def action_copy_issue_key(self) -> None:
+        if self._job is None or not self._job.task_key:
+            self.notify("Ключ задачи недоступен", severity="warning")
+            return
+        notify_copied(self, self._job.task_key)
+
+    def action_copy_menu(self) -> None:
+        if self._job is None:
+            self.notify("Работа не загружена", severity="warning")
+            return
+        open_copy_modal(self, copy_items_for_job(self._job, self.jira_base))
+
     def _reload(self) -> None:
         job = self._get_fn(self.job_id) if self._get_fn else None
         body = self.query_one("#job-body", Static)
         if job is None:
+            self._job = None
             body.update("[dim]работа не найдена[/dim]")
             return
+        self._job = job
         self._title = job.title or ""
         self.sub_title = f"#{job.id} {job.title}".strip()
         sc = status_color(job.status)
@@ -1167,6 +1198,7 @@ class JwuDashboard(App):
         Binding("[", "tab_prev", "← вкладка"),
         Binding("]", "tab_next", "→ вкладка"),
         Binding("y", "copy_issue_key", "Копировать ключ"),
+        Binding("Y", "copy_menu", "Копировать…"),
     ]
 
     def __init__(
@@ -1701,7 +1733,8 @@ class JwuDashboard(App):
                 obj.id, get_fn=self._analysis_get_fn, refresh_interval=local_iv))
         elif isinstance(obj, Job):
             self.push_screen(JobDetailScreen(
-                obj.id, get_fn=self._job_get_fn, refresh_interval=local_iv))
+                obj.id, get_fn=self._job_get_fn, jira_base=self.jira_base,
+                refresh_interval=local_iv))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Поиск по ключу задачи: Enter в поле #search сразу открывает карточку (с загрузкой)."""
@@ -1833,7 +1866,19 @@ class JwuDashboard(App):
     def action_copy_issue_key(self) -> None:
         obj = self._selected_obj()
         if isinstance(obj, Issue):
-            _notify_copy_issue_key(self, obj.key)
+            notify_copied(self, obj.key)
+        elif isinstance(obj, Job) and obj.task_key:
+            notify_copied(self, obj.task_key)
+
+    def action_copy_menu(self) -> None:
+        obj = self._selected_obj()
+        if isinstance(obj, Issue):
+            open_copy_modal(self, copy_items_for_issue(
+                obj, self.jira_base, user=self.data.user))
+        elif isinstance(obj, Job):
+            open_copy_modal(self, copy_items_for_job(obj, self.jira_base))
+        elif isinstance(obj, PR):
+            open_copy_modal(self, copy_items_for_pr(obj))
 
     def action_ack_changes(self) -> None:
         """C / «очистить всё» — убрать ВСЕ накопленные изменения."""
@@ -1868,7 +1913,14 @@ class JwuDashboard(App):
                 return None
         if action == "copy_issue_key":
             try:
-                return True if isinstance(self._selected_obj(), Issue) else None
+                obj = self._selected_obj()
+                return True if isinstance(obj, (Issue, Job)) else None
+            except Exception:  # noqa: BLE001
+                return None
+        if action == "copy_menu":
+            try:
+                obj = self._selected_obj()
+                return True if isinstance(obj, (Issue, Job, PR)) else None
             except Exception:  # noqa: BLE001
                 return None
         return True

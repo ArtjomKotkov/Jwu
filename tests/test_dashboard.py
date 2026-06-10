@@ -4,8 +4,14 @@ import sqlite3
 import pytest
 from textual.widgets import DataTable, TabbedContent
 
+from jwu.cli.copy_modal import (
+    CopyModalScreen,
+    copy_items_for_issue,
+    copy_items_for_job,
+    copy_items_for_pr,
+)
 from jwu.cli.dashboard import JwuDashboard, _fmt_ago
-from jwu.core.models import Issue, PR
+from jwu.core.models import Issue, Job, PR
 from jwu.core.service import DashboardData, dashboard_from_memory
 from jwu.core.store import Store
 
@@ -1461,9 +1467,50 @@ def test_bracket_keys_switch_tabs():
     asyncio.run(run())
 
 
+def test_copy_items_for_issue():
+    from jwu.core.models import Comment
+
+    issue = _issue("ABC-1")
+    issue.summary = "Fix bug"
+    issue.comments = [Comment(id="1", author="Bob", body="эй [~alice] глянь сюда")]
+    items = copy_items_for_issue(issue, "https://jira.test", user="alice")
+    by_key = {i.hotkey: i for i in items}
+    assert by_key["i"].value == "ABC-1"
+    assert by_key["u"].value == "https://jira.test/browse/ABC-1"
+    assert by_key["m"].value == "[ABC-1](https://jira.test/browse/ABC-1)"
+    assert by_key["w"].value == "[ABC-1|https://jira.test/browse/ABC-1]"
+    assert by_key["t"].value == "Fix bug"
+    assert by_key["s"].value == "ABC-1: Fix bug"
+    assert by_key["e"].value == "эй [~alice] глянь сюда"
+    assert "e" not in {i.hotkey for i in copy_items_for_issue(issue, "https://jira.test")}
+
+
+def test_copy_items_for_job_and_pr():
+    job = Job(id=7, task_key="X-1", title="dev work")
+    jitems = {i.hotkey: i for i in copy_items_for_job(job, "https://jira.test")}
+    assert jitems["i"].value == "X-1"
+    assert jitems["n"].value == "7"
+    assert jitems["t"].value == "dev work"
+
+    pr = PR(
+        id=5, project="P", repository="r", title="pr title",
+        url="https://bb/pr/5", source_branch="feat", target_branch="main",
+        latest_commit="abc123def",
+    )
+    pitems = {i.hotkey: i for i in copy_items_for_pr(pr)}
+    assert pitems["p"].value == "5"
+    assert pitems["r"].value == "P/r"
+    assert pitems["m"].value == "[P/r#5](https://bb/pr/5)"
+    assert pitems["w"].value == "[P/r#5|https://bb/pr/5]"
+    assert pitems["b"].value == "feat → main"
+    assert pitems["f"].value == "feat"
+    assert pitems["c"].value == "abc123def"
+    assert "w" in {i.hotkey for i in copy_items_for_job(job, "https://jira.test")}
+
+
 def test_y_copies_issue_key_from_list(monkeypatch):
     copied: list[str] = []
-    monkeypatch.setattr("jwu.cli.dashboard.copy_to_clipboard", copied.append)
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
 
     data = _dash_data()
     app = JwuDashboard(data, jira_base="https://jira.test")
@@ -1480,29 +1527,9 @@ def test_y_copies_issue_key_from_list(monkeypatch):
     asyncio.run(run())
 
 
-def test_y_copies_issue_key_from_detail(monkeypatch):
-    copied: list[str] = []
-    monkeypatch.setattr("jwu.cli.dashboard.copy_to_clipboard", copied.append)
-
-    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
-
-    async def run() -> None:
-        async with app.run_test() as pilot:
-            await pilot.press("enter")
-            await pilot.pause()
-            notes = []
-            app.screen.notify = lambda *a, **k: notes.append((a, k))  # type: ignore[method-assign]
-            await pilot.press("y")
-            assert copied == ["A-1"]
-            assert notes and notes[0][0][0] == "Скопировано: A-1"
-            await pilot.press("escape")
-
-    asyncio.run(run())
-
-
 def test_y_ignored_on_pr_tab(monkeypatch):
     copied: list[str] = []
-    monkeypatch.setattr("jwu.cli.dashboard.copy_to_clipboard", copied.append)
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
 
     data = _dash_data()
     app = JwuDashboard(data, jira_base="https://jira.test")
@@ -1514,6 +1541,105 @@ def test_y_ignored_on_pr_tab(monkeypatch):
             assert app.query_one("#tabs", TabbedContent).active == "tab-prs-review"
             await pilot.press("y")
             assert copied == []
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_Y_copies_issue_key_from_list_via_modal(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
+
+    data = _dash_data()
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            notes = []
+            app.notify = lambda *a, **k: notes.append((a, k))  # type: ignore[method-assign]
+            await pilot.press("Y")
+            await pilot.pause()
+            assert isinstance(app.screen, CopyModalScreen)
+            await pilot.press("i")
+            assert copied == ["A-1"]
+            assert notes and notes[0][0][0] == "Скопировано: ключ Jira"
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_Y_copies_issue_key_from_detail(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
+
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("Y")
+            await pilot.pause()
+            await pilot.press("i")
+            assert copied == ["A-1"]
+            await pilot.press("escape")
+
+    asyncio.run(run())
+
+
+def test_Y_copy_modal_on_pr_tab(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
+
+    data = _dash_data()
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            for _ in range(3):  # mine → mentions → prs-mine → prs-review
+                await pilot.press("]")
+            assert app.query_one("#tabs", TabbedContent).active == "tab-prs-review"
+            await pilot.press("Y")
+            await pilot.pause()
+            assert isinstance(app.screen, CopyModalScreen)
+            await pilot.press("p")
+            assert copied == ["5"]
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_copy_modal_quit_with_q(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
+
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("Y")
+            await pilot.pause()
+            assert isinstance(app.screen, CopyModalScreen)
+            await pilot.press("q")
+            await pilot.pause()
+            assert app.is_running is False
+
+    asyncio.run(run())
+
+
+def test_copy_modal_navigation_and_enter(monkeypatch):
+    copied: list[str] = []
+    monkeypatch.setattr("jwu.cli.copy_modal.copy_to_clipboard", copied.append)
+
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("Y")
+            await pilot.pause()
+            await pilot.press("j")
+            await pilot.press("enter")
+            assert copied == ["https://jira.test/browse/A-1"]
             await pilot.press("q")
 
     asyncio.run(run())
