@@ -371,7 +371,7 @@ def test_refresh_all_is_only_manual_sync():
 
 
 def test_failed_sync_marks_status_and_notifies():
-    """Упавший синк: уведомление + метка [неудачно] и след. попытка в строке; успех её снимает."""
+    """Упавший синк: уведомление + метка «не удалось» и след. попытка в строке; успех её снимает."""
     data = _dash_data()
     app = JwuDashboard(
         data, memory_fn=lambda: data, full_sync_fn=lambda: data,
@@ -385,16 +385,65 @@ def test_failed_sync_marks_status_and_notifies():
             app.query_one("#tabs", TabbedContent).active = "tab-mine"
             app._after_refresh(None, "Jira недоступна")
             assert app._sync_failed is True
+            assert app._auto_paused is False  # первая ошибка — ещё ретраим
             assert notes and notes[0][1].get("severity") == "error"
             line = app._network_line()
-            assert "[неудачно]" in line
+            assert "не удалось" in line
             assert "след. попытка через" in line
-            # успешный синк снимает метку
+            # успешный синк снимает метку и сбрасывает счётчик
             app._after_refresh(data, None)
             assert app._sync_failed is False
-            assert "[неудачно]" not in app._network_line()
+            assert app._fail_count == 0
+            assert "не удалось" not in app._network_line()
 
     asyncio.run(run())
+
+
+def test_second_failure_pauses_auto_sync():
+    """Вторая подряд ошибка паузит авто-синк: планировщик не ставит следующий тик."""
+    data = _dash_data()
+    app = JwuDashboard(
+        data, memory_fn=lambda: data, full_sync_fn=lambda: data,
+        jira_base="https://jira.test", auto_update=True, slow_interval=600,
+    )
+
+    async def run() -> None:
+        async with app.run_test():
+            app.notify = lambda *a, **k: None  # type: ignore[method-assign]
+            timers: list = []
+            app.set_timer = lambda *a, **k: timers.append(a)  # type: ignore[method-assign]
+            app._after_refresh(None, "Jira недоступна")   # попытка 1 → ретрай
+            assert app._auto_paused is False
+            assert timers, "после первой ошибки должен планироваться ретрай"
+            timers.clear()
+            app._after_refresh(None, "Jira недоступна")   # попытка 2 → пауза
+            assert app._auto_paused is True
+            assert not timers, "на паузе следующий авто-синк не планируется"
+            line = app._network_line()
+            assert "авто-синхронизация остановлена" in line
+            # ручной R снимает паузу и обнуляет счётчик
+            app.action_refresh_all()
+            assert app._auto_paused is False
+            assert app._fail_count == 0
+
+    asyncio.run(run())
+
+
+def test_classify_sync_error_auth():
+    """Ошибка доступа (401/403 или логин в Jira) → «Не удалось авторизоваться»."""
+    from jwu.cli.dashboard import _classify_sync_error
+    from jwu.core.jira import JiraError
+    from jwu.core.bitbucket import BitbucketError
+
+    assert _classify_sync_error(JiraError("Логин в Jira не удался: 403: ...", 403)) \
+        == "Не удалось авторизоваться"
+    assert _classify_sync_error(JiraError("Логин в Jira не удался: что-то")) \
+        == "Не удалось авторизоваться"
+    assert _classify_sync_error(BitbucketError("401: токен невалиден", 401)) \
+        == "Не удалось авторизоваться"
+    # сетевые/прочие ошибки — как есть
+    assert _classify_sync_error(JiraError("Сеть/Jira недоступна: timeout")) \
+        == "Сеть/Jira недоступна: timeout"
 
 
 def test_auto_update_starts_timers():

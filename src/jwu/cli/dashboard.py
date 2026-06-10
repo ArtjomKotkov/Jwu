@@ -28,6 +28,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
+from ..core.bitbucket import BitbucketError
+from ..core.jira import JiraError
 from .copy_modal import (
     copy_items_for_issue,
     copy_items_for_job,
@@ -47,6 +49,20 @@ from ..core.models import (
 )
 from ..core.service import DashboardData, PRDetail
 from ..core.ui_prefs import UIPrefs, load_ui_prefs, save_ui_prefs
+
+
+def _classify_sync_error(exc: BaseException) -> str:
+    """Короткий текст ошибки синка для пользователя.
+
+    Ошибку доступа (логин/токен/гейт — 401/403 или JiraError при логине) показываем
+    как «Не удалось авторизоваться», а не сырым дампом ответа Jira/Bitbucket.
+    Остальное (сеть и пр.) — как есть.
+    """
+    code = getattr(exc, "status_code", None)
+    if code in (401, 403) or (isinstance(exc, JiraError) and code is None
+                              and "Логин" in str(exc)):
+        return "Не удалось авторизоваться"
+    return str(exc) or "Не удалось синхронизироваться"
 
 DELTA_ICON = {
     "new_issue": "🆕",
@@ -1259,6 +1275,11 @@ class JwuDashboard(App):
         self._sync_failed = False
         self._fail_at: Optional[str] = None
         self._sync_error = ""
+        # подряд упавшие авто-синки; после 2-х (попытка + 1 ретрай) авто-синк паузим,
+        # чтобы не плодить ошибки. Сбрасывается успешным или ручным (R) синком.
+        self._fail_count = 0
+        self._auto_paused = False
+        self._RETRY_LIMIT = 2
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1424,8 +1445,14 @@ class JwuDashboard(App):
             return f"[yellow]⟳ синхронизация с сетью… {_fmt_dur(monotonic() - started)}[/yellow]"
         if self._sync_failed:
             ago = _fmt_ago(self._fail_at)
+            err = f": {self._sync_error}" if self._sync_error else ""
+            if self._auto_paused:
+                # ретраи исчерпаны — следующего авто-синка не будет (только R вручную)
+                return (f"[red]🔄 последняя синхронизация: {ago} — не удалось{err}; "
+                        f"авто-синхронизация остановлена (R — повторить)[/red]")
             nxt = self._next_network_hint(label="след. попытка")
-            return f"[red]🔄 последний синк: {ago} \\[неудачно][/red][dim]{nxt}[/dim]"
+            return (f"[red]🔄 последняя синхронизация: {ago} — не удалось{err}"
+                    f"[/red][dim]{nxt}[/dim]")
         last_network = max(
             (v for k, v in self.data.last_sync.items()
              if k not in self.LOCAL_SECTIONS and v),
@@ -1968,12 +1995,15 @@ class JwuDashboard(App):
         if self._full_sync_fn is None:
             self.query_one("#status", Static).update("полный синк недоступен (нет доступа)")
             return
+        # ручной синк снимает паузу и обнуляет счётчик: даём авто-синку новый шанс
+        self._fail_count = 0
+        self._auto_paused = False
         self._begin_sync("network")
         self._run_full_sync()
 
     def _schedule_next_slow_sync(self) -> None:
         """One-shot таймер на следующий авто-синк (через self.slow_interval секунд)."""
-        if not self.auto_update or self._full_sync_fn is None:
+        if not self.auto_update or self._full_sync_fn is None or self._auto_paused:
             return
         self._last_slow_mono = monotonic()  # точка отсчёта countdown в статус-строке
         self.set_timer(self.slow_interval, self._auto_slow_sync)
@@ -1986,7 +2016,7 @@ class JwuDashboard(App):
         try:
             data = self._full_sync_fn()
         except Exception as exc:  # noqa: BLE001
-            self.call_from_thread(self._after_refresh, None, str(exc))
+            self.call_from_thread(self._after_refresh, None, _classify_sync_error(exc))
             return
         self.call_from_thread(self._after_refresh, data, None)
 
@@ -2016,23 +2046,36 @@ class JwuDashboard(App):
         self._end_sync("network")
         try:
             if error is not None:
-                # синк упал: запомнить момент и ошибку (статус-строка покажет [неудачно]
+                # синк упал: запомнить момент и ошибку (статус-строка покажет «не удалось»
                 # до следующего успеха), плюс показать всплывающее уведомление.
                 self._sync_failed = True
                 self._fail_at = datetime.now(timezone.utc).isoformat()
                 self._sync_error = error
-                self.notify(error, title="Синхронизация не удалась",
-                            severity="error", timeout=10)
+                self._fail_count += 1
+                # после исчерпания ретраев — пауза, чтобы не плодить ошибки
+                self._auto_paused = self._fail_count >= self._RETRY_LIMIT
+                if self._auto_paused:
+                    self.notify(f"{error}. Авто-синхронизация остановлена — "
+                                f"нажмите R, чтобы повторить.",
+                                title="Синхронизация не удалась",
+                                severity="error", timeout=10)
+                else:
+                    self.notify(error, title="Синхронизация не удалась",
+                                severity="error", timeout=10)
                 self._update_status()
                 return
+            # успех — сбрасываем счётчик и снимаем паузу
             self._sync_failed = False
             self._sync_error = ""
+            self._fail_count = 0
+            self._auto_paused = False
             if data is not None:
                 self._apply_data(data)
             else:
                 self._update_status()
         finally:
             # Следующий авто-синк отсчитывается от КОНЦА текущего, а не от старта.
+            # На паузе (_auto_paused) планировщик сам ничего не ставит.
             self._schedule_next_slow_sync()
 
 

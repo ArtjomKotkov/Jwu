@@ -637,8 +637,14 @@ def changes(
 
 
 def _full_sync_dashboard() -> DashboardData:
-    """Полный синк всех секций + снимок из памяти (для --sync)."""
-    with _service() as svc:
+    """Полный синк всех секций + снимок из памяти (для --sync и авто-синка дашборда).
+
+    В отличие от _service(), ошибки доступа (JiraError/BitbucketError) НЕ гасятся в
+    typer.Exit, а пробрасываются: дашборд показывает их в статусе/уведомлении сам,
+    а не печатает в stderr поверх TUI (иначе в уведомление прилетала пустая строка).
+    """
+    _prepare_db()
+    with Service.from_config(load_config()) as svc:
         svc.sync()
         return svc.dashboard()
 
@@ -680,14 +686,23 @@ def dashboard(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON вместо TUI (для Claude)."),
 ) -> None:
     """Дашборд: задачи на мне, упоминания, PR и изменения. По умолчанию — из памяти."""
+    # _full_sync_dashboard пробрасывает ошибки доступа (для авто-синка TUI); в
+    # синхронных ветках команды показываем их так же чисто, как остальные команды.
+    def _initial_sync() -> DashboardData:
+        try:
+            return _full_sync_dashboard()
+        except (JiraError, BitbucketError) as exc:
+            err.print(f"[red]Ошибка авторизации:[/red] {exc}")
+            raise typer.Exit(code=1)
+
     if json_out:
-        data = _full_sync_dashboard() if do_sync else dashboard_from_memory(_store())
+        data = _initial_sync() if do_sync else dashboard_from_memory(_store())
         _emit_json(data.to_json_dict())
         return
 
     # TUI: начальные данные — из памяти (без токенов); refresh активной вкладки — по сети, лениво.
     if do_sync:
-        data = _full_sync_dashboard()
+        data = _initial_sync()
     else:
         with _store() as store:
             data = dashboard_from_memory(store)
