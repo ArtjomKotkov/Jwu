@@ -135,7 +135,7 @@ _JIRA_BLOCK_RE = re.compile(
 _INLINE_RE = re.compile(
     r"\[~(?P<user>[^\]\r\n]+)\]"
     r"|\[\^(?P<file>[^\]\r\n]+)\]"
-    r"|!(?P<img>[^!\r\n|\s]+\.[A-Za-z0-9]+)(?:\|[^!\r\n]*)?!"
+    r"|!(?P<img>[^!\r\n|\s][^!\r\n|]*?\.[A-Za-z0-9]+)(?:\|[^!\r\n]*)?!"
     r"|\[(?:(?P<ltext>[^\]|\r\n]*)\|)?(?P<lurl>https?://[^\]\r\n]+)\]"
     r"|(?P<bare>https?://[^\s\]]+)"
 )

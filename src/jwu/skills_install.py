@@ -20,6 +20,7 @@ EXPECTED_SKILLS = {
     "jwu-commit-message",
     "jwu-analyze-day",
     "jwu-post-analyze-day",
+    "jwu-4test-message",
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

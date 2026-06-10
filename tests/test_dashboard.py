@@ -183,6 +183,19 @@ def test_render_jira_text_inline_attachments_and_links():
     assert "[^app.log]" not in plain      # сырой маркер вложения убран
 
 
+def test_render_jira_image_with_spaces_in_name():
+    from rich.text import Text as RText
+
+    from jwu.cli.dashboard import render_jira_text
+
+    # Jira-картинка с пробелами в имени и параметрами размера (как в PROJ-25)
+    body = "вот:\n!Снимок экрана 2026-06-03 в 19.38.24.png|width=966,height=378!"
+    parts = render_jira_text(body)
+    plain = "".join(p.plain for p in parts if isinstance(p, RText))
+    assert "🖼 Снимок экрана 2026-06-03 в 19.38.24.png" in plain
+    assert "!" not in plain and "width=" not in plain   # сырой маркер/параметры убраны
+
+
 def _spans_with(text, needle):
     """Стили всех спанов rich.Text, содержащие подстроку needle."""
     return [str(sp.style) for sp in text.spans if needle in str(sp.style)]
