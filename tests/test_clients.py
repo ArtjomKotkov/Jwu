@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 import respx
@@ -84,6 +86,30 @@ def test_jira_401_raises():
         with pytest.raises(JiraError) as exc:
             jira.myself()
     assert exc.value.status_code == 401
+
+
+@respx.mock
+def test_jira_add_worklog_posts_time_and_comment():
+    route = respx.post(f"{JIRA}/rest/api/2/issue/PROJ-7/worklog").mock(
+        return_value=httpx.Response(201, json={"id": "10001", "timeSpent": "2h 30m"})
+    )
+    with JiraClient(JIRA, "tok") as jira:
+        res = jira.add_worklog("PROJ-7", "2h 30m", comment="перенёс фикс stat v2")
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent == {"timeSpent": "2h 30m", "comment": "перенёс фикс stat v2"}
+    assert res["timeSpent"] == "2h 30m"
+
+
+@respx.mock
+def test_jira_add_worklog_error_raises():
+    respx.post(f"{JIRA}/rest/api/2/issue/PROJ-7/worklog").mock(
+        return_value=httpx.Response(400, text="bad time")
+    )
+    with JiraClient(JIRA, "tok") as jira:
+        with pytest.raises(JiraError) as exc:
+            jira.add_worklog("PROJ-7", "не время")
+    assert exc.value.status_code == 400
 
 
 @respx.mock

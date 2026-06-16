@@ -981,6 +981,32 @@ def notes(
         console.print(f"[dim]{n.ts} · {n.author}[/dim] {n.text}")
 
 
+@app.command()
+def worklog(
+    key: str = typer.Argument(..., help="Ключ задачи, напр. PROJ-5525."),
+    time: str = typer.Argument(..., help="Время в формате Jira: «2h 30m», «45m», «1d 4h»."),
+    comment: Optional[str] = typer.Option(None, "--comment", "-m", help="Описание работы."),
+    started: Optional[str] = typer.Option(
+        None, "--started", help="Начало работы, ISO 8601 (по умолчанию — текущий момент)."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Залогировать время по задаче в таймтрекер Jira (worklog)."""
+    try:
+        with _service() as svc:
+            result = svc.add_worklog(key, time, comment=comment, started=started)
+    except JiraError as exc:
+        if json_out:
+            _emit_json({"ok": False, "key": key, "error": str(exc)})
+        else:
+            console.print(f"[red]✗[/red] {key}: не залогировано — {exc}")
+        raise typer.Exit(1)
+    if json_out:
+        _emit_json({"ok": True, "key": key, "timeSpent": time, "worklog": result})
+    else:
+        console.print(f"[green]✓[/green] {key}: затрекано {time}")
+
+
 # --------------------------------------------------------------------------- #
 # jobs / job
 # --------------------------------------------------------------------------- #
