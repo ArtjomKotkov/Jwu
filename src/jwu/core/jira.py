@@ -101,7 +101,41 @@ class JiraClient:
             raise JiraError(f"{resp.status_code}: {resp.text[:200]}", resp.status_code)
         return resp.json()
 
+    def _post(self, path: str, json_body: dict, params: dict | None = None) -> dict:
+        try:
+            resp = self._client.post(path, json=json_body, params=params)
+        except httpx.HTTPError as exc:  # сетевые ошибки
+            raise JiraError(f"Сеть/Jira недоступна: {exc}") from exc
+        if resp.status_code == 401:
+            raise JiraError("401: токен Jira невалиден", 401)
+        if resp.status_code == 403:
+            raise JiraError("403: нет прав в Jira", 403)
+        if resp.status_code >= 400:
+            raise JiraError(f"{resp.status_code}: {resp.text[:200]}", resp.status_code)
+        return resp.json() if resp.content else {}
+
     # --- API ------------------------------------------------------------- #
+
+    def add_worklog(
+        self,
+        key: str,
+        time_spent: str,
+        *,
+        comment: str | None = None,
+        started: str | None = None,
+    ) -> dict:
+        """Залогировать время по задаче (worklog).
+
+        ``time_spent`` — в формате Jira: ``"2h 30m"``, ``"45m"``, ``"1d 4h"``.
+        ``started`` — ISO ``"2026-06-15T09:00:00.000+0000"``; по умолчанию Jira ставит
+        текущий момент. ``comment`` — описание работы (попадает в карточку worklog).
+        """
+        body: dict = {"timeSpent": time_spent}
+        if comment:
+            body["comment"] = comment
+        if started:
+            body["started"] = started
+        return self._post(f"/api/2/issue/{key}/worklog", body)
 
     def myself(self) -> dict:
         """Текущий пользователь — заодно проверка токена."""

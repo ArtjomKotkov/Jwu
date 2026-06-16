@@ -326,6 +326,17 @@ class Service:
     def issue(self, key: str) -> Issue:
         return self.jira.issue(key, with_dev=True)
 
+    def add_worklog(
+        self,
+        key: str,
+        time_spent: str,
+        *,
+        comment: str | None = None,
+        started: str | None = None,
+    ) -> dict:
+        """Залогировать время по задаче в таймтрекер Jira (worklog)."""
+        return self.jira.add_worklog(key, time_spent, comment=comment, started=started)
+
     def attachments_dir(self, key: str) -> Path:
         """Каталог по умолчанию для скачанных вложений задачи: <tmp>/jwu/<KEY>."""
         return Path(tempfile.gettempdir()) / "jwu" / key
