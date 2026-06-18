@@ -237,3 +237,82 @@ def test_dashboard_from_memory_reads_cached_identity(tmp_path):
     d = dashboard_from_memory(store)
     store.close()
     assert (d.user, d.display_name, d.email) == ("alice", "Alice", "a@example.com")
+
+
+@respx.mock
+def test_my_reviews_filters_by_date_and_status(tmp_path):
+    from datetime import datetime
+
+    svc = _service(tmp_path)
+    svc.cfg.jira.username = "me"
+
+    def review_pr(pr_id, title, status):
+        raw = bitbucket_pr_raw(pr_id=pr_id, title=title)
+        raw["reviewers"] = [{
+            "user": {"name": "me", "displayName": "Me"},
+            "approved": status == "APPROVED",
+            "status": status,
+        }]
+        return raw
+
+    respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
+        return_value=httpx.Response(200, json=bitbucket_dashboard_raw([
+            review_pr(1, "ABC-1 апрув сегодня", "APPROVED"),
+            review_pr(2, "ABC-2 апрув давно", "APPROVED"),
+            review_pr(3, "ABC-3 ещё не смотрел", "UNAPPROVED"),
+        ]))
+    )
+
+    ts_today = 1_781_700_000_000
+    ts_old = 1_700_000_000_000
+    today = datetime.fromtimestamp(ts_today / 1000).date().isoformat()
+
+    def acts(ts):
+        return {"isLastPage": True, "values": [
+            {"action": "APPROVED", "user": {"name": "me"}, "createdDate": ts}
+        ]}
+
+    for pid, ts in ((1, ts_today), (2, ts_old), (3, ts_today)):
+        respx.get(
+            f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/{pid}/activities"
+        ).mock(return_value=httpx.Response(200, json=acts(ts)))
+
+    # фильтр по сегодняшней дате: только PR #1 (UNAPPROVED #3 отброшен по статусу,
+    # #2 — по дате)
+    today_reviews = svc.my_reviews(on=today)
+    assert [p.id for p in today_reviews] == [1]
+    assert today_reviews[0].my_review_status == "APPROVED"
+    assert today_reviews[0].my_review_at == ts_today
+
+    # без фильтра по дате — оба апрувнутых (#1, #2), но не UNAPPROVED (#3)
+    all_mine = svc.my_reviews()
+    assert sorted(p.id for p in all_mine) == [1, 2]
+    svc.close()
+
+
+@respx.mock
+def test_my_worklogs_on_filters_author_and_date(tmp_path):
+    svc = _service(tmp_path)
+    svc.cfg.jira.username = "me"
+
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1/worklog").mock(
+        return_value=httpx.Response(200, json={"worklogs": [
+            {"author": {"name": "me"}, "timeSpent": "2h", "timeSpentSeconds": 7200,
+             "comment": "Ревью", "started": "2026-06-17T10:00:00.000+0000"},
+            {"author": {"name": "other"}, "timeSpent": "1h", "timeSpentSeconds": 3600,
+             "comment": "чужое", "started": "2026-06-17T10:00:00.000+0000"},
+            {"author": {"name": "me"}, "timeSpent": "30m", "timeSpentSeconds": 1800,
+             "comment": "вчера", "started": "2026-06-16T10:00:00.000+0000"},
+        ]})
+    )
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-2/worklog").mock(
+        return_value=httpx.Response(200, json={"worklogs": []})
+    )
+
+    data = svc.my_worklogs_on(["PROJ-1", "PROJ-2", "PROJ-1"], "2026-06-17")
+    # только мои записи за дату; PROJ-2 без записей не попадает; дубль ключа схлопнут
+    assert list(data.keys()) == ["PROJ-1"]
+    assert len(data["PROJ-1"]) == 1
+    assert data["PROJ-1"][0]["time"] == "2h"
+    assert data["PROJ-1"][0]["comment"] == "Ревью"
+    svc.close()

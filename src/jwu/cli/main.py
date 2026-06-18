@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -504,15 +505,24 @@ def attachments(
 
 
 def _render_prs(prs: list[PR]) -> None:
+    mine = any(p.my_review_status for p in prs)
     table = Table(show_header=True, header_style="bold")
     table.add_column("PR", style="cyan", no_wrap=True)
     table.add_column("Repo")
-    table.add_column("Состояние")
-    table.add_column("Конфликт")
+    if mine:
+        table.add_column("Моё ревью")
+    else:
+        table.add_column("Состояние")
+        table.add_column("Конфликт")
     table.add_column("Title")
     for pr in prs:
-        conflict = "—" if pr.conflicted is None else ("[red]да[/red]" if pr.conflicted else "нет")
-        table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", pr.state, conflict, pr.title)
+        if mine:
+            mark = "[green]галка[/green]" if pr.my_review_status == "APPROVED" else "[yellow]needs work[/yellow]"
+            when = f" {fmt_dt(pr.my_review_at)}" if pr.my_review_at else ""
+            table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", f"{mark}{when}", pr.title)
+        else:
+            conflict = "—" if pr.conflicted is None else ("[red]да[/red]" if pr.conflicted else "нет")
+            table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", pr.state, conflict, pr.title)
     console.print(table)
     console.print(f"[dim]Всего: {len(prs)}[/dim]")
 
@@ -521,11 +531,17 @@ def _render_prs(prs: list[PR]) -> None:
 def prs(
     view: str = typer.Option("review", "--view", "-v", help="mine | review"),
     no_conflicts: bool = typer.Option(False, "--no-conflicts", help="Не запрашивать статус конфликтов (быстрее)."),
+    mine_reviews: bool = typer.Option(False, "--mine-reviews", help="Только PR, где я апрувнул / поставил needs work; добавляет дату моего ревью (из activities, медленнее)."),
+    on: Optional[str] = typer.Option(None, "--on", help="Фильтр ревью по дате моего апрува/needs work (YYYY-MM-DD или 'today'). Включает --mine-reviews."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """PR из Bitbucket по роли (мои / на ревью) со статусом merge-конфликта."""
     with _service() as svc:
-        prs_list = svc.prs(view, with_conflicts=not no_conflicts)
+        if mine_reviews or on is not None:
+            day = datetime.now().date().isoformat() if (on or "").lower() == "today" else on
+            prs_list = svc.my_reviews(on=day)
+        else:
+            prs_list = svc.prs(view, with_conflicts=not no_conflicts)
     if json_out:
         _emit_json([p.model_dump() for p in prs_list])
     else:
@@ -1005,6 +1021,34 @@ def worklog(
         _emit_json({"ok": True, "key": key, "timeSpent": time, "worklog": result})
     else:
         console.print(f"[green]✓[/green] {key}: затрекано {time}")
+
+
+@app.command()
+def worklogs(
+    keys: list[str] = typer.Argument(..., help="Ключи задач: PROJ-1 PROJ-2 …"),
+    on: str = typer.Option("today", "--on", help="Дата (YYYY-MM-DD или 'today')."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Мои уже залогированные worklog'и по задачам за день (проверка двойного трека)."""
+    day = datetime.now().date().isoformat() if on.lower() == "today" else on
+    with _service() as svc:
+        data = svc.my_worklogs_on(keys, day)
+    if json_out:
+        _emit_json(data)
+        return
+    if not data:
+        console.print(f"[dim]За {day} по этим задачам ничего не затрекано.[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Задача", style="cyan", no_wrap=True)
+    table.add_column("Время")
+    table.add_column("Описание")
+    for key, entries in data.items():
+        for e in entries:
+            table.add_row(key, e["time"], (e["comment"] or "—").splitlines()[0][:60])
+    console.print(table)
+    total = sum(e["seconds"] for entries in data.values() for e in entries)
+    console.print(f"[dim]Итого за {day}: {total // 3600}h {(total % 3600) // 60}m[/dim]")
 
 
 # --------------------------------------------------------------------------- #

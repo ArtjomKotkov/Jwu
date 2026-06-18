@@ -137,6 +137,11 @@ class JiraClient:
             body["started"] = started
         return self._post(f"/api/2/issue/{key}/worklog", body)
 
+    def worklogs(self, key: str) -> list[dict]:
+        """Все worklog-записи задачи (значения из /issue/{key}/worklog)."""
+        data = self._get(f"/api/2/issue/{key}/worklog")
+        return data.get("worklogs", []) or []
+
     def myself(self) -> dict:
         """Текущий пользователь — заодно проверка токена."""
         return self._get("/api/2/myself")

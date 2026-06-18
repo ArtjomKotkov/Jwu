@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import tempfile
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -337,6 +338,35 @@ class Service:
         """Залогировать время по задаче в таймтрекер Jira (worklog)."""
         return self.jira.add_worklog(key, time_spent, comment=comment, started=started)
 
+    def my_worklogs_on(self, keys: list[str], date: str) -> dict[str, list[dict]]:
+        """Мои worklog-записи по задачам за дату — чтобы не задвоить трекинг.
+
+        ``date`` — YYYY-MM-DD, сравнивается с датой поля ``started`` (как его отдаёт Jira,
+        в таймзоне пользователя). Возвращает только задачи, где за этот день у меня
+        что-то уже залогировано: ``{KEY: [{time, seconds, comment, started}, ...]}``.
+        """
+        me = self._resolve_username()
+        out: dict[str, list[dict]] = {}
+        for key in dict.fromkeys(k for k in keys if k):  # уникальные, порядок сохранён
+            try:
+                wls = self.jira.worklogs(key)
+            except Exception:  # noqa: BLE001 — нет задачи/прав/сети — пропускаем
+                continue
+            mine = [
+                {
+                    "time": w.get("timeSpent", "") or "",
+                    "seconds": int(w.get("timeSpentSeconds", 0) or 0),
+                    "comment": w.get("comment", "") or "",
+                    "started": w.get("started", "") or "",
+                }
+                for w in wls
+                if (w.get("author") or {}).get("name") == me
+                and (w.get("started", "") or "")[0:10] == date
+            ]
+            if mine:
+                out[key] = mine
+        return out
+
     def attachments_dir(self, key: str) -> Path:
         """Каталог по умолчанию для скачанных вложений задачи: <tmp>/jwu/<KEY>."""
         return Path(tempfile.gettempdir()) / "jwu" / key
@@ -385,6 +415,32 @@ class Service:
                     except Exception:  # noqa: BLE001
                         pass
         return prs
+
+    def my_reviews(self, *, on: str | None = None) -> list[PR]:
+        """PR на ревью, где мой статус — APPROVED или NEEDS_WORK, с датой моего ревью.
+
+        Заполняет у каждого PR `my_review_status` и `my_review_at` (дата из activities,
+        epoch ms). Если задан `on` (YYYY-MM-DD, локальная дата) — оставляет только ревью,
+        поставленные в этот день; PR без даты моего ревья при фильтре отбрасываются.
+        """
+        login = self._resolve_username()
+        out: list[PR] = []
+        for pr in self.bitbucket.dashboard_prs("review"):
+            mine = next((r for r in pr.reviewers if r.name == login), None)
+            if mine is None or mine.status not in ("APPROVED", "NEEDS_WORK"):
+                continue
+            if not (pr.project and pr.repository):
+                continue
+            ts = self.bitbucket.my_review_at(pr.project, pr.repository, pr.id, login)
+            pr.my_review_status = mine.status
+            pr.my_review_at = ts
+            if on is not None:
+                if ts is None:
+                    continue
+                if datetime.fromtimestamp(ts / 1000).date().isoformat() != on:
+                    continue
+            out.append(pr)
+        return out
 
     def pr(self, pr_id: int, *, project: str | None = None, repo: str | None = None) -> PR:
         return self.bitbucket.pr(

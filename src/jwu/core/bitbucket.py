@@ -198,6 +198,27 @@ class BitbucketClient:
             })
         return out
 
+    def my_review_at(self, project: str, repo: str, pr_id: int, login: str) -> int | None:
+        """Дата (epoch ms) последнего ревью-действия пользователя в PR.
+
+        Берётся из activities: action ``APPROVED`` / ``REVIEWED`` (= needs work) /
+        ``UNAPPROVED``. В массиве reviewers даты нет — поэтому тянем ленту активностей.
+        Возвращает None, если пользователь не оставлял ревью-действий.
+        """
+        acts = self._paged(
+            f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/activities"
+        )
+        best: int | None = None
+        for a in acts:
+            if (a.get("user") or {}).get("name") != login:
+                continue
+            if a.get("action") not in ("APPROVED", "REVIEWED", "UNAPPROVED"):
+                continue
+            ts = int(a.get("createdDate") or 0)
+            if best is None or ts > best:
+                best = ts
+        return best
+
     def pr_comments(self, project: str, repo: str, pr_id: int) -> list[PRComment]:
         """Комментарии PR из activities: общие + inline (с file:line и куском диффа)."""
         acts = self._paged(
