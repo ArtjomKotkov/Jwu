@@ -182,6 +182,27 @@ def test_bitbucket_pr_comments_newest_thread_first():
     assert [c.text for c in comments] == ["свежий", "старый"]
 
 
+@respx.mock
+def test_bitbucket_my_review_at_latest_action_by_user():
+    activities = {
+        "isLastPage": True,
+        "values": [
+            {"action": "APPROVED", "user": {"name": "me"}, "createdDate": 3000},
+            {"action": "REVIEWED", "user": {"name": "me"}, "createdDate": 1000},
+            {"action": "APPROVED", "user": {"name": "other"}, "createdDate": 5000},
+            {"action": "COMMENTED", "user": {"name": "me"}, "createdDate": 9000},
+        ],
+    }
+    respx.get(
+        f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/77/activities"
+    ).mock(return_value=httpx.Response(200, json=activities))
+    with BitbucketClient(BB, "tok") as bb:
+        # самое свежее ревью-действие пользователя (апрув 3000), а не его коммент (9000)
+        # и не апрув другого ревьюера (5000)
+        assert bb.my_review_at("PROJ", "repo", 77, "me") == 3000
+        assert bb.my_review_at("PROJ", "repo", 77, "nobody") is None
+
+
 def test_anchor_index_matches_line_numbers():
     from jwu.core.bitbucket import _anchor_index, _diff_lines
 

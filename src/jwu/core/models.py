@@ -299,6 +299,9 @@ class PR(BaseModel):
     can_merge: Optional[bool] = None
     # проставляется в sync (дешёвый /commits?limit=1) для детекта новых коммитов:
     latest_commit: str = ""
+    # проставляются командой `prs --mine-reviews` (из activities, для текущего юзера):
+    my_review_status: str = ""           # APPROVED | NEEDS_WORK — мой статус по PR
+    my_review_at: Optional[int] = None   # дата (ms) моего апрува/needs-work, из activities
 
     @classmethod
     def from_bitbucket(cls, raw: dict) -> "PR":
