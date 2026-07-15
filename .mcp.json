@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jwu": {
+      "command": "/Users/akotkov/Library/Caches/pypoetry/virtualenvs/jwu-ku_xF94C-py3.10/bin/jwu-mcp",
+      "args": []
+    }
+  }
+}

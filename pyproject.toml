@@ -18,10 +18,12 @@ dependencies = [
     "tomli-w>=1.0",
     "tomli>=2.0; python_version < '3.11'",
     "pyperclip (>=1.11.0,<2.0.0)",
+    "mcp (>=1.28.1,<2.0.0)",
 ]
 
 [project.scripts]
 jwu = "jwu.cli.main:app"
+jwu-mcp = "jwu.mcp_server:main"
 
 [tool.poetry]
 packages = [{include = "jwu", from = "src"}]
