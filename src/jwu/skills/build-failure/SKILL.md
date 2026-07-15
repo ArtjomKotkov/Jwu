@@ -13,6 +13,11 @@ description: Use when the user wants to understand why a CI build failed for a P
 Единый источник данных — **jwu** (у него есть доступ в Bitbucket+Jenkins; команды сборок
 не зависят от Jira). Анализ делегируется субагенту **jenkins-build-analyst**.
 
+> **MCP-first.** Read-данные бери MCP-инструментами jwu — они предпочтительнее bash:
+> `jwu_builds(pr_id, project, repo)` вместо `jwu builds …`, `jwu_build(pr_id, project, repo, url)`
+> вместо `jwu build …`. Команды `jwu builds/build … --json` в bash — **фолбэк**, если
+> MCP-сервер jwu не подключён.
+
 ## Шаги
 1. **Собери вводные** из запроса: номер PR (обязательно, если нет прямого URL сборки),
    опц. `project`/`repo` Bitbucket, опц. прямой `build_url`, целевую ветку (по умолчанию

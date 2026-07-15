@@ -16,6 +16,11 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 Логирование делается командой `jwu worklog <KEY> "<время>" -m "<описание>"` —
 по одной задаче за раз, только после «да».
 
+> **MCP-first.** Логирование предпочитай MCP-инструментом `jwu_worklog(key, time, comment, started)`
+> вместо bash `jwu worklog …` (инстанс Jira/SDESK выбирается по префиксу ключа; это ВНЕШНЯЯ
+> запись — только после явного «да»). Сбор списка ревью (`jwu prs --mine-reviews --on`) и
+> проверка двойного трека (`jwu worklogs --on`) MCP-инструментов не имеют — остаются на bash.
+
 ## Шаги
 
 1. **Собери задачи дня.** Если итоги дня уже есть в контексте (после

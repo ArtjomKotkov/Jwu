@@ -44,7 +44,7 @@ description: Use when the user asks to write/generate a commit message inside a 
 
 1. **Ветка:** `git rev-parse --abbrev-ref HEAD`.
 2. **Префикс задачи** — извлечь из имени ветки регуляркой `^[A-Z][A-Z0-9]+-[0-9]+`
-   (напр. `EXAMPLE-1111-foo-bar` → `EXAMPLE-1111`, `WEBIMCORE-12507-x` → `WEBIMCORE-12507`).
+   (напр. `EXAMPLE-1111-foo-bar` → `EXAMPLE-1111`, `PROJ-2222-x` → `PROJ-2222`).
    - Не нашли? **НЕ выдумывать.** Печатать сообщение без префикса и предупредить пользователя.
 3. **Что менялось** — собрать всё:
    - `git diff HEAD --stat` — обзор по файлам.

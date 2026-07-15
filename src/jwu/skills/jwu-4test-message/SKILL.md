@@ -12,6 +12,10 @@ description: Use when the user wants a «4test» message — step-by-step testin
 копирования в Jira-комментарий — сам в Jira ничего не постит, git/jwu не меняет (по
 подтверждению может сохранить копию в работу, см. шаг 9).
 
+> **MCP-first.** Операции предпочитай MCP-инструментами jwu, bash `jwu …` — фолбэк:
+> `jwu jobs …` → `jwu_jobs(task, pr, status)` · `jwu task <KEY>` → `jwu_task(key)` ·
+> `jwu job add …` → `jwu_job_add(job_id, text, kind, status)`.
+
 Это **абстрактный** скилл: суть фикса и проверяемое поведение он выводит сам из работы,
 задачи и диффа, а стенд-специфику и важные нюансы **пользователь передаёт текстом** в
 аргументах вызова.
