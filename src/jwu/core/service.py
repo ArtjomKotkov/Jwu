@@ -12,34 +12,45 @@ import tempfile
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .bitbucket import BitbucketClient
 from .config import (
     Config,
     bitbucket_token,
+    jenkins_auth,
     jira_login,
     jira_proxy_basic,
     jira_token,
     load_config,
+    sdesk_enabled,
+    sdesk_login,
+    sdesk_proxy_basic,
+    sdesk_token,
 )
+from .jenkins import JenkinsClient, JenkinsError, parse_build_url
 from .jira import JiraClient
 from .models import (
     Analysis,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
+    BuildReport,
+    BuildStatus,
     Delta,
     Issue,
     Job,
     Note,
     PR,
     PRComment,
+    TestCaseFailure,
 )
 from .store import Store
 
 _UNSAFE_NAME_RE = re.compile(r"[^\w.\- ]+", re.UNICODE)
-# Ключ Jira-задачи в имени ветки/заголовке PR (PROJ-123 / WEBIMCORE-12508).
+# Ключ Jira-задачи в имени ветки/заголовке PR (напр. PROJ-123 / ABC-4567).
 _PR_TASK_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-[0-9]+)\b")
+# project/repo/id из URL PR Bitbucket (для статусов сборок по dev-панели задачи).
+_BITBUCKET_PR_URL_RE = re.compile(r"/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)")
 # Алиасы «ключ из ветки PR → канонический ключ задачи в Jira» — лежат одним JSON
 # в meta под этим ключом. Нужны, когда Jira слила старую задачу в новый ключ
 # (PR ссылается на старый, а snapshot пишется под канонический).
@@ -55,6 +66,35 @@ def _load_pr_task_aliases(store: Store) -> dict[str, str]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _jira_like_client(
+    base_url: str,
+    *,
+    token: str | None = None,
+    login: tuple[str, str] | None = None,
+    proxy_basic: tuple[str, str] | None = None,
+) -> JiraClient:
+    """Собрать клиента Jira-подобного инстанса (Jira / SDESK) по кредам.
+
+    ``login`` задан → сессионная авторизация за nginx Basic-гейтом (``proxy_basic``);
+    иначе — обычный PAT через ``Authorization: Bearer``. При session_login сетевой
+    логин происходит уже здесь (в конструкторе JiraClient).
+    """
+    if login is not None:
+        return JiraClient(base_url, proxy_basic=proxy_basic, session_login=login)
+    return JiraClient(base_url, token or "")
+
+
+def _build_sdesk_client(cfg: Config) -> JiraClient:
+    """Клиент SDESK по его СВОИМ кредам (сессия за гейтом либо PAT). Может кинуть
+    JiraError на логине — вызывается лениво, поэтому падение SDESK не рушит Jira."""
+    slogin = sdesk_login(cfg)
+    if slogin is not None:
+        return _jira_like_client(
+            cfg.sdesk.base_url, login=slogin, proxy_basic=sdesk_proxy_basic(cfg)
+        )
+    return _jira_like_client(cfg.sdesk.base_url, token=sdesk_token(cfg))
 
 
 def _safe_filename(name: str) -> str:
@@ -197,10 +237,27 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
 
 
 class Service:
-    def __init__(self, cfg: Config, jira: JiraClient, bitbucket: BitbucketClient, store: Store) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        jira: JiraClient | None,
+        bitbucket: BitbucketClient,
+        store: Store,
+        jenkins: JenkinsClient | None = None,
+        sdesk: JiraClient | None = None,
+        sdesk_factory: "Callable[[], JiraClient] | None" = None,
+    ) -> None:
         self.cfg = cfg
         self.jira = jira
+        # Второй Jira-инстанс (SDESK): строится ЛЕНИВО (self._sdesk_factory) при первом
+        # обращении к его ключу — чтобы недоступный/неверно настроенный SDESK не рушил
+        # работу с основной Jira. Задачи с его префиксом ключа обслуживаются им, всё
+        # остальное (вью/синк/дашборд) остаётся на основной Jira. Тесты могут передать
+        # готовый клиент через sdesk=...
+        self.sdesk = sdesk
+        self._sdesk_factory = sdesk_factory
         self.bitbucket = bitbucket
+        self.jenkins = jenkins
         self.store = store
         self._me: dict | None = None      # кэш /myself на время жизни сервиса
         self._cred_fp: str | None = None  # кэш отпечатка кредов
@@ -213,23 +270,48 @@ class Service:
         login = jira_login(cfg)
         if login is not None:
             # за Jira стоит nginx Basic-гейт + сессионная авторизация
-            jira = JiraClient(
-                cfg.jira.base_url,
-                proxy_basic=jira_proxy_basic(cfg),
-                session_login=login,
+            jira = _jira_like_client(
+                cfg.jira.base_url, login=login, proxy_basic=jira_proxy_basic(cfg)
             )
             if not cfg.jira.username:
                 cfg.jira.username = login[0]
         else:
             # гейта нет — обычный PAT через Bearer
-            jira = JiraClient(cfg.jira.base_url, jira_token(cfg))
+            jira = _jira_like_client(cfg.jira.base_url, token=jira_token(cfg))
+        # SDESK — второй Jira-инстанс (если подключён): строится ЛЕНИВО, чтобы его
+        # логин (сессия за гейтом либо PAT) не выполнялся, пока не понадобится задача
+        # с его префиксом ключа. Иначе недоступный SDESK ронял бы все команды.
+        sdesk_factory = (lambda: _build_sdesk_client(cfg)) if sdesk_enabled(cfg) else None
         bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
+        # Jenkins опционален: клиент создаётся всегда (для парсинга/единообразия),
+        # но без токена — без auth, и глубокие вызовы вернут 401/403, что мы ловим.
+        jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
         store = Store(db_path or str(default_db_path()))
-        return cls(cfg, jira, bitbucket, store)
+        return cls(cfg, jira, bitbucket, store, jenkins, sdesk_factory=sdesk_factory)
+
+    @classmethod
+    def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None) -> "Service":
+        """Лёгкий сервис для CI-сборок: только Bitbucket + Jenkins, без логина в Jira.
+
+        Разбор упавших сборок нужен ровно тогда, когда CI красный, — и не должен зависеть
+        от доступности Jira. Поэтому build/builds ходят через этот фабричный метод.
+        """
+        from .config import db_path as default_db_path
+
+        cfg = cfg or load_config()
+        bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
+        jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
+        store = Store(db_path or str(default_db_path()))
+        return cls(cfg, None, bitbucket, store, jenkins)
 
     def close(self) -> None:
-        self.jira.close()
+        if self.jira is not None:
+            self.jira.close()
+        if self.sdesk is not None:
+            self.sdesk.close()
         self.bitbucket.close()
+        if self.jenkins is not None:
+            self.jenkins.close()
         self.store.close()
 
     def __enter__(self) -> "Service":
@@ -239,6 +321,35 @@ class Service:
         self.close()
 
     # --- Jira ----------------------------------------------------------- #
+
+    def _sdesk_client(self) -> JiraClient | None:
+        """Материализовать SDESK-клиент при первом обращении (здесь и происходит логин).
+
+        Тесты могут передать готовый клиент через ``sdesk=`` — тогда фабрика не нужна.
+        """
+        if self.sdesk is None and self._sdesk_factory is not None:
+            self.sdesk = self._sdesk_factory()
+        return self.sdesk
+
+    def _key_is_sdesk(self, key: str) -> bool:
+        """Принадлежит ли ключ инстансу SDESK (по совпадению префикса с sdesk.project)."""
+        if not sdesk_enabled(self.cfg):
+            return False
+        return key.split("-", 1)[0].upper() == self.cfg.sdesk.project.upper()
+
+    def _client_for_key(self, key: str) -> JiraClient:
+        """Выбрать инстанс по префиксу ключа: SDESK-* → SDESK-инстанс, иначе основная Jira.
+
+        Резолвинг по одной задаче (карточка/worklog/вложения) ходит в тот инстанс,
+        которому принадлежит ключ. Вью/синк/дашборд остаются на основной Jira.
+        SDESK строится лениво прямо здесь, поэтому его логин случается только для его
+        ключей — и его ошибки не задевают команды по основной Jira.
+        """
+        if self._key_is_sdesk(key):
+            client = self._sdesk_client()
+            if client is not None:
+                return client
+        return self.jira
 
     def _myself(self) -> dict:
         """/myself с кэшем на время жизни сервиса (один запрос на синк)."""
@@ -325,7 +436,7 @@ class Service:
         return kept
 
     def issue(self, key: str) -> Issue:
-        return self.jira.issue(key, with_dev=True)
+        return self._client_for_key(key).issue(key, with_dev=True)
 
     def add_worklog(
         self,
@@ -336,7 +447,9 @@ class Service:
         started: str | None = None,
     ) -> dict:
         """Залогировать время по задаче в таймтрекер Jira (worklog)."""
-        return self.jira.add_worklog(key, time_spent, comment=comment, started=started)
+        return self._client_for_key(key).add_worklog(
+            key, time_spent, comment=comment, started=started
+        )
 
     def my_worklogs_on(self, keys: list[str], date: str) -> dict[str, list[dict]]:
         """Мои worklog-записи по задачам за дату — чтобы не задвоить трекинг.
@@ -349,7 +462,7 @@ class Service:
         out: dict[str, list[dict]] = {}
         for key in dict.fromkeys(k for k in keys if k):  # уникальные, порядок сохранён
             try:
-                wls = self.jira.worklogs(key)
+                wls = self._client_for_key(key).worklogs(key)
             except Exception:  # noqa: BLE001 — нет задачи/прав/сети — пропускаем
                 continue
             mine = [
@@ -386,7 +499,8 @@ class Service:
         разводятся префиксом id вложения.
         """
         wanted = set(kinds) if kinds is not None else set(DOWNLOADABLE_ATTACH_KINDS)
-        issue = issue or self.jira.issue(key, with_dev=False)
+        client = self._client_for_key(key)
+        issue = issue or client.issue(key, with_dev=False)
         dest = Path(dest) if dest is not None else self.attachments_dir(key)
         results: list[tuple[Attachment, Path]] = []
         used: set[str] = set()
@@ -397,7 +511,7 @@ class Service:
             if name in used:  # коллизия имён → развести префиксом id
                 name = f"{att.id}-{name}"
             used.add(name)
-            path = self.jira.download_attachment(att.url, dest / name)
+            path = client.download_attachment(att.url, dest / name)
             results.append((att, path))
         return results
 
@@ -532,7 +646,7 @@ class Service:
             if key in existing or aliases.get(key) in existing:
                 continue
             try:
-                full = self.jira.issue(key, with_dev=False)
+                full = self._client_for_key(key).issue(key, with_dev=False)
             except Exception:  # noqa: BLE001 — отсутствующая/недоступная задача не валит синк
                 continue
             if full.key not in existing:
@@ -591,7 +705,88 @@ class Service:
             commits = self.bitbucket.pr_commits(project, repo, pr_id)
         except Exception:  # noqa: BLE001
             commits = []
+        try:
+            pr.builds = self.build_statuses_for_pr(project, repo, pr_id)
+        except Exception:  # noqa: BLE001
+            pr.builds = []
         return PRDetail(pr=pr, comments=comments, commits=commits)
+
+    def build_statuses_for_pr(self, project: str, repo: str, pr_id: int) -> list[BuildStatus]:
+        """Статусы CI-сборок по head-коммиту PR (то, что видно на странице PR)."""
+        sha = self.bitbucket.latest_commit(project, repo, pr_id)
+        if not sha:
+            return []
+        return self.bitbucket.build_statuses(sha)
+
+    def build_statuses_for_pr_url(self, url: str) -> list[BuildStatus]:
+        """Статусы сборок по URL PR из dev-панели задачи (парсит project/repo/id из URL)."""
+        match = _BITBUCKET_PR_URL_RE.search(url or "")
+        if not match:
+            return []
+        return self.build_statuses_for_pr(match.group(1), match.group(2), int(match.group(3)))
+
+    def build_report(
+        self,
+        project: str | None,
+        repo: str | None,
+        pr_id: int,
+        *,
+        build_url: str | None = None,
+    ) -> BuildReport | None:
+        """Детальный разбор сборки PR: статус из Bitbucket + причина падения из Jenkins.
+
+        По умолчанию берётся упавшая сборка (иначе — первая по head-коммиту), либо
+        конкретная по ``build_url``. Без Jenkins-токена/доступа отчёт деградирует до
+        статуса из Bitbucket с пояснением в ``note``. None — если по коммиту сборок нет.
+        """
+        project = project or self.cfg.bitbucket.project
+        repo = repo or self.cfg.bitbucket.repo
+        statuses = self.build_statuses_for_pr(project, repo, pr_id)
+        if build_url:
+            chosen = next((b for b in statuses if b.url == build_url), None) or BuildStatus(url=build_url)
+        else:
+            chosen = next((b for b in statuses if b.state == "FAILED"), None)
+            chosen = chosen or next((b for b in statuses if b.state == "INPROGRESS"), None)
+            chosen = chosen or (statuses[0] if statuses else None)
+        if chosen is None:
+            return None
+
+        report = BuildReport(
+            state=chosen.state, name=chosen.name, url=chosen.url, description=chosen.description,
+        )
+        parsed = parse_build_url(chosen.url)
+        if parsed:
+            report.job_path, report.number = parsed
+
+        if self.jenkins is None or self.jenkins.auth is None:
+            report.note = "Jenkins-токен не настроен — детализация недоступна (`jwu configure`)."
+            return report
+        if parsed is None:
+            report.note = f"Не удалось разобрать URL сборки Jenkins: {chosen.url!r}"
+            return report
+
+        job_path, number = parsed
+        try:
+            info = self.jenkins.build_info(job_path, number)
+            report.jenkins_available = True
+            report.result = info["result"] or ""
+            report.building = info["building"]
+            report.sha = info["sha"]
+            report.branch = info["branch"]
+            report.summary = self.jenkins.test_summary(job_path, number)
+            report.failures = [
+                TestCaseFailure(
+                    class_name=c["class"], name=c["name"], status=c["status"],
+                    error_details=c["error_details"], stack=c["stack"],
+                )
+                for c in self.jenkins.failed_cases(job_path, number)
+            ]
+            # Консольный хвост нужен только для разбора провала (не для зелёной/идущей).
+            if not report.building and report.result not in ("", "SUCCESS"):
+                report.console_tail = self.jenkins.console_tail(job_path, number)
+        except JenkinsError as exc:
+            report.note = f"Jenkins недоступен: {exc}"
+        return report
 
     def collect_day_context(self, *, max_pr_comments: int = 8) -> DayContext:
         """Фулл-синк + расширенный контекст для дневного анализа Claude Code."""
@@ -674,9 +869,24 @@ class Service:
             result["jira"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
         except Exception as exc:  # noqa: BLE001
             result["jira"] = {"ok": False, "error": str(exc)}
+        # SDESK — второй Jira-инстанс: проверяем, только если подключён. Материализация
+        # (логин) идёт лениво и её ошибка не мешает отчёту по Jira/Bitbucket.
+        if sdesk_enabled(self.cfg):
+            try:
+                me = self._sdesk_client().myself()
+                result["sdesk"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
+            except Exception as exc:  # noqa: BLE001
+                result["sdesk"] = {"ok": False, "error": str(exc)}
         try:
             self.bitbucket.ping()
             result["bitbucket"] = {"ok": True}
         except Exception as exc:  # noqa: BLE001
             result["bitbucket"] = {"ok": False, "error": str(exc)}
+        # Jenkins опционален: проверяем, только если настроен токен.
+        if self.jenkins is not None and self.jenkins.auth is not None:
+            try:
+                self.jenkins.ping()
+                result["jenkins"] = {"ok": True}
+            except Exception as exc:  # noqa: BLE001
+                result["jenkins"] = {"ok": False, "error": str(exc)}
         return result

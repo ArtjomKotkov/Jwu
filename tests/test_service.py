@@ -19,6 +19,7 @@ from .fixtures import (
 
 JIRA = "https://jira.test"
 BB = "https://git.test"
+SDESK = "https://sdesk.test"
 
 
 def _service(tmp_path):
@@ -31,6 +32,109 @@ def _service(tmp_path):
         BitbucketClient(BB, "tok"),
         Store(tmp_path / "state.db"),
     )
+
+
+def _service_with_sdesk(tmp_path):
+    cfg = Config()
+    cfg.jira.base_url = JIRA
+    cfg.bitbucket.base_url = BB
+    cfg.sdesk.base_url = SDESK
+    cfg.sdesk.project = "SDESK"
+    return Service(
+        cfg,
+        JiraClient(JIRA, "tok"),
+        BitbucketClient(BB, "tok"),
+        Store(tmp_path / "state.db"),
+        sdesk=JiraClient(SDESK, "stok"),
+    )
+
+
+def test_client_for_key_routes_by_prefix(tmp_path):
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        assert svc._client_for_key("SDESK-39336") is svc.sdesk
+        assert svc._client_for_key("sdesk-1") is svc.sdesk  # регистр не важен
+        assert svc._client_for_key("WMCTASKS-5") is svc.jira
+    finally:
+        svc.close()
+
+
+def test_client_for_key_without_sdesk_always_jira(tmp_path):
+    svc = _service(tmp_path)
+    try:
+        assert svc._client_for_key("SDESK-1") is svc.jira  # SDESK не подключён
+    finally:
+        svc.close()
+
+
+@respx.mock
+def test_issue_and_worklog_route_to_sdesk_instance(tmp_path):
+    """SDESK-ключ ходит на хост SDESK, обычный — на основную Jira."""
+    jira_issue = respx.get(f"{JIRA}/rest/api/2/issue/WMCTASKS-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(key="WMCTASKS-1")))
+    sdesk_issue = respx.get(f"{SDESK}/rest/api/2/issue/SDESK-39336").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(key="SDESK-39336")))
+    for host in (JIRA, SDESK):
+        respx.get(f"{host}/rest/dev-status/1.0/issue/detail").mock(
+            return_value=httpx.Response(200, json={"detail": []}))
+    sdesk_wl = respx.post(f"{SDESK}/rest/api/2/issue/SDESK-39336/worklog").mock(
+        return_value=httpx.Response(201, json={"id": "1"}))
+
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        assert svc.issue("SDESK-39336").key == "SDESK-39336"
+        assert svc.issue("WMCTASKS-1").key == "WMCTASKS-1"
+        svc.add_worklog("SDESK-39336", "1h")
+    finally:
+        svc.close()
+
+    assert sdesk_issue.called and jira_issue.called
+    assert sdesk_wl.called  # worklog ушёл на SDESK, а не на Jira
+
+
+@respx.mock
+def test_broken_sdesk_does_not_break_jira(tmp_path):
+    """Ленивое построение SDESK: недоступный/неверный SDESK не рушит команды по Jira.
+
+    Фабрика SDESK кидает при логине; обращение к Jira-ключу этого даже не касается,
+    а auth_check отдаёт jira ok и sdesk error, а не падает целиком.
+    """
+    from jwu.core.jira import JiraError
+
+    cfg = Config()
+    cfg.jira.base_url = JIRA
+    cfg.bitbucket.base_url = BB
+    cfg.sdesk.base_url = SDESK
+    cfg.sdesk.project = "SDESK"
+
+    def _boom():
+        raise JiraError("401: не удалось залогиниться", 401)
+
+    svc = Service(
+        cfg,
+        JiraClient(JIRA, "tok"),
+        BitbucketClient(BB, "tok"),
+        Store(tmp_path / "state.db"),
+        sdesk_factory=_boom,
+    )
+
+    respx.get(f"{JIRA}/rest/api/2/issue/WMCTASKS-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(key="WMCTASKS-1")))
+    respx.get(f"{JIRA}/rest/dev-status/1.0/issue/detail").mock(
+        return_value=httpx.Response(200, json={"detail": []}))
+    respx.get(f"{JIRA}/rest/api/2/myself").mock(
+        return_value=httpx.Response(200, json={"name": "akotkov", "displayName": "AK"}))
+    respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
+        return_value=httpx.Response(200, json=bitbucket_dashboard_raw([])))
+
+    try:
+        # Jira-ключ работает как ни в чём не бывало — SDESK-фабрика не дёргается
+        assert svc.issue("WMCTASKS-1").key == "WMCTASKS-1"
+        res = svc.auth_check()
+        assert res["jira"]["ok"] is True
+        assert res["sdesk"]["ok"] is False and "401" in res["sdesk"]["error"]
+    finally:
+        svc.close()
 
 
 @respx.mock

@@ -16,10 +16,28 @@ username = ""
 mine = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
 mentions = "(comment ~ currentUser() OR watcher = currentUser()) AND updated >= -14d ORDER BY updated DESC"
 
+# SDESK — второй Jira-инстанс (тот же REST API, другой хост). Опционален: секции нет —
+# и jwu ведёт себя как раньше. Задачи с префиксом ключа = project (напр. SDESK-39336)
+# резолвятся сюда, остальные — в основную [jira]. Секреты СВОИ (keyring: sdesk-*), даже
+# если совпадают с Jira, — чтобы ротировать независимо. Настраивается `jwu configure`
+# (--sdesk-host …) или руками ниже; пароли — в keyring, не тут.
+# [sdesk]
+# base_url = "https://sdesk.example.com"
+# project = "SDESK"
+# username = ""
+# proxy_basic_user = ""  # логин nginx-гейта перед SDESK, если он есть
+
 [bitbucket]
 base_url = "https://git.example.com"
 project = "PROJ"
 repo = "repo"
+
+# Jenkins опционален: статусы сборок jwu берёт из Bitbucket и без него, токен нужен
+# только для детализации причины падения (`jwu build`). username = логин Jenkins
+# (он же account секрета), токен (API Token из профиля Jenkins) — в keyring.
+[jenkins]
+base_url = "https://jenkins.example.com"
+username = ""
 
 [storage]
 # db_path = "/custom/path/state.db"   # по умолчанию ~/.local/share/jwu/state.db

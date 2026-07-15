@@ -317,11 +317,16 @@ def test_configure_interactive_prompts_for_gate(monkeypatch, tmp_path):
     _fake_authcheck(monkeypatch)
 
     # порядок промптов: host, user, project, PAT, session-pw, gate-login, gate-pw,
-    # bb-host, bb-project, bb-repo, bb-PAT, db-path
+    # sdesk-host (пусто => SDESK пропускается целиком),
+    # bb-host, bb-project, bb-repo, bb-PAT, jenkins-host, jenkins-user, db-path.
+    # Jenkins username пустой => токен не спрашивается.
     answers = "\n".join([
         "https://jira.x", "alice", "ACME", "", "",
         "gw", "GPW",
-        "https://git.x", "WEBIM", "server", "", str(tmp_path / "x.db"),
+        "",
+        "https://git.x", "PROJ", "repo", "",
+        "", "",
+        str(tmp_path / "x.db"),
     ]) + "\n"
     res = runner.invoke(cli.app, ["configure"], input=answers)
     assert res.exit_code == 0, res.output

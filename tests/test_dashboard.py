@@ -194,7 +194,7 @@ def test_render_jira_image_with_spaces_in_name():
 
     from jwu.cli.dashboard import render_jira_text
 
-    # Jira-картинка с пробелами в имени и параметрами размера (как в WMDJANGOCHAT-25)
+    # Jira-картинка с пробелами в имени и параметрами размера (как в PROJ-25)
     body = "вот:\n!Снимок экрана 2026-06-03 в 19.38.24.png|width=966,height=378!"
     parts = render_jira_text(body)
     plain = "".join(p.plain for p in parts if isinstance(p, RText))
@@ -212,7 +212,7 @@ def test_render_jira_color_and_bold():
 
     from jwu.cli.dashboard import render_jira_text
 
-    # цвет + жирный (как в WMDJANGOCHAT-25), плюс «пустой» {*}{*}
+    # цвет + жирный (как в PROJ-25), плюс «пустой» {*}{*}
     parts = render_jira_text("{color:#de350b}*Сервер*{color}{*}{*}")
     text = next(p for p in parts if isinstance(p, RText))
     assert "Сервер" in text.plain
@@ -848,16 +848,16 @@ def test_reviewers_cell_slots_and_sorting():
 
     cell = reviewers_cell([
         # умышленно не по алфавиту — должен отсортироваться
-        Reviewer(name="ckotkov", display_name="Сергей Петров"),                  # N (без статуса)
-        Reviewer(name="akotkov", display_name="Artjom Kotkov", approved=True),    # A
-        Reviewer(name="obogim", display_name="Oleg Bogimirky", status="NEEDS_WORK"),  # NW
+        Reviewer(name="cuser", display_name="Сергей Петров"),                  # N (без статуса)
+        Reviewer(name="auser", display_name="Alice Adams", approved=True),    # A
+        Reviewer(name="ouser", display_name="Oscar Brown", status="NEEDS_WORK"),  # NW
     ])
     plain = cell.plain
     # ровно три слота по 25 символов = 75
     assert len(plain) == 3 * REVIEWER_SLOT_WIDTH
-    # порядок: Artjom (A) → Oleg (NW) → Сергей (N), отсортированы по имени без регистра
-    assert plain[:REVIEWER_SLOT_WIDTH] == "[A] Artjom Kotkov".ljust(REVIEWER_SLOT_WIDTH)
-    assert plain[REVIEWER_SLOT_WIDTH:2 * REVIEWER_SLOT_WIDTH] == "[NW] Oleg Bogimirky".ljust(REVIEWER_SLOT_WIDTH)
+    # порядок: Alice (A) → Oscar (NW) → Сергей (N), отсортированы по имени без регистра
+    assert plain[:REVIEWER_SLOT_WIDTH] == "[A] Alice Adams".ljust(REVIEWER_SLOT_WIDTH)
+    assert plain[REVIEWER_SLOT_WIDTH:2 * REVIEWER_SLOT_WIDTH] == "[NW] Oscar Brown".ljust(REVIEWER_SLOT_WIDTH)
     assert plain[2 * REVIEWER_SLOT_WIDTH:] == "[N] Сергей Петров".ljust(REVIEWER_SLOT_WIDTH)
     # цвета по статусу прокинуты на весь слот (бейдж + имя)
     spans = {s.start: s.style for s in cell.spans}
@@ -1298,7 +1298,7 @@ def test_normalize_issue_key():
     """Ключ обрезается по краям и приводится к верхнему регистру."""
     from jwu.cli.dashboard import normalize_issue_key
 
-    assert normalize_issue_key("  wmdjangochat-25  ") == "WMDJANGOCHAT-25"
+    assert normalize_issue_key("  proj-25  ") == "PROJ-25"
     assert normalize_issue_key("PROJ-1") == "PROJ-1"
     assert normalize_issue_key("") == ""
     assert normalize_issue_key("   ") == ""
@@ -1357,13 +1357,13 @@ def test_search_opens_issue_detail_for_normalized_key():
             inp = app.query_one("#search", Input)
             inp.focus()
             await pilot.pause()
-            inp.value = "  wmdjangochat-25 "
+            inp.value = "  proj-25 "
             await pilot.press("enter")
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert calls == ["WMDJANGOCHAT-25"]
+            assert calls == ["PROJ-25"]
             assert isinstance(app.screen, IssueDetailScreen)
-            assert app.screen.issue.key == "WMDJANGOCHAT-25"
+            assert app.screen.issue.key == "PROJ-25"
             assert inp.value == ""  # поле очищено после сабмита
             await pilot.press("escape")
             await pilot.press("q")

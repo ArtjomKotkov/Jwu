@@ -55,6 +55,28 @@ class JiraConfig:
 
 
 @dataclass
+class SdeskConfig:
+    """Второй Jira-инстанс (SDESK) — тот же REST API, но отдельный хост и СВОИ секреты.
+
+    Креды могут совпадать с основной Jira, но лежат под отдельными keyring-сервисами
+    (``sdesk-*``), чтобы их можно было ротировать/сносить независимо. Инстанс считается
+    подключённым, только когда заданы ``base_url`` и ``project`` (см. ``sdesk_enabled``);
+    иначе jwu ведёт себя как раньше, будто SDESK нет. Задачи резолвятся в этот инстанс
+    по префиксу ключа, совпадающему с ``project`` (напр. ``SDESK-39336``).
+    """
+
+    base_url: str = ""
+    project: str = ""  # префикс ключей этого инстанса (SDESK); пусто => инстанс выключен
+    username: str = ""  # логин для login/proxy-секретов; пусто => берётся из session_login
+    token_account: str = "sdesk"
+    token_service: str = "sdesk-pat"
+    token_env: str = "SDESK_TOKEN"
+    proxy_basic_service: str = "sdesk-proxy-basic"
+    login_service: str = "sdesk-login"
+    proxy_basic_user: str = ""
+
+
+@dataclass
 class BitbucketConfig:
     base_url: str = "https://git.example.com"
     project: str = "PROJ"
@@ -65,6 +87,22 @@ class BitbucketConfig:
 
 
 @dataclass
+class JenkinsConfig:
+    """CI Jenkins: глубокие детали сборок (тест-репорт, консоль) поверх статусов из Bitbucket.
+
+    Авторизация — HTTP basic ``username:apiToken`` (API-токен из профиля Jenkins).
+    Сборки jwu видит и без Jenkins (через build-status API Bitbucket); токен нужен только
+    чтобы вытащить причину падения (упавшие кейсы, лог). Без него `jwu build` деградирует
+    до списка статусов.
+    """
+
+    base_url: str = "https://jenkins.example.com"
+    username: str = ""  # логин Jenkins = account для basic-auth и для секрета токена
+    token_service: str = "jenkins-pat"
+    token_env: str = "JENKINS_TOKEN"
+
+
+@dataclass
 class StorageConfig:
     db_path: str = ""  # пусто => дефолт data_dir()/state.db; переопределяется env JWU_DB_PATH
 
@@ -72,7 +110,9 @@ class StorageConfig:
 @dataclass
 class Config:
     jira: JiraConfig = field(default_factory=JiraConfig)
+    sdesk: SdeskConfig = field(default_factory=SdeskConfig)
     bitbucket: BitbucketConfig = field(default_factory=BitbucketConfig)
+    jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
 
 
@@ -132,6 +172,17 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     if views:
         cfg.jira.views = {**DEFAULT_VIEWS, **views}
 
+    sd = raw.get("sdesk", {}) or {}
+    cfg.sdesk.base_url = sd.get("base_url", cfg.sdesk.base_url).rstrip("/")
+    cfg.sdesk.project = sd.get("project", cfg.sdesk.project)
+    cfg.sdesk.username = sd.get("username", cfg.sdesk.username)
+    cfg.sdesk.token_account = sd.get("token_account", cfg.sdesk.token_account)
+    cfg.sdesk.token_service = sd.get("token_service", cfg.sdesk.token_service)
+    cfg.sdesk.token_env = sd.get("token_env", cfg.sdesk.token_env)
+    cfg.sdesk.proxy_basic_service = sd.get("proxy_basic_service", cfg.sdesk.proxy_basic_service)
+    cfg.sdesk.proxy_basic_user = sd.get("proxy_basic_user", cfg.sdesk.proxy_basic_user)
+    cfg.sdesk.login_service = sd.get("login_service", cfg.sdesk.login_service)
+
     b = raw.get("bitbucket", {}) or {}
     cfg.bitbucket.base_url = b.get("base_url", cfg.bitbucket.base_url).rstrip("/")
     cfg.bitbucket.project = b.get("project", cfg.bitbucket.project)
@@ -139,6 +190,12 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     cfg.bitbucket.token_account = b.get("token_account", cfg.bitbucket.token_account)
     cfg.bitbucket.token_service = b.get("token_service", cfg.bitbucket.token_service)
     cfg.bitbucket.token_env = b.get("token_env", cfg.bitbucket.token_env)
+
+    k = raw.get("jenkins", {}) or {}
+    cfg.jenkins.base_url = k.get("base_url", cfg.jenkins.base_url).rstrip("/")
+    cfg.jenkins.username = k.get("username", cfg.jenkins.username)
+    cfg.jenkins.token_service = k.get("token_service", cfg.jenkins.token_service)
+    cfg.jenkins.token_env = k.get("token_env", cfg.jenkins.token_env)
 
     s = raw.get("storage", {}) or {}
     cfg.storage.db_path = s.get("db_path", cfg.storage.db_path)
@@ -163,10 +220,24 @@ def save_config(cfg: Config, path: Path | None = None) -> Path:
     if cfg.jira.proxy_basic_user:
         jira["proxy_basic_user"] = cfg.jira.proxy_basic_user
 
+    # SDESK пишем, только если инстанс подключён — иначе не засоряем конфиг пустой секцией.
+    if sdesk_enabled(cfg):
+        sd = raw.setdefault("sdesk", {})
+        sd["base_url"] = cfg.sdesk.base_url
+        sd["project"] = cfg.sdesk.project
+        sd["username"] = cfg.sdesk.username
+        if cfg.sdesk.proxy_basic_user:
+            sd["proxy_basic_user"] = cfg.sdesk.proxy_basic_user
+
     bb = raw.setdefault("bitbucket", {})
     bb["base_url"] = cfg.bitbucket.base_url
     bb["project"] = cfg.bitbucket.project
     bb["repo"] = cfg.bitbucket.repo
+
+    if cfg.jenkins.username or cfg.jenkins.base_url != JenkinsConfig().base_url:
+        jk = raw.setdefault("jenkins", {})
+        jk["base_url"] = cfg.jenkins.base_url
+        jk["username"] = cfg.jenkins.username
 
     if cfg.storage.db_path:
         raw.setdefault("storage", {})["db_path"] = cfg.storage.db_path
@@ -187,8 +258,42 @@ def _require_secret(service: str, account: str, env_var: str) -> str:
     return val
 
 
+def sdesk_enabled(cfg: Config) -> bool:
+    """Подключён ли второй Jira-инстанс (SDESK): заданы и хост, и project-префикс."""
+    return bool(cfg.sdesk.base_url and cfg.sdesk.project)
+
+
+# --- секреты Jira-подобного инстанса (Jira / SDESK) ------------------------- #
+# Обе секции (JiraConfig / SdeskConfig) делят имена полей секретов, поэтому логика
+# доступа к keyring общая и параметризуется самой секцией.
+
+
+def _section_token(section) -> str:
+    return _require_secret(section.token_service, section.token_account, section.token_env)
+
+
+def _section_login(section) -> tuple[str, str] | None:
+    """Сессионный логин (username из секции, пароль из keyring) или None."""
+    if not section.username:
+        return None
+    pw = secrets.get_secret(section.login_service, section.username)
+    return (section.username, pw) if pw else None
+
+
+def _section_proxy_basic(section) -> tuple[str, str] | None:
+    """Креды nginx-гейта (proxy_basic_user из секции, пароль из keyring) или None."""
+    if not section.proxy_basic_user:
+        return None
+    pw = secrets.get_secret(section.proxy_basic_service, section.proxy_basic_user)
+    return (section.proxy_basic_user, pw) if pw else None
+
+
 def jira_token(cfg: Config) -> str:
-    return _require_secret(cfg.jira.token_service, cfg.jira.token_account, cfg.jira.token_env)
+    return _section_token(cfg.jira)
+
+
+def sdesk_token(cfg: Config) -> str:
+    return _section_token(cfg.sdesk)
 
 
 def bitbucket_token(cfg: Config) -> str:
@@ -197,20 +302,36 @@ def bitbucket_token(cfg: Config) -> str:
     )
 
 
+def jenkins_auth(cfg: Config) -> tuple[str, str] | None:
+    """Basic-auth (username, apiToken) для Jenkins или None, если токен/логин не заданы.
+
+    Возвращает None мягко (не бросает): Jenkins опционален — без него jwu всё равно
+    показывает статусы сборок через Bitbucket, просто без детализации причины падения.
+    """
+    if not cfg.jenkins.username:
+        return None
+    token = secrets.get_secret(cfg.jenkins.token_service, cfg.jenkins.username, env_var=cfg.jenkins.token_env)
+    return (cfg.jenkins.username, token) if token else None
+
+
 def jira_login(cfg: Config) -> tuple[str, str] | None:
     """Сессионный логин Jira (username из конфига, пароль из keyring) или None."""
-    if not cfg.jira.username:
-        return None
-    pw = secrets.get_secret(cfg.jira.login_service, cfg.jira.username)
-    return (cfg.jira.username, pw) if pw else None
+    return _section_login(cfg.jira)
 
 
 def jira_proxy_basic(cfg: Config) -> tuple[str, str] | None:
-    """Креды nginx-гейта (proxy_basic_user из конфига, пароль из keyring) или None."""
-    if not cfg.jira.proxy_basic_user:
-        return None
-    pw = secrets.get_secret(cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user)
-    return (cfg.jira.proxy_basic_user, pw) if pw else None
+    """Креды nginx-гейта Jira (proxy_basic_user из конфига, пароль из keyring) или None."""
+    return _section_proxy_basic(cfg.jira)
+
+
+def sdesk_login(cfg: Config) -> tuple[str, str] | None:
+    """Сессионный логин SDESK (username из конфига, пароль из keyring) или None."""
+    return _section_login(cfg.sdesk)
+
+
+def sdesk_proxy_basic(cfg: Config) -> tuple[str, str] | None:
+    """Креды nginx-гейта SDESK (proxy_basic_user из конфига, пароль из keyring) или None."""
+    return _section_proxy_basic(cfg.sdesk)
 
 
 def secret_slots(cfg: Config) -> list[tuple[str, str]]:
@@ -224,7 +345,14 @@ def secret_slots(cfg: Config) -> list[tuple[str, str]]:
         (cfg.jira.login_service, cfg.jira.username),
         (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user),
         (cfg.bitbucket.token_service, cfg.bitbucket.token_account),
+        (cfg.jenkins.token_service, cfg.jenkins.username),
     ]
+    if sdesk_enabled(cfg):
+        pairs += [
+            (cfg.sdesk.token_service, cfg.sdesk.token_account),
+            (cfg.sdesk.login_service, cfg.sdesk.username),
+            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user),
+        ]
     return [(s, a) for (s, a) in pairs if s and a]
 
 
@@ -249,6 +377,16 @@ def export_bundle(cfg: Config, path: Path) -> int:
     }
     if cfg.jira.proxy_basic_user:
         raw["jira"]["proxy_basic_user"] = cfg.jira.proxy_basic_user
+    if sdesk_enabled(cfg):
+        raw["sdesk"] = {
+            "base_url": cfg.sdesk.base_url,
+            "project": cfg.sdesk.project,
+            "username": cfg.sdesk.username,
+        }
+        if cfg.sdesk.proxy_basic_user:
+            raw["sdesk"]["proxy_basic_user"] = cfg.sdesk.proxy_basic_user
+    if cfg.jenkins.username:
+        raw["jenkins"] = {"base_url": cfg.jenkins.base_url, "username": cfg.jenkins.username}
 
     sec_list: list[dict] = []
     for service, account in secret_slots(cfg):

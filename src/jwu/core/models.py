@@ -267,6 +267,66 @@ class Reviewer(BaseModel):
         )
 
 
+class BuildStatus(BaseModel):
+    """Статус CI-сборки по коммиту (build-status API Bitbucket — то, что видно на странице PR).
+
+    ``state``: SUCCESSFUL | FAILED | INPROGRESS. ``url`` ведёт на сборку в CI (Jenkins) —
+    это мост к детальному разбору падения (см. JenkinsClient).
+    """
+
+    state: str = ""
+    key: str = ""
+    name: str = ""
+    url: str = ""
+    description: str = ""
+    date_added: int = 0  # epoch ms
+
+    @classmethod
+    def from_bitbucket(cls, raw: dict) -> "BuildStatus":
+        return cls(
+            state=raw.get("state", "") or "",
+            key=raw.get("key", "") or "",
+            name=raw.get("name", "") or "",
+            url=raw.get("url", "") or "",
+            description=raw.get("description", "") or "",
+            date_added=int(raw.get("dateAdded", 0) or 0),
+        )
+
+
+class TestCaseFailure(BaseModel):
+    """Один упавший тест-кейс из Jenkins testReport."""
+
+    class_name: str = ""
+    name: str = ""
+    status: str = ""  # FAILED | REGRESSION | ERROR
+    error_details: str = ""
+    stack: str = ""
+
+
+class BuildReport(BaseModel):
+    """Детальный разбор одной сборки: статус из Bitbucket + (если есть токен) данные Jenkins.
+
+    Деградирует мягко: без доступа в Jenkins остаётся state/url/description из Bitbucket,
+    а ``jenkins_available=False`` и ``note`` объясняют, почему нет детализации.
+    """
+
+    state: str = ""        # из build-status Bitbucket
+    name: str = ""
+    url: str = ""
+    description: str = ""
+    job_path: str = ""
+    number: int = 0
+    jenkins_available: bool = False
+    result: str = ""       # из Jenkins (FAILURE/SUCCESS/None если идёт)
+    building: bool = False
+    sha: str = ""
+    branch: str = ""
+    summary: Optional[dict] = None  # {"fail": int, "passed": int, "skip": int}
+    failures: list[TestCaseFailure] = Field(default_factory=list)
+    console_tail: str = ""
+    note: str = ""
+
+
 class PRComment(BaseModel):
     id: str
     author: str = ""
@@ -302,6 +362,8 @@ class PR(BaseModel):
     # проставляются командой `prs --mine-reviews` (из activities, для текущего юзера):
     my_review_status: str = ""           # APPROVED | NEEDS_WORK — мой статус по PR
     my_review_at: Optional[int] = None   # дата (ms) моего апрува/needs-work, из activities
+    # статусы CI-сборок по head-коммиту (build-status API); пусто, если не запрашивались:
+    builds: list[BuildStatus] = Field(default_factory=list)
 
     @classmethod
     def from_bitbucket(cls, raw: dict) -> "PR":
