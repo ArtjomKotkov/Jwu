@@ -13,6 +13,10 @@ description: Use when the user wants to run a code review of current changes ins
 Скилл собирает локальный дифф (рабочее дерево + ещё не запушенные коммиты против
 целевой ветки) + контекст задачи Jira и отдаёт всё это субагенту-ревьюверу.
 
+> **MCP-first.** Операции предпочитай MCP-инструментами jwu, bash `jwu …` — фолбэк:
+> `jwu task <KEY> --json` → `jwu_task(key)` · `jwu pr <id> --project <KEY> --repo <slug> --json` → `jwu_pr(pr_id, project, repo)` ·
+> `jwu job add …` → `jwu_job_add(job_id, text, kind, status)`.
+
 ## Аргумент и выбор субагента
 
 Вызов: `/jwu-job-review <reviewer-subagent>` — где `<reviewer-subagent>` это имя

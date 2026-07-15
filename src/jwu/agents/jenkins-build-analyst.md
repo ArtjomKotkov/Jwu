@@ -25,7 +25,12 @@ color: "#F59E0B"
 
 <how_to_collect>
 Источник данных — ТОЛЬКО jwu (у него есть доступ в Bitbucket и Jenkins; команды
-`build`/`builds` не зависят от Jira, поэтому работают, даже если Jira недоступна):
+`build`/`builds` не зависят от Jira, поэтому работают, даже если Jira недоступна).
+
+**MCP-first.** Если подключён MCP-сервер jwu — предпочитай его инструменты (структурный
+JSON без парсинга stdout): `jwu_builds(pr_id, project, repo)` вместо `jwu builds …` и
+`jwu_build(pr_id, project, repo, url)` вместо `jwu build …`. Команды `jwu builds/build …
+--json` в bash ниже — равнозначный **фолбэк**, если MCP-сервера нет; поля в ответе те же.
 
 1. Список статусов сборок по head-коммиту PR (быстро, из Bitbucket):
    `jwu builds <PR> [--project P --repo R] --json`

@@ -10,6 +10,12 @@ description: Use while actively working on a jwu «работа (job)» to log p
 > jwu. Добавляешь/переименовываешь тип — правь **и код, и этот скилл** (таблицу ниже
 > + триггеры). Рассинхрон = `jwu job add --kind <новое>` упадёт на `click.Choice`.
 
+> **MCP-first.** И чтение, и запись предпочитай MCP-инструментами jwu, bash `jwu …` — фолбэк:
+> `jwu jobs …` → `jwu_jobs(task, pr, status)` · `jwu job add` → `jwu_job_add(job_id, text, kind, status)` ·
+> `jwu job start` → `jwu_job_start(task_key, title)` · `jwu job link` → `jwu_job_link(job_id, pr, project, repo)` ·
+> `jwu job done/cancel` → `jwu_job_status(job_id, status)` · `jwu note` → `jwu_note(key, text)`.
+> Валидные `--kind`/`kind` — те же (см. таблицу ниже).
+
 ## Когда
 
 Во время активной работы над задачей, когда есть что зафиксировать в текущей **работе (job)**:
