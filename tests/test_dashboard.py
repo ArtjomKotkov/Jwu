@@ -848,16 +848,16 @@ def test_reviewers_cell_slots_and_sorting():
 
     cell = reviewers_cell([
         # умышленно не по алфавиту — должен отсортироваться
-        Reviewer(name="ckotkov", display_name="Сергей Петров"),                  # N (без статуса)
-        Reviewer(name="jdoe", display_name="Artjom Kotkov", approved=True),    # A
-        Reviewer(name="obogim", display_name="Oleg Bogimirky", status="NEEDS_WORK"),  # NW
+        Reviewer(name="cuser", display_name="Сергей Петров"),                  # N (без статуса)
+        Reviewer(name="auser", display_name="Alice Adams", approved=True),    # A
+        Reviewer(name="ouser", display_name="Oscar Brown", status="NEEDS_WORK"),  # NW
     ])
     plain = cell.plain
     # ровно три слота по 25 символов = 75
     assert len(plain) == 3 * REVIEWER_SLOT_WIDTH
-    # порядок: Artjom (A) → Oleg (NW) → Сергей (N), отсортированы по имени без регистра
-    assert plain[:REVIEWER_SLOT_WIDTH] == "[A] Artjom Kotkov".ljust(REVIEWER_SLOT_WIDTH)
-    assert plain[REVIEWER_SLOT_WIDTH:2 * REVIEWER_SLOT_WIDTH] == "[NW] Oleg Bogimirky".ljust(REVIEWER_SLOT_WIDTH)
+    # порядок: Alice (A) → Oscar (NW) → Сергей (N), отсортированы по имени без регистра
+    assert plain[:REVIEWER_SLOT_WIDTH] == "[A] Alice Adams".ljust(REVIEWER_SLOT_WIDTH)
+    assert plain[REVIEWER_SLOT_WIDTH:2 * REVIEWER_SLOT_WIDTH] == "[NW] Oscar Brown".ljust(REVIEWER_SLOT_WIDTH)
     assert plain[2 * REVIEWER_SLOT_WIDTH:] == "[N] Сергей Петров".ljust(REVIEWER_SLOT_WIDTH)
     # цвета по статусу прокинуты на весь слот (бейдж + имя)
     spans = {s.start: s.style for s in cell.spans}

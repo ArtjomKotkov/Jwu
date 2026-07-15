@@ -22,11 +22,13 @@ EXPECTED_SKILLS = {
     "jwu-post-analyze-day",
     "jwu-track-time",
     "jwu-4test-message",
+    "build-failure",
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.
 EXPECTED_AGENTS = {
     "reviewer-jwu-sample",
+    "jenkins-build-analyst",
 }
 
 

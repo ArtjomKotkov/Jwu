@@ -10,7 +10,7 @@ from typing import Optional
 
 import httpx
 
-from .models import PR, PRComment, _get
+from .models import PR, BuildStatus, PRComment, _get
 
 # роль в dashboard/pull-requests
 ROLE_BY_VIEW = {"mine": "AUTHOR", "review": "REVIEWER"}
@@ -173,6 +173,33 @@ class BitbucketClient:
         return self._get(
             f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
         )
+
+    def build_statuses(self, commit_sha: str) -> list[BuildStatus]:
+        """Статусы CI-сборок по коммиту (build-status API — то, что рисуется на странице PR).
+
+        Эндпоинт живёт под ``/rest/build-status/1.0`` (вне базового ``/rest/api/1.0``),
+        поэтому дёргаем абсолютным URL. Bitbucket иногда задваивает запись по одной сборке
+        (чистый ключ + ключ с экранированными слэшами) — дедуплицируем по URL, предпочитая
+        запись без ``\\`` в ключе.
+        """
+        url = f"{self.base_url}/rest/build-status/1.0/commits/{commit_sha}"
+        try:
+            resp = self._client.get(url)
+        except httpx.HTTPError as exc:
+            raise BitbucketError(f"Сеть/Bitbucket недоступен: {exc}") from exc
+        if resp.status_code == 401:
+            raise BitbucketError("401: токен Bitbucket невалиден", 401)
+        if resp.status_code == 403:
+            raise BitbucketError("403: нет прав в Bitbucket", 403)
+        if resp.status_code >= 400:
+            raise BitbucketError(f"{resp.status_code}: {resp.text[:200]}", resp.status_code)
+        by_url: dict[str, BuildStatus] = {}
+        for raw in resp.json().get("values", []) or []:
+            bs = BuildStatus.from_bitbucket(raw)
+            existing = by_url.get(bs.url)
+            if existing is None or ("\\" in existing.key and "\\" not in bs.key):
+                by_url[bs.url] = bs
+        return list(by_url.values())
 
     def latest_commit(self, project: str, repo: str, pr_id: int) -> str:
         """ID последнего коммита PR (дёшево, для детекта новых коммитов)."""

@@ -70,6 +70,19 @@ def _service() -> Service:
         raise typer.Exit(code=1)
 
 
+def _builds_service() -> Service:
+    """Сервис для команд сборок: только Bitbucket + Jenkins, без зависимости от Jira."""
+    try:
+        _prepare_db()
+        return Service.for_builds(load_config())
+    except ConfigError as exc:
+        err.print(f"[red]Ошибка конфига:[/red] {exc}")
+        raise typer.Exit(code=1)
+    except (JiraError, BitbucketError) as exc:
+        err.print(f"[red]Ошибка авторизации:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
 def _store() -> Store:
     """Только память — без токенов/сети (для note/notes/changes)."""
     try:
@@ -119,6 +132,26 @@ def _render_attachments(attachments: list) -> None:
                       f" · {a.author} · {fmt_dt(a.created)}[/dim]")
 
 
+_BUILD_ICON = {"SUCCESSFUL": "[green]✅[/green]", "FAILED": "[red]❌[/red]",
+               "INPROGRESS": "[yellow]🔄[/yellow]"}
+
+
+def _build_icon(state: str) -> str:
+    return _BUILD_ICON.get(state, "[dim]•[/dim]")
+
+
+def _render_builds(builds: list) -> None:
+    """Секция «Сборки» в выводе jwu pr (статусы CI по head-коммиту)."""
+    if not builds:
+        return
+    console.print(f"\n[bold]Сборки ({len(builds)})[/bold]")
+    for b in builds:
+        desc = f" [dim]{b.description}[/dim]" if b.description else ""
+        console.print(f"  {_build_icon(b.state)} {b.name or b.key}{desc}")
+        if b.url:
+            console.print(f"      [dim]{b.url}[/dim]")
+
+
 # --------------------------------------------------------------------------- #
 # auth
 # --------------------------------------------------------------------------- #
@@ -133,13 +166,17 @@ def auth_check(json_out: bool = typer.Option(False, "--json", help="Вывест
         _emit_json(result)
         raise typer.Exit(code=0 if result["jira"]["ok"] and result["bitbucket"]["ok"] else 1)
     ok = True
-    for name in ("jira", "bitbucket"):
-        r = result[name]
+    # Jenkins опционален — печатаем, если настроен, но на код выхода не влияет.
+    for name in ("jira", "sdesk", "bitbucket", "jenkins"):
+        r = result.get(name)
+        if r is None:
+            continue
         if r["ok"]:
             extra = f" ({r.get('name')})" if r.get("name") else ""
             console.print(f"[green]✓[/green] {name}{extra}")
         else:
-            ok = False
+            if name != "jenkins":
+                ok = False
             console.print(f"[red]✗[/red] {name}: {r.get('error')}")
     raise typer.Exit(code=0 if ok else 1)
 
@@ -167,8 +204,10 @@ def _auth_check_report() -> None:
     try:
         with Service.from_config(load_config()) as svc:
             res = svc.auth_check()
-        for name in ("jira", "bitbucket"):
-            r = res[name]
+        for name in ("jira", "sdesk", "bitbucket", "jenkins"):
+            r = res.get(name)
+            if r is None:
+                continue
             mark = "[green]✓[/green]" if r["ok"] else "[red]✗[/red]"
             extra = f" {r.get('error')}" if not r["ok"] else (
                 f" ({r.get('name')})" if r.get("name") else "")
@@ -191,10 +230,25 @@ def configure_main(
     gate_user: Optional[str] = typer.Option(None, "--gate-user",
         help="Логин nginx Basic-гейта перед Jira (если есть)."),
     gate_password: Optional[str] = typer.Option(None, "--gate-password"),
+    sdesk_host: Optional[str] = typer.Option(None, "--sdesk-host",
+        help="Хост второго Jira-инстанса SDESK (Enter/пусто — без SDESK)."),
+    sdesk_project: Optional[str] = typer.Option(None, "--sdesk-project",
+        help="Префикс ключей SDESK (напр. SDESK)."),
+    sdesk_user: Optional[str] = typer.Option(None, "--sdesk-user"),
+    sdesk_token_opt: Optional[str] = typer.Option(None, "--sdesk-token"),
+    sdesk_password: Optional[str] = typer.Option(None, "--sdesk-password",
+        help="Пароль для сессионного логина SDESK."),
+    sdesk_gate_password: Optional[str] = typer.Option(None, "--sdesk-gate-password",
+        help="Пароль nginx-гейта перед SDESK (логин-гейт берётся из --gate-user, если не задан отдельно)."),
+    sdesk_gate_user: Optional[str] = typer.Option(None, "--sdesk-gate-user"),
     bitbucket_host: Optional[str] = typer.Option(None, "--bitbucket-host"),
     bitbucket_project: Optional[str] = typer.Option(None, "--bitbucket-project"),
     bitbucket_repo: Optional[str] = typer.Option(None, "--bitbucket-repo"),
     bitbucket_token_opt: Optional[str] = typer.Option(None, "--bitbucket-token"),
+    jenkins_host: Optional[str] = typer.Option(None, "--jenkins-host"),
+    jenkins_user: Optional[str] = typer.Option(None, "--jenkins-user"),
+    jenkins_token_opt: Optional[str] = typer.Option(None, "--jenkins-token",
+        help="API-токен Jenkins (профиль → Security → API Token)."),
     db_path_opt: Optional[str] = typer.Option(None, "--db-path"),
 ) -> None:
     """Визард настройки (когда вызвано без подкоманды export/import)."""
@@ -209,13 +263,26 @@ def configure_main(
         if bitbucket_host is not None: cfg.bitbucket.base_url = bitbucket_host.rstrip("/")
         if bitbucket_project is not None: cfg.bitbucket.project = bitbucket_project
         if bitbucket_repo is not None: cfg.bitbucket.repo = bitbucket_repo
+        if jenkins_host is not None: cfg.jenkins.base_url = jenkins_host.rstrip("/")
+        if jenkins_user is not None: cfg.jenkins.username = jenkins_user
         if gate_user is not None: cfg.jira.proxy_basic_user = gate_user
+        if sdesk_host is not None: cfg.sdesk.base_url = sdesk_host.rstrip("/")
+        if sdesk_project is not None: cfg.sdesk.project = sdesk_project
+        if sdesk_user is not None: cfg.sdesk.username = sdesk_user
+        # логин гейта SDESK: явный --sdesk-gate-user, иначе тот же, что у Jira-гейта
+        if sdesk_gate_user is not None: cfg.sdesk.proxy_basic_user = sdesk_gate_user
+        elif gate_user is not None and not cfg.sdesk.proxy_basic_user:
+            cfg.sdesk.proxy_basic_user = gate_user
         if db_path_opt is not None: cfg.storage.db_path = db_path_opt
         new_secrets = {
             (cfg.jira.token_service, cfg.jira.token_account): jira_token_opt,
             (cfg.jira.login_service, cfg.jira.username): jira_password,
             (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gate_password,
+            (cfg.sdesk.token_service, cfg.sdesk.token_account): sdesk_token_opt,
+            (cfg.sdesk.login_service, cfg.sdesk.username): sdesk_password,
+            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user): sdesk_gate_password,
             (cfg.bitbucket.token_service, cfg.bitbucket.token_account): bitbucket_token_opt,
+            (cfg.jenkins.token_service, cfg.jenkins.username): jenkins_token_opt,
         }
     else:
         cfg.jira.base_url = (jira_host or _prompt_default("Jira host", cfg.jira.base_url)).rstrip("/")
@@ -231,6 +298,26 @@ def configure_main(
         gpw = gate_password if gate_password is not None else (
             _prompt_default("Пароль nginx-гейта", "", secret=True)
             if cfg.jira.proxy_basic_user else "")
+        # SDESK — второй Jira-инстанс (опционально). Enter на хосте — пропустить целиком.
+        cfg.sdesk.base_url = (sdesk_host or _prompt_default(
+            "SDESK host (Enter — без SDESK)", cfg.sdesk.base_url)).rstrip("/")
+        if cfg.sdesk.base_url:
+            cfg.sdesk.project = sdesk_project or _prompt_default(
+                "SDESK project (префикс ключей)", cfg.sdesk.project or "SDESK")
+            cfg.sdesk.username = sdesk_user or _prompt_default(
+                "SDESK username", cfg.sdesk.username or cfg.jira.username)
+            sdtok = sdesk_token_opt if sdesk_token_opt is not None else _prompt_default(
+                "SDESK PAT-токен", "", secret=True)
+            sdpw = sdesk_password if sdesk_password is not None else _prompt_default(
+                "SDESK пароль (сессия)", "", secret=True)
+            cfg.sdesk.proxy_basic_user = sdesk_gate_user or _prompt_default(
+                "Логин nginx-гейта SDESK (Enter — как у Jira/без гейта)",
+                cfg.sdesk.proxy_basic_user or cfg.jira.proxy_basic_user)
+            sdgpw = sdesk_gate_password if sdesk_gate_password is not None else (
+                _prompt_default("Пароль nginx-гейта SDESK", "", secret=True)
+                if cfg.sdesk.proxy_basic_user else "")
+        else:
+            sdtok = sdpw = sdgpw = ""
         cfg.bitbucket.base_url = (bitbucket_host or _prompt_default(
             "Bitbucket host", cfg.bitbucket.base_url)).rstrip("/")
         cfg.bitbucket.project = bitbucket_project or _prompt_default(
@@ -239,13 +326,25 @@ def configure_main(
             "Bitbucket repo", cfg.bitbucket.repo)
         btok = bitbucket_token_opt if bitbucket_token_opt is not None else _prompt_default(
             "Bitbucket PAT-токен", "", secret=True)
+        # Jenkins опционален (детализация причин падения сборок). Enter — пропустить.
+        cfg.jenkins.base_url = (jenkins_host or _prompt_default(
+            "Jenkins host (Enter — без Jenkins)", cfg.jenkins.base_url)).rstrip("/")
+        cfg.jenkins.username = jenkins_user or _prompt_default(
+            "Jenkins username", cfg.jenkins.username)
+        ktok = jenkins_token_opt if jenkins_token_opt is not None else (
+            _prompt_default("Jenkins API-токен", "", secret=True)
+            if cfg.jenkins.username else "")
         cur_db = cfg.storage.db_path or str(db_path(cfg))
         cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
         new_secrets = {
             (cfg.jira.token_service, cfg.jira.token_account): jtok,
             (cfg.jira.login_service, cfg.jira.username): jpw,
             (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gpw,
+            (cfg.sdesk.token_service, cfg.sdesk.token_account): sdtok,
+            (cfg.sdesk.login_service, cfg.sdesk.username): sdpw,
+            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user): sdgpw,
             (cfg.bitbucket.token_service, cfg.bitbucket.token_account): btok,
+            (cfg.jenkins.token_service, cfg.jenkins.username): ktok,
         }
 
     path = save_config(cfg)
@@ -379,10 +478,18 @@ def task(
         issue = svc.issue(key)
         notes = svc.get_notes(key)
         jobs_list = svc.jobs_for_task(key)
+        # Статусы CI-сборок по OPEN-PR из dev-панели (best-effort, не валим карточку).
+        pr_builds: dict[str, list] = {}
+        for pr in [p for p in issue.pull_requests if p.status == "OPEN"][:5]:
+            try:
+                pr_builds[pr.id] = svc.build_statuses_for_pr_url(pr.url)
+            except Exception:  # noqa: BLE001
+                pr_builds[pr.id] = []
     if json_out:
         payload = issue.model_dump()
         payload["notes"] = [n.model_dump() for n in notes]
         payload["jobs"] = [j.model_dump() for j in jobs_list]
+        payload["pr_builds"] = {pid: [b.model_dump() for b in bs] for pid, bs in pr_builds.items()}
         _emit_json(payload)
         return
     console.print(f"[bold cyan]{issue.key}[/bold cyan]  [{issue.status}]  {issue.summary}")
@@ -403,6 +510,9 @@ def task(
             console.print(f"  ветка: {b.name} [dim]{b.repository}[/dim]")
         for pr in issue.pull_requests:
             console.print(f"  PR {pr.id} [{pr.status}] {pr.name}")
+            for b in pr_builds.get(pr.id, []):
+                desc = f" [dim]{b.description}[/dim]" if b.description else ""
+                console.print(f"      {_build_icon(b.state)} {b.name or b.key}{desc}")
     if jobs_list:
         console.print(f"\n[bold]Работы ({len(jobs_list)})[/bold]")
         for j in jobs_list:
@@ -571,6 +681,7 @@ def pr(
     console.print(f"{pull.source_branch} → {pull.target_branch}  [dim]{pull.project}/{pull.repository}[/dim]")
     if pull.conflicted is not None:
         console.print(f"конфликт: {'[red]да[/red]' if pull.conflicted else 'нет'}  can_merge: {pull.can_merge}")
+    _render_builds(pull.builds)
     if pull.reviewers:
         console.print("[bold]Ревьюеры[/bold]")
         for r in pull.reviewers:
@@ -588,6 +699,73 @@ def pr(
         console.print(f"[bold]Работы ({len(jobs_list)})[/bold]")
         for j in jobs_list:
             console.print(f"  #{j.id} [{j.status}] {j.title or '—'} [dim]{j.task_key}[/dim]")
+
+
+@app.command()
+def builds(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта Bitbucket."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug репозитория."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Статусы CI-сборок по head-коммиту PR (быстро, из build-status API Bitbucket)."""
+    with _builds_service() as svc:
+        proj = project or svc.cfg.bitbucket.project
+        rp = repo or svc.cfg.bitbucket.repo
+        statuses = svc.build_statuses_for_pr(proj, rp, pr_id)
+    if json_out:
+        _emit_json([b.model_dump() for b in statuses])
+        return
+    if not statuses:
+        console.print("[dim]Сборок по head-коммиту PR нет.[/dim]")
+        return
+    _render_builds(statuses)
+
+
+@app.command()
+def build(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта Bitbucket."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug репозитория."),
+    url: Optional[str] = typer.Option(None, "--url", help="URL конкретной сборки Jenkins."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON (для субагента-аналитика)."),
+) -> None:
+    """Детальный разбор сборки: статус из Bitbucket + причина падения из Jenkins.
+
+    По умолчанию берётся упавшая сборка по head-коммиту PR. Без Jenkins-токена выводит
+    только статус из Bitbucket. ``--json`` отдаёт структурированный отчёт для анализа.
+    """
+    with _builds_service() as svc:
+        report = svc.build_report(project, repo, pr_id, build_url=url)
+    if json_out:
+        _emit_json(report.model_dump() if report is not None else None)
+        return
+    if report is None:
+        console.print("[dim]Сборок по head-коммиту PR нет.[/dim]")
+        return
+    console.print(f"{_build_icon(report.state)} [bold]{report.name}[/bold]  "
+                  f"[dim]{report.description}[/dim]")
+    if report.url:
+        console.print(f"[dim]{report.url}[/dim]")
+    if report.jenkins_available:
+        res = report.result or ("идёт" if report.building else "—")
+        line = f"результат: {res}"
+        if report.branch:
+            line += f"  ветка: {report.branch}"
+        if report.sha:
+            line += f"  commit: {report.sha[:10]}"
+        console.print(line)
+        if report.summary is not None:
+            s = report.summary
+            console.print(f"тесты: [red]fail={s['fail']}[/red] pass={s['passed']} skip={s['skip']}")
+        if report.failures:
+            console.print(f"\n[bold red]Упавшие тесты ({len(report.failures)})[/bold red]")
+            for f in report.failures:
+                console.print(f"  [red]✗[/red] {f.class_name}::{f.name} [dim]({f.status})[/dim]")
+                if f.error_details:
+                    console.print(f"      [yellow]{f.error_details.strip().splitlines()[0][:200]}[/yellow]")
+    if report.note:
+        console.print(f"[yellow]{report.note}[/yellow]")
 
 
 # --------------------------------------------------------------------------- #
