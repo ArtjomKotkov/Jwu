@@ -1040,7 +1040,8 @@ class JobDetailScreen(Screen):
     BINDINGS = [
         Binding("escape,backspace,q", "app.pop_screen", "← Назад"),
         Binding("x", "close_job", "Закрыть (неактуальна)"),
-        Binding("d", "delete_job", "✕ Удалить"),
+        Binding("d", "finish_job", "✓ Завершить (done)"),
+        Binding("D", "delete_job", "✕ Удалить"),
         Binding("y", "copy_issue_key", "Копировать ключ"),
         Binding("Y", "copy_menu", "Копировать…"),
     ]
@@ -1067,6 +1068,17 @@ class JobDetailScreen(Screen):
             fn(self.job_id, "cancelled")
             getattr(self.app, "_run_memory_refresh", lambda: None)()
         self.app.pop_screen()
+
+    def action_finish_job(self) -> None:
+        def do() -> None:
+            fn = getattr(self.app, "_job_status_fn", None)
+            if fn is not None:
+                fn(self.job_id, "done")
+                getattr(self.app, "_run_memory_refresh", lambda: None)()
+            self.app.pop_screen()
+
+        self.app.push_screen(ConfirmScreen(
+            f"Завершить работу #{self.job_id} «{self._title}» (done)?", do))
 
     def action_delete_job(self) -> None:
         def do() -> None:
@@ -1210,7 +1222,8 @@ class JwuDashboard(App):
         Binding("c", "clear_section", "Очистить"),
         Binding("C", "ack_changes", "Очистить всё"),
         Binding("x", "close_job", "Закрыть работу"),
-        Binding("d", "delete_job", "✕ Удалить работу"),
+        Binding("d", "finish_job", "✓ Завершить работу"),
+        Binding("D", "delete_job", "✕ Удалить работу"),
         Binding("[", "tab_prev", "← вкладка"),
         Binding("]", "tab_next", "→ вкладка"),
         Binding("y", "copy_issue_key", "Копировать ключ"),
@@ -1933,7 +1946,7 @@ class JwuDashboard(App):
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Кнопки удаления/закрытия работы — только на вкладке «Работы»."""
-        if action in ("delete_job", "close_job"):
+        if action in ("delete_job", "close_job", "finish_job"):
             try:
                 return True if self._active()[2] == "jobs" else None
             except Exception:  # noqa: BLE001
@@ -1959,6 +1972,19 @@ class JwuDashboard(App):
         self._job_status_fn(job.id, "cancelled")
         self._run_memory_refresh()
         self.query_one("#status", Static).update(f"работа #{job.id} закрыта (неактуальна)")
+
+    def action_finish_job(self) -> None:
+        job = self._selected_obj()
+        if not isinstance(job, Job) or self._job_status_fn is None:
+            return
+
+        def do() -> None:
+            self._job_status_fn(job.id, "done")  # type: ignore[misc]
+            self._run_memory_refresh()
+            self.query_one("#status", Static).update(f"работа #{job.id} завершена (done)")
+
+        self.push_screen(ConfirmScreen(
+            f"Завершить работу #{job.id} «{job.title or ''}» (done)?", do))
 
     def action_delete_job(self) -> None:
         job = self._selected_obj()
