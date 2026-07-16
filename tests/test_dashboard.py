@@ -568,7 +568,18 @@ def test_tui_job_close_and_delete():
             await pilot.pause()
             app.action_close_job()                       # x — закрыть
             assert calls["status"] == (7, "cancelled")
-            app.action_delete_job()                      # d — удалить (с подтверждением)
+            app.action_finish_job()                      # отказ в диалоге — статус не меняется
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            assert calls["status"] == (7, "cancelled")
+            app.action_finish_job()                      # d — завершить (с подтверждением)
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            await pilot.pause()
+            assert calls["status"] == (7, "done")
+            app.action_delete_job()                      # D — удалить (с подтверждением)
             await pilot.pause()
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
@@ -586,6 +597,7 @@ def test_check_action_scopes_job_buttons():
     async def run() -> None:
         async with app.run_test() as pilot:
             assert app.check_action("delete_job", ()) is None      # на «Мои задачи» скрыто
+            assert app.check_action("finish_job", ()) is None
             assert app.check_action("refresh", ()) is True
             app.query_one("#tabs", TabbedContent).active = "tab-jobs"
             await pilot.pause()
@@ -593,6 +605,7 @@ def test_check_action_scopes_job_buttons():
             await pilot.pause()
             assert app.check_action("delete_job", ()) is True       # на «Работы» доступно
             assert app.check_action("close_job", ()) is True
+            assert app.check_action("finish_job", ()) is True
 
     asyncio.run(run())
 
