@@ -18,7 +18,9 @@ from ..core.bitbucket import BitbucketError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
 from ..core.dates import fmt_ago, fmt_dt
-from ..core.maintenance import ensure_db_available, run_daily_maintenance
+from ..core.maintenance import (
+    ensure_db_available, run_daily_maintenance, warn_if_cloud_path,
+)
 from ..skills_install import (
     default_agents_dest as _agents_dest,
     default_dest as _skills_dest,
@@ -95,12 +97,28 @@ def _open_store() -> Store:
 
 
 def _resolve_workspace(store: Store) -> Workspace:
-    """Активный воркспейс для текущего вызова (или внятный отказ)."""
+    """Активный воркспейс для текущего вызова (или внятный отказ).
+
+    Здесь же однократно доезжает legacy-конфиг: старый config.toml + секреты из keyring
+    переносятся в воркспейс «Работа», чтобы обновление jwu не потребовало ручных действий.
+    """
+    _migrate_legacy_once(store)
     try:
         return workspaces.resolve_workspace(store, explicit=_WORKSPACE_ARG)
     except workspaces.WorkspaceError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
+
+
+def _migrate_legacy_once(store: Store) -> None:
+    try:
+        fields, moved = workspaces.migrate_legacy_config(store)
+    except Exception as exc:  # noqa: BLE001 — недоступный keyring не должен ломать команду
+        err.print(f"[yellow]⚠ не удалось перенести старый конфиг в БД: {exc}[/yellow]")
+        return
+    if fields or moved:
+        err.print(f"[dim]Старый конфиг перенесён в воркспейс «work» "
+                  f"(секретов: {moved}). Keyring не тронут.[/dim]")
 
 
 def _service() -> Service:
@@ -109,7 +127,7 @@ def _service() -> Service:
         _prepare_db()
         with Store(str(db_path())) as probe:
             ws = _resolve_workspace(probe)
-        return Service.for_workspace(ws, load_config())
+        return Service.for_workspace(ws)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -125,7 +143,7 @@ def _builds_service() -> Service:
         with Store(str(db_path())) as probe:
             ws = _resolve_workspace(probe)
         _require_bitbucket(ws)
-        return Service.for_builds(load_config(), workspace_id=ws.id)
+        return Service.builds_for_workspace(ws)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -141,7 +159,7 @@ def _require_jira(svc: Service) -> None:
     slug = svc.workspace.slug if svc.workspace else "?"
     err.print(
         f"[red]В воркспейсе «{slug}» Jira не подключена.[/red]\n"
-        f"Подключить: [cyan]jwu workspace configure {slug} --jira-host …[/cyan]\n"
+        f"Подключить: [cyan]jwu configure -W {slug} --jira-host …[/cyan]\n"
         f"Локальные фичи: [cyan]jwu feature list[/cyan]   ·   "
         f"работа без задачи: [cyan]jwu job start --title \"…\"[/cyan]"
     )
@@ -155,7 +173,7 @@ def _require_bitbucket(ws: Workspace) -> None:
         return
     err.print(
         f"[red]В воркспейсе «{ws.slug}» Bitbucket не подключён.[/red]\n"
-        f"Подключить: [cyan]jwu workspace configure {ws.slug} --bitbucket-token …[/cyan]"
+        f"Подключить: [cyan]jwu configure -W {ws.slug} --bitbucket-token …[/cyan]"
     )
     raise typer.Exit(code=1)
 
@@ -290,10 +308,37 @@ configure_app = typer.Typer(
 app.add_typer(configure_app, name="configure")
 
 
+def _enable_configured_integrations(store: Store, ws: Workspace, cfg) -> None:
+    """Включить интеграции воркспейса, которые пользователь реально настроил.
+
+    Признак «настроил» — непустой секрет плюс хост, отличный от заглушки в дефолтах
+    Config (jira.example.com/git.example.com): иначе `jwu configure` без единого флага
+    включал бы обе интеграции всем подряд.
+    """
+    from ..core.config import BitbucketConfig, JiraConfig
+
+    stored = store.workspace_secrets(ws.id)
+    updates: dict[str, bool] = {}
+    jira_ready = (cfg.jira.base_url and cfg.jira.base_url != JiraConfig().base_url
+                  and (stored.get("jira.token") or stored.get("jira.password")))
+    if jira_ready and not ws.jira_enabled:
+        updates["jira_enabled"] = True
+    bb_ready = (cfg.bitbucket.base_url and cfg.bitbucket.base_url != BitbucketConfig().base_url
+                and stored.get("bitbucket.token"))
+    if bb_ready and not ws.bitbucket_enabled:
+        updates["bitbucket_enabled"] = True
+    if updates:
+        store.update_workspace(ws.id, **updates)
+        names = ", ".join("Jira" if k == "jira_enabled" else "Bitbucket" for k in updates)
+        console.print(f"[green]Подключено к воркспейсу «{ws.label}»:[/green] {names}")
+
+
 def _auth_check_report() -> None:
     """Проверить связь по текущему конфигу и напечатать ✓/✗ по Jira и Bitbucket."""
     try:
-        with Service.from_config(load_config()) as svc:
+        with _open_store() as store:
+            ws = _resolve_workspace(store)
+        with Service.for_workspace(ws) as svc:
             res = svc.auth_check()
         for name in ("jira", "sdesk", "bitbucket", "jenkins"):
             r = res.get(name)
@@ -366,14 +411,14 @@ def configure_main(
             cfg.sdesk.proxy_basic_user = gate_user
         if db_path_opt is not None: cfg.storage.db_path = db_path_opt
         new_secrets = {
-            (cfg.jira.token_service, cfg.jira.token_account): jira_token_opt,
-            (cfg.jira.login_service, cfg.jira.username): jira_password,
-            (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gate_password,
-            (cfg.sdesk.token_service, cfg.sdesk.token_account): sdesk_token_opt,
-            (cfg.sdesk.login_service, cfg.sdesk.username): sdesk_password,
-            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user): sdesk_gate_password,
-            (cfg.bitbucket.token_service, cfg.bitbucket.token_account): bitbucket_token_opt,
-            (cfg.jenkins.token_service, cfg.jenkins.username): jenkins_token_opt,
+            "jira.token": jira_token_opt,
+            "jira.password": jira_password,
+            "jira.gate_password": gate_password,
+            "sdesk.token": sdesk_token_opt,
+            "sdesk.password": sdesk_password,
+            "sdesk.gate_password": sdesk_gate_password,
+            "bitbucket.token": bitbucket_token_opt,
+            "jenkins.token": jenkins_token_opt,
         }
     else:
         cfg.jira.base_url = (jira_host or _prompt_default("Jira host", cfg.jira.base_url)).rstrip("/")
@@ -428,29 +473,37 @@ def configure_main(
         cur_db = cfg.storage.db_path or str(db_path(cfg))
         cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
         new_secrets = {
-            (cfg.jira.token_service, cfg.jira.token_account): jtok,
-            (cfg.jira.login_service, cfg.jira.username): jpw,
-            (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gpw,
-            (cfg.sdesk.token_service, cfg.sdesk.token_account): sdtok,
-            (cfg.sdesk.login_service, cfg.sdesk.username): sdpw,
-            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user): sdgpw,
-            (cfg.bitbucket.token_service, cfg.bitbucket.token_account): btok,
-            (cfg.jenkins.token_service, cfg.jenkins.username): ktok,
+            "jira.token": jtok,
+            "jira.password": jpw,
+            "jira.gate_password": gpw,
+            "sdesk.token": sdtok,
+            "sdesk.password": sdpw,
+            "sdesk.gate_password": sdgpw,
+            "bitbucket.token": btok,
+            "jenkins.token": ktok,
         }
 
-    path = save_config(cfg)
-    saved = 0
-    try:
-        for (service, account), value in new_secrets.items():
-            if value and account:  # пусто/None или нет account => не трогаем
-                secrets.set_secret(service, account, value)
-                saved += 1
-    except Exception as exc:  # noqa: BLE001 — keyring недоступен
-        err.print(f"[red]Не удалось записать секрет в keyring:[/red] {exc}\n"
-                  f"Задай токен через переменную окружения (JIRA_TOKEN/BITBUCKET_TOKEN).")
-        raise typer.Exit(code=1)
+    # Путь до БД — единственное, что остаётся глобальным: БД надо найти ДО того,
+    # как известен воркспейс (в ней же лежат конфиги воркспейсов).
+    global_cfg = load_config()
+    if cfg.storage.db_path != global_cfg.storage.db_path:
+        global_cfg.storage.db_path = cfg.storage.db_path
+        save_config(global_cfg)
 
-    console.print(f"[green]Конфиг сохранён[/green]: {path}  (секретов записано: {saved})")
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        workspaces.save_workspace_config(store, ws, cfg)
+        saved = 0
+        for slot, value in new_secrets.items():
+            if value:  # пусто/None => не трогаем, старое значение остаётся
+                store.set_workspace_secret(ws.id, slot, value)
+                saved += 1
+        _enable_configured_integrations(store, ws, cfg)
+        for warn in warn_if_cloud_path(db_path()):
+            err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+    console.print(f"[green]Конфиг воркспейса «{ws.label}» сохранён[/green] "
+                  f"(секретов записано: {saved})")
     _auth_check_report()
 
 
@@ -458,11 +511,15 @@ def configure_main(
 def configure_export(
     path: str = typer.Argument(..., help="Куда записать бандл (.toml)."),
 ) -> None:
-    """Выгрузить config + СЕКРЕТЫ в переносимый файл (плайнтекст — храните безопасно)."""
+    """Выгрузить настройки воркспейса + СЕКРЕТЫ в файл (плайнтекст — храните безопасно)."""
     from ..core.config import export_bundle
 
-    n = export_bundle(load_config(), Path(path))
-    console.print(f"[green]Бандл записан[/green]: {path}  (секретов: {n})")
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        cfg = workspaces.config_for_workspace(store, ws)
+        n = export_bundle(cfg, Path(path))
+    console.print(f"[green]Бандл записан[/green]: {path}  "
+                  f"(воркспейс «{ws.label}», секретов: {n})")
     err.print("[yellow]Внимание:[/yellow] файл содержит пароли в открытом виде — "
               "не коммить и храни безопасно.")
 
@@ -471,20 +528,24 @@ def configure_export(
 def configure_import(
     path: str = typer.Argument(..., help="Файл бандла (.toml) из `configure export`."),
 ) -> None:
-    """Применить бандл: записать config.toml и секреты в keyring, затем проверить связь."""
-    from ..core.config import import_bundle
+    """Применить бандл к активному воркспейсу: настройки и секреты, затем проверить связь."""
+    from ..core.config import read_bundle
 
     try:
-        _cfg, n = import_bundle(Path(path))
+        cfg, values = read_bundle(Path(path))
     except ConfigError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
-    except Exception as exc:  # noqa: BLE001 — keyring недоступен
-        err.print(f"[red]Не удалось записать секрет в keyring:[/red] {exc}\n"
-                  f"Задай токен через переменную окружения (JIRA_TOKEN/BITBUCKET_TOKEN).")
-        raise typer.Exit(code=1)
 
-    console.print(f"[green]Импортировано[/green]: config + секретов {n}")
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        workspaces.save_workspace_config(store, ws, cfg)
+        for slot, value in values.items():
+            store.set_workspace_secret(ws.id, slot, value)
+        _enable_configured_integrations(store, ws, cfg)
+
+    console.print(f"[green]Импортировано[/green] в воркспейс «{ws.label}»: "
+                  f"настройки + секретов {len(values)}")
     _auth_check_report()
 
 
@@ -658,12 +719,30 @@ def workspace_current(
     console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
 
 
+@workspace_app.command("migrate")
+def workspace_migrate() -> None:
+    """Перенести старый config.toml и секреты из keyring в БД (обычно происходит само)."""
+    store = _open_store()
+    ws = store.get_workspace_by_slug("work") or _resolve_workspace(store)
+    fields, moved = workspaces.migrate_legacy_config(store, ws)
+    if not fields and not moved:
+        console.print("[dim]Переносить нечего — это уже сделано ранее.[/dim]")
+        return
+    console.print(f"[green]Перенесено в «{ws.label}»[/green]: настроек {fields}, "
+                  f"секретов {moved}. Keyring не тронут (остаётся как фолбэк).")
+    for warn in warn_if_cloud_path(db_path()):
+        err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+
 @workspace_app.command("show")
 def workspace_show(
     slug: Optional[str] = typer.Argument(None, help="Slug/id; без него — активный."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+    show_secrets: bool = typer.Option(
+        False, "--show-secrets", help="Показать секреты в открытом виде."
+    ),
 ) -> None:
-    """Карточка воркспейса: папки, интеграции, счётчики."""
+    """Карточка воркспейса: папки, интеграции, счётчики, настройки."""
     store = _open_store()
     ws = workspaces.find_workspace(store, slug) if slug else _resolve_workspace(store)
     if ws is None:
@@ -671,7 +750,13 @@ def workspace_show(
         raise typer.Exit(code=1)
     store.use_workspace(ws.id)
     if json_out:
-        _emit_json(_ws_json(store, ws))
+        payload = _ws_json(store, ws)
+        payload["settings"] = store.workspace_settings(ws.id)
+        payload["secrets"] = {
+            slot: (value if show_secrets else "****")
+            for slot, value in store.workspace_secrets(ws.id).items()
+        }
+        _emit_json(payload)
         return
     console.print(f"[b]{ws.label}[/b]")
     console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
@@ -687,6 +772,21 @@ def workspace_show(
             console.print(f"  📁 {p.path}{label}{mark}")
     else:
         console.print("\n[dim]Папок нет. Привязать текущую: jwu workspace add-path .[/dim]")
+
+    settings = {k: v for k, v in store.workspace_settings(ws.id).items()
+                if not k.startswith("features.") and v}
+    if settings:
+        console.print("\n[b]Настройки[/b]")
+        for key in sorted(settings):
+            if key.startswith("jira.views."):
+                continue  # JQL длинный и шумный — виден в --json
+            console.print(f"  [dim]{key}[/dim] = {settings[key]}")
+    stored = store.workspace_secrets(ws.id)
+    if stored:
+        console.print("\n[b]Секреты[/b] [dim](в БД, открытым текстом)[/dim]")
+        for slot in sorted(stored):
+            value = stored[slot] if show_secrets else "****"
+            console.print(f"  [dim]{slot}[/dim] = {value}")
 
 
 @workspace_app.command("add-path")

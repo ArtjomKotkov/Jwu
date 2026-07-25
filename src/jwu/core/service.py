@@ -339,10 +339,15 @@ class Service:
 
         Воркспейс без Jira и Bitbucket вообще не требует кредов — ни один токен не
         запрашивается, и работа с локальными фичами/работами возможна «из коробки».
+
+        Store открывается ПЕРВЫМ: конфиг воркспейса (и его секреты) читаются из этой же
+        БД, поэтому источник секретов должен держать живое соединение сервиса, а не чужое.
         """
         from .config import db_path as default_db_path
+        from .workspaces import config_for_workspace
 
-        cfg = cfg or load_config()
+        store = Store(db_path or str(default_db_path()), workspace.id)
+        cfg = cfg or config_for_workspace(store, workspace)
         jira = None
         sdesk_factory = None
         if workspace.jira_enabled:
@@ -362,9 +367,22 @@ class Service:
             bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
             jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
 
-        store = Store(db_path or str(default_db_path()), workspace.id)
         return cls(cfg, jira, bitbucket, store, jenkins,
                    sdesk_factory=sdesk_factory, workspace=workspace)
+
+    @classmethod
+    def builds_for_workspace(
+        cls, workspace: Workspace, cfg: Config | None = None, *, db_path: str | None = None
+    ) -> "Service":
+        """Bitbucket + Jenkins в контексте воркспейса, без логина в Jira (см. for_builds)."""
+        from .config import db_path as default_db_path
+        from .workspaces import config_for_workspace
+
+        store = Store(db_path or str(default_db_path()), workspace.id)
+        cfg = cfg or config_for_workspace(store, workspace)
+        bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
+        jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
+        return cls(cfg, None, bitbucket, store, jenkins, workspace=workspace)
 
     def close(self) -> None:
         if self.jira is not None:

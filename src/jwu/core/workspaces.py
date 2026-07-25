@@ -25,8 +25,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import secrets as secrets_mod
+from .config import Config, _apply_raw, load_config
 from .models import Workspace
-from .store import Store
+from .store import DEFAULT_WORKSPACE_SLUG as DEFAULT_SLUG, Store
 
 ACTIVE_META_KEY = "active_workspace"
 ENV_VAR = "JWU_WORKSPACE"
@@ -197,6 +199,100 @@ def add_path(
     store.add_workspace_path(workspace.id, norm, label)
     warn = None if Path(norm).exists() else "папки сейчас нет на диске"
     return norm, warn
+
+
+# --------------------------------------------------------------------------- #
+# Конфиг воркспейса (настройки в БД, секреты — там же)
+# --------------------------------------------------------------------------- #
+
+# Несекретные поля конфига, которые хранятся в workspace_settings. Плоский список
+# «путь в Config» — чтобы добавление поля не требовало ALTER TABLE.
+_SETTING_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("jira.base_url", "jira", "base_url"),
+    ("jira.username", "jira", "username"),
+    ("jira.project", "jira", "project"),
+    ("jira.proxy_basic_user", "jira", "proxy_basic_user"),
+    ("sdesk.base_url", "sdesk", "base_url"),
+    ("sdesk.project", "sdesk", "project"),
+    ("sdesk.username", "sdesk", "username"),
+    ("sdesk.proxy_basic_user", "sdesk", "proxy_basic_user"),
+    ("bitbucket.base_url", "bitbucket", "base_url"),
+    ("bitbucket.project", "bitbucket", "project"),
+    ("bitbucket.repo", "bitbucket", "repo"),
+    ("jenkins.base_url", "jenkins", "base_url"),
+    ("jenkins.username", "jenkins", "username"),
+)
+
+LEGACY_MIGRATED_META = "workspaces.legacy_migrated"
+
+
+def _settings_to_raw(settings: dict[str, str]) -> dict:
+    """Плоский KV ('jira.base_url') → вложенный dict, как из tomllib.load(config.toml).
+
+    Так переиспользуется весь разбор из config._apply_raw: дефолты, rstrip('/'), merge views.
+    """
+    raw: dict = {}
+    for key, value in settings.items():
+        parts = key.split(".")
+        if len(parts) < 2 or parts[0] not in ("jira", "sdesk", "bitbucket", "jenkins"):
+            continue  # служебные ключи воркспейса (features.seq и пр.) — не конфиг
+        node = raw
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    return raw
+
+
+def config_for_workspace(store: Store, workspace: Workspace) -> Config:
+    """Собрать Config воркспейса: настройки и секреты — из БД, путь до БД — глобальный."""
+    cfg = _apply_raw(Config(), _settings_to_raw(store.workspace_settings(workspace.id)))
+    # storage остаётся глобальным: БД надо найти ДО того, как известен воркспейс
+    cfg.storage.db_path = load_config().storage.db_path
+    cfg.secrets = secrets_mod.DbSecrets(store, workspace.id)
+    return cfg
+
+
+def save_workspace_config(store: Store, workspace: Workspace, cfg: Config) -> None:
+    """Записать несекретные поля конфига в настройки воркспейса."""
+    values = {key: str(getattr(getattr(cfg, section), attr) or "")
+              for key, section, attr in _SETTING_FIELDS}
+    for name, jql in (cfg.jira.views or {}).items():
+        values[f"jira.views.{name}"] = jql
+    store.set_workspace_settings(workspace.id, values)
+
+
+def migrate_legacy_config(store: Store, workspace: Workspace | None = None) -> tuple[int, int]:
+    """Перенести глобальный config.toml + секреты из keyring в воркспейс.
+
+    Возвращает (перенесено настроек, перенесено секретов). Повторный вызов ничего не
+    делает — сторожевой флаг в meta. Keyring НЕ чистим: откат на старую версию jwu
+    должен оставаться возможным.
+    """
+    if store.get_meta(LEGACY_MIGRATED_META) == "1":
+        return (0, 0)
+    workspace = workspace or store.get_workspace_by_slug(DEFAULT_SLUG)
+    if workspace is None:
+        return (0, 0)
+
+    cfg = load_config()  # глобальный config.toml + KeyringSecrets
+    save_workspace_config(store, workspace, cfg)
+    moved = 0
+    for slot in secrets_mod.SECRET_SLOTS:
+        ref = _keyring_ref(cfg, slot)
+        if ref is None:
+            continue
+        value = secrets_mod.get_secret(*ref)
+        if value:
+            store.set_workspace_secret(workspace.id, slot, value)
+            moved += 1
+    store.set_meta(LEGACY_MIGRATED_META, "1")
+    return (len(_SETTING_FIELDS), moved)
+
+
+def _keyring_ref(cfg: Config, slot: str):
+    from .config import slot_keyring_ref
+
+    return slot_keyring_ref(cfg, slot)
 
 
 def create(

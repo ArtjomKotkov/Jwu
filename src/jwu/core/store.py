@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     value        TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (workspace_id, key)
 );
+CREATE TABLE IF NOT EXISTS workspace_secrets (
+    workspace_id INTEGER NOT NULL,
+    slot         TEXT NOT NULL,
+    value        TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, slot)
+);
 CREATE TABLE IF NOT EXISTS sync_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at   TEXT NOT NULL,
@@ -208,7 +215,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -277,9 +284,23 @@ def _m003_features(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_feature ON jobs(feature_id)")
 
 
+def _m004_secrets(conn: sqlite3.Connection) -> None:
+    """v3 → v4: секреты воркспейсов живут в БД (таблица создаётся в SCHEMA).
+
+    Сам перенос из keyring делает ``workspaces.migrate_legacy_config`` — он требует
+    конфига, а миграции схемы намеренно ничего о нём не знают.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS workspace_secrets ("
+        " workspace_id INTEGER NOT NULL, slot TEXT NOT NULL, value TEXT NOT NULL,"
+        " updated_at TEXT NOT NULL, PRIMARY KEY (workspace_id, slot))"
+    )
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
+    (4, _m004_secrets),
 ]
 
 
@@ -290,9 +311,23 @@ class Store:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._restrict_permissions()
         self._migrate()
         self.conn.commit()
         self.workspace_id = workspace_id or self._default_workspace_id()
+
+    def _restrict_permissions(self) -> None:
+        """0600 на файлы БД: в ней лежат секреты воркспейсов в открытом виде.
+
+        Не критично, если не вышло (Windows, сетевая ФС, чужой владелец) — молча пропускаем.
+        """
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{self.path}{suffix}")
+            try:
+                if path.exists():
+                    path.chmod(0o600)
+            except OSError:
+                pass
 
     def use_workspace(self, workspace_id: int) -> None:
         """Переключить скоуп уже открытого соединения (смена воркспейса в TUI)."""
@@ -467,6 +502,7 @@ class Store:
                 self.conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace_id,))
         self.conn.execute("DELETE FROM workspace_paths WHERE workspace_id = ?", (workspace_id,))
         self.conn.execute("DELETE FROM workspace_settings WHERE workspace_id = ?", (workspace_id,))
+        self.conn.execute("DELETE FROM workspace_secrets WHERE workspace_id = ?", (workspace_id,))
         self.conn.execute(
             "DELETE FROM meta WHERE key LIKE ?", (f"w{workspace_id}:%",)
         )
@@ -526,6 +562,39 @@ class Store:
             [(workspace_id, k, v) for k, v in values.items()],
         )
         self.conn.commit()
+
+    # --- секреты воркспейса (плайнтекст в БД; см. chmod 600 в __init__) --- #
+
+    def get_workspace_secret(self, workspace_id: int, slot: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM workspace_secrets WHERE workspace_id = ? AND slot = ?",
+            (workspace_id, slot),
+        ).fetchone()
+        return (row["value"] or None) if row else None
+
+    def set_workspace_secret(self, workspace_id: int, slot: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO workspace_secrets (workspace_id, slot, value, updated_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(workspace_id, slot) DO UPDATE SET"
+            " value = excluded.value, updated_at = excluded.updated_at",
+            (workspace_id, slot, value, _now()),
+        )
+        self.conn.commit()
+
+    def delete_workspace_secret(self, workspace_id: int, slot: str) -> None:
+        self.conn.execute(
+            "DELETE FROM workspace_secrets WHERE workspace_id = ? AND slot = ?",
+            (workspace_id, slot),
+        )
+        self.conn.commit()
+
+    def workspace_secrets(self, workspace_id: int) -> dict[str, str]:
+        """Все секреты воркспейса. Вызывающий обязан не печатать их без спроса."""
+        rows = self.conn.execute(
+            "SELECT slot, value FROM workspace_secrets WHERE workspace_id = ?", (workspace_id,)
+        ).fetchall()
+        return {r["slot"]: r["value"] for r in rows}
 
     # --- запись синка --------------------------------------------------- #
 
