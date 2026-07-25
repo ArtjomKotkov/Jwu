@@ -432,6 +432,9 @@ class Workspace(BaseModel):
     created_at: str = ""
     updated_at: str = ""
     paths: list[WorkspacePath] = Field(default_factory=list)
+    # Счётчик работ для списков/экрана выбора: заполняется вызывающим по требованию
+    # (Store сам его не считает — это лишний запрос на каждое чтение воркспейса).
+    jobs_count: int = 0
 
     @property
     def label(self) -> str:
