@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import webbrowser
 import zlib
+from pathlib import Path
 from datetime import datetime, timezone
 from time import monotonic
 from typing import Callable, Optional
@@ -39,13 +40,21 @@ from .copy_modal import (
 )
 from ..core.models import (
     JOB_RECORD_BADGES,
+    LOCAL_FEATURE_BADGES,
     Analysis,
     Comment,
     Issue,
     Job,
+    LocalFeature,
     PR,
     PRComment,
+    WorkspacePath,
     classify_attachment,
+)
+from .workspace_screens import (
+    FeatureDetailScreen,
+    TextPromptScreen,
+    WorkspacePickerScreen,
 )
 from ..core.service import DashboardData, PRDetail
 from ..core.ui_prefs import UIPrefs, load_ui_prefs, save_ui_prefs
@@ -82,15 +91,23 @@ DELTA_ICON = {
 ATTACH_ICON = {"image": "🖼", "log": "📄", "doc": "📕", "archive": "🗜", "video": "🎬", "other": "📎"}
 
 # pane id -> (table id, kind, section-токен)
+# Набор ПОЛНЫЙ всегда: вкладки не создаются/не удаляются, а прячутся (см.
+# _apply_tab_visibility) — так compose/on_mount остаются простыми и предсказуемыми.
 TABS = {
+    "tab-workspace": ("t-workspace", "path", "workspace"),
     "tab-mine": ("t-mine", "issue", "mine"),
     "tab-mentions": ("t-mentions", "mention", "mentions"),
+    "tab-features": ("t-features", "feature", "features"),
     "tab-prs-mine": ("t-prs-mine", "pr", "prs_mine"),
     "tab-prs-review": ("t-prs-review", "pr", "prs_review"),
     "tab-analysis": ("t-analysis", "analysis", "analysis"),
     "tab-jobs": ("t-jobs", "job", "jobs"),
 }
 _TAB_ORDER = tuple(TABS.keys())
+
+# Вкладки, которые видны только при подключённой интеграции воркспейса.
+JIRA_TABS = ("tab-mine", "tab-mentions")
+BITBUCKET_TABS = ("tab-prs-mine", "tab-prs-review")
 
 
 class DashboardTable(DataTable):
@@ -108,7 +125,9 @@ MENTION_COLUMNS = ["Когда", "Задача", "Упоминание"]
 PR_MINE_COLUMNS = ["PR", "Конфликт", "Задача", "Назначен", "Статус", "Title", "Ревью"]
 PR_REVIEW_COLUMNS = ["PR", "Конфликт", "Title", "Ревью"]
 ANALYSIS_COLUMNS = ["ID", "Дата/время", "Заголовок"]
-JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Задача", "PR", "Title"]
+JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Якорь", "PR", "Title"]
+PATH_COLUMNS = ["Папка", "Метка", "Состояние", "Добавлена"]
+FEATURE_COLUMNS = ["Ключ", "Обновлена", "Статус", "Приоритет", "Название"]
 
 
 from ..core.dates import fmt_ago as _fmt_ago, fmt_dt as _fmt_dt  # noqa: E402
@@ -1224,6 +1243,10 @@ class JwuDashboard(App):
         Binding("x", "close_job", "Закрыть работу"),
         Binding("d", "finish_job", "✓ Завершить работу"),
         Binding("D", "delete_job", "✕ Удалить работу"),
+        Binding("D", "remove_path", "✕ Отвязать папку"),
+        Binding("W", "pick_workspace", "Воркспейс"),
+        Binding("a", "add_path", "Добавить папку"),
+        Binding("N", "new_feature", "Новая фича"),
         Binding("[", "tab_prev", "← вкладка"),
         Binding("]", "tab_next", "→ вкладка"),
         Binding("y", "copy_issue_key", "Копировать ключ"),
@@ -1244,6 +1267,19 @@ class JwuDashboard(App):
         job_status_fn: Optional[Callable[[int, str], None]] = None,
         ack_changes_fn: Optional[Callable[[], DashboardData]] = None,
         clear_changes_fn: Optional[Callable[[list[tuple[str, str]]], DashboardData]] = None,
+        # воркспейсы и локальные фичи — тоже только через callable (TUI не знает про БД)
+        workspaces_fn: Optional[Callable[[], list]] = None,
+        workspace_switch_fn: Optional[Callable[[int], DashboardData]] = None,
+        workspace_create_fn: Optional[Callable[[str], None]] = None,
+        path_add_fn: Optional[Callable[[int, str], DashboardData]] = None,
+        path_remove_fn: Optional[Callable[[int, str], DashboardData]] = None,
+        feature_get_fn: Optional[Callable[[int], object]] = None,
+        feature_jobs_fn: Optional[Callable[[int], list]] = None,
+        feature_create_fn: Optional[Callable[[str], None]] = None,
+        feature_status_fn: Optional[Callable[[int, str], None]] = None,
+        feature_edit_fn: Optional[Callable[[int, str], None]] = None,
+        cwd: str = "",
+        start_with_picker: bool = False,
         jira_base: str = "",
         env_label: str = "",
         auto_update: bool = False,
@@ -1268,6 +1304,18 @@ class JwuDashboard(App):
         self._job_status_fn = job_status_fn
         self._ack_changes_fn = ack_changes_fn
         self._clear_changes_fn = clear_changes_fn
+        self._workspaces_fn = workspaces_fn
+        self._workspace_switch_fn = workspace_switch_fn
+        self._workspace_create_fn = workspace_create_fn
+        self._path_add_fn = path_add_fn
+        self._path_remove_fn = path_remove_fn
+        self._feature_get_fn = feature_get_fn
+        self._feature_jobs_fn = feature_jobs_fn
+        self._feature_create_fn = feature_create_fn
+        self._feature_status_fn = feature_status_fn
+        self._feature_edit_fn = feature_edit_fn
+        self.cwd = cwd
+        self._start_with_picker = start_with_picker
         self.jira_base = jira_base.rstrip("/")
         self.env_label = env_label
         self.auto_update = auto_update
@@ -1298,10 +1346,18 @@ class JwuDashboard(App):
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             with TabbedContent(id="tabs"):
+                with TabPane("Workspace", id="tab-workspace"):
+                    # единственная вкладка с шапкой над таблицей: без неё непонятно,
+                    # в каком контуре ты вообще находишься
+                    with Vertical():
+                        yield Static(id="ws-head")
+                        yield DashboardTable(id="t-workspace")
                 with TabPane("Мои задачи", id="tab-mine"):
                     yield DashboardTable(id="t-mine")
                 with TabPane("Упоминания", id="tab-mentions"):
                     yield DashboardTable(id="t-mentions")
+                with TabPane("Фичи", id="tab-features"):
+                    yield DashboardTable(id="t-features")
                 with TabPane("PR: мои", id="tab-prs-mine"):
                     yield DashboardTable(id="t-prs-mine")
                 with TabPane("PR: на ревью", id="tab-prs-review"):
@@ -1333,11 +1389,17 @@ class JwuDashboard(App):
                 cols = PR_MINE_COLUMNS if table_id == "t-prs-mine" else PR_REVIEW_COLUMNS
             else:
                 cols = {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS,
-                        "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS}[kind]
+                        "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS,
+                        "path": PATH_COLUMNS, "feature": FEATURE_COLUMNS}[kind]
             for col in cols:
                 table.add_column(col, key=col)
+        self._apply_tab_visibility()
+        self.query_one("#tabs", TabbedContent).active = self._initial_tab()
         self._render()
-        self.query_one("#t-mine", DataTable).focus()
+        self._focus_active_table()
+        if self._start_with_picker:
+            # воркспейс не определился — показываем выбор поверх пустого дашборда
+            self.call_after_refresh(self.action_pick_workspace)
         self.set_interval(1.0, self._update_status)  # живой таймер/счётчик в статус-строке
         if self.auto_update:
             if self._memory_fn is not None:
@@ -1368,13 +1430,65 @@ class JwuDashboard(App):
 
     def _data_for(self, section: str) -> list:
         return {
+            "workspace": self.data.paths,
             "mine": self.data.mine,
             "mentions": self.data.mentions,
+            "features": self.data.features,
             "prs_mine": self.data.prs_mine,
             "prs_review": self.data.prs_review,
             "analysis": self.data.analyses,
             "jobs": self.data.jobs,
         }[section]
+
+    # --- видимость вкладок ----------------------------------------------- #
+
+    def _visible_tabs(self) -> tuple[str, ...]:
+        """Вкладки, актуальные для текущего воркспейса, в фиксированном порядке.
+
+        Вкладки отключённой интеграции прячем, а не показываем пустыми: в личном
+        воркспейсе «PR: на ревью» — это шум, а не подсказка. Локальные фичи, наоборот,
+        нужны именно там, где Jira нет (иначе они дублировали бы задачи).
+        """
+        hidden: set[str] = set()
+        if not self.data.jira_enabled:
+            hidden |= set(JIRA_TABS)
+        else:
+            hidden.add("tab-features")
+        if not self.data.bitbucket_enabled:
+            hidden |= set(BITBUCKET_TABS)
+        return tuple(pane for pane in _TAB_ORDER if pane not in hidden)
+
+    def _initial_tab(self) -> str:
+        """Вкладка при старте: сразу к работе, а не к структуре воркспейса.
+
+        «Workspace» стоит первой в порядке (её удобно листать влево), но открывать
+        дашборд каждый раз на списке папок незачем — там справочная информация.
+        """
+        visible = self._visible_tabs()
+        for candidate in ("tab-mine", "tab-features", "tab-jobs"):
+            if candidate in visible:
+                return candidate
+        return visible[0] if visible else "tab-workspace"
+
+    def _apply_tab_visibility(self) -> None:
+        tabs = self.query_one("#tabs", TabbedContent)
+        visible = self._visible_tabs()
+        for pane_id in _TAB_ORDER:
+            try:
+                (tabs.show_tab if pane_id in visible else tabs.hide_tab)(pane_id)
+            except Exception:  # noqa: BLE001 — вкладки может не быть в урезанной сборке
+                pass
+        if visible and tabs.active not in visible:
+            tabs.active = self._initial_tab()
+
+    def _focus_active_table(self) -> None:
+        spec = TABS.get(self.query_one("#tabs", TabbedContent).active)
+        if not spec:
+            return
+        try:
+            self.query_one(f"#{spec[0]}", DataTable).focus()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _compute_deltas_by_section(self) -> None:
         """Разложить дельты по вкладкам (по принадлежности key/id к спискам вкладки)."""
@@ -1388,7 +1502,8 @@ class JwuDashboard(App):
         prm_ids = {p.id for p in self.data.prs_mine}
         prr_ids = {p.id for p in self.data.prs_review}
         by: dict[str, list] = {s: [] for s in
-                               ("mine", "mentions", "prs_mine", "prs_review", "analysis", "jobs")}
+                               ("workspace", "mine", "mentions", "features",
+                                "prs_mine", "prs_review", "analysis", "jobs")}
         for d in deltas:
             if d.section:  # дельта исчезновения (gone/pr_gone) — сущности в списке уже нет
                 if d.section in by:
@@ -1412,6 +1527,7 @@ class JwuDashboard(App):
     def _render(self) -> None:
         self._compute_deltas_by_section()
         self._render_changes()
+        self._render_workspace_head()
         for pane_id, (table_id, kind, section) in TABS.items():
             items = self._sorted(table_id, kind, self._data_for(section))
             if kind == "issue":
@@ -1422,6 +1538,10 @@ class JwuDashboard(App):
                 self._fill_prs(table_id, items)
             elif kind == "job":
                 self._fill_jobs(table_id, items)
+            elif kind == "path":
+                self._fill_paths(table_id, items)
+            elif kind == "feature":
+                self._fill_features(table_id, items)
             else:
                 self._fill_analyses(table_id, items)
             badge = len(self._deltas_by_section.get(section, []))
@@ -1700,11 +1820,66 @@ class JwuDashboard(App):
                 Text(str(j.id), style="cyan"),
                 Text(_fmt_dt(j.updated_at), style="dim"),
                 Text(j.status, style=status_color(j.status)),
-                Text(j.task_key),
+                Text(j.anchor),
                 Text(prs),
                 Text(j.title or "—"),
             )
         self._rows[table_id] = list(jobs)
+        self._restore_cursor(table, cur)
+
+    def _render_workspace_head(self) -> None:
+        """Шапка вкладки Workspace: что за контур и что в нём подключено."""
+        try:
+            head = self.query_one("#ws-head", Static)
+        except Exception:  # noqa: BLE001 — шапки нет в урезанных тестовых сборках
+            return
+        ws = self.data.workspace
+        if ws is None:
+            head.update("[dim]Воркспейс не выбран (W — выбрать).[/dim]")
+            return
+        yes = "[green]да[/green]"
+        no = "[dim]нет[/dim]"
+        active_jobs = len([j for j in self.data.jobs if j.status == "active"])
+        lines = [
+            f"[b]{escape(ws.name or ws.slug)}[/b] [dim]({escape(ws.slug)})[/dim]",
+            f"[dim]Jira:[/dim] {yes if ws.jira_enabled else no}   "
+            f"[dim]Bitbucket:[/dim] {yes if ws.bitbucket_enabled else no}   "
+            f"[dim]папок:[/dim] {len(self.data.paths)}   "
+            f"[dim]работ:[/dim] {len(self.data.jobs)} (активных {active_jobs})",
+            "[dim]W — сменить воркспейс · a — добавить папку · D — отвязать · o — открыть[/dim]",
+        ]
+        head.update(Text.from_markup("\n".join(lines)))
+
+    def _fill_paths(self, table_id: str, paths: list) -> None:
+        table = self.query_one(f"#{table_id}", DataTable)
+        cur = table.cursor_row
+        table.clear()
+        for p in paths:
+            exists = Path(p.path).exists()
+            table.add_row(
+                Text(p.path),
+                Text(p.label or "—", style="dim"),
+                Text("есть" if exists else "нет на диске",
+                     style="green" if exists else "yellow"),
+                Text(_fmt_dt(p.added_at), style="dim"),
+            )
+        self._rows[table_id] = list(paths)
+        self._restore_cursor(table, cur)
+
+    def _fill_features(self, table_id: str, features: list) -> None:
+        table = self.query_one(f"#{table_id}", DataTable)
+        cur = table.cursor_row
+        table.clear()
+        for f in features:
+            label, color = LOCAL_FEATURE_BADGES.get(f.status, (f.status, "white"))
+            table.add_row(
+                Text(f.key, style="cyan"),
+                Text(_fmt_dt(f.updated_at), style="dim"),
+                Text(label, style=color),
+                Text(f.priority or "—", style="dim"),
+                Text(f.title or "—"),
+            )
+        self._rows[table_id] = list(features)
         self._restore_cursor(table, cur)
 
     def _fill_analyses(self, table_id: str, analyses: list[Analysis]) -> None:
@@ -1724,13 +1899,13 @@ class JwuDashboard(App):
 
     def action_tab_next(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
-        order = _TAB_ORDER
+        order = self._visible_tabs() or _TAB_ORDER
         idx = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(idx + 1) % len(order)]
 
     def action_tab_prev(self) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
-        order = _TAB_ORDER
+        order = self._visible_tabs() or _TAB_ORDER
         idx = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(idx - 1) % len(order)]
 
@@ -1774,6 +1949,11 @@ class JwuDashboard(App):
         elif isinstance(obj, Job):
             self.push_screen(JobDetailScreen(
                 obj.id, get_fn=self._job_get_fn, jira_base=self.jira_base,
+                refresh_interval=local_iv))
+        elif isinstance(obj, LocalFeature):
+            self.push_screen(FeatureDetailScreen(
+                obj.id, get_fn=self._feature_get_fn, jobs_fn=self._feature_jobs_fn,
+                status_fn=self._feature_status_fn, edit_fn=self._feature_edit_fn,
                 refresh_interval=local_iv))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -1902,13 +2082,20 @@ class JwuDashboard(App):
             webbrowser.open(f"{self.jira_base}/browse/{obj.key}")
         elif isinstance(obj, PR) and obj.url:
             webbrowser.open(obj.url)
+        elif isinstance(obj, WorkspacePath) and Path(obj.path).exists():
+            # папку открываем файловым менеджером ОС — без subprocess
+            webbrowser.open(f"file://{obj.path}")
 
     def action_copy_issue_key(self) -> None:
         obj = self._selected_obj()
         if isinstance(obj, Issue):
             notify_copied(self, obj.key)
-        elif isinstance(obj, Job) and obj.task_key:
-            notify_copied(self, obj.task_key)
+        elif isinstance(obj, LocalFeature):
+            notify_copied(self, obj.key)
+        elif isinstance(obj, Job) and obj.anchor:
+            notify_copied(self, obj.anchor)
+        elif isinstance(obj, WorkspacePath):
+            notify_copied(self, obj.path)
 
     def action_copy_menu(self) -> None:
         obj = self._selected_obj()
@@ -1951,6 +2138,22 @@ class JwuDashboard(App):
                 return True if self._active()[2] == "jobs" else None
             except Exception:  # noqa: BLE001
                 return None
+        # `D` делит клавишу с удалением работы: на вкладке Workspace это отвязка папки
+        if action == "add_path":
+            try:
+                return True if self._active()[2] == "workspace" else None
+            except Exception:  # noqa: BLE001
+                return None
+        if action in ("new_feature",):
+            try:
+                return True if self._active()[2] == "features" else None
+            except Exception:  # noqa: BLE001
+                return None
+        if action == "remove_path":
+            try:
+                return True if self._active()[2] == "workspace" else None
+            except Exception:  # noqa: BLE001
+                return None
         if action == "copy_issue_key":
             try:
                 obj = self._selected_obj()
@@ -1964,6 +2167,87 @@ class JwuDashboard(App):
             except Exception:  # noqa: BLE001
                 return None
         return True
+
+    # --- воркспейс и локальные фичи -------------------------------------- #
+
+    def action_pick_workspace(self) -> None:
+        if self._workspaces_fn is None or self._workspace_switch_fn is None:
+            return
+        self.push_screen(WorkspacePickerScreen(
+            workspaces_fn=self._workspaces_fn,
+            choose_fn=self._switch_workspace,
+            create_fn=self._workspace_create_fn,
+            bind_cwd_fn=self._bind_cwd,
+            cwd=self.cwd,
+            at_startup=self._start_with_picker and self.data.workspace is None,
+        ))
+
+    def _switch_workspace(self, workspace_id: int) -> None:
+        if self._workspace_switch_fn is None:
+            return
+        try:
+            data = self._workspace_switch_fn(workspace_id)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(str(exc), title="Не удалось сменить воркспейс", severity="error")
+            return
+        self._start_with_picker = False
+        self._apply_data(data)
+        self._apply_tab_visibility()
+        self._focus_active_table()
+        name = data.workspace.slug if data.workspace else "?"
+        self.query_one("#status", Static).update(f"воркспейс: {name}")
+
+    def _bind_cwd(self, workspace_id: int) -> None:
+        if self._path_add_fn is None or not self.cwd:
+            return
+        try:
+            data = self._path_add_fn(workspace_id, self.cwd)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(str(exc), title="Не удалось привязать папку", severity="error")
+            return
+        self._apply_data(data)
+
+    def action_add_path(self) -> None:
+        """Добавить папку в текущий воркспейс (только на вкладке Workspace)."""
+        ws = self.data.workspace
+        if ws is None or self._path_add_fn is None:
+            return
+
+        def do(path: str) -> None:
+            try:
+                data = self._path_add_fn(ws.id, path)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                self.notify(str(exc), title="Не удалось добавить папку", severity="error")
+                return
+            self._apply_data(data)
+
+        self.push_screen(TextPromptScreen(
+            "Папка воркспейса", value=self.cwd, placeholder="/path/to/repo", on_submit=do))
+
+    def action_remove_path(self) -> None:
+        path_row = self._selected_obj()
+        ws = self.data.workspace
+        if ws is None or path_row is None or self._path_remove_fn is None:
+            return
+        target = getattr(path_row, "path", None)
+        if not target:
+            return
+
+        def do() -> None:
+            self._apply_data(self._path_remove_fn(ws.id, target))  # type: ignore[misc]
+
+        self.push_screen(ConfirmScreen(f"Отвязать папку {target} от воркспейса?", do))
+
+    def action_new_feature(self) -> None:
+        if self._feature_create_fn is None:
+            return
+
+        def do(title: str) -> None:
+            self._feature_create_fn(title)  # type: ignore[misc]
+            self._run_memory_refresh()
+
+        self.push_screen(TextPromptScreen(
+            "Новая фича", placeholder="что нужно сделать", on_submit=do))
 
     def action_close_job(self) -> None:
         job = self._selected_obj()
@@ -2106,8 +2390,10 @@ class JwuDashboard(App):
 
 
 _TAB_TITLE = {
+    "tab-workspace": "Workspace",
     "tab-mine": "Мои задачи",
     "tab-mentions": "Упоминания",
+    "tab-features": "Фичи",
     "tab-prs-mine": "PR: мои",
     "tab-prs-review": "PR: на ревью",
     "tab-analysis": "Анализ",

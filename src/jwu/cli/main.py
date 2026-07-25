@@ -1291,7 +1291,9 @@ def _full_sync_dashboard() -> DashboardData:
     а не печатает в stderr поверх TUI (иначе в уведомление прилетала пустая строка).
     """
     _prepare_db()
-    with Service.from_config(load_config()) as svc:
+    with Store(str(db_path())) as probe:
+        ws = workspaces.resolve_workspace(probe, explicit=_WORKSPACE_ARG)
+    with Service.for_workspace(ws) as svc:
         svc.sync()
         return svc.dashboard()
 
@@ -1348,14 +1350,26 @@ def dashboard(
         return
 
     # TUI: начальные данные — из памяти (без токенов); refresh активной вкладки — по сети, лениво.
-    if do_sync:
-        data = _initial_sync()
-    else:
-        with _store() as store:
-            data = dashboard_from_memory(store)
-    cfg = load_config()
+    # Если воркспейс определить не удалось (папка ни к одному не привязана и активного нет) —
+    # не падаем, а стартуем с экрана выбора: дашборд без контура показывать нечего.
+    needs_picker = False
+    try:
+        with _open_store() as store:
+            ws = workspaces.resolve_workspace(store, explicit=_WORKSPACE_ARG)
+            store.use_workspace(ws.id)
+            data = _initial_sync() if do_sync else dashboard_from_memory(store)
+            cfg = workspaces.config_for_workspace(store, ws)
+    except workspaces.WorkspaceNotSelected:
+        needs_picker = True
+        data = DashboardData()
+        cfg = load_config()
 
     from .dashboard import JwuDashboard  # ленивый импорт textual
+
+    env_label = ""
+    if cfg.jira.base_url:
+        env_label = (f"{cfg.jira.project} @ "
+                     f"{urlparse(cfg.jira.base_url).netloc or cfg.jira.base_url}")
 
     JwuDashboard(
         data,
@@ -1369,8 +1383,20 @@ def dashboard(
         job_status_fn=_job_set_status,
         ack_changes_fn=_ack_changes,
         clear_changes_fn=_clear_changes,
+        workspaces_fn=_tui_workspaces,
+        workspace_switch_fn=_tui_switch_workspace,
+        workspace_create_fn=_tui_create_workspace,
+        path_add_fn=_tui_add_path,
+        path_remove_fn=_tui_remove_path,
+        feature_get_fn=_feature_get,
+        feature_jobs_fn=_feature_jobs,
+        feature_create_fn=_feature_create,
+        feature_status_fn=_feature_set_status,
+        feature_edit_fn=_feature_set_title,
+        cwd=str(Path.cwd()),
+        start_with_picker=needs_picker,
         jira_base=cfg.jira.base_url,
-        env_label=f"{cfg.jira.project} @ {urlparse(cfg.jira.base_url).netloc or cfg.jira.base_url}",
+        env_label=env_label,
         auto_update=auto_update,
         fast_interval=fast_interval,
         slow_interval=slow_interval,
@@ -1412,6 +1438,80 @@ def _job_set_status(job_id: int, status: str) -> None:
     """Сменить статус работы (для кнопки «закрыть» в TUI)."""
     with _store() as store:
         store.set_job_status(job_id, status)
+
+
+# --- колбэки TUI по воркспейсам и фичам ------------------------------------- #
+# Смена воркспейса в TUI = подмена глобального выбора для последующих вызовов:
+# все остальные колбэки ходят через _store(), который читает _WORKSPACE_ARG.
+
+
+def _tui_workspaces() -> list[Workspace]:
+    """Список воркспейсов со счётчиком работ (для экрана выбора)."""
+    with _open_store() as store:
+        items = store.list_workspaces()
+        for ws in items:
+            store.use_workspace(ws.id)
+            ws.jobs_count = len(store.list_jobs())
+        return items
+
+
+def _tui_switch_workspace(workspace_id: int) -> DashboardData:
+    global _WORKSPACE_ARG
+    with _open_store() as store:
+        ws = store.get_workspace(workspace_id)
+        if ws is None:
+            raise ValueError(f"воркспейс #{workspace_id} не найден")
+        _WORKSPACE_ARG = ws.slug
+        workspaces.set_active(store, ws)
+        store.use_workspace(ws.id)
+        return dashboard_from_memory(store)
+
+
+def _tui_create_workspace(slug: str) -> None:
+    with _open_store() as store:
+        workspaces.create(store, slug)
+
+
+def _tui_add_path(workspace_id: int, path: str) -> DashboardData:
+    with _open_store() as store:
+        ws = store.get_workspace(workspace_id)
+        if ws is None:
+            raise ValueError(f"воркспейс #{workspace_id} не найден")
+        workspaces.add_path(store, ws, path)
+        store.use_workspace(ws.id)
+        return dashboard_from_memory(store)
+
+
+def _tui_remove_path(workspace_id: int, path: str) -> DashboardData:
+    with _open_store() as store:
+        store.remove_workspace_path(path, workspace_id)
+        store.use_workspace(workspace_id)
+        return dashboard_from_memory(store)
+
+
+def _feature_get(feature_id: int):
+    with _store() as store:
+        return store.get_feature(feature_id)
+
+
+def _feature_jobs(feature_id: int) -> list[Job]:
+    with _store() as store:
+        return store.list_jobs(feature_id=feature_id)
+
+
+def _feature_create(title: str) -> None:
+    with _store() as store:
+        store.create_feature(title)
+
+
+def _feature_set_status(feature_id: int, status: str) -> None:
+    with _store() as store:
+        store.update_feature(feature_id, status=status)
+
+
+def _feature_set_title(feature_id: int, title: str) -> None:
+    with _store() as store:
+        store.update_feature(feature_id, title=title)
 
 
 # --------------------------------------------------------------------------- #
