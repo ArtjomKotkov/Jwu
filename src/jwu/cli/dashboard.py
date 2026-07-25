@@ -1337,6 +1337,7 @@ class JwuDashboard(App):
         # путь папки → найденные в ней репозитории; None = ещё не индексировали
         self._git_index: dict[str, list] = {}
         self._tree_roots: list[str] = []   # корни дерева структуры (папки воркспейса)
+        self._loading_workspace = False    # идёт смена контура (показываем маркер)
         self._rows: dict[str, list] = {}        # table id -> объекты (Issue|PR) по строкам
         self._sort: dict[str, tuple[int, bool]] = {}  # table id -> (колонка, reverse)
         self._changed_issue_keys: set[str] = set()
@@ -1645,6 +1646,9 @@ class JwuDashboard(App):
 
     def _update_status(self) -> None:
         status = self.query_one("#status", Static)
+        if self._loading_workspace:
+            status.update("[yellow]⟳ переключаю воркспейс, читаю данные…[/yellow]")
+            return
         user_block = self._user_block()
         # Две строки состояния показываются всегда — состояние памяти и состояние сети
         # независимы. Если идёт один из синков — подменяется только его строка.
@@ -2292,17 +2296,38 @@ class JwuDashboard(App):
         ))
 
     def _switch_workspace(self, workspace_id: int) -> None:
+        """Смена контура: чтение из БД уходит в поток, экран сразу говорит «загружаю».
+
+        На большой базе снимок собирается заметное время, и без явного маркера
+        переключение выглядит зависанием.
+        """
         if self._workspace_switch_fn is None:
             return
+        self._loading_workspace = True
+        self._update_status()
+        self._load_workspace(workspace_id)
+
+    @work(thread=True, exclusive=True, group="switch-workspace")
+    def _load_workspace(self, workspace_id: int) -> None:
         try:
-            data = self._workspace_switch_fn(workspace_id)
+            data = self._workspace_switch_fn(workspace_id)  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001
-            self.notify(str(exc), title="Не удалось сменить воркспейс", severity="error")
+            self.call_from_thread(self._workspace_switch_failed, str(exc))
             return
+        self.call_from_thread(self._workspace_switched, data)
+
+    def _workspace_switch_failed(self, error: str) -> None:
+        self._loading_workspace = False
+        self.notify(error, title="Не удалось сменить воркспейс", severity="error")
+        self._update_status()
+
+    def _workspace_switched(self, data: DashboardData) -> None:
+        self._loading_workspace = False
         self._start_with_picker = False
         self._apply_data(data)
         self._apply_tab_visibility()
         self._focus_active_table()
+        self._run_reindex()  # у нового контура свои папки — переиндексировать
         name = data.workspace.slug if data.workspace else "?"
         self.query_one("#status", Static).update(f"воркспейс: {name}")
 
