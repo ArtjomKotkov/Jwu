@@ -2320,3 +2320,71 @@ def test_tree_rebuild_keeps_expanded_nodes(tmp_path):
             await pilot.press("q")
 
     asyncio.run(run())
+
+
+def test_workspace_switch_shows_loading_marker(tmp_path):
+    """Смена контура не должна выглядеть зависанием: сразу показываем маркер."""
+    import threading
+
+    from jwu.core import workspaces
+    from textual.widgets import Static
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home", name="Личное")
+    store.use_workspace(home.id)
+    home_data = dashboard_from_memory(store)
+    work = store.get_workspace_by_slug("work")
+    store.use_workspace(work.id)
+    work_data = dashboard_from_memory(store)
+    store.close()
+
+    release = threading.Event()
+    seen: list[str] = []
+
+    def slow_switch(workspace_id):
+        release.wait(timeout=5)      # имитируем медленное чтение большой базы
+        return home_data
+
+    app = JwuDashboard(work_data, workspace_switch_fn=slow_switch)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._switch_workspace(home.id)
+            await pilot.pause()
+            seen.append(str(app.query_one("#status", Static).render()))
+            release.set()
+            for _ in range(20):      # ждём завершения фонового чтения
+                await pilot.pause()
+                if not app._loading_workspace:
+                    break
+            seen.append(str(app.query_one("#status", Static).render()))
+            assert app.data.workspace.slug == "home"
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert "переключаю воркспейс" in seen[0]        # пока грузится — явный маркер
+    assert "переключаю воркспейс" not in seen[1]    # после загрузки маркер снят
+
+
+def test_workspace_switch_error_clears_marker(tmp_path):
+    """Ошибка чтения не должна оставить дашборд с вечным «загружаю»."""
+    store = Store(tmp_path / "state.db")
+    data = dashboard_from_memory(store)
+    store.close()
+
+    def failing(workspace_id):
+        raise RuntimeError("БД недоступна")
+
+    app = JwuDashboard(data, workspace_switch_fn=failing)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._switch_workspace(42)
+            for _ in range(20):
+                await pilot.pause()
+                if not app._loading_workspace:
+                    break
+            assert app._loading_workspace is False
+            await pilot.press("q")
+
+    asyncio.run(run())
