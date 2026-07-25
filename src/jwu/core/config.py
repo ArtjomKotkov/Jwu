@@ -114,6 +114,42 @@ class Config:
     bitbucket: BitbucketConfig = field(default_factory=BitbucketConfig)
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    # Откуда берутся секреты. По умолчанию — системный keyring (как исторически);
+    # для конфига воркспейса подставляется secrets.DbSecrets (см. workspaces.config_for_workspace).
+    secrets: "secrets.SecretSource" = field(default_factory=secrets.KeyringSecrets)
+
+
+# Слот секрета -> где он лежал в keyring: (service, account). Пара вычисляется из конфига,
+# потому что account — это логин/имя аккаунта из соответствующей секции.
+def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
+    section, _, kind = slot.partition(".")
+    if section in ("jira", "sdesk"):
+        sec = cfg.jira if section == "jira" else cfg.sdesk
+        pairs = {
+            "token": (sec.token_service, sec.token_account),
+            "password": (sec.login_service, sec.username),
+            "gate_password": (sec.proxy_basic_service, sec.proxy_basic_user),
+        }
+    elif section == "bitbucket":
+        pairs = {"token": (cfg.bitbucket.token_service, cfg.bitbucket.token_account)}
+    elif section == "jenkins":
+        pairs = {"token": (cfg.jenkins.token_service, cfg.jenkins.username)}
+    else:
+        return None
+    ref = pairs.get(kind)
+    return ref if ref and all(ref) else None
+
+
+def get_slot(cfg: Config, slot: str) -> str | None:
+    """Значение секрета по слоту из настроенного источника (env → источник → keyring)."""
+    return cfg.secrets.get(
+        slot, env_var=secrets.SLOT_ENV.get(slot), keyring_ref=slot_keyring_ref(cfg, slot)
+    )
+
+
+def set_slot(cfg: Config, slot: str, value: str) -> None:
+    """Записать секрет по слоту в настроенный источник."""
+    cfg.secrets.set(slot, value, keyring_ref=slot_keyring_ref(cfg, slot))
 
 
 class ConfigError(RuntimeError):
@@ -157,7 +193,7 @@ def load_config(path: Path | None = None) -> Config:
 
 
 def _apply_raw(cfg: Config, raw: dict) -> Config:
-    """Наложить разобранный TOML (dict) на Config. Общая логика load_config и import_bundle."""
+    """Наложить разобранный TOML (dict) на Config. Общая логика load_config и read_bundle."""
     j = raw.get("jira", {}) or {}
     cfg.jira.base_url = j.get("base_url", cfg.jira.base_url).rstrip("/")
     cfg.jira.project = j.get("project", cfg.jira.project)
@@ -248,12 +284,13 @@ def save_config(cfg: Config, path: Path | None = None) -> Path:
     return path
 
 
-def _require_secret(service: str, account: str, env_var: str) -> str:
-    val = secrets.get_secret(service, account, env_var=env_var)
+def _require_slot(cfg: Config, slot: str) -> str:
+    val = get_slot(cfg, slot)
     if not val:
+        env_var = secrets.SLOT_ENV.get(slot, "")
+        hint = f" или задай переменную окружения {env_var}" if env_var else ""
         raise ConfigError(
-            f"Секрет не найден ({service}). Запусти `jwu configure` "
-            f"или задай переменную окружения {env_var}."
+            f"Секрет не найден ({slot}). Запусти `jwu configure`{hint}."
         )
     return val
 
@@ -264,42 +301,38 @@ def sdesk_enabled(cfg: Config) -> bool:
 
 
 # --- секреты Jira-подобного инстанса (Jira / SDESK) ------------------------- #
-# Обе секции (JiraConfig / SdeskConfig) делят имена полей секретов, поэтому логика
-# доступа к keyring общая и параметризуется самой секцией.
+# Обе секции (JiraConfig / SdeskConfig) устроены одинаково, поэтому логика доступа
+# общая и параметризуется префиксом слота ("jira" | "sdesk").
 
 
-def _section_token(section) -> str:
-    return _require_secret(section.token_service, section.token_account, section.token_env)
-
-
-def _section_login(section) -> tuple[str, str] | None:
-    """Сессионный логин (username из секции, пароль из keyring) или None."""
+def _section_login(cfg: Config, prefix: str) -> tuple[str, str] | None:
+    """Сессионный логин (username из секции, пароль из хранилища) или None."""
+    section = cfg.jira if prefix == "jira" else cfg.sdesk
     if not section.username:
         return None
-    pw = secrets.get_secret(section.login_service, section.username)
+    pw = get_slot(cfg, f"{prefix}.password")
     return (section.username, pw) if pw else None
 
 
-def _section_proxy_basic(section) -> tuple[str, str] | None:
-    """Креды nginx-гейта (proxy_basic_user из секции, пароль из keyring) или None."""
+def _section_proxy_basic(cfg: Config, prefix: str) -> tuple[str, str] | None:
+    """Креды nginx-гейта (proxy_basic_user из секции, пароль из хранилища) или None."""
+    section = cfg.jira if prefix == "jira" else cfg.sdesk
     if not section.proxy_basic_user:
         return None
-    pw = secrets.get_secret(section.proxy_basic_service, section.proxy_basic_user)
+    pw = get_slot(cfg, f"{prefix}.gate_password")
     return (section.proxy_basic_user, pw) if pw else None
 
 
 def jira_token(cfg: Config) -> str:
-    return _section_token(cfg.jira)
+    return _require_slot(cfg, "jira.token")
 
 
 def sdesk_token(cfg: Config) -> str:
-    return _section_token(cfg.sdesk)
+    return _require_slot(cfg, "sdesk.token")
 
 
 def bitbucket_token(cfg: Config) -> str:
-    return _require_secret(
-        cfg.bitbucket.token_service, cfg.bitbucket.token_account, cfg.bitbucket.token_env
-    )
+    return _require_slot(cfg, "bitbucket.token")
 
 
 def jenkins_auth(cfg: Config) -> tuple[str, str] | None:
@@ -310,55 +343,35 @@ def jenkins_auth(cfg: Config) -> tuple[str, str] | None:
     """
     if not cfg.jenkins.username:
         return None
-    token = secrets.get_secret(cfg.jenkins.token_service, cfg.jenkins.username, env_var=cfg.jenkins.token_env)
+    token = get_slot(cfg, "jenkins.token")
     return (cfg.jenkins.username, token) if token else None
 
 
 def jira_login(cfg: Config) -> tuple[str, str] | None:
-    """Сессионный логин Jira (username из конфига, пароль из keyring) или None."""
-    return _section_login(cfg.jira)
+    """Сессионный логин Jira (username из конфига, пароль из хранилища) или None."""
+    return _section_login(cfg, "jira")
 
 
 def jira_proxy_basic(cfg: Config) -> tuple[str, str] | None:
-    """Креды nginx-гейта Jira (proxy_basic_user из конфига, пароль из keyring) или None."""
-    return _section_proxy_basic(cfg.jira)
+    """Креды nginx-гейта Jira (proxy_basic_user из конфига, пароль из хранилища) или None."""
+    return _section_proxy_basic(cfg, "jira")
 
 
 def sdesk_login(cfg: Config) -> tuple[str, str] | None:
-    """Сессионный логин SDESK (username из конфига, пароль из keyring) или None."""
-    return _section_login(cfg.sdesk)
+    """Сессионный логин SDESK (username из конфига, пароль из хранилища) или None."""
+    return _section_login(cfg, "sdesk")
 
 
 def sdesk_proxy_basic(cfg: Config) -> tuple[str, str] | None:
-    """Креды nginx-гейта SDESK (proxy_basic_user из конфига, пароль из keyring) или None."""
-    return _section_proxy_basic(cfg.sdesk)
-
-
-def secret_slots(cfg: Config) -> list[tuple[str, str]]:
-    """Все (service, account) секретов, известных по конфигу (с пустым account отброшены).
-
-    Единый источник правды о том, какие секреты у jwu есть: PAT Jira, сессионный
-    пароль Jira, пароль nginx-гейта, PAT Bitbucket.
-    """
-    pairs = [
-        (cfg.jira.token_service, cfg.jira.token_account),
-        (cfg.jira.login_service, cfg.jira.username),
-        (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user),
-        (cfg.bitbucket.token_service, cfg.bitbucket.token_account),
-        (cfg.jenkins.token_service, cfg.jenkins.username),
-    ]
-    if sdesk_enabled(cfg):
-        pairs += [
-            (cfg.sdesk.token_service, cfg.sdesk.token_account),
-            (cfg.sdesk.login_service, cfg.sdesk.username),
-            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user),
-        ]
-    return [(s, a) for (s, a) in pairs if s and a]
+    """Креды nginx-гейта SDESK (proxy_basic_user из конфига, пароль из хранилища) или None."""
+    return _section_proxy_basic(cfg, "sdesk")
 
 
 def export_bundle(cfg: Config, path: Path) -> int:
-    """Записать переносимый бандл: несекретные поля + СЕКРЕТЫ из keyring (плайнтекст).
+    """Записать переносимый бандл: несекретные поля + СЕКРЕТЫ (плайнтекст).
 
+    Секреты берутся из источника, настроенного в ``cfg`` (БД воркспейса либо keyring),
+    и пишутся слотами — так бандл не зависит от того, где они лежали на этой машине.
     Возвращает число выгруженных секретов. Файл содержит пароли в открытом виде —
     предназначен для переноса между машинами, хранить безопасно.
     """
@@ -389,10 +402,10 @@ def export_bundle(cfg: Config, path: Path) -> int:
         raw["jenkins"] = {"base_url": cfg.jenkins.base_url, "username": cfg.jenkins.username}
 
     sec_list: list[dict] = []
-    for service, account in secret_slots(cfg):
-        val = secrets.get_secret(service, account)
+    for slot in secrets.SECRET_SLOTS:
+        val = get_slot(cfg, slot)
         if val:
-            sec_list.append({"service": service, "account": account, "value": val})
+            sec_list.append({"slot": slot, "value": val})
     raw["secrets"] = sec_list
 
     path = Path(path).expanduser()
@@ -402,11 +415,11 @@ def export_bundle(cfg: Config, path: Path) -> int:
     return len(sec_list)
 
 
-def import_bundle(path: Path) -> tuple[Config, int]:
-    """Прочитать бандл: применить конфиг (в config.toml) и записать секреты в keyring.
+def read_bundle(path: Path) -> tuple[Config, dict[str, str]]:
+    """Прочитать бандл: вернуть (конфиг, секреты по слотам). Ничего никуда не пишет.
 
-    Возвращает (cfg, число записанных секретов). KeyringError при записи секрета
-    пробрасывается наверх — обработает CLI.
+    Понимает и старый формат, где секреты были записаны парой (service, account):
+    такие записи разворачиваются в слоты по тому же конфигу.
     """
     path = Path(path).expanduser()
     if not path.exists():
@@ -417,14 +430,15 @@ def import_bundle(path: Path) -> tuple[Config, int]:
         raw = tomllib.load(fh)
 
     cfg = _apply_raw(Config(), raw)
-    save_config(cfg)
-
-    written = 0
+    by_ref = {slot_keyring_ref(cfg, slot): slot for slot in secrets.SECRET_SLOTS}
+    values: dict[str, str] = {}
     for entry in raw.get("secrets", []) or []:
-        service = entry.get("service")
-        account = entry.get("account")
         value = entry.get("value")
-        if service and account and value:
-            secrets.set_secret(service, account, value)
-            written += 1
-    return cfg, written
+        if not value:
+            continue
+        slot = entry.get("slot")
+        if not slot:  # старый формат: (service, account)
+            slot = by_ref.get((entry.get("service"), entry.get("account")))
+        if slot:
+            values[slot] = value
+    return cfg, values

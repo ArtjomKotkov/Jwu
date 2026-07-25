@@ -108,10 +108,10 @@ def test_jira_login_none_without_password(monkeypatch):
     assert cfgmod.jira_login(cfg) is None
 
 
-def test_export_import_bundle_roundtrip(tmp_path, monkeypatch):
-    """export → import переносит config + ВСЕ секреты (включая гейт) в чистую среду."""
+def test_export_read_bundle_roundtrip(tmp_path, monkeypatch):
+    """export → read переносит config и ВСЕ секреты; секреты адресуются слотами."""
     from jwu.core import secrets
-    from jwu.core.config import export_bundle, import_bundle
+    from jwu.core.config import export_bundle, read_bundle
 
     _mem(monkeypatch)
     cfg_path = tmp_path / "config.toml"
@@ -136,21 +136,18 @@ def test_export_import_bundle_roundtrip(tmp_path, monkeypatch):
     text = bundle.read_text()
     assert "JPW" in text and "GPW" in text  # секреты в бандле (плайнтекст)
 
-    # «новая машина»: пустой keyring + нет config.toml
-    m2 = _mem(monkeypatch)
-    if cfg_path.exists():
-        cfg_path.unlink()
-
-    cfg2, written = import_bundle(bundle)
-    assert written == 4
+    # «новая машина»: пустой keyring — всё нужное приезжает из бандла
+    _mem(monkeypatch)
+    cfg2, values = read_bundle(bundle)
+    assert cfg2.jira.base_url == "https://jira.acme.com"
     assert cfg2.jira.proxy_basic_user == "gateuser"
-
-    loaded = load_config(cfg_path)
-    assert loaded.jira.base_url == "https://jira.acme.com"
-    assert loaded.jira.proxy_basic_user == "gateuser"
-    assert m2.get_password("jira-login", "alice") == "JPW"
-    assert m2.get_password("jira-proxy-basic", "gateuser") == "GPW"
-    assert m2.get_password("bitbucket-pat", "bitbucket") == "BTOK"
+    assert cfg2.bitbucket.repo == "server"
+    assert values == {
+        "jira.token": "JTOK", "jira.password": "JPW",
+        "jira.gate_password": "GPW", "bitbucket.token": "BTOK",
+    }
+    # read_bundle ничего не пишет: config.toml остаётся нетронутым
+    assert not cfg_path.exists()
 
 
 def test_sdesk_disabled_by_default():
@@ -203,9 +200,9 @@ def test_sdesk_secrets_use_own_services(monkeypatch):
     assert cfgmod.jira_login(cfg) is None
 
 
-def test_export_import_includes_sdesk(tmp_path, monkeypatch):
+def test_export_read_bundle_includes_sdesk(tmp_path, monkeypatch):
     from jwu.core import secrets
-    from jwu.core.config import export_bundle, import_bundle, sdesk_enabled
+    from jwu.core.config import export_bundle, read_bundle, sdesk_enabled
 
     _mem(monkeypatch)
     cfg_path = tmp_path / "config.toml"
@@ -228,20 +225,134 @@ def test_export_import_includes_sdesk(tmp_path, monkeypatch):
     assert n == 4  # jira PAT + 3 sdesk-секрета
     assert "SDPW" in bundle.read_text()
 
-    m2 = _mem(monkeypatch)
-    if cfg_path.exists():
-        cfg_path.unlink()
-    cfg2, written = import_bundle(bundle)
-    assert written == 4
+    _mem(monkeypatch)
+    cfg2, values = read_bundle(bundle)
     assert sdesk_enabled(cfg2) is True
     assert cfg2.sdesk.project == "SDESK"
-    assert m2.get_password("sdesk-login", "alice") == "SDPW"
-    assert m2.get_password("sdesk-proxy-basic", "gw") == "SDGPW"
+    assert values["sdesk.password"] == "SDPW"
+    assert values["sdesk.gate_password"] == "SDGPW"
 
 
-def test_import_bundle_missing_file_raises(tmp_path):
-    from jwu.core.config import ConfigError, import_bundle
+def test_read_bundle_missing_file_raises(tmp_path):
+    from jwu.core.config import ConfigError, read_bundle
 
     import pytest
     with pytest.raises(ConfigError):
-        import_bundle(tmp_path / "nope.toml")
+        read_bundle(tmp_path / "nope.toml")
+
+
+# --------------------------------------------------------------------------- #
+# Секреты воркспейса в БД
+# --------------------------------------------------------------------------- #
+
+
+def test_db_secrets_prefer_env_then_db_then_keyring(tmp_path, monkeypatch):
+    """Порядок источников: переменная окружения → БД воркспейса → keyring (фолбэк)."""
+    from jwu.core import secrets as secmod
+    from jwu.core.store import Store
+    from jwu.core.workspaces import config_for_workspace
+
+    m = _mem(monkeypatch)
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+    cfg = config_for_workspace(store, ws)
+
+    # только keyring
+    m.set_password("bitbucket-pat", "bitbucket", "FROM_KEYRING")
+    assert cfgmod.bitbucket_token(cfg) == "FROM_KEYRING"
+
+    # БД перебивает keyring
+    store.set_workspace_secret(ws.id, "bitbucket.token", "FROM_DB")
+    assert cfgmod.bitbucket_token(cfg) == "FROM_DB"
+
+    # переменная окружения перебивает всё
+    monkeypatch.setenv("BITBUCKET_TOKEN", "FROM_ENV")
+    assert cfgmod.bitbucket_token(cfg) == "FROM_ENV"
+    store.close()
+
+
+def test_db_secrets_write_goes_to_db_not_keyring(tmp_path, monkeypatch):
+    from jwu.core.store import Store
+    from jwu.core.workspaces import config_for_workspace
+
+    m = _mem(monkeypatch)
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+    cfg = config_for_workspace(store, ws)
+
+    cfgmod.set_slot(cfg, "jira.token", "NEW")
+    assert store.get_workspace_secret(ws.id, "jira.token") == "NEW"
+    assert m.get_password("jira-pat", "jira") is None  # в keyring не пишем
+    store.close()
+
+
+def test_legacy_migration_moves_config_and_secrets_once(tmp_path, monkeypatch):
+    from jwu.core import secrets, workspaces
+    from jwu.core.store import Store
+
+    m = _mem(monkeypatch)
+    cfg_path = tmp_path / "config.toml"
+    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
+    cfg = Config()
+    cfg.jira.base_url = "https://jira.acme.com"
+    cfg.jira.username = "alice"
+    cfg.bitbucket.repo = "server"
+    cfgmod.save_config(cfg, cfg_path)
+    secrets.set_secret("jira-pat", "jira", "JTOK")
+    secrets.set_secret("jira-login", "alice", "JPW")
+
+    store = Store(tmp_path / "state.db")
+    fields, moved = workspaces.migrate_legacy_config(store)
+    assert moved == 2 and fields > 0
+
+    ws = store.get_workspace_by_slug("work")
+    assert store.workspace_settings(ws.id)["jira.base_url"] == "https://jira.acme.com"
+    assert store.workspace_secrets(ws.id) == {"jira.token": "JTOK", "jira.password": "JPW"}
+    # keyring не чистим: откат на старую версию jwu должен оставаться возможным
+    assert m.get_password("jira-pat", "jira") == "JTOK"
+
+    # повторный вызов ничего не делает
+    assert workspaces.migrate_legacy_config(store) == (0, 0)
+    store.close()
+
+
+def test_workspace_config_roundtrip_keeps_views(tmp_path, monkeypatch):
+    from jwu.core import workspaces
+    from jwu.core.store import Store
+
+    _mem(monkeypatch)
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+
+    cfg = Config()
+    cfg.jira.base_url = "https://jira.acme.com"
+    cfg.jira.views = dict(cfg.jira.views, mine="assignee = currentUser() ORDER BY key")
+    cfg.sdesk.base_url = "https://sdesk.acme.com"
+    cfg.sdesk.project = "SDESK"
+    workspaces.save_workspace_config(store, ws, cfg)
+
+    loaded = workspaces.config_for_workspace(store, ws)
+    assert loaded.jira.base_url == "https://jira.acme.com"
+    assert loaded.jira.views["mine"] == "assignee = currentUser() ORDER BY key"
+    assert cfgmod.sdesk_enabled(loaded) is True
+    store.close()
+
+
+def test_db_file_is_chmod_600(tmp_path):
+    import stat
+
+    from jwu.core.store import Store
+
+    db = tmp_path / "state.db"
+    Store(db).close()
+    assert stat.S_IMODE(db.stat().st_mode) == 0o600
+
+
+def test_cloud_path_warning(tmp_path):
+    from jwu.core.maintenance import warn_if_cloud_path
+
+    assert warn_if_cloud_path(tmp_path / "state.db") == []
+    warns = warn_if_cloud_path(
+        tmp_path / "Library" / "Mobile Documents" / "jwu" / "state.db"
+    )
+    assert warns and "открытом виде" in warns[0]

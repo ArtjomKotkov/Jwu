@@ -219,26 +219,9 @@ def test_pr_json_includes_jobs(monkeypatch, tmp_path):
     assert payload["comments"][0]["text"] == "нужно поправить"
 
 
-def test_configure_non_interactive_writes_config_and_secrets(monkeypatch, tmp_path):
-    import keyring
-
-    from jwu.core import config as cfgmod
-    from jwu.core.config import load_config
-
-    cfg_path = tmp_path / "config.toml"
-    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
-
-    store = {}
-    monkeypatch.setattr(keyring, "set_password",
-                        lambda s, a, p: store.__setitem__((s, a), p))
-    monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
-
-    class _FakeSvc:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def auth_check(self): return {"jira": {"ok": True, "name": "Alice"},
-                                      "bitbucket": {"ok": True}}
-    monkeypatch.setattr(cli.Service, "from_config", classmethod(lambda cls, c: _FakeSvc()))
+def test_configure_non_interactive_writes_settings_and_secrets(monkeypatch, tmp_path):
+    """Несекретные поля и секреты уезжают в воркспейс; в config.toml секретов нет."""
+    db, cfg_path, keyring_store = _configure_env(monkeypatch, tmp_path)
 
     res = runner.invoke(cli.app, [
         "configure", "--non-interactive",
@@ -253,42 +236,35 @@ def test_configure_non_interactive_writes_config_and_secrets(monkeypatch, tmp_pa
     ])
     assert res.exit_code == 0, res.output
 
-    loaded = load_config(cfg_path)
-    assert loaded.jira.base_url == "https://jira.acme.com"
-    assert loaded.jira.username == "alice"
-    assert loaded.bitbucket.repo == "server"
-    assert loaded.storage.db_path == str(tmp_path / "jwu.db")
+    store = Store(db)
+    ws = store.get_workspace_by_slug("work")
+    settings = store.workspace_settings(ws.id)
+    assert settings["jira.base_url"] == "https://jira.acme.com"
+    assert settings["jira.username"] == "alice"
+    assert settings["bitbucket.repo"] == "server"
+    assert store.workspace_secrets(ws.id) == {"jira.token": "JTOK", "bitbucket.token": "BTOK"}
+    store.close()
 
-    # секреты ушли в keyring, а НЕ в файл
+    # секретов нет в config.toml — там только путь до БД
     text = cfg_path.read_text()
     assert "JTOK" not in text and "BTOK" not in text
-    assert store[("jira-pat", "jira")] == "JTOK"
-    assert store[("bitbucket-pat", "bitbucket")] == "BTOK"
+    assert str(tmp_path / "jwu.db") in text
 
 
-def test_configure_non_interactive_keeps_existing_secret_when_omitted(monkeypatch, tmp_path):
-    import keyring
+def test_configure_keeps_existing_secret_when_omitted(monkeypatch, tmp_path):
+    """Не переданный токен не затирается — остаётся прежний."""
+    db, _, _ = _configure_env(monkeypatch, tmp_path)
+    assert runner.invoke(cli.app, ["configure", "--non-interactive",
+                                   "--jira-token", "OLD"]).exit_code == 0
 
-    from jwu.core import config as cfgmod
-
-    cfg_path = tmp_path / "config.toml"
-    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
-    store = {("jira-pat", "jira"): "OLD"}
-    monkeypatch.setattr(keyring, "set_password",
-                        lambda s, a, p: store.__setitem__((s, a), p))
-    monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
-
-    class _FakeSvc:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def auth_check(self): return {"jira": {"ok": True}, "bitbucket": {"ok": True}}
-    monkeypatch.setattr(cli.Service, "from_config", classmethod(lambda cls, c: _FakeSvc()))
-
-    res = runner.invoke(cli.app, [
-        "configure", "--non-interactive", "--jira-user", "bob",
-    ])
+    res = runner.invoke(cli.app, ["configure", "--non-interactive", "--jira-user", "bob"])
     assert res.exit_code == 0, res.output
-    assert store[("jira-pat", "jira")] == "OLD"  # токен не передан — не затёрт
+
+    store = Store(db)
+    ws = store.get_workspace_by_slug("work")
+    assert store.workspace_secrets(ws.id)["jira.token"] == "OLD"
+    assert store.workspace_settings(ws.id)["jira.username"] == "bob"
+    store.close()
 
 
 def test_install_claude_skills_to_custom_dest(tmp_path):
@@ -304,22 +280,33 @@ def _fake_authcheck(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def auth_check(self): return {"jira": {"ok": True}, "bitbucket": {"ok": True}}
-    monkeypatch.setattr(cli.Service, "from_config", classmethod(lambda cls, c: _FakeSvc()))
+    # проверка связи после configure идёт через воркспейс — сеть в тестах не трогаем
+    monkeypatch.setattr(cli.Service, "for_workspace",
+                        classmethod(lambda cls, ws, cfg=None, **kw: _FakeSvc()))
 
 
-def test_configure_interactive_prompts_for_gate(monkeypatch, tmp_path):
-    """Интерактивный визард спрашивает логин/пароль гейта и пишет proxy_basic."""
+def _configure_env(monkeypatch, tmp_path):
+    """Изолировать configure: свой config.toml, своя БД, keyring в памяти."""
     import keyring
 
     from jwu.core import config as cfgmod
 
     cfg_path = tmp_path / "config.toml"
     monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
-    store = {}
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+    monkeypatch.setattr(cli, "_WORKSPACE_ARG", None)
+    keyring_store = {}
     monkeypatch.setattr(keyring, "set_password",
-                        lambda s, a, p: store.__setitem__((s, a), p))
-    monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
+                        lambda s, a, p: keyring_store.__setitem__((s, a), p))
+    monkeypatch.setattr(keyring, "get_password", lambda s, a: keyring_store.get((s, a)))
     _fake_authcheck(monkeypatch)
+    return db, cfg_path, keyring_store
+
+
+def test_configure_interactive_writes_to_workspace(monkeypatch, tmp_path):
+    """Интерактивный визард спрашивает гейт и кладёт настройки/секреты в воркспейс."""
+    db, cfg_path, keyring_store = _configure_env(monkeypatch, tmp_path)
 
     # порядок промптов: host, user, project, PAT, session-pw, gate-login, gate-pw,
     # sdesk-host (пусто => SDESK пропускается целиком),
@@ -336,25 +323,53 @@ def test_configure_interactive_prompts_for_gate(monkeypatch, tmp_path):
     res = runner.invoke(cli.app, ["configure"], input=answers)
     assert res.exit_code == 0, res.output
 
-    loaded = cfgmod.load_config(cfg_path)
-    assert loaded.jira.proxy_basic_user == "gw"
-    assert store[("jira-proxy-basic", "gw")] == "GPW"
-    assert ("jira-login", "alice") not in store  # пустой сессионный пароль не пишется
+    store = Store(db)
+    ws = store.get_workspace_by_slug("work")
+    settings = store.workspace_settings(ws.id)
+    assert settings["jira.base_url"] == "https://jira.x"
+    assert settings["jira.proxy_basic_user"] == "gw"
+    secrets_in_db = store.workspace_secrets(ws.id)
+    assert secrets_in_db["jira.gate_password"] == "GPW"
+    assert "jira.password" not in secrets_in_db  # пустой сессионный пароль не пишется
+    store.close()
+
+    # в keyring больше не пишем — только читаем как фолбэк
+    assert keyring_store == {}
+
+
+def test_configure_keeps_db_path_in_global_config(monkeypatch, tmp_path):
+    """Путь до БД остаётся глобальным: его надо знать ДО того, как известен воркспейс."""
+    db, cfg_path, _ = _configure_env(monkeypatch, tmp_path)
+    from jwu.core import config as cfgmod
+
+    res = runner.invoke(cli.app, [
+        "configure", "--non-interactive", "--db-path", str(tmp_path / "moved.db"),
+    ])
+    assert res.exit_code == 0, res.output
+    assert cfgmod.load_config(cfg_path).storage.db_path == str(tmp_path / "moved.db")
+
+
+def test_configure_enables_integrations_by_hosts(monkeypatch, tmp_path):
+    """Заданный хост включает интеграцию воркспейса — иначе команды отказывали бы."""
+    db, _, _ = _configure_env(monkeypatch, tmp_path)
+    runner.invoke(cli.app, ["workspace", "create", "home", "--no-jira", "--no-bitbucket"])
+
+    res = runner.invoke(cli.app, [
+        "-W", "home", "configure", "--non-interactive",
+        "--jira-host", "https://jira.acme.com", "--jira-token", "JTOK",
+    ])
+    assert res.exit_code == 0, res.output
+
+    store = Store(db)
+    ws = store.get_workspace_by_slug("home")
+    assert ws.jira_enabled is True
+    assert ws.bitbucket_enabled is False  # хост Bitbucket не задавали
+    store.close()
 
 
 def test_configure_export_then_import_cli(monkeypatch, tmp_path):
-    """configure export пишет бандл, configure import восстанавливает config + секреты."""
-    import keyring
-
-    from jwu.core import config as cfgmod
-
-    cfg_path = tmp_path / "config.toml"
-    monkeypatch.setattr(cfgmod, "config_path", lambda: cfg_path)
-    store = {}
-    monkeypatch.setattr(keyring, "set_password",
-                        lambda s, a, p: store.__setitem__((s, a), p))
-    monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
-    _fake_authcheck(monkeypatch)
+    """configure export пишет бандл, configure import восстанавливает воркспейс."""
+    db, cfg_path, _ = _configure_env(monkeypatch, tmp_path)
 
     res = runner.invoke(cli.app, [
         "configure", "--non-interactive",
@@ -364,23 +379,41 @@ def test_configure_export_then_import_cli(monkeypatch, tmp_path):
         "--bitbucket-token", "BTOK",
     ])
     assert res.exit_code == 0, res.output
-    assert store[("jira-login", "alice")] == "JPW"
-    assert store[("jira-proxy-basic", "gw")] == "GPW"
 
     bundle = tmp_path / "b.toml"
     res = runner.invoke(cli.app, ["configure", "export", str(bundle)])
     assert res.exit_code == 0, res.output
     assert bundle.exists()
 
-    # «новая машина»: чистый keyring + нет config
-    store.clear()
-    cfg_path.unlink()
+    # «новая машина»: чистая БД
+    db2 = tmp_path / "fresh.db"
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db2))
     res = runner.invoke(cli.app, ["configure", "import", str(bundle)])
     assert res.exit_code == 0, res.output
-    assert store[("jira-login", "alice")] == "JPW"
-    assert store[("jira-proxy-basic", "gw")] == "GPW"
-    assert store[("bitbucket-pat", "bitbucket")] == "BTOK"
-    assert cfgmod.load_config(cfg_path).jira.proxy_basic_user == "gw"
+
+    store = Store(db2)
+    ws = store.get_workspace_by_slug("work")
+    assert store.workspace_settings(ws.id)["jira.proxy_basic_user"] == "gw"
+    assert store.workspace_secrets(ws.id) == {
+        "jira.password": "JPW", "jira.gate_password": "GPW", "bitbucket.token": "BTOK",
+    }
+    store.close()
+
+
+def test_import_reads_legacy_bundle_format(tmp_path):
+    """Старый бандл (секреты парой service/account) читается и раскладывается по слотам."""
+    from jwu.core.config import read_bundle
+
+    bundle = tmp_path / "old.toml"
+    bundle.write_text(
+        '[jira]\nbase_url = "https://jira.x"\nusername = "alice"\n'
+        'proxy_basic_user = "gw"\n\n'
+        '[[secrets]]\nservice = "jira-login"\naccount = "alice"\nvalue = "JPW"\n\n'
+        '[[secrets]]\nservice = "bitbucket-pat"\naccount = "bitbucket"\nvalue = "BTOK"\n'
+    )
+    cfg, values = read_bundle(bundle)
+    assert cfg.jira.username == "alice"
+    assert values == {"jira.password": "JPW", "bitbucket.token": "BTOK"}
 
 
 # --------------------------------------------------------------------------- #
