@@ -17,6 +17,14 @@ from pathlib import Path
 from .config import ConfigError, data_dir
 
 
+def _restrict(path: Path, mode: int) -> None:
+    """Ужать права (700 на каталог бэкапов, 600 на копии). Не вышло — не критично."""
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
 def ensure_db_available(db_file: Path) -> None:
     """Бросить ConfigError, если БД отсутствует, но рядом лежит iCloud-плейсхолдер."""
     if db_file.exists():
@@ -31,6 +39,57 @@ def ensure_db_available(db_file: Path) -> None:
     # файла нет вовсе — это первый запуск; Store создаст новую БД (это ок)
 
 
+# Папки файловых облаков: БД с секретами в открытом виде им отдавать не стоит.
+_CLOUD_MARKERS = (
+    "Mobile Documents", "iCloud Drive", "iCloudDrive",
+    "Dropbox", "Google Drive", "GoogleDrive", "OneDrive", "YandexDisk", "Яндекс.Диск",
+)
+
+
+def warn_if_cloud_path(db_file: Path) -> list[str]:
+    """Предупреждения, если БД (а в ней — секреты плайнтекстом) лежит в облачной папке."""
+    parts = set(Path(db_file).expanduser().parts)
+    hit = next((m for m in _CLOUD_MARKERS if m in parts), None)
+    if not hit:
+        return []
+    return [
+        f"БД лежит в облачной папке ({hit}): {db_file}. В ней хранятся токены и пароли "
+        "в открытом виде — они уедут в облако. Перенеси БД локально "
+        "(jwu configure --db-path ~/.local/share/jwu/state.db) либо держи секреты "
+        "в переменных окружения."
+    ]
+
+
+def backup_before_migration(
+    db_file: Path, *, to_version: int, backups_dir: Path | None = None
+) -> Path | None:
+    """Снять копию БД перед структурной миграцией схемы; вернуть путь копии или None.
+
+    Копия делается через sqlite backup API (консистентно даже при активном WAL) и НЕ попадает
+    под ротацию ежедневных бэкапов (другое имя) — она должна пережить любые последующие
+    проблемы. Пустую только что созданную БД не копируем.
+    """
+    if not db_file.exists() or db_file.stat().st_size == 0:
+        return None
+    bdir = backups_dir or (data_dir() / "backups")
+    bdir.mkdir(parents=True, exist_ok=True)
+    dest = bdir / f"{db_file.name}.pre-v{to_version}-{date.today().isoformat()}"
+    if dest.exists():
+        return dest
+    src = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(str(dest))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    _restrict(bdir, 0o700)
+    _restrict(dest, 0o600)
+    return dest
+
+
 def run_daily_maintenance(
     db_file: Path, *, backups_dir: Path | None = None, keep: int = 7
 ) -> list[str]:
@@ -39,11 +98,15 @@ def run_daily_maintenance(
     Бэкапы кладутся в ЛОКАЛЬНЫЙ каталог (по умолчанию ``data_dir()/backups``), а не рядом
     с БД — чтобы они не уезжали в iCloud и пережили порчу синка. Возвращает короткие
     сообщения для вывода (или []). Битую БД не бэкапит (чтобы не плодить мусор).
+
+    ВНИМАНИЕ: копия содержит секреты воркспейсов в открытом виде (они хранятся в БД),
+    поэтому каталог и файлы закрываются правами 700/600.
     """
     if not db_file.exists():
         return []
     bdir = backups_dir or (data_dir() / "backups")
     bdir.mkdir(parents=True, exist_ok=True)
+    _restrict(bdir, 0o700)
     marker = bdir / f"{db_file.name}.bak-{date.today().isoformat()}"
     if marker.exists():
         return []  # сегодня уже делали
@@ -60,6 +123,7 @@ def run_daily_maintenance(
         return [f"⚠ integrity_check: {row[0] if row else '?'}; бэкап пропущен"]
 
     shutil.copy2(db_file, marker)
+    _restrict(marker, 0o600)
     for old in sorted(bdir.glob(f"{db_file.name}.bak-*"))[:-keep]:
         old.unlink()
     return [f"бэкап БД: {marker.name}"]

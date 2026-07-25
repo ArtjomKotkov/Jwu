@@ -23,6 +23,8 @@ EXPECTED_SKILLS = {
     "jwu-track-time",
     "jwu-4test-message",
     "build-failure",
+    "jwu-workspace-setup",
+    "jwu-update",
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

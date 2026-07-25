@@ -39,10 +39,13 @@ from .models import (
     Delta,
     Issue,
     Job,
+    LocalFeature,
     Note,
     PR,
     PRComment,
     TestCaseFailure,
+    Workspace,
+    WorkspacePath,
 )
 from .store import Store
 
@@ -58,7 +61,7 @@ _PR_TASK_ALIAS_META = "pr_task_aliases"
 
 
 def _load_pr_task_aliases(store: Store) -> dict[str, str]:
-    raw = store.get_meta(_PR_TASK_ALIAS_META)
+    raw = store.get_workspace_meta(_PR_TASK_ALIAS_META)
     if not raw:
         return {}
     try:
@@ -160,6 +163,16 @@ class DashboardData:
     prs_review: list[PR] = field(default_factory=list)
     analyses: list[Analysis] = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
+    # Контекст воркспейса: сам воркспейс, его папки и локальные фичи. Флаги интеграций
+    # продублированы отдельно, чтобы TUI мог решать про видимость вкладок без workspace.
+    workspace: Workspace | None = None
+    # Все воркспейсы (со счётчиком работ) — вкладка «Workspace» управляет ими,
+    # поэтому список нужен прямо в снимке, а не отдельным колбэком.
+    workspaces: list[Workspace] = field(default_factory=list)
+    paths: list[WorkspacePath] = field(default_factory=list)
+    features: list[LocalFeature] = field(default_factory=list)
+    jira_enabled: bool = True
+    bitbucket_enabled: bool = True
     # key задачи → её последний известный статус и текущий assignee;
     # для колонок «Назначен» / «Статус» в PR-таблицах.
     task_status: dict[str, str] = field(default_factory=dict)
@@ -170,6 +183,12 @@ class DashboardData:
             "user": self.user,
             "display_name": self.display_name,
             "email": self.email,
+            "workspace": self.workspace.model_dump() if self.workspace else None,
+            "workspaces": [w.model_dump() for w in self.workspaces],
+            "paths": [p.model_dump() for p in self.paths],
+            "features": [f.model_dump() for f in self.features],
+            "jira_enabled": self.jira_enabled,
+            "bitbucket_enabled": self.bitbucket_enabled,
             "last_sync": self.last_sync,
             "deltas": [d.model_dump() for d in self.deltas],
             "mine": [i.model_dump() for i in self.mine],
@@ -189,7 +208,7 @@ _IDENTITY_META = "identity"
 
 def _read_identity(store: Store) -> dict:
     """Кэш личности (user/display_name/email + отпечаток кредов) из памяти."""
-    raw = store.get_meta(_IDENTITY_META)
+    raw = store.get_workspace_meta(_IDENTITY_META)
     if not raw:
         return {}
     try:
@@ -205,6 +224,15 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
     после перезапуска, до первого синка.
     """
     ident = _read_identity(store)
+    ws = store.get_workspace(store.workspace_id)
+    # Список всех контуров со счётчиком работ — для вкладки управления воркспейсами.
+    # Скоуп store при этом восстанавливаем: дальше он читает данные текущего воркспейса.
+    all_workspaces = store.list_workspaces()
+    for item in all_workspaces:
+        store.use_workspace(item.id)
+        item.jobs_count = len(store.list_jobs())
+    if ws is not None:
+        store.use_workspace(ws.id)
     # Все известные задачи по ключу → статус (для колонки «Статус задачи» в PR-таблицах).
     # Берём из всех вью разом, чтобы статус был и для PR с чужой задачей (review).
     all_issues = store.latest_issues(None)
@@ -231,6 +259,12 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
         prs_review=store.latest_prs("review"),
         analyses=store.list_analyses(),
         jobs=store.list_jobs(),  # все работы (включая закрытые/завершённые)
+        workspace=ws,
+        workspaces=all_workspaces,
+        paths=ws.paths if ws else [],
+        features=store.list_features(),
+        jira_enabled=ws.jira_enabled if ws else True,
+        bitbucket_enabled=ws.bitbucket_enabled if ws else True,
         task_status=task_status,
         task_assignee=task_assignee,
     )
@@ -241,13 +275,17 @@ class Service:
         self,
         cfg: Config,
         jira: JiraClient | None,
-        bitbucket: BitbucketClient,
+        bitbucket: BitbucketClient | None,
         store: Store,
         jenkins: JenkinsClient | None = None,
         sdesk: JiraClient | None = None,
         sdesk_factory: "Callable[[], JiraClient] | None" = None,
+        workspace: Workspace | None = None,
     ) -> None:
         self.cfg = cfg
+        # Воркспейс, в контексте которого работает сервис (None — старый глобальный режим).
+        # Его флаги jira_enabled/bitbucket_enabled определяют, какие клиенты вообще созданы.
+        self.workspace = workspace
         self.jira = jira
         # Второй Jira-инстанс (SDESK): строится ЛЕНИВО (self._sdesk_factory) при первом
         # обращении к его ключу — чтобы недоступный/неверно настроенный SDESK не рушил
@@ -263,7 +301,8 @@ class Service:
         self._cred_fp: str | None = None  # кэш отпечатка кредов
 
     @classmethod
-    def from_config(cls, cfg: Config | None = None, *, db_path: str | None = None) -> "Service":
+    def from_config(cls, cfg: Config | None = None, *, db_path: str | None = None,
+                    workspace_id: int | None = None) -> "Service":
         from .config import db_path as default_db_path
 
         cfg = cfg or load_config()
@@ -286,11 +325,12 @@ class Service:
         # Jenkins опционален: клиент создаётся всегда (для парсинга/единообразия),
         # но без токена — без auth, и глубокие вызовы вернут 401/403, что мы ловим.
         jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
-        store = Store(db_path or str(default_db_path()))
+        store = Store(db_path or str(default_db_path()), workspace_id)
         return cls(cfg, jira, bitbucket, store, jenkins, sdesk_factory=sdesk_factory)
 
     @classmethod
-    def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None) -> "Service":
+    def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None,
+                   workspace_id: int | None = None) -> "Service":
         """Лёгкий сервис для CI-сборок: только Bitbucket + Jenkins, без логина в Jira.
 
         Разбор упавших сборок нужен ровно тогда, когда CI красный, — и не должен зависеть
@@ -301,15 +341,69 @@ class Service:
         cfg = cfg or load_config()
         bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
         jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
-        store = Store(db_path or str(default_db_path()))
+        store = Store(db_path or str(default_db_path()), workspace_id)
         return cls(cfg, None, bitbucket, store, jenkins)
+
+    @classmethod
+    def for_workspace(
+        cls, workspace: Workspace, cfg: Config | None = None, *, db_path: str | None = None
+    ) -> "Service":
+        """Сервис в контексте воркспейса: клиенты только для подключённых интеграций.
+
+        Воркспейс без Jira и Bitbucket вообще не требует кредов — ни один токен не
+        запрашивается, и работа с локальными фичами/работами возможна «из коробки».
+
+        Store открывается ПЕРВЫМ: конфиг воркспейса (и его секреты) читаются из этой же
+        БД, поэтому источник секретов должен держать живое соединение сервиса, а не чужое.
+        """
+        from .config import db_path as default_db_path
+        from .workspaces import config_for_workspace
+
+        store = Store(db_path or str(default_db_path()), workspace.id)
+        cfg = cfg or config_for_workspace(store, workspace)
+        jira = None
+        sdesk_factory = None
+        if workspace.jira_enabled:
+            login = jira_login(cfg)
+            if login is not None:
+                jira = _jira_like_client(
+                    cfg.jira.base_url, login=login, proxy_basic=jira_proxy_basic(cfg)
+                )
+                if not cfg.jira.username:
+                    cfg.jira.username = login[0]
+            else:
+                jira = _jira_like_client(cfg.jira.base_url, token=jira_token(cfg))
+            sdesk_factory = (lambda: _build_sdesk_client(cfg)) if sdesk_enabled(cfg) else None
+
+        bitbucket = jenkins = None
+        if workspace.bitbucket_enabled:
+            bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
+            jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
+
+        return cls(cfg, jira, bitbucket, store, jenkins,
+                   sdesk_factory=sdesk_factory, workspace=workspace)
+
+    @classmethod
+    def builds_for_workspace(
+        cls, workspace: Workspace, cfg: Config | None = None, *, db_path: str | None = None
+    ) -> "Service":
+        """Bitbucket + Jenkins в контексте воркспейса, без логина в Jira (см. for_builds)."""
+        from .config import db_path as default_db_path
+        from .workspaces import config_for_workspace
+
+        store = Store(db_path or str(default_db_path()), workspace.id)
+        cfg = cfg or config_for_workspace(store, workspace)
+        bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
+        jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
+        return cls(cfg, None, bitbucket, store, jenkins, workspace=workspace)
 
     def close(self) -> None:
         if self.jira is not None:
             self.jira.close()
         if self.sdesk is not None:
             self.sdesk.close()
-        self.bitbucket.close()
+        if self.bitbucket is not None:
+            self.bitbucket.close()
         if self.jenkins is not None:
             self.jenkins.close()
         self.store.close()
@@ -353,6 +447,8 @@ class Service:
 
     def _myself(self) -> dict:
         """/myself с кэшем на время жизни сервиса (один запрос на синк)."""
+        if self.jira is None:
+            return {}  # воркспейс без Jira — личности «из Jira» просто нет
         if self._me is None:
             try:
                 self._me = self.jira.myself()
@@ -400,7 +496,7 @@ class Service:
         display = me.get("displayName", "") or ""
         email = me.get("emailAddress", "") or ""
         if login:
-            self.store.set_meta(_IDENTITY_META, json.dumps({
+            self.store.set_workspace_meta(_IDENTITY_META, json.dumps({
                 "fp": fp, "user": login,
                 "display_name": display, "email": email,
             }))
@@ -661,13 +757,25 @@ class Service:
                 aliases.pop(key, None)
                 changed = True
         if changed:
-            self.store.set_meta(_PR_TASK_ALIAS_META, json.dumps(aliases, ensure_ascii=False))
+            self.store.set_workspace_meta(_PR_TASK_ALIAS_META, json.dumps(aliases, ensure_ascii=False))
 
     def sync(self) -> SyncResult:
-        """Полный синк всех секций в одном прогоне (для `jwu sync`)."""
-        run_id = self.store.start_sync_run(["mine", "mentions", "prs:mine", "prs:review"])
-        counts = self._sync_tasks(run_id, ["mine", "mentions"])
-        counts |= self._sync_prs(run_id, ["mine", "review"])
+        """Полный синк всех секций в одном прогоне (для `jwu sync`).
+
+        Секции отключённых интеграций пропускаются целиком — и в ``views`` прогона их
+        тоже нет, иначе детекция исчезновения решила бы, что вкладка «опустела».
+        """
+        views: list[str] = []
+        if self.jira is not None:
+            views += ["mine", "mentions"]
+        if self.bitbucket is not None:
+            views += ["prs:mine", "prs:review"]
+        run_id = self.store.start_sync_run(views)
+        counts: dict[str, int] = {}
+        if self.jira is not None:
+            counts |= self._sync_tasks(run_id, ["mine", "mentions"])
+        if self.bitbucket is not None:
+            counts |= self._sync_prs(run_id, ["mine", "review"])
         # counts фиксируем ДО compute_changes: детекция исчезновения (gone/pr_gone)
         # опирается на надёжность прогона по counts, а ради «вкладка реально пуста»
         # vs «фетч упал» это должно быть видно уже для текущего прогона.
@@ -679,9 +787,13 @@ class Service:
     def sync_section(self, section: str) -> SyncResult:
         """Синк одной секции/вкладки: mine | mentions | prs_mine | prs_review."""
         if section in ("mine", "mentions"):
+            if self.jira is None:
+                raise ValueError("В этом воркспейсе Jira не подключена")
             run_id = self.store.start_sync_run([section])
             counts = self._sync_tasks(run_id, [section])
         elif section in ("prs_mine", "prs_review"):
+            if self.bitbucket is None:
+                raise ValueError("В этом воркспейсе Bitbucket не подключён")
             view = "mine" if section == "prs_mine" else "review"
             run_id = self.store.start_sync_run([f"prs:{view}"])
             counts = self._sync_prs(run_id, [view])

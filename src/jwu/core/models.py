@@ -401,6 +401,53 @@ class PR(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Воркспейсы
+# --------------------------------------------------------------------------- #
+
+
+class WorkspacePath(BaseModel):
+    """Папка, отнесённая к воркспейсу (абсолютный путь после resolve).
+
+    ``tags`` — по ним папку находят: «legacy-бэкенд», «новая-версия», «фронт». Именно
+    теги отвечают на вопрос «где что лежит», когда в воркспейсе несколько репозиториев.
+    """
+
+    id: int = 0
+    workspace_id: int = 0
+    path: str = ""
+    label: str = ""
+    tags: list[str] = Field(default_factory=list)
+    added_at: str = ""
+
+
+class Workspace(BaseModel):
+    """Контур работы: набор папок + свой конфиг интеграций + свои локальные данные.
+
+    ``jira_enabled``/``bitbucket_enabled`` объявляются ЯВНО при создании, а не выводятся
+    из наличия токена: воркспейс без Jira должен вести себя предсказуемо (скрытые вкладки,
+    внятные отказы Jira-команд) ещё до того, как креды вообще настроены.
+    """
+
+    id: int = 0
+    slug: str = ""
+    name: str = ""
+    jira_enabled: bool = False
+    bitbucket_enabled: bool = False
+    archived: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+    paths: list[WorkspacePath] = Field(default_factory=list)
+    # Счётчик работ для списков/экрана выбора: заполняется вызывающим по требованию
+    # (Store сам его не считает — это лишний запрос на каждое чтение воркспейса).
+    jobs_count: int = 0
+
+    @property
+    def label(self) -> str:
+        """Как показывать воркспейс человеку: «Название (slug)» либо просто slug."""
+        return f"{self.name} ({self.slug})" if self.name and self.name != self.slug else self.slug
+
+
+# --------------------------------------------------------------------------- #
 # Память: дельты и заметки
 # --------------------------------------------------------------------------- #
 
@@ -476,10 +523,55 @@ class JobPRLink(BaseModel):
 
 class Job(BaseModel):
     id: int = 0
-    task_key: str = ""
+    task_key: str = ""          # ключ Jira; пусто — работа без задачи Jira
     title: str = ""
     status: str = "active"      # active | done | paused
     created_at: str = ""
     updated_at: str = ""
+    # Локальная фича как якорь работы (воркспейс без Jira). Взаимоисключимо с task_key.
+    feature_id: Optional[int] = None
+    feature_key: str = ""       # денормализация для рендера (JOIN при чтении)
     records: list[JobRecord] = Field(default_factory=list)
     prs: list[JobPRLink] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def anchor(self) -> str:
+        """К чему привязана работа: задача Jira, локальная фича либо ничего."""
+        return self.task_key or self.feature_key or f"#{self.id}"
+
+
+# --------------------------------------------------------------------------- #
+# Локальные фичи (мини-трекер воркспейса без Jira)
+# --------------------------------------------------------------------------- #
+
+
+# Статусы локальной фичи — единый источник для CLI-валидации и рендера.
+LOCAL_FEATURE_STATUSES = ["open", "in_progress", "review", "done", "cancelled"]
+
+# статус -> (подпись, цвет rich)
+LOCAL_FEATURE_BADGES: dict[str, tuple[str, str]] = {
+    "open":        ("открыта", "white"),
+    "in_progress": ("в работе", "yellow"),
+    "review":      ("на ревью", "blue"),
+    "done":        ("готова", "green"),
+    "cancelled":   ("отменена", "dim"),
+}
+
+
+class LocalFeature(BaseModel):
+    """Задача локального трекера воркспейса — замена карточки Jira, когда Jira нет.
+
+    Ключ (``HOMEJWU-1``) намеренно совместим по формату с ключами Jira: имя ветки
+    ``HOMEJWU-1-dark-theme`` тогда даёт префикс коммита по той же регулярке, что и раньше.
+    """
+
+    id: int = 0
+    workspace_id: int = 0
+    key: str = ""
+    title: str = ""
+    status: str = "open"
+    priority: str = ""
+    description: str = ""
+    created_at: str = ""
+    updated_at: str = ""

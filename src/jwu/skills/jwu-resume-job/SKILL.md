@@ -14,6 +14,25 @@ description: Use when continuing work on an existing jwu «работа (job)» 
 > **MCP-first.** Read-операции предпочитай MCP-инструментами jwu, bash `jwu …` — фолбэк:
 > `jwu jobs …` → `jwu_jobs(task, pr, status)` · `jwu pr <id> …` → `jwu_pr(pr_id, project, repo)` ·
 > `jwu builds <id>` → `jwu_builds(pr_id, project, repo)` · `jwu build <id>` → `jwu_build(pr_id, project, repo, url)`.
+> **Воркспейс = где лежит код.** jwu работает в контексте *воркспейса*: он определяется
+> автоматически по текущей папке, проверить — `jwu_workspace_current()`
+> (bash: `jwu workspace current --json`).
+>
+> **Код проекта лежит ИМЕННО в папках воркспейса** — их список даёт
+> `jwu_workspace_paths()` (bash: `jwu workspace paths`). Ищи и правь только в них;
+> остальное на диске к задаче отношения не имеет. У папок есть **теги** («legacy-бэкенд»,
+> «новая-версия», «фронт») — по ним понятно, что где: `jwu_workspace_paths(tag="legacy-бэкенд")`.
+> Не угадывай по имени каталога — спроси теги. Пользователь просит пометить папку —
+> `jwu_workspace_tag(path, add=[...])` (bash: `jwu workspace tag <DIR> --add <тег>`).
+>
+> Если `jira_enabled=false` — Jira-команды и инструменты **не вызывай**: якорь работы там
+> либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
+> (`jwu job start --title "…"`). Если папка не привязана ни к одному воркспейсу — скажи
+> об этом пользователю и предложи подключить проект.
+> Если папка не привязана ни к одному воркспейсу (`source` не `cwd`) — **не логируй работу**:
+> записи уедут в чужой контур. Сначала подключи проект — скилл **jwu-workspace-setup**
+> (`jwu init`).
+
 
 ## Когда
 
@@ -25,6 +44,9 @@ description: Use when continuing work on an existing jwu «работа (job)» 
 ## Шаги
 
 1. **Найти работу.**
+   - Сначала `jwu_workspace_current()` — работы скоупятся по воркспейсу, и в чужом их не видно.
+   - Якорь работы в выводе — поле `anchor`: ключ задачи Jira, ключ локальной фичи либо `#<id>`
+     (работа без якоря). По фиче ищи `jwu jobs --feature <KEY> --json`.
    - Знаешь ключ задачи: `jwu jobs --task <KEY> --json` (бери активную).
    - Не знаешь: `jwu jobs --status active --json`. Несколько активных → покажи список
      (`id / task_key / updated_at`) и **спроси, какую**; одна — бери её.
