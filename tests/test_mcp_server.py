@@ -140,3 +140,98 @@ def test_job_start_validates_anchors(fresh_server):
 def test_bad_feature_status_is_rejected(fresh_server):
     with pytest.raises(ValueError, match="Недопустимый статус"):
         _run(srv.jwu_features(status="лол", workspace="work"))
+
+
+def test_workspace_create_and_paths_via_mcp(fresh_server, tmp_path, monkeypatch):
+    """Создание воркспейса и привязка папок доступны агенту без похода в bash."""
+    folder = tmp_path / "pet"
+    folder.mkdir()
+
+    ws = _run(srv.jwu_workspace_create(
+        "home-jwu", name="Личное", paths=[str(folder)]))
+    assert ws["slug"] == "home-jwu"
+    assert ws["jira_enabled"] is False          # интеграции объявляются явно
+    assert ws["paths"] == [str(folder.resolve())]
+
+    # по привязанной папке воркспейс определяется сам
+    monkeypatch.chdir(folder)
+    assert _run(srv.jwu_workspace_current())["slug"] == "home-jwu"
+
+    other = tmp_path / "second"
+    other.mkdir()
+    payload = _run(srv.jwu_workspace_add_path(str(other), label="второй репозиторий"))
+    assert set(payload["paths"]) == {str(folder.resolve()), str(other.resolve())}
+
+    payload = _run(srv.jwu_workspace_remove_path(str(other)))
+    assert payload["paths"] == [str(folder.resolve())]
+
+
+def test_workspace_create_rejects_duplicates_and_bad_slug(fresh_server):
+    _run(srv.jwu_workspace_create("home"))
+    with pytest.raises(ValueError, match="уже есть"):
+        _run(srv.jwu_workspace_create("home"))
+    with pytest.raises(ValueError, match="Некорректный slug"):
+        _run(srv.jwu_workspace_create("Не Слаг"))
+
+
+def test_add_path_refuses_foreign_folder(fresh_server, tmp_path):
+    folder = tmp_path / "shared"
+    folder.mkdir()
+    _run(srv.jwu_workspace_create("home", paths=[str(folder)]))
+    with pytest.raises(ValueError, match="уже принадлежит"):
+        _run(srv.jwu_workspace_add_path(str(folder), workspace="work"))
+
+
+def test_workspace_use_switches_default(fresh_server, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run(srv.jwu_workspace_create("home"))
+    # два воркспейса, папка не привязана — без активного резолв невозможен
+    assert _run(srv.jwu_workspace_current())["workspace"] is None
+
+    _run(srv.jwu_workspace_use("home"))
+    current = _run(srv.jwu_workspace_current())
+    assert (current["slug"], current["source"]) == ("home", "active")
+
+    with pytest.raises(ValueError, match="не найден"):
+        _run(srv.jwu_workspace_use("nope"))
+
+
+def test_remove_path_reports_when_not_bound(fresh_server, tmp_path):
+    with pytest.raises(ValueError, match="не привязана"):
+        _run(srv.jwu_workspace_remove_path(str(tmp_path), workspace="work"))
+
+
+def test_tags_via_mcp_answer_where_the_code_lives(fresh_server, tmp_path):
+    """Агент помечает папки и потом находит их по тегу — «где legacy, где новая версия»."""
+    legacy = tmp_path / "old-backend"
+    fresh = tmp_path / "new-backend"
+    legacy.mkdir()
+    fresh.mkdir()
+
+    _run(srv.jwu_workspace_create("dev", paths=[str(legacy)]))
+    _run(srv.jwu_workspace_add_path(str(fresh), tags=["новая-версия"], workspace="dev"))
+    _run(srv.jwu_workspace_tag(str(legacy), add=["legacy-бэкенд", "django"], workspace="dev"))
+
+    found = _run(srv.jwu_workspace_paths(tag="legacy-бэкенд", workspace="dev"))
+    assert [p["path"] for p in found["paths"]] == [str(legacy.resolve())]
+    assert found["paths"][0]["tags"] == ["django", "legacy-бэкенд"]
+
+    everything = _run(srv.jwu_workspace_paths(workspace="dev"))
+    assert everything["known_tags"] == {"django": 1, "legacy-бэкенд": 1, "новая-версия": 1}
+    assert len(everything["paths"]) == 2
+
+
+def test_tag_replace_and_remove_via_mcp(fresh_server, tmp_path):
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    _run(srv.jwu_workspace_create("dev", paths=[str(folder)]))
+    _run(srv.jwu_workspace_tag(str(folder), add=["a", "b"], workspace="dev"))
+
+    assert _run(srv.jwu_workspace_tag(str(folder), remove=["a"], workspace="dev"))["tags"] == ["b"]
+    replaced = _run(srv.jwu_workspace_tag(str(folder), replace=["фронт"], workspace="dev"))
+    assert replaced["tags"] == ["фронт"]
+
+
+def test_tagging_unbound_folder_is_refused(fresh_server, tmp_path):
+    with pytest.raises(ValueError, match="не привязана"):
+        _run(srv.jwu_workspace_tag(str(tmp_path / "nope"), add=["x"], workspace="work"))

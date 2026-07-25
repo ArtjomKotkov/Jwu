@@ -21,18 +21,33 @@ description: Use when the user wants to start/track work on a specific Jira task
 > `jwu job start` → `jwu_job_start(task_key, title)` · `jwu job add` → `jwu_job_add(job_id, text, kind, status)` ·
 > `jwu job link` → `jwu_job_link(job_id, pr, project, repo)` · `jwu job done/cancel` → `jwu_job_status(job_id, status)` ·
 > `jwu note` → `jwu_note(key, text)`. Bash-эквиваленты — фолбэк.
-> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
-> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
-> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
-> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
-> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
-> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
-> `jwu workspace add-path .`.
+> **Воркспейс = где лежит код.** jwu работает в контексте *воркспейса*: он определяется
+> автоматически по текущей папке, проверить — `jwu_workspace_current()`
+> (bash: `jwu workspace current --json`).
+>
+> **Код проекта лежит ИМЕННО в папках воркспейса** — их список даёт
+> `jwu_workspace_paths()` (bash: `jwu workspace paths`). Ищи и правь только в них;
+> остальное на диске к задаче отношения не имеет. У папок есть **теги** («legacy-бэкенд»,
+> «новая-версия», «фронт») — по ним понятно, что где: `jwu_workspace_paths(tag="legacy-бэкенд")`.
+> Не угадывай по имени каталога — спроси теги. Пользователь просит пометить папку —
+> `jwu_workspace_tag(path, add=[...])` (bash: `jwu workspace tag <DIR> --add <тег>`).
+>
+> Если `jira_enabled=false` — Jira-команды и инструменты **не вызывай**: якорь работы там
+> либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
+> (`jwu job start --title "…"`). Если папка не привязана ни к одному воркспейсу — скажи
+> об этом пользователю и предложи подключить проект.
+> Если папка не привязана ни к одному воркспейсу (`source` не `cwd`) — **не логируй работу**:
+> записи уедут в чужой контур. Сначала подключи проект — скилл **jwu-workspace-setup**
+> (`jwu init`).
 
 
 ## Шаги
 
-0. **Определи воркспейс:** `jwu_workspace_current()`. Дальше две ветки:
+0. **Определи воркспейс и где лежит код:** `jwu_workspace_current()`, затем
+   `jwu_workspace_paths()` — это единственные папки, в которых стоит искать и править.
+   Теги подсказывают, куда именно идти («legacy-бэкенд» vs «новая-версия»); если папок
+   несколько и неясно, в какой из них задача — **спроси**, а не перебирай все.
+   Дальше две ветки:
    - **есть Jira** (`jira_enabled=true`) — всё как ниже, якорь работы это ключ задачи;
    - **нет Jira** — вместо `jwu task <KEY>` смотри карточку локальной фичи
      (`jwu feature show <KEY>` / `jwu_features()`), работу заводи как

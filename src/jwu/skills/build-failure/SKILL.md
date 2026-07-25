@@ -17,13 +17,24 @@ description: Use when the user wants to understand why a CI build failed for a P
 > `jwu_builds(pr_id, project, repo)` вместо `jwu builds …`, `jwu_build(pr_id, project, repo, url)`
 > вместо `jwu build …`. Команды `jwu builds/build … --json` в bash — **фолбэк**, если
 > MCP-сервер jwu не подключён.
-> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
-> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
-> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
-> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
-> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
-> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
-> `jwu workspace add-path .`.
+> **Воркспейс = где лежит код.** jwu работает в контексте *воркспейса*: он определяется
+> автоматически по текущей папке, проверить — `jwu_workspace_current()`
+> (bash: `jwu workspace current --json`).
+>
+> **Код проекта лежит ИМЕННО в папках воркспейса** — их список даёт
+> `jwu_workspace_paths()` (bash: `jwu workspace paths`). Ищи и правь только в них;
+> остальное на диске к задаче отношения не имеет. У папок есть **теги** («legacy-бэкенд»,
+> «новая-версия», «фронт») — по ним понятно, что где: `jwu_workspace_paths(tag="legacy-бэкенд")`.
+> Не угадывай по имени каталога — спроси теги. Пользователь просит пометить папку —
+> `jwu_workspace_tag(path, add=[...])` (bash: `jwu workspace tag <DIR> --add <тег>`).
+>
+> Если `jira_enabled=false` — Jira-команды и инструменты **не вызывай**: якорь работы там
+> либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
+> (`jwu job start --title "…"`). Если папка не привязана ни к одному воркспейсу — скажи
+> об этом пользователю и предложи подключить проект.
+> Если папка не привязана ни к одному воркспейсу (`source` не `cwd`) — **не логируй работу**:
+> записи уедут в чужой контур. Сначала подключи проект — скилл **jwu-workspace-setup**
+> (`jwu init`).
 
 
 > **Нужны Bitbucket и Jenkins.** Если `bitbucket_enabled=false`, разбирать нечего: скажи, что в

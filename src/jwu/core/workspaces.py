@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import secrets as secrets_mod
@@ -178,7 +178,8 @@ def set_active(store: Store, workspace: Workspace) -> None:
 
 
 def add_path(
-    store: Store, workspace: Workspace, path: str | Path, label: str = ""
+    store: Store, workspace: Workspace, path: str | Path, label: str = "",
+    tags: list[str] | None = None,
 ) -> tuple[str, str | None]:
     """Привязать папку к воркспейсу.
 
@@ -190,13 +191,16 @@ def add_path(
     for row in store.all_workspace_paths():
         if row.path == norm:
             if row.workspace_id == workspace.id:
+                if tags:
+                    store.add_path_tags(row.id, tags)
+                    return norm, "папка уже была привязана — обновил теги"
                 return norm, "папка уже привязана к этому воркспейсу"
             other = store.get_workspace(row.workspace_id)
             raise WorkspaceError(
                 f"Папка {norm} уже принадлежит воркспейсу «{other.slug if other else '?'}». "
                 "Сначала отвяжи её: jwu workspace remove-path"
             )
-    store.add_workspace_path(workspace.id, norm, label)
+    store.add_workspace_path(workspace.id, norm, label, tags=tags or [])
     warn = None if Path(norm).exists() else "папки сейчас нет на диске"
     return norm, warn
 
@@ -295,11 +299,78 @@ def _keyring_ref(cfg: Config, slot: str):
     return slot_keyring_ref(cfg, slot)
 
 
+# --------------------------------------------------------------------------- #
+# Инициализация проекта: что jwu предлагает завести для папки
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Suggestion:
+    """Предложение по настройке воркспейса для папки. Ничего не создаёт — только совет."""
+
+    path: str
+    slug: str
+    name: str
+    workspace: Workspace | None = None   # если папка уже привязана — этот воркспейс
+    source: str = ""                     # почему именно он (см. Resolution.source)
+    repos: list = field(default_factory=list)          # gitinfo.GitInfo внутри папки
+    suggested_paths: list[str] = field(default_factory=list)  # что предложить привязать
+    suggested_tags: dict[str, list[str]] = field(default_factory=dict)  # путь → теги
+
+    @property
+    def already_bound(self) -> bool:
+        return self.workspace is not None and self.source == "cwd"
+
+
+def _slug_from_path(path: Path) -> str:
+    """Slug из имени папки: DnDex → dndex, my_project → my-project."""
+    raw = re.sub(r"[^a-zA-Z0-9]+", "-", path.name).strip("-").lower()
+    return raw or "workspace"
+
+
+def suggest(store: Store, path: str | Path | None = None) -> Suggestion:
+    """Что стоит завести для этой папки: slug, какие папки привязать, какие теги дать.
+
+    Read-only: решение остаётся за пользователем. Репозитории ищутся тем же индексатором,
+    что рисует маркеры в дашборде, поэтому предложение совпадает с тем, что потом видно.
+    """
+    from . import gitinfo
+
+    folder = Path(normalize_path(path or Path.cwd()))
+    bound = workspace_for_path(store, folder)
+    repos = gitinfo.find_repos(folder)
+
+    # Если сама папка — репозиторий, привязываем её; иначе привязываем найденные внутри
+    # (папка-контейнер вроде ~/dev полезнее раздельными репозиториями: у каждого свои теги).
+    own = next((r for r in repos if r.root == str(folder)), None)
+    if own is not None or not repos:
+        suggested = [str(folder)]
+    else:
+        suggested = [r.root for r in repos]
+
+    tags: dict[str, list[str]] = {}
+    for target in suggested:
+        info = next((r for r in repos if r.root == target), None)
+        if info is not None:
+            tags[target] = [info.name.lower()]
+
+    return Suggestion(
+        path=str(folder),
+        slug=_slug_from_path(folder),
+        name=folder.name,
+        workspace=bound[0] if bound else None,
+        source="cwd" if bound else "",
+        repos=repos,
+        suggested_paths=suggested,
+        suggested_tags=tags,
+    )
+
+
 def create(
     store: Store, slug: str, *, name: str = "", jira: bool = False, bitbucket: bool = False,
-    paths: list[str] | None = None,
+    paths: list[str] | None = None, tags: list[str] | None = None,
 ) -> Workspace:
-    """Создать воркспейс и сразу привязать к нему папки."""
+    """Создать воркспейс и сразу привязать к нему папки (с общими тегами, если заданы)."""
     slug = normalize_slug(slug)
     if store.get_workspace_by_slug(slug) is not None:
         raise WorkspaceError(f"Воркспейс «{slug}» уже есть.")
@@ -307,6 +378,6 @@ def create(
         slug, name=name or slug, jira_enabled=jira, bitbucket_enabled=bitbucket
     )
     for path in paths or []:
-        add_path(store, ws, path)
+        add_path(store, ws, path, tags=list(tags or []))
     refreshed = store.get_workspace(ws.id)
     return refreshed or ws

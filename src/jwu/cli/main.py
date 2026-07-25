@@ -605,7 +605,7 @@ def _ws_json(store: Store, ws: Workspace) -> dict:
         "jira_enabled": ws.jira_enabled,
         "bitbucket_enabled": ws.bitbucket_enabled,
         "archived": ws.archived,
-        "paths": [{"path": p.path, "label": p.label} for p in ws.paths],
+        "paths": [{"path": p.path, "label": p.label, "tags": p.tags} for p in ws.paths],
         "jobs": len(jobs),
         "jobs_active": len([j for j in jobs if j.status == "active"]),
         "created_at": ws.created_at,
@@ -651,6 +651,8 @@ def workspace_create(
     slug: str = typer.Argument(..., help="Короткое имя (латиница): work, home-jwu."),
     name: str = typer.Option("", "--name", help="Человекочитаемое название."),
     paths: list[str] = typer.Option([], "--path", help="Папка воркспейса (можно несколько)."),
+    tag: list[str] = typer.Option(
+        [], "--tag", "-t", help="Теги для указанных папок: legacy-бэкенд, новая-версия…"),
     jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключена ли Jira."),
     bitbucket: bool = typer.Option(
         False, "--bitbucket/--no-bitbucket", help="Подключён ли Bitbucket."
@@ -662,7 +664,8 @@ def workspace_create(
     store = _open_store()
     try:
         ws = workspaces.create(
-            store, slug, name=name, jira=jira, bitbucket=bitbucket, paths=list(paths)
+            store, slug, name=name, jira=jira, bitbucket=bitbucket, paths=list(paths),
+            tags=list(tag),
         )
     except workspaces.WorkspaceError as exc:
         err.print(f"[red]{exc}[/red]")
@@ -677,6 +680,122 @@ def workspace_create(
         console.print(f"  📁 {p.path}")
     if jira or bitbucket:
         console.print(f"Настроить доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
+
+
+@app.command("init")
+def init_workspace(
+    path: str = typer.Argument(".", help="Папка проекта (по умолчанию — текущая)."),
+    slug: Optional[str] = typer.Option(None, "--slug", help="Имя воркспейса (иначе — по папке)."),
+    name: str = typer.Option("", "--name", help="Человекочитаемое название."),
+    jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключить Jira."),
+    bitbucket: bool = typer.Option(
+        False, "--bitbucket/--no-bitbucket", help="Подключить Bitbucket."),
+    attach: Optional[str] = typer.Option(
+        None, "--attach", help="Привязать папку к СУЩЕСТВУЮЩЕМУ воркспейсу вместо создания."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать, применить предложение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON (для агентов)."),
+) -> None:
+    """Подключить проект к jwu: завести воркспейс для папки, привязать репозитории, дать теги.
+
+    Сначала показывает, ЧТО собирается сделать (найденные репозитории и предлагаемые теги),
+    и только потом спрашивает подтверждение. Интеграции по умолчанию не подключаются —
+    для личного проекта они не нужны, а для рабочего есть `jwu configure`.
+    """
+    store = _open_store()
+    sg = workspaces.suggest(store, path)
+
+    # ГЛАВНОЕ: если папка уже резолвится в воркспейс — НИЧЕГО не создаём.
+    # Повторный init обязан быть безопасным: он подтверждает, что проект уже подключён.
+    if sg.already_bound and sg.workspace is not None:
+        ws = sg.workspace
+        store.use_workspace(ws.id)
+        if json_out:
+            payload = _ws_json(store, ws)
+            payload.update({"ok": True, "already_initialized": True, "path": sg.path})
+            _emit_json(payload)
+            return
+        console.print(f"[green]Проект уже подключён[/green] к воркспейсу «{ws.label}» "
+                      f"[dim](папка резолвится сюда)[/dim]")
+        for p_ in ws.paths:
+            chips = f"   [cyan]{' '.join('#' + t for t in p_.tags)}[/cyan]" if p_.tags else ""
+            console.print(f"  📁 {p_.path}{chips}")
+        console.print("Добавить репозиторий: [cyan]jwu workspace add-path <DIR> --tag <тег>[/cyan]"
+                      "   ·   теги: [cyan]jwu workspace tag <DIR> --add <тег>[/cyan]")
+        return
+
+    # Папка не привязана, но воркспейсы уже есть — возможно, её надо привязать к одному
+    # из них, а не плодить новый. Молча не решаем.
+    existing = [w for w in store.list_workspaces()]
+    if attach:
+        target = workspaces.find_workspace(store, attach)
+        if target is None:
+            err.print(f"[red]Воркспейс «{attach}» не найден.[/red] Список: jwu workspace list")
+            raise typer.Exit(code=1)
+        for folder in sg.suggested_paths:
+            workspaces.add_path(store, target, folder, tags=sg.suggested_tags.get(folder, []))
+        workspaces.set_active(store, target)
+        target = store.get_workspace(target.id) or target
+        if json_out:
+            _emit_json(_ws_json(store, target))
+            return
+        console.print(f"[green]Папки привязаны[/green] к воркспейсу «{target.label}» "
+                      f"(папок теперь {len(target.paths)})")
+        return
+
+    target_slug = slug or sg.slug
+    if json_out and not yes:
+        _emit_json({
+            "ok": False, "reason": "confirm_required", "path": sg.path,
+            "suggested": {"slug": target_slug, "name": name or sg.name,
+                          "paths": sg.suggested_paths, "tags": sg.suggested_tags,
+                          "jira": jira, "bitbucket": bitbucket},
+            "repos": [{"root": r.root, "name": r.name, "branch": r.branch} for r in sg.repos],
+            # альтернатива созданию: привязать папку к уже существующему контуру
+            "existing_workspaces": [{"slug": w.slug, "name": w.name,
+                                     "paths": len(w.paths)} for w in existing],
+        })
+        raise typer.Exit(code=0)
+
+    # Превью — только для человека: при --json на stdout должен быть ТОЛЬКО JSON.
+    if not json_out:
+        console.print(f"[b]Подключаю проект[/b] {sg.path}")
+        console.print(f"  воркспейс: [cyan]{target_slug}[/cyan]"
+                      f"   Jira: {_yes_no(jira)}   Bitbucket: {_yes_no(bitbucket)}")
+        if sg.repos:
+            console.print(f"  найдено репозиториев: {len(sg.repos)}")
+        for folder in sg.suggested_paths:
+            tags = sg.suggested_tags.get(folder, [])
+            chips = f"   [cyan]{' '.join('#' + t for t in tags)}[/cyan]" if tags else ""
+            console.print(f"  📁 {folder}{chips}")
+        if not sg.repos:
+            console.print("  [dim]git-репозиториев не нашлось — привяжу папку как есть[/dim]")
+        if existing:
+            console.print(f"[dim]уже есть воркспейсы: {', '.join(w.slug for w in existing)}. "
+                          f"Привязать папку к одному из них: jwu init --attach <slug>[/dim]")
+
+    if not yes and not typer.confirm("Всё верно?", default=True):
+        console.print("[dim]Отменено. Можно задать своё: jwu init --slug … --name …[/dim]")
+        raise typer.Exit(code=1)
+
+    try:
+        ws = workspaces.create(store, target_slug, name=name or sg.name,
+                               jira=jira, bitbucket=bitbucket)
+        for folder in sg.suggested_paths:
+            workspaces.add_path(store, ws, folder, tags=sg.suggested_tags.get(folder, []))
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    workspaces.set_active(store, ws)
+    ws = store.get_workspace(ws.id) or ws
+
+    if json_out:
+        _emit_json(_ws_json(store, ws))
+        return
+    console.print(f"\n[green]Готово:[/green] воркспейс «{ws.label}», папок {len(ws.paths)}")
+    console.print("Дальше: [cyan]jwu dashboard[/cyan]   ·   "
+                  "фичи: [cyan]jwu feature add \"…\"[/cyan]")
+    if jira or bitbucket:
+        console.print(f"Доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
 
 
 @workspace_app.command("use")
@@ -769,7 +888,8 @@ def workspace_show(
         for p in ws.paths:
             mark = "" if Path(p.path).exists() else "  [yellow](нет на диске)[/yellow]"
             label = f"  [dim]{p.label}[/dim]" if p.label else ""
-            console.print(f"  📁 {p.path}{label}{mark}")
+            tags = f"  [cyan]{' '.join('#' + t for t in p.tags)}[/cyan]" if p.tags else ""
+            console.print(f"  📁 {p.path}{tags}{label}{mark}")
     else:
         console.print("\n[dim]Папок нет. Привязать текущую: jwu workspace add-path .[/dim]")
 
@@ -793,18 +913,83 @@ def workspace_show(
 def workspace_add_path(
     path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
     label: str = typer.Option("", "--label", help="Пометка (например «бэкенд»)."),
+    tag: list[str] = typer.Option(
+        [], "--tag", "-t",
+        help="Тег для поиска (можно несколько): legacy-бэкенд, новая-версия, фронт."),
 ) -> None:
     """Привязать папку к воркспейсу — по ней он и будет определяться автоматически."""
     store = _open_store()
     ws = _resolve_workspace(store)
     try:
-        norm, warn = workspaces.add_path(store, ws, path, label)
+        norm, warn = workspaces.add_path(store, ws, path, label, tags=list(tag))
     except workspaces.WorkspaceError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
-    console.print(f"[green]{norm}[/green] → воркспейс «{ws.label}»")
+    tags_note = f"   [cyan]{' '.join('#' + t for t in tag)}[/cyan]" if tag else ""
+    console.print(f"[green]{norm}[/green] → воркспейс «{ws.label}»{tags_note}")
     if warn:
         err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+
+@workspace_app.command("tag")
+def workspace_tag(
+    path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
+    add: list[str] = typer.Option([], "--add", "-a", help="Добавить тег (можно несколько)."),
+    remove: list[str] = typer.Option([], "--remove", "-r", help="Убрать тег."),
+    set_: list[str] = typer.Option([], "--set", help="Заменить весь набор тегов."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Теги папки: по ним потом искать, где что лежит (legacy-бэкенд, новая-версия…)."""
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    norm = workspaces.normalize_path(path)
+    row = next((p for p in store.workspace_paths(ws.id) if p.path == norm), None)
+    if row is None:
+        err.print(f"[red]Папка {norm} не привязана к воркспейсу «{ws.label}».[/red]\n"
+                  f"Привязать: [cyan]jwu workspace add-path {path}[/cyan]")
+        raise typer.Exit(code=1)
+    if set_:
+        tags = store.set_path_tags(row.id, list(set_))
+    else:
+        if add:
+            store.add_path_tags(row.id, list(add))
+        tags = store.remove_path_tags(row.id, list(remove)) if remove \
+            else store._path_tags([row.id]).get(row.id, [])
+    if json_out:
+        _emit_json({"path": norm, "tags": tags})
+        return
+    console.print(f"{norm}   [cyan]{' '.join('#' + t for t in tags) or '— без тегов'}[/cyan]")
+
+
+@workspace_app.command("paths")
+def workspace_paths(
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Только папки с этим тегом."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Папки воркспейса (с тегами). С --tag — поиск: где лежит legacy-бэкенд и т.п."""
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    rows = store.workspace_paths(ws.id, tag=tag)
+    if json_out:
+        _emit_json({"workspace": ws.slug, "tag": tag,
+                    "paths": [p.model_dump() for p in rows],
+                    "known_tags": store.all_tags(ws.id)})
+        return
+    if not rows:
+        what = f" с тегом «{tag}»" if tag else ""
+        console.print(f"[dim]Папок{what} нет.[/dim]")
+        raise typer.Exit(code=1 if tag else 0)
+    table = Table(box=None, pad_edge=False)
+    for col in ("Папка", "Теги", "Метка"):
+        table.add_column(col)
+    for row in rows:
+        table.add_row(row.path,
+                      " ".join(f"#{t}" for t in row.tags) or "—",
+                      row.label or "—")
+    console.print(table)
+    known = store.all_tags(ws.id)
+    if known and not tag:
+        console.print("[dim]теги: " + "  ".join(f"#{t}({n})" for t, n in known.items()) + "[/dim]")
 
 
 @workspace_app.command("remove-path")
@@ -1332,6 +1517,10 @@ def dashboard(
         900.0, "--slow-interval", help="Интервал авто-синка сетевых таблиц (задачи/PR), сек. Отсчёт ведётся от ОКОНЧАНИЯ предыдущего синка."),
     detail_interval: float = typer.Option(
         60.0, "--detail-interval", help="Интервал авто-дотягивания открытой задачи/PR из сети, сек."),
+    index_interval: float = typer.Option(
+        120.0, "--index-interval",
+        help="Интервал переиндексации папок воркспейса (git-ветки в «Структуре»), сек. "
+             "0 — только при открытии дашборда. Работает и без -a: индексация локальная."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON вместо TUI (для Claude)."),
 ) -> None:
     """Дашборд: задачи на мне, упоминания, PR и изменения. По умолчанию — из памяти."""
@@ -1386,6 +1575,7 @@ def dashboard(
         workspaces_fn=_tui_workspaces,
         workspace_switch_fn=_tui_switch_workspace,
         workspace_create_fn=_tui_create_workspace,
+        workspace_delete_fn=_tui_delete_workspace,
         path_add_fn=_tui_add_path,
         path_remove_fn=_tui_remove_path,
         feature_get_fn=_feature_get,
@@ -1401,6 +1591,7 @@ def dashboard(
         fast_interval=fast_interval,
         slow_interval=slow_interval,
         detail_interval=detail_interval,
+        index_interval=index_interval,
     ).run()
 
 
@@ -1470,6 +1661,30 @@ def _tui_switch_workspace(workspace_id: int) -> DashboardData:
 def _tui_create_workspace(slug: str) -> None:
     with _open_store() as store:
         workspaces.create(store, slug)
+
+
+def _tui_delete_workspace(workspace_id: int) -> DashboardData:
+    """Удалить воркспейс из TUI и вернуть снимок уже другого (активного) контура."""
+    global _WORKSPACE_ARG
+    with _open_store() as store:
+        ws = store.get_workspace(workspace_id)
+        if ws is None:
+            raise ValueError(f"воркспейс #{workspace_id} не найден")
+        if len(store.list_workspaces(include_archived=True)) <= 1:
+            raise ValueError("это единственный воркспейс — удалять нечего")
+        store.delete_workspace(workspace_id)
+        if (store.get_meta(workspaces.ACTIVE_META_KEY) or "") == ws.slug:
+            store.set_meta(workspaces.ACTIVE_META_KEY, "")
+        if _WORKSPACE_ARG == ws.slug:
+            _WORKSPACE_ARG = None
+        # переезжаем в первый оставшийся, иначе дашборду нечего показывать
+        rest = store.list_workspaces()
+        target = rest[0] if rest else None
+        if target is not None:
+            _WORKSPACE_ARG = target.slug
+            workspaces.set_active(store, target)
+            store.use_workspace(target.id)
+        return dashboard_from_memory(store)
 
 
 def _tui_add_path(workspace_id: int, path: str) -> DashboardData:

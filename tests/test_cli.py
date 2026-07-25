@@ -534,3 +534,117 @@ def _cfg_stub():
     from jwu.core.config import Config
 
     return Config()
+
+
+# --------------------------------------------------------------------------- #
+# jwu init — подключение проекта
+# --------------------------------------------------------------------------- #
+
+
+def _repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ".git").mkdir()
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    return path
+
+
+def test_init_creates_workspace_with_repo_tags(monkeypatch, tmp_path):
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    db = _patch_open_store(monkeypatch, tmp_path)
+    project = _repo(tmp_path / "DnDex")
+
+    res = runner.invoke(cli.app, ["init", str(project), "--yes", "--json"])
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["slug"] == "dndex"                      # slug выведен из имени папки
+    assert [p["path"] for p in payload["paths"]] == [str(project.resolve())]
+    assert payload["paths"][0]["tags"] == ["dndex"]        # тег из имени репозитория
+    assert payload["jira_enabled"] is False                # интеграции не навязываем
+
+    store = Store(db)
+    assert {w.slug for w in store.list_workspaces()} == {"work", "dndex"}
+    store.close()
+
+
+def test_init_is_idempotent_and_never_duplicates(monkeypatch, tmp_path):
+    """Повторный init на привязанной папке НЕ создаёт второй воркспейс."""
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    db = _patch_open_store(monkeypatch, tmp_path)
+    project = _repo(tmp_path / "DnDex")
+    runner.invoke(cli.app, ["init", str(project), "--yes"])
+
+    res = runner.invoke(cli.app, ["init", str(project), "--yes", "--json"])
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["already_initialized"] is True
+    assert payload["slug"] == "dndex"
+
+    store = Store(db)
+    assert len([w for w in store.list_workspaces()]) == 2   # work + dndex, третьего нет
+    store.close()
+
+
+def test_init_recognizes_nested_folder_as_initialized(monkeypatch, tmp_path):
+    """Вложенная папка проекта тоже считается подключённой — резолв идёт по дереву."""
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    db = _patch_open_store(monkeypatch, tmp_path)
+    project = _repo(tmp_path / "DnDex")
+    nested = project / "src" / "core"
+    nested.mkdir(parents=True)
+    runner.invoke(cli.app, ["init", str(project), "--yes"])
+
+    res = runner.invoke(cli.app, ["init", str(nested), "--yes", "--json"])
+    assert json.loads(res.stdout)["already_initialized"] is True
+    store = Store(db)
+    assert len(store.list_workspaces()) == 2
+    store.close()
+
+
+def test_init_json_without_yes_asks_for_confirmation(monkeypatch, tmp_path):
+    """Агенту сначала отдаём предложение и список существующих контуров — без записи."""
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    db = _patch_open_store(monkeypatch, tmp_path)
+    project = _repo(tmp_path / "DnDex")
+
+    res = runner.invoke(cli.app, ["init", str(project), "--json"])
+    payload = json.loads(res.stdout)
+    assert payload["reason"] == "confirm_required"
+    assert payload["suggested"]["slug"] == "dndex"
+    assert [w["slug"] for w in payload["existing_workspaces"]] == ["work"]
+
+    store = Store(db)
+    assert len(store.list_workspaces()) == 1     # ничего не создано
+    store.close()
+
+
+def test_init_attach_binds_to_existing_workspace(monkeypatch, tmp_path):
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    db = _patch_open_store(monkeypatch, tmp_path)
+    project = _repo(tmp_path / "DnDex")
+
+    res = runner.invoke(cli.app, ["init", str(project), "--attach", "work", "--json"])
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["slug"] == "work"
+    assert [p["path"] for p in payload["paths"]] == [str(project.resolve())]
+
+    store = Store(db)
+    assert len(store.list_workspaces()) == 1     # новый контур не появился
+    store.close()
+
+
+def test_init_suggests_inner_repos_for_container_folder(monkeypatch, tmp_path):
+    """Папка-контейнер: привязываем найденные внутри репозитории, у каждого свой тег."""
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    _patch_open_store(monkeypatch, tmp_path)
+    container = tmp_path / "dev"
+    _repo(container / "backend")
+    _repo(container / "frontend")
+
+    res = runner.invoke(cli.app, ["init", str(container), "--yes", "--json"])
+    payload = json.loads(res.stdout)
+    paths = {p["path"]: p["tags"] for p in payload["paths"]}
+    assert paths == {
+        str((container / "backend").resolve()): ["backend"],
+        str((container / "frontend").resolve()): ["frontend"],
+    }
