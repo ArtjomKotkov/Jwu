@@ -21,8 +21,24 @@ description: Use when the user wants to start/track work on a specific Jira task
 > `jwu job start` → `jwu_job_start(task_key, title)` · `jwu job add` → `jwu_job_add(job_id, text, kind, status)` ·
 > `jwu job link` → `jwu_job_link(job_id, pr, project, repo)` · `jwu job done/cancel` → `jwu_job_status(job_id, status)` ·
 > `jwu note` → `jwu_note(key, text)`. Bash-эквиваленты — фолбэк.
+> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
+> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
+> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
+> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
+> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
+> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
+> `jwu workspace add-path .`.
+
 
 ## Шаги
+
+0. **Определи воркспейс:** `jwu_workspace_current()`. Дальше две ветки:
+   - **есть Jira** (`jira_enabled=true`) — всё как ниже, якорь работы это ключ задачи;
+   - **нет Jira** — вместо `jwu task <KEY>` смотри карточку локальной фичи
+     (`jwu feature show <KEY>` / `jwu_features()`), работу заводи как
+     `jwu job start --feature <KEY> --title "<суть цикла>"`, а если фичи нет —
+     `jwu job start --title "<суть>"` (работа без якоря). **Ключ задачи не выдумывай.**
+     Фаза 1 без Bitbucket сводится к прогону локальных тестов — конфликт и CI смотреть негде.
 
 1. **Карточка задачи целиком:** `jwu task <KEY>` (поля: `status`, `description`, `comments`, `links`,
    `pull_requests`, `branches`, `commits`, `notes`, плюс секция «Работы»; `--json` если нужна структура).

@@ -16,6 +16,14 @@ description: Use when the user wants to run a code review of current changes ins
 > **MCP-first.** Операции предпочитай MCP-инструментами jwu, bash `jwu …` — фолбэк:
 > `jwu task <KEY> --json` → `jwu_task(key)` · `jwu pr <id> --project <KEY> --repo <slug> --json` → `jwu_pr(pr_id, project, repo)` ·
 > `jwu job add …` → `jwu_job_add(job_id, text, kind, status)`.
+> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
+> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
+> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
+> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
+> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
+> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
+> `jwu workspace add-path .`.
+
 
 ## Аргумент и выбор субагента
 
@@ -38,6 +46,9 @@ description: Use when the user wants to run a code review of current changes ins
   или в пользовательских настройках, не здесь.
 
 ## Шаги
+
+> Ревью идёт по **локальному диффу** и от Jira не зависит — работает в любом воркспейсе.
+> Записи ревью пишутся в работу текущего воркспейса.
 
 1. **Найди работу.**
    - Подхвати текущую работу (если контекста нет — через **jwu-resume-job**): нужен

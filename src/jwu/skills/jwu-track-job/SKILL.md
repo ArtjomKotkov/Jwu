@@ -15,6 +15,14 @@ description: Use while actively working on a jwu «работа (job)» to log p
 > `jwu job start` → `jwu_job_start(task_key, title)` · `jwu job link` → `jwu_job_link(job_id, pr, project, repo)` ·
 > `jwu job done/cancel` → `jwu_job_status(job_id, status)` · `jwu note` → `jwu_note(key, text)`.
 > Валидные `--kind`/`kind` — те же (см. таблицу ниже).
+> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
+> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
+> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
+> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
+> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
+> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
+> `jwu workspace add-path .`.
+
 
 ## Когда
 
@@ -25,6 +33,9 @@ description: Use while actively working on a jwu «работа (job)» to log p
 ## Перед записью
 
 - Нужен `JOB_ID` текущего цикла. Не знаешь — `jwu jobs --task <KEY>` (бери активную) либо спроси.
+  Работы ищутся **в текущем воркспейсе**; если якорь — локальная фича, фильтр другой:
+  `jwu jobs --feature <KEY>`. Статусы фич (`open | in_progress | review | done | cancelled`)
+  живут в `LOCAL_FEATURE_STATUSES` (`src/jwu/core/models.py`) — там же источник истины.
   **Не плоди новые работы ради заметки** — новая работа = новый цикл правок, это делает jwu-start-job.
 - Контекст потерян / новая сессия / вернулись к задаче — сначала подхвати состояние работы
   через **jwu-resume-job**, потом логируй.
