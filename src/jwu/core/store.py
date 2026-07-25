@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS workspace_paths (
     added_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ws_paths_ws ON workspace_paths(workspace_id);
+CREATE TABLE IF NOT EXISTS workspace_path_tags (
+    path_id INTEGER NOT NULL,
+    tag     TEXT NOT NULL,
+    PRIMARY KEY (path_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_path_tags_tag ON workspace_path_tags(tag);
 CREATE TABLE IF NOT EXISTS workspace_settings (
     workspace_id INTEGER NOT NULL,
     key          TEXT NOT NULL,
@@ -215,7 +221,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -297,10 +303,24 @@ def _m004_secrets(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m005_path_tags(conn: sqlite3.Connection) -> None:
+    """v4 → v5: теги папок воркспейса («legacy-бэкенд», «новая-версия» и т.п.).
+
+    Отдельной таблицей, а не списком в колонке: по тегу ищут, а поиск по подстроке
+    в JSON — это то, за что потом стыдно.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS workspace_path_tags ("
+        " path_id INTEGER NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (path_id, tag))"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_path_tags_tag ON workspace_path_tags(tag)")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
     (4, _m004_secrets),
+    (5, _m005_path_tags),
 ]
 
 
@@ -500,6 +520,9 @@ class Store:
                 self.conn.execute("DELETE FROM job_prs WHERE job_id = ?", (jid,))
             for table in WORKSPACE_SCOPED_TABLES:
                 self.conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace_id,))
+        self.conn.execute(
+            "DELETE FROM workspace_path_tags WHERE path_id IN"
+            " (SELECT id FROM workspace_paths WHERE workspace_id = ?)", (workspace_id,))
         self.conn.execute("DELETE FROM workspace_paths WHERE workspace_id = ?", (workspace_id,))
         self.conn.execute("DELETE FROM workspace_settings WHERE workspace_id = ?", (workspace_id,))
         self.conn.execute("DELETE FROM workspace_secrets WHERE workspace_id = ?", (workspace_id,))
@@ -511,41 +534,110 @@ class Store:
 
     # --- папки воркспейса ------------------------------------------------ #
 
-    def add_workspace_path(self, workspace_id: int, path: str, label: str = "") -> WorkspacePath:
+    def add_workspace_path(self, workspace_id: int, path: str, label: str = "",
+                           tags: list[str] | None = None) -> WorkspacePath:
         ts = _now()
         cur = self.conn.execute(
             "INSERT INTO workspace_paths (workspace_id, path, label, added_at) VALUES (?, ?, ?, ?)",
             (workspace_id, path, label, ts),
         )
+        path_id = int(cur.lastrowid)
         self.conn.commit()
-        return WorkspacePath(id=int(cur.lastrowid), workspace_id=workspace_id, path=path,
-                             label=label, added_at=ts)
+        applied = self.add_path_tags(path_id, tags or [])
+        return WorkspacePath(id=path_id, workspace_id=workspace_id, path=path,
+                             label=label, added_at=ts, tags=applied)
 
-    def remove_workspace_path(self, path: str, workspace_id: int | None = None) -> bool:
-        sql, params = "DELETE FROM workspace_paths WHERE path = ?", [path]
-        if workspace_id is not None:
-            sql += " AND workspace_id = ?"
-            params.append(workspace_id)
-        cur = self.conn.execute(sql, params)
-        self.conn.commit()
-        return cur.rowcount > 0
-
-    def workspace_paths(self, workspace_id: int) -> list[WorkspacePath]:
+    def _path_tags(self, path_ids: list[int]) -> dict[int, list[str]]:
+        """Теги пачкой: одна выборка на все папки, чтобы не дёргать БД в цикле."""
+        if not path_ids:
+            return {}
+        marks = ",".join("?" * len(path_ids))
         rows = self.conn.execute(
-            "SELECT id, workspace_id, path, label, added_at FROM workspace_paths"
-            " WHERE workspace_id = ? ORDER BY path",
+            f"SELECT path_id, tag FROM workspace_path_tags WHERE path_id IN ({marks})"
+            " ORDER BY tag",
+            path_ids,
+        ).fetchall()
+        out: dict[int, list[str]] = {}
+        for row in rows:
+            out.setdefault(row["path_id"], []).append(row["tag"])
+        return out
+
+    def set_path_tags(self, path_id: int, tags: list[str]) -> list[str]:
+        """Заменить набор тегов папки целиком."""
+        self.conn.execute("DELETE FROM workspace_path_tags WHERE path_id = ?", (path_id,))
+        clean = sorted({t for t in (t.strip() for t in tags) if t})
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO workspace_path_tags (path_id, tag) VALUES (?, ?)",
+            [(path_id, t) for t in clean],
+        )
+        self.conn.commit()
+        return clean
+
+    def add_path_tags(self, path_id: int, tags: list[str]) -> list[str]:
+        clean = {t for t in (t.strip() for t in tags) if t}
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO workspace_path_tags (path_id, tag) VALUES (?, ?)",
+            [(path_id, t) for t in sorted(clean)],
+        )
+        self.conn.commit()
+        return self._path_tags([path_id]).get(path_id, [])
+
+    def remove_path_tags(self, path_id: int, tags: list[str]) -> list[str]:
+        clean = {t for t in (t.strip() for t in tags) if t}
+        self.conn.executemany(
+            "DELETE FROM workspace_path_tags WHERE path_id = ? AND tag = ?",
+            [(path_id, t) for t in sorted(clean)],
+        )
+        self.conn.commit()
+        return self._path_tags([path_id]).get(path_id, [])
+
+    def all_tags(self, workspace_id: int) -> dict[str, int]:
+        """Теги воркспейса со счётчиком папок — чтобы было видно, что вообще заведено."""
+        rows = self.conn.execute(
+            "SELECT t.tag AS tag, COUNT(*) AS n FROM workspace_path_tags t"
+            " JOIN workspace_paths p ON p.id = t.path_id"
+            " WHERE p.workspace_id = ? GROUP BY t.tag ORDER BY t.tag",
             (workspace_id,),
         ).fetchall()
+        return {r["tag"]: r["n"] for r in rows}
+
+    def remove_workspace_path(self, path: str, workspace_id: int | None = None) -> bool:
+        find, params = "SELECT id FROM workspace_paths WHERE path = ?", [path]
+        if workspace_id is not None:
+            find += " AND workspace_id = ?"
+            params.append(workspace_id)
+        row = self.conn.execute(find, params).fetchone()
+        if row is None:
+            return False
+        self.conn.execute("DELETE FROM workspace_path_tags WHERE path_id = ?", (row["id"],))
+        self.conn.execute("DELETE FROM workspace_paths WHERE id = ?", (row["id"],))
+        self.conn.commit()
+        return True
+
+    def workspace_paths(self, workspace_id: int, *, tag: str | None = None) -> list[WorkspacePath]:
+        """Папки воркспейса вместе с тегами; с ``tag`` — только помеченные им."""
+        sql = ("SELECT p.id, p.workspace_id, p.path, p.label, p.added_at FROM workspace_paths p")
+        params: list = []
+        if tag:
+            sql += " JOIN workspace_path_tags t ON t.path_id = p.id AND t.tag = ?"
+            params.append(tag.strip())
+        sql += " WHERE p.workspace_id = ? ORDER BY p.path"
+        params.append(workspace_id)
+        rows = self.conn.execute(sql, params).fetchall()
+        tags = self._path_tags([r["id"] for r in rows])
         return [WorkspacePath(id=r["id"], workspace_id=r["workspace_id"], path=r["path"],
-                              label=r["label"], added_at=r["added_at"]) for r in rows]
+                              label=r["label"], added_at=r["added_at"],
+                              tags=tags.get(r["id"], [])) for r in rows]
 
     def all_workspace_paths(self) -> list[WorkspacePath]:
         """Все зарегистрированные папки (для резолва воркспейса по текущей директории)."""
         rows = self.conn.execute(
             "SELECT id, workspace_id, path, label, added_at FROM workspace_paths"
         ).fetchall()
+        tags = self._path_tags([r["id"] for r in rows])
         return [WorkspacePath(id=r["id"], workspace_id=r["workspace_id"], path=r["path"],
-                              label=r["label"], added_at=r["added_at"]) for r in rows]
+                              label=r["label"], added_at=r["added_at"],
+                              tags=tags.get(r["id"], [])) for r in rows]
 
     # --- настройки воркспейса (плоский KV: 'jira.base_url' → значение) ---- #
 

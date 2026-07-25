@@ -406,12 +406,17 @@ class PR(BaseModel):
 
 
 class WorkspacePath(BaseModel):
-    """Папка, отнесённая к воркспейсу (абсолютный путь после resolve)."""
+    """Папка, отнесённая к воркспейсу (абсолютный путь после resolve).
+
+    ``tags`` — по ним папку находят: «legacy-бэкенд», «новая-версия», «фронт». Именно
+    теги отвечают на вопрос «где что лежит», когда в воркспейсе несколько репозиториев.
+    """
 
     id: int = 0
     workspace_id: int = 0
     path: str = ""
     label: str = ""
+    tags: list[str] = Field(default_factory=list)
     added_at: str = ""
 
 

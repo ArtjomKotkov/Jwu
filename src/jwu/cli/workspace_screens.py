@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 from rich.console import Group
@@ -17,16 +19,24 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, Static, Tree
 
+from ..core import gitinfo
 from ..core.dates import fmt_dt as _fmt_dt
-from ..core.models import LOCAL_FEATURE_BADGES, LocalFeature, Workspace
+from ..core.models import LOCAL_FEATURE_BADGES, LocalFeature, Workspace, WorkspacePath
 
 WORKSPACE_COLUMNS = ["Workspace", "Название", "Jira", "Bitbucket", "Папок", "Работ"]
 
 
-class TextPromptScreen(ModalScreen):
-    """Модалка с одним полем ввода. Enter — подтвердить, Escape — отмена."""
+class TextPromptScreen(ModalScreen[Optional[str]]):
+    """Модалка с одним полем ввода. Enter — подтвердить, Escape — отмена.
+
+    Результат отдаётся ЧЕРЕЗ ``dismiss(value)``, а не вызовом колбэка на месте:
+    иначе обработчик успевал перерисовать нижний экран, пока модалка ещё не снята,
+    и его правки не доезжали до отрисовки (таблица обновлялась только после перезапуска).
+    Вызывающий передаёт колбэк вторым аргументом ``push_screen`` — он сработает
+    уже после того, как экран действительно закрыт.
+    """
 
     CSS = """
     TextPromptScreen { align: center middle; }
@@ -35,13 +45,11 @@ class TextPromptScreen(ModalScreen):
     """
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
-    def __init__(self, title: str, *, value: str = "",
-                 placeholder: str = "", on_submit: Callable[[str], None]) -> None:
+    def __init__(self, title: str, *, value: str = "", placeholder: str = "") -> None:
         super().__init__()
         self._title = title
         self._value = value
         self._placeholder = placeholder
-        self._on_submit = on_submit
 
     def compose(self) -> ComposeResult:
         with Vertical(id="prompt-box"):
@@ -49,16 +57,16 @@ class TextPromptScreen(ModalScreen):
             yield Input(value=self._value, placeholder=self._placeholder, id="prompt-input")
 
     def on_mount(self) -> None:
-        self.query_one("#prompt-input", Input).focus()
+        field = self.query_one("#prompt-input", Input)
+        field.focus()
+        field.cursor_position = len(field.value)  # чтобы можно было дописывать к пути
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        value = event.value.strip()
-        self.dismiss()
-        if value:
-            self._on_submit(value)
+        event.stop()
+        self.dismiss(event.value.strip() or None)
 
     def action_cancel(self) -> None:
-        self.dismiss()
+        self.dismiss(None)
 
 
 class WorkspacePickerScreen(ModalScreen):
@@ -160,14 +168,17 @@ class WorkspacePickerScreen(ModalScreen):
         if self._create_fn is None:
             return
 
-        def do(slug: str) -> None:
+        def do(slug: Optional[str]) -> None:
+            if not slug:
+                return
             self._create_fn(slug)  # type: ignore[misc]
             self._reload()
 
-        self.app.push_screen(TextPromptScreen(
-            "Новый воркспейс: короткое имя (латиница, напр. home-jwu)",
-            placeholder="home-jwu", on_submit=do,
-        ))
+        self.app.push_screen(
+            TextPromptScreen("Новый воркспейс: короткое имя (латиница, напр. home-jwu)",
+                             placeholder="home-jwu"),
+            do,
+        )
 
     def action_bind_cwd(self) -> None:
         ws = self._selected()
@@ -180,6 +191,132 @@ class WorkspacePickerScreen(ModalScreen):
         self.dismiss()
         if self._at_startup:
             self.app.exit()
+
+
+@dataclass
+class TreeEntry:
+    """Что стоит за узлом дерева: путь, каталог ли это и папка ли воркспейса."""
+
+    path: str
+    is_dir: bool
+    root: Optional[WorkspacePath] = None  # задано только у корневых узлов
+
+
+class WorkspaceTree(Tree[TreeEntry]):
+    """Структура воркспейса деревом: корни — папки контура, внутри — их содержимое.
+
+    Содержимое подгружается ЛЕНИВО, при раскрытии узла: дерево не обходит диск заранее,
+    поэтому большой каталог не тормозит вкладку. Каталоги-репозитории помечаются
+    «имя/ветка» (см. core.gitinfo — читается файлами, без запуска git).
+
+    Textual из коробки вешает на раскрытие только ``space``, а ←/→ отдаёт под переход
+    к родителю (shift+←). Привычное по редакторам поведение приходится задать самим.
+    """
+
+    BINDINGS = [
+        *Tree.BINDINGS,
+        Binding("right,l", "expand_node", "Раскрыть", show=False),
+        Binding("left,h", "collapse_node", "Свернуть", show=False),
+        Binding("j", "cursor_down", show=False),
+        Binding("k", "cursor_up", show=False),
+    ]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("workspace", **kwargs)
+        self.show_root = False
+        self.guide_depth = 2
+
+    # --- наполнение ------------------------------------------------------ #
+
+    def set_roots(self, paths: list[WorkspacePath]) -> None:
+        """Пересобрать корни (папки воркспейса), сохранив раскрытые узлы."""
+        expanded = {data.path for data, node in self._walk_entries() if node.is_expanded}
+        self.root.remove_children()
+        for wp in paths:
+            node = self.root.add(
+                wp.path, data=TreeEntry(path=wp.path, is_dir=True, root=wp),
+                allow_expand=True,
+            )
+            if wp.path in expanded:
+                node.expand()
+        self.root.expand()
+        # Без курсора (cursor_line = -1) стрелки некуда применить — дерево выглядит
+        # «мёртвым». Ставим его на первую папку сразу после наполнения.
+        if paths and self.cursor_line < 0:
+            self.cursor_line = 0
+
+    def _walk_entries(self):
+        stack = list(self.root.children)
+        while stack:
+            node = stack.pop()
+            data = node.data
+            if data is not None:
+                yield data, node
+            stack.extend(node.children)
+
+    def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
+        node = event.node
+        data = node.data
+        if data is None or not data.is_dir or node.children:
+            return
+        for child in self._children_of(data.path):
+            node.add_leaf(child.path.rsplit("/", 1)[-1], data=child) if not child.is_dir \
+                else node.add(child.path.rsplit("/", 1)[-1], data=child, allow_expand=True)
+
+    @staticmethod
+    def _children_of(path: str) -> list[TreeEntry]:
+        """Содержимое каталога: сначала папки, затем файлы; служебное скрыто."""
+        try:
+            entries = sorted(
+                Path(path).iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+        except OSError:
+            return []
+        out: list[TreeEntry] = []
+        for item in entries:
+            if item.name.startswith(".") or item.name in gitinfo.SKIP_DIRS:
+                continue
+            out.append(TreeEntry(path=str(item), is_dir=item.is_dir()))
+        return out
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None or not data.is_dir:
+            return label
+        info = gitinfo.git_info(data.path)
+        tags = data.root.tags if data.root else []
+        if info is None and not tags:
+            return label
+        label = label.copy()
+        if info is not None:
+            label.append("  ")
+            label.append(f" {info.label} ", style="black on cyan")
+        for tag in tags:
+            label.append("  ")
+            label.append(f"#{tag}", style="magenta")
+        return label
+
+    # --- клавиши --------------------------------------------------------- #
+
+    def action_expand_node(self) -> None:
+        node = self.cursor_node
+        if node is None:
+            return
+        if node.allow_expand and not node.is_expanded:
+            node.expand()
+        else:
+            self.action_cursor_down()
+
+    def action_collapse_node(self) -> None:
+        node = self.cursor_node
+        if node is None:
+            return
+        if node.is_expanded:
+            node.collapse()
+        elif node.parent is not None and node.parent is not self.root:
+            self.cursor_line = node.parent.line
 
 
 class FeatureDetailScreen(Screen):
@@ -268,9 +405,11 @@ class FeatureDetailScreen(Screen):
         if feature is None or self._edit_fn is None:
             return
 
-        def do(value: str) -> None:
+        def do(value: Optional[str]) -> None:
+            if not value:
+                return
             self._edit_fn(self.feature_id, value)  # type: ignore[misc]
             self._reload()
 
-        self.app.push_screen(TextPromptScreen(
-            "Название фичи", value=feature.title, on_submit=do))
+        self.app.push_screen(
+            TextPromptScreen("Название фичи", value=feature.title), do)

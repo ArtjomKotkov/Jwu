@@ -333,3 +333,85 @@ def test_create_validates_slug(resolve_env):
         workspaces.create(store, "Не Слаг")
     with pytest.raises(workspaces.WorkspaceError, match="уже есть"):
         workspaces.create(store, "home")
+
+
+# --------------------------------------------------------------------------- #
+# Теги папок: «где что лежит»
+# --------------------------------------------------------------------------- #
+
+
+def test_tags_are_saved_and_searchable(tmp_path):
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+    legacy = tmp_path / "old"
+    fresh = tmp_path / "new"
+    legacy.mkdir()
+    fresh.mkdir()
+
+    workspaces.add_path(store, ws, legacy, tags=["legacy-бэкенд", "django"])
+    workspaces.add_path(store, ws, fresh, tags=["новая-версия"])
+
+    by_legacy = store.workspace_paths(ws.id, tag="legacy-бэкенд")
+    assert [p.path for p in by_legacy] == [str(legacy.resolve())]
+    assert by_legacy[0].tags == ["django", "legacy-бэкенд"]   # отсортированы
+
+    assert [p.path for p in store.workspace_paths(ws.id, tag="новая-версия")] == \
+        [str(fresh.resolve())]
+    assert store.workspace_paths(ws.id, tag="нет-такого") == []
+    assert store.all_tags(ws.id) == {"django": 1, "legacy-бэкенд": 1, "новая-версия": 1}
+    store.close()
+
+
+def test_tags_add_remove_replace(tmp_path):
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, ws, folder, tags=["бэкенд"])
+    row = store.workspace_paths(ws.id)[0]
+
+    assert store.add_path_tags(row.id, ["legacy", " бэкенд "]) == ["legacy", "бэкенд"]
+    assert store.remove_path_tags(row.id, ["legacy"]) == ["бэкенд"]
+    assert store.set_path_tags(row.id, ["новая-версия", "фронт"]) == ["новая-версия", "фронт"]
+    assert store.workspace_paths(ws.id)[0].tags == ["новая-версия", "фронт"]
+    store.close()
+
+
+def test_rebinding_same_folder_merges_tags(tmp_path):
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, ws, folder, tags=["бэкенд"])
+
+    _, warn = workspaces.add_path(store, ws, folder, tags=["legacy"])
+    assert warn and "теги" in warn
+    assert store.workspace_paths(ws.id)[0].tags == ["legacy", "бэкенд"]
+    store.close()
+
+
+def test_tags_die_with_their_path(tmp_path):
+    store = Store(tmp_path / "state.db")
+    ws = store.get_workspace_by_slug("work")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, ws, folder, tags=["бэкенд"])
+
+    store.remove_workspace_path(str(folder.resolve()), ws.id)
+    assert store.conn.execute("SELECT COUNT(*) FROM workspace_path_tags").fetchone()[0] == 0
+    store.close()
+
+
+def test_tags_are_isolated_between_workspaces(tmp_path):
+    store = Store(tmp_path / "state.db")
+    work = store.get_workspace_by_slug("work")
+    home = workspaces.create(store, "home")
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    workspaces.add_path(store, work, a, tags=["общий"])
+    workspaces.add_path(store, home, b, tags=["общий"])
+
+    assert store.all_tags(work.id) == {"общий": 1}
+    assert [p.path for p in store.workspace_paths(work.id, tag="общий")] == [str(a.resolve())]
+    store.close()

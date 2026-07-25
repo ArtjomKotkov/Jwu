@@ -166,6 +166,9 @@ class DashboardData:
     # Контекст воркспейса: сам воркспейс, его папки и локальные фичи. Флаги интеграций
     # продублированы отдельно, чтобы TUI мог решать про видимость вкладок без workspace.
     workspace: Workspace | None = None
+    # Все воркспейсы (со счётчиком работ) — вкладка «Workspace» управляет ими,
+    # поэтому список нужен прямо в снимке, а не отдельным колбэком.
+    workspaces: list[Workspace] = field(default_factory=list)
     paths: list[WorkspacePath] = field(default_factory=list)
     features: list[LocalFeature] = field(default_factory=list)
     jira_enabled: bool = True
@@ -181,6 +184,7 @@ class DashboardData:
             "display_name": self.display_name,
             "email": self.email,
             "workspace": self.workspace.model_dump() if self.workspace else None,
+            "workspaces": [w.model_dump() for w in self.workspaces],
             "paths": [p.model_dump() for p in self.paths],
             "features": [f.model_dump() for f in self.features],
             "jira_enabled": self.jira_enabled,
@@ -221,6 +225,14 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
     """
     ident = _read_identity(store)
     ws = store.get_workspace(store.workspace_id)
+    # Список всех контуров со счётчиком работ — для вкладки управления воркспейсами.
+    # Скоуп store при этом восстанавливаем: дальше он читает данные текущего воркспейса.
+    all_workspaces = store.list_workspaces()
+    for item in all_workspaces:
+        store.use_workspace(item.id)
+        item.jobs_count = len(store.list_jobs())
+    if ws is not None:
+        store.use_workspace(ws.id)
     # Все известные задачи по ключу → статус (для колонки «Статус задачи» в PR-таблицах).
     # Берём из всех вью разом, чтобы статус был и для PR с чужой задачей (review).
     all_issues = store.latest_issues(None)
@@ -248,6 +260,7 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
         analyses=store.list_analyses(),
         jobs=store.list_jobs(),  # все работы (включая закрытые/завершённые)
         workspace=ws,
+        workspaces=all_workspaces,
         paths=ws.paths if ws else [],
         features=store.list_features(),
         jira_enabled=ws.jira_enabled if ws else True,
