@@ -17,6 +17,17 @@ description: Use when the user wants to understand why a CI build failed for a P
 > `jwu_builds(pr_id, project, repo)` вместо `jwu builds …`, `jwu_build(pr_id, project, repo, url)`
 > вместо `jwu build …`. Команды `jwu builds/build … --json` в bash — **фолбэк**, если
 > MCP-сервер jwu не подключён.
+> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
+> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
+> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
+> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
+> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
+> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
+> `jwu workspace add-path .`.
+
+
+> **Нужны Bitbucket и Jenkins.** Если `bitbucket_enabled=false`, разбирать нечего: скажи, что в
+> этом воркспейсе CI не подключён, и предложи прогнать тесты локально.
 
 ## Шаги
 1. **Собери вводные** из запроса: номер PR (обязательно, если нет прямого URL сборки),

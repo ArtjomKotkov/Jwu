@@ -5,6 +5,14 @@ description: Use when the user asks for a daily work analysis / summary of their
 
 # jwu: разбор рабочего дня
 
+> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
+> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
+> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
+> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
+> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
+> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
+> `jwu workspace add-path .`.
+
 ## Overview
 
 Краткий разбор рабочего дня по данным из `jwu` (Jira + Bitbucket). Утилита делает фулл-синк и
@@ -12,6 +20,10 @@ description: Use when the user asks for a daily work analysis / summary of their
 НЕ углубляйся в детали — пользователь хочет обзор «что случилось и что делать», подробности он разберёт сам.
 
 ## Шаги
+
+0. `jwu action day-analyze` **требует Jira**. Если в воркспейсе её нет — не зови команду, а собери
+   сводку из локальных данных: `jwu features --json` (что в работе) + `jwu jobs --json` (что делалось).
+   Сохранение результата не меняется: `jwu analysis save` пишет в текущий воркспейс.
 
 1. Выполни команду и прочитай её stdout целиком (это контекст + инструкция):
 

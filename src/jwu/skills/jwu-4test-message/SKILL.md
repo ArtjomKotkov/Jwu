@@ -15,6 +15,14 @@ description: Use when the user wants a «4test» message — step-by-step testin
 > **MCP-first.** Операции предпочитай MCP-инструментами jwu, bash `jwu …` — фолбэк:
 > `jwu jobs …` → `jwu_jobs(task, pr, status)` · `jwu task <KEY>` → `jwu_task(key)` ·
 > `jwu job add …` → `jwu_job_add(job_id, text, kind, status)`.
+> **Воркспейс.** jwu работает в контексте *воркспейса* — контура со своими папками,
+> интеграциями и данными. Он определяется автоматически по текущей рабочей папке; проверить —
+> `jwu_workspace_current()` (bash: `jwu workspace current --json`). Если `jira_enabled=false` —
+> Jira-команды и инструменты **не вызывай**: якорь работы там либо локальная фича
+> (`jwu_features` / `jwu feature list`), либо ничего (`jwu job start --title "…"`).
+> Если папка не привязана ни к одному воркспейсу — скажи об этом пользователю и предложи
+> `jwu workspace add-path .`.
+
 
 Это **абстрактный** скилл: суть фикса и проверяемое поведение он выводит сам из работы,
 задачи и диффа, а стенд-специфику и важные нюансы **пользователь передаёт текстом** в
@@ -41,6 +49,10 @@ description: Use when the user wants a «4test» message — step-by-step testin
 - **Каждый проверочный шаг — с ожидаемым результатом** (`ОЖИДАНИЕ: …`).
 
 ## Источники (что собрать перед составлением)
+
+> **Откуда описание.** В воркспейсе с Jira это карточка задачи (`jwu task <KEY>`); без Jira —
+> описание локальной фичи (`jwu feature show <KEY>`). Остальное не меняется: инструкция всё так же
+> собирается из лога работы + диффа + твоих вводных.
 
 1. **Что сделали — работа (job):**
    - `jwu jobs --task <KEY> --json` → активную/последнюю → `jwu job show <JOB_ID> --json`.

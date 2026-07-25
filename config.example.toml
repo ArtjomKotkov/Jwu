@@ -1,43 +1,56 @@
-# Конфиг пишется командой `jwu configure` — руками править не нужно.
-# Секреты (пароли/токены) здесь НЕ хранятся: они в системном keyring.
-# Файл необязателен — без него используются дефолты (jira.example.com / git.example.com).
+# ВНИМАНИЕ: с появлением воркспейсов этот файл почти не используется.
+#
+# Настройки интеграций (хосты, логины, project/repo) и секреты хранятся в БД —
+# ОТДЕЛЬНО для каждого воркспейса. Пишутся командой `jwu configure [-W <slug>]`,
+# смотрятся через `jwu workspace show`. Старый config.toml и секреты из keyring
+# переезжают в воркспейс «Работа» автоматически при первом запуске (или вручную:
+# `jwu workspace migrate`); keyring при этом не чистится и остаётся фолбэком на
+# чтение, так что откат на прежнюю версию jwu ничего не ломает.
+#
+# Здесь по-прежнему имеет смысл только [storage]: путь до БД нужно знать ДО того,
+# как известен воркспейс (конфиги воркспейсов лежат внутри самой БД).
 
-[jira]
-base_url = "https://jira.example.com"
-project = "PROJ"
-# username: логин для @mention-матчинга и account для login/proxy-секретов.
-# Если пусто — берётся из /myself при синке.
-username = ""
+[storage]
+# db_path = "/custom/path/state.db"   # по умолчанию ~/.local/share/jwu/state.db
+#
+# В БД лежат СЕКРЕТЫ воркспейсов в открытом виде (файл закрывается правами 600).
+# Не клади её в облачную папку (iCloud/Dropbox/Google Drive) — jwu предупредит.
+# Если облако всё же нужно, держи токены в переменных окружения: JIRA_TOKEN,
+# SDESK_TOKEN, BITBUCKET_TOKEN, JENKINS_TOKEN — они перекрывают значения из БД.
+
+# --- ниже: те же поля, но как они выглядят в настройках воркспейса ------------
+# Правятся через `jwu configure`; оставлено как справка о структуре.
+
+# [jira]
+# base_url = "https://jira.example.com"
+# project = "PROJ"
+# username — логин для @mention-матчинга и account для login/proxy-секретов;
+# если пусто, берётся из /myself при синке
+# username = ""
 # proxy_basic_user = ""  # логин nginx-гейта перед Jira, если он есть
 
 # «Ждут моего ревью» — это PR в Bitbucket: `jwu prs --view review`.
 # Для задач Jira вью review не задаём (на инстансе нет поля reviewer).
-[jira.views]
-mine = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
-mentions = "(comment ~ currentUser() OR watcher = currentUser()) AND updated >= -14d ORDER BY updated DESC"
+# [jira.views]
+# mine = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
+# mentions = "(comment ~ currentUser() OR watcher = currentUser()) AND updated >= -14d ORDER BY updated DESC"
 
-# SDESK — второй Jira-инстанс (тот же REST API, другой хост). Опционален: секции нет —
+# SDESK — второй Jira-инстанс (тот же REST API, другой хост). Опционален: не задан —
 # и jwu ведёт себя как раньше. Задачи с префиксом ключа = project (напр. SDESK-39336)
-# резолвятся сюда, остальные — в основную [jira]. Секреты СВОИ (keyring: sdesk-*), даже
-# если совпадают с Jira, — чтобы ротировать независимо. Настраивается `jwu configure`
-# (--sdesk-host …) или руками ниже; пароли — в keyring, не тут.
+# резолвятся сюда, остальные — в основную jira. Секреты у него свои.
 # [sdesk]
 # base_url = "https://sdesk.example.com"
 # project = "SDESK"
 # username = ""
-# proxy_basic_user = ""  # логин nginx-гейта перед SDESK, если он есть
+# proxy_basic_user = ""
 
-[bitbucket]
-base_url = "https://git.example.com"
-project = "PROJ"
-repo = "repo"
+# [bitbucket]
+# base_url = "https://git.example.com"
+# project = "PROJ"
+# repo = "repo"
 
 # Jenkins опционален: статусы сборок jwu берёт из Bitbucket и без него, токен нужен
-# только для детализации причины падения (`jwu build`). username = логин Jenkins
-# (он же account секрета), токен (API Token из профиля Jenkins) — в keyring.
-[jenkins]
-base_url = "https://jenkins.example.com"
-username = ""
-
-[storage]
-# db_path = "/custom/path/state.db"   # по умолчанию ~/.local/share/jwu/state.db
+# только для детализации причины падения (`jwu build`).
+# [jenkins]
+# base_url = "https://jenkins.example.com"
+# username = ""
