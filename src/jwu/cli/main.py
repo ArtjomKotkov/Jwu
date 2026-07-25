@@ -18,7 +18,9 @@ from ..core.bitbucket import BitbucketError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
 from ..core.dates import fmt_ago, fmt_dt
-from ..core.maintenance import ensure_db_available, run_daily_maintenance
+from ..core.maintenance import (
+    ensure_db_available, run_daily_maintenance, warn_if_cloud_path,
+)
 from ..skills_install import (
     default_agents_dest as _agents_dest,
     default_dest as _skills_dest,
@@ -26,10 +28,14 @@ from ..skills_install import (
     install_skills,
 )
 from ..core.jira import JiraError
-from ..core.models import JOB_RECORD_BADGES, JOB_RECORD_KINDS, Delta, Issue, Job, Note, PR
+from ..core.models import (
+    JOB_RECORD_BADGES, JOB_RECORD_KINDS, LOCAL_FEATURE_BADGES, LOCAL_FEATURE_STATUSES,
+    Delta, Issue, Job, LocalFeature, Note, PR, Workspace,
+)
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
 from .dashboard import render_jira_text
 from ..core.store import Store
+from ..core import workspaces
 
 app = typer.Typer(
     add_completion=False,
@@ -44,9 +50,31 @@ analysis_app = typer.Typer(help="Сохранённые анализы/план�
 app.add_typer(analysis_app, name="analysis")
 job_app = typer.Typer(help="Работы (jobs): цикл работы над задачей, прогресс и связи с PR.")
 app.add_typer(job_app, name="job")
+workspace_app = typer.Typer(
+    help="Воркспейсы: контуры работы (папки + свои интеграции и данные)."
+)
+app.add_typer(workspace_app, name="workspace")
+feature_app = typer.Typer(help="Локальные фичи: мини-трекер воркспейса, когда Jira нет.")
+app.add_typer(feature_app, name="feature")
 
 console = Console()
 err = Console(stderr=True)
+
+# Значение глобального флага --workspace/-W: заполняется корневым колбэком ДО команды
+# и читается фабриками _store()/_service(). Через параметр не пробросить — команд много.
+_WORKSPACE_ARG: Optional[str] = None
+
+
+@app.callback()
+def _root(
+    workspace: Optional[str] = typer.Option(
+        None, "--workspace", "-W", envvar=workspaces.ENV_VAR,
+        help="Воркспейс (slug или id). По умолчанию определяется по текущей папке.",
+    ),
+) -> None:
+    """jwu — Jira + Bitbucket с памятью, разложенной по воркспейсам."""
+    global _WORKSPACE_ARG
+    _WORKSPACE_ARG = workspace
 
 
 def _prepare_db() -> None:
@@ -58,10 +86,48 @@ def _prepare_db() -> None:
         err.print(f"[dim]{msg}[/dim]")
 
 
-def _service() -> Service:
+def _open_store() -> Store:
+    """Store без скоупа воркспейса — для команд про сами воркспейсы."""
     try:
         _prepare_db()
-        return Service.from_config(load_config())
+    except ConfigError as exc:
+        err.print(f"[red]Ошибка БД:[/red] {exc}")
+        raise typer.Exit(code=1)
+    return Store(str(db_path()))
+
+
+def _resolve_workspace(store: Store) -> Workspace:
+    """Активный воркспейс для текущего вызова (или внятный отказ).
+
+    Здесь же однократно доезжает legacy-конфиг: старый config.toml + секреты из keyring
+    переносятся в воркспейс «Работа», чтобы обновление jwu не потребовало ручных действий.
+    """
+    _migrate_legacy_once(store)
+    try:
+        return workspaces.resolve_workspace(store, explicit=_WORKSPACE_ARG)
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+def _migrate_legacy_once(store: Store) -> None:
+    try:
+        fields, moved = workspaces.migrate_legacy_config(store)
+    except Exception as exc:  # noqa: BLE001 — недоступный keyring не должен ломать команду
+        err.print(f"[yellow]⚠ не удалось перенести старый конфиг в БД: {exc}[/yellow]")
+        return
+    if fields or moved:
+        err.print(f"[dim]Старый конфиг перенесён в воркспейс «work» "
+                  f"(секретов: {moved}). Keyring не тронут.[/dim]")
+
+
+def _service() -> Service:
+    """Сервис активного воркспейса. Клиенты создаются только для его интеграций."""
+    try:
+        _prepare_db()
+        with Store(str(db_path())) as probe:
+            ws = _resolve_workspace(probe)
+        return Service.for_workspace(ws)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -74,7 +140,10 @@ def _builds_service() -> Service:
     """Сервис для команд сборок: только Bitbucket + Jenkins, без зависимости от Jira."""
     try:
         _prepare_db()
-        return Service.for_builds(load_config())
+        with Store(str(db_path())) as probe:
+            ws = _resolve_workspace(probe)
+        _require_bitbucket(ws)
+        return Service.builds_for_workspace(ws)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -83,14 +152,54 @@ def _builds_service() -> Service:
         raise typer.Exit(code=1)
 
 
+def _require_jira(svc: Service) -> None:
+    """Отказать внятно, если команда требует Jira, а в воркспейсе её нет."""
+    if svc.jira is not None:
+        return
+    slug = svc.workspace.slug if svc.workspace else "?"
+    err.print(
+        f"[red]В воркспейсе «{slug}» Jira не подключена.[/red]\n"
+        f"Подключить: [cyan]jwu configure -W {slug} --jira-host …[/cyan]\n"
+        f"Локальные фичи: [cyan]jwu feature list[/cyan]   ·   "
+        f"работа без задачи: [cyan]jwu job start --title \"…\"[/cyan]"
+    )
+    svc.close()
+    raise typer.Exit(code=1)
+
+
+def _require_bitbucket(ws: Workspace) -> None:
+    """Отказать внятно, если команда требует Bitbucket, а в воркспейсе его нет."""
+    if ws.bitbucket_enabled:
+        return
+    err.print(
+        f"[red]В воркспейсе «{ws.slug}» Bitbucket не подключён.[/red]\n"
+        f"Подключить: [cyan]jwu configure -W {ws.slug} --bitbucket-token …[/cyan]"
+    )
+    raise typer.Exit(code=1)
+
+
+def _service_with_jira() -> Service:
+    """Сервис для команд, которым Jira обязательна."""
+    svc = _service()
+    _require_jira(svc)
+    return svc
+
+
+def _service_with_bitbucket() -> Service:
+    """Сервис для команд, которым обязателен Bitbucket."""
+    svc = _service()
+    if svc.bitbucket is None:
+        ws = svc.workspace
+        svc.close()
+        _require_bitbucket(ws or Workspace(slug="?"))
+    return svc
+
+
 def _store() -> Store:
-    """Только память — без токенов/сети (для note/notes/changes)."""
-    try:
-        _prepare_db()
-    except ConfigError as exc:
-        err.print(f"[red]Ошибка БД:[/red] {exc}")
-        raise typer.Exit(code=1)
-    return Store(str(db_path()))
+    """Только память — без токенов/сети (для note/notes/changes), в скоупе воркспейса."""
+    store = _open_store()
+    store.use_workspace(_resolve_workspace(store).id)
+    return store
 
 
 def _emit_json(payload: object) -> None:
@@ -199,10 +308,37 @@ configure_app = typer.Typer(
 app.add_typer(configure_app, name="configure")
 
 
+def _enable_configured_integrations(store: Store, ws: Workspace, cfg) -> None:
+    """Включить интеграции воркспейса, которые пользователь реально настроил.
+
+    Признак «настроил» — непустой секрет плюс хост, отличный от заглушки в дефолтах
+    Config (jira.example.com/git.example.com): иначе `jwu configure` без единого флага
+    включал бы обе интеграции всем подряд.
+    """
+    from ..core.config import BitbucketConfig, JiraConfig
+
+    stored = store.workspace_secrets(ws.id)
+    updates: dict[str, bool] = {}
+    jira_ready = (cfg.jira.base_url and cfg.jira.base_url != JiraConfig().base_url
+                  and (stored.get("jira.token") or stored.get("jira.password")))
+    if jira_ready and not ws.jira_enabled:
+        updates["jira_enabled"] = True
+    bb_ready = (cfg.bitbucket.base_url and cfg.bitbucket.base_url != BitbucketConfig().base_url
+                and stored.get("bitbucket.token"))
+    if bb_ready and not ws.bitbucket_enabled:
+        updates["bitbucket_enabled"] = True
+    if updates:
+        store.update_workspace(ws.id, **updates)
+        names = ", ".join("Jira" if k == "jira_enabled" else "Bitbucket" for k in updates)
+        console.print(f"[green]Подключено к воркспейсу «{ws.label}»:[/green] {names}")
+
+
 def _auth_check_report() -> None:
     """Проверить связь по текущему конфигу и напечатать ✓/✗ по Jira и Bitbucket."""
     try:
-        with Service.from_config(load_config()) as svc:
+        with _open_store() as store:
+            ws = _resolve_workspace(store)
+        with Service.for_workspace(ws) as svc:
             res = svc.auth_check()
         for name in ("jira", "sdesk", "bitbucket", "jenkins"):
             r = res.get(name)
@@ -275,14 +411,14 @@ def configure_main(
             cfg.sdesk.proxy_basic_user = gate_user
         if db_path_opt is not None: cfg.storage.db_path = db_path_opt
         new_secrets = {
-            (cfg.jira.token_service, cfg.jira.token_account): jira_token_opt,
-            (cfg.jira.login_service, cfg.jira.username): jira_password,
-            (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gate_password,
-            (cfg.sdesk.token_service, cfg.sdesk.token_account): sdesk_token_opt,
-            (cfg.sdesk.login_service, cfg.sdesk.username): sdesk_password,
-            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user): sdesk_gate_password,
-            (cfg.bitbucket.token_service, cfg.bitbucket.token_account): bitbucket_token_opt,
-            (cfg.jenkins.token_service, cfg.jenkins.username): jenkins_token_opt,
+            "jira.token": jira_token_opt,
+            "jira.password": jira_password,
+            "jira.gate_password": gate_password,
+            "sdesk.token": sdesk_token_opt,
+            "sdesk.password": sdesk_password,
+            "sdesk.gate_password": sdesk_gate_password,
+            "bitbucket.token": bitbucket_token_opt,
+            "jenkins.token": jenkins_token_opt,
         }
     else:
         cfg.jira.base_url = (jira_host or _prompt_default("Jira host", cfg.jira.base_url)).rstrip("/")
@@ -337,29 +473,37 @@ def configure_main(
         cur_db = cfg.storage.db_path or str(db_path(cfg))
         cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
         new_secrets = {
-            (cfg.jira.token_service, cfg.jira.token_account): jtok,
-            (cfg.jira.login_service, cfg.jira.username): jpw,
-            (cfg.jira.proxy_basic_service, cfg.jira.proxy_basic_user): gpw,
-            (cfg.sdesk.token_service, cfg.sdesk.token_account): sdtok,
-            (cfg.sdesk.login_service, cfg.sdesk.username): sdpw,
-            (cfg.sdesk.proxy_basic_service, cfg.sdesk.proxy_basic_user): sdgpw,
-            (cfg.bitbucket.token_service, cfg.bitbucket.token_account): btok,
-            (cfg.jenkins.token_service, cfg.jenkins.username): ktok,
+            "jira.token": jtok,
+            "jira.password": jpw,
+            "jira.gate_password": gpw,
+            "sdesk.token": sdtok,
+            "sdesk.password": sdpw,
+            "sdesk.gate_password": sdgpw,
+            "bitbucket.token": btok,
+            "jenkins.token": ktok,
         }
 
-    path = save_config(cfg)
-    saved = 0
-    try:
-        for (service, account), value in new_secrets.items():
-            if value and account:  # пусто/None или нет account => не трогаем
-                secrets.set_secret(service, account, value)
-                saved += 1
-    except Exception as exc:  # noqa: BLE001 — keyring недоступен
-        err.print(f"[red]Не удалось записать секрет в keyring:[/red] {exc}\n"
-                  f"Задай токен через переменную окружения (JIRA_TOKEN/BITBUCKET_TOKEN).")
-        raise typer.Exit(code=1)
+    # Путь до БД — единственное, что остаётся глобальным: БД надо найти ДО того,
+    # как известен воркспейс (в ней же лежат конфиги воркспейсов).
+    global_cfg = load_config()
+    if cfg.storage.db_path != global_cfg.storage.db_path:
+        global_cfg.storage.db_path = cfg.storage.db_path
+        save_config(global_cfg)
 
-    console.print(f"[green]Конфиг сохранён[/green]: {path}  (секретов записано: {saved})")
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        workspaces.save_workspace_config(store, ws, cfg)
+        saved = 0
+        for slot, value in new_secrets.items():
+            if value:  # пусто/None => не трогаем, старое значение остаётся
+                store.set_workspace_secret(ws.id, slot, value)
+                saved += 1
+        _enable_configured_integrations(store, ws, cfg)
+        for warn in warn_if_cloud_path(db_path()):
+            err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+    console.print(f"[green]Конфиг воркспейса «{ws.label}» сохранён[/green] "
+                  f"(секретов записано: {saved})")
     _auth_check_report()
 
 
@@ -367,11 +511,15 @@ def configure_main(
 def configure_export(
     path: str = typer.Argument(..., help="Куда записать бандл (.toml)."),
 ) -> None:
-    """Выгрузить config + СЕКРЕТЫ в переносимый файл (плайнтекст — храните безопасно)."""
+    """Выгрузить настройки воркспейса + СЕКРЕТЫ в файл (плайнтекст — храните безопасно)."""
     from ..core.config import export_bundle
 
-    n = export_bundle(load_config(), Path(path))
-    console.print(f"[green]Бандл записан[/green]: {path}  (секретов: {n})")
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        cfg = workspaces.config_for_workspace(store, ws)
+        n = export_bundle(cfg, Path(path))
+    console.print(f"[green]Бандл записан[/green]: {path}  "
+                  f"(воркспейс «{ws.label}», секретов: {n})")
     err.print("[yellow]Внимание:[/yellow] файл содержит пароли в открытом виде — "
               "не коммить и храни безопасно.")
 
@@ -380,20 +528,24 @@ def configure_export(
 def configure_import(
     path: str = typer.Argument(..., help="Файл бандла (.toml) из `configure export`."),
 ) -> None:
-    """Применить бандл: записать config.toml и секреты в keyring, затем проверить связь."""
-    from ..core.config import import_bundle
+    """Применить бандл к активному воркспейсу: настройки и секреты, затем проверить связь."""
+    from ..core.config import read_bundle
 
     try:
-        _cfg, n = import_bundle(Path(path))
+        cfg, values = read_bundle(Path(path))
     except ConfigError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
-    except Exception as exc:  # noqa: BLE001 — keyring недоступен
-        err.print(f"[red]Не удалось записать секрет в keyring:[/red] {exc}\n"
-                  f"Задай токен через переменную окружения (JIRA_TOKEN/BITBUCKET_TOKEN).")
-        raise typer.Exit(code=1)
 
-    console.print(f"[green]Импортировано[/green]: config + секретов {n}")
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        workspaces.save_workspace_config(store, ws, cfg)
+        for slot, value in values.items():
+            store.set_workspace_secret(ws.id, slot, value)
+        _enable_configured_integrations(store, ws, cfg)
+
+    console.print(f"[green]Импортировано[/green] в воркспейс «{ws.label}»: "
+                  f"настройки + секретов {len(values)}")
     _auth_check_report()
 
 
@@ -437,6 +589,484 @@ def install_claude_skills(
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Воркспейсы
+# --------------------------------------------------------------------------- #
+
+
+def _ws_json(store: Store, ws: Workspace) -> dict:
+    """Воркспейс для --json. Счётчики считаются в его же скоупе (store переключается)."""
+    store.use_workspace(ws.id)
+    jobs = store.list_jobs()
+    return {
+        "id": ws.id,
+        "slug": ws.slug,
+        "name": ws.name,
+        "jira_enabled": ws.jira_enabled,
+        "bitbucket_enabled": ws.bitbucket_enabled,
+        "archived": ws.archived,
+        "paths": [{"path": p.path, "label": p.label, "tags": p.tags} for p in ws.paths],
+        "jobs": len(jobs),
+        "jobs_active": len([j for j in jobs if j.status == "active"]),
+        "created_at": ws.created_at,
+        "updated_at": ws.updated_at,
+    }
+
+
+def _yes_no(flag: bool) -> str:
+    return "[green]да[/green]" if flag else "[dim]нет[/dim]"
+
+
+@workspace_app.command("list")
+def workspace_list(
+    all_ws: bool = typer.Option(False, "--all", help="Показать и архивные."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Список воркспейсов."""
+    store = _open_store()
+    items = store.list_workspaces(include_archived=all_ws)
+    active = store.get_meta(workspaces.ACTIVE_META_KEY) or ""
+    if json_out:
+        _emit_json({"active": active, "workspaces": [_ws_json(store, w) for w in items]})
+        return
+    if not items:
+        console.print("[dim]Воркспейсов нет. Создать: jwu workspace create <slug>[/dim]")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("", "Slug", "Название", "Jira", "Bitbucket", "Папок", "Работ"):
+        table.add_column(col)
+    for ws in items:
+        store.use_workspace(ws.id)
+        table.add_row(
+            "→" if ws.slug == active else " ",
+            ws.slug, ws.name,
+            _yes_no(ws.jira_enabled), _yes_no(ws.bitbucket_enabled),
+            str(len(ws.paths)), str(len(store.list_jobs())),
+        )
+    console.print(table)
+
+
+@workspace_app.command("create")
+def workspace_create(
+    slug: str = typer.Argument(..., help="Короткое имя (латиница): work, home-jwu."),
+    name: str = typer.Option("", "--name", help="Человекочитаемое название."),
+    paths: list[str] = typer.Option([], "--path", help="Папка воркспейса (можно несколько)."),
+    tag: list[str] = typer.Option(
+        [], "--tag", "-t", help="Теги для указанных папок: legacy-бэкенд, новая-версия…"),
+    jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключена ли Jira."),
+    bitbucket: bool = typer.Option(
+        False, "--bitbucket/--no-bitbucket", help="Подключён ли Bitbucket."
+    ),
+    use: bool = typer.Option(True, "--use/--no-use", help="Сделать активным."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Создать воркспейс. Интеграции объявляются явно — по умолчанию их нет."""
+    store = _open_store()
+    try:
+        ws = workspaces.create(
+            store, slug, name=name, jira=jira, bitbucket=bitbucket, paths=list(paths),
+            tags=list(tag),
+        )
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if use:
+        workspaces.set_active(store, ws)
+    if json_out:
+        _emit_json(_ws_json(store, ws))
+        return
+    console.print(f"[green]Воркспейс «{ws.label}» создан.[/green]")
+    for p in ws.paths:
+        console.print(f"  📁 {p.path}")
+    if jira or bitbucket:
+        console.print(f"Настроить доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
+
+
+@app.command("init")
+def init_workspace(
+    path: str = typer.Argument(".", help="Папка проекта (по умолчанию — текущая)."),
+    slug: Optional[str] = typer.Option(None, "--slug", help="Имя воркспейса (иначе — по папке)."),
+    name: str = typer.Option("", "--name", help="Человекочитаемое название."),
+    jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключить Jira."),
+    bitbucket: bool = typer.Option(
+        False, "--bitbucket/--no-bitbucket", help="Подключить Bitbucket."),
+    attach: Optional[str] = typer.Option(
+        None, "--attach", help="Привязать папку к СУЩЕСТВУЮЩЕМУ воркспейсу вместо создания."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать, применить предложение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON (для агентов)."),
+) -> None:
+    """Подключить проект к jwu: завести воркспейс для папки, привязать репозитории, дать теги.
+
+    Сначала показывает, ЧТО собирается сделать (найденные репозитории и предлагаемые теги),
+    и только потом спрашивает подтверждение. Интеграции по умолчанию не подключаются —
+    для личного проекта они не нужны, а для рабочего есть `jwu configure`.
+    """
+    store = _open_store()
+    sg = workspaces.suggest(store, path)
+
+    # ГЛАВНОЕ: если папка уже резолвится в воркспейс — НИЧЕГО не создаём.
+    # Повторный init обязан быть безопасным: он подтверждает, что проект уже подключён.
+    if sg.already_bound and sg.workspace is not None:
+        ws = sg.workspace
+        store.use_workspace(ws.id)
+        if json_out:
+            payload = _ws_json(store, ws)
+            payload.update({"ok": True, "already_initialized": True, "path": sg.path})
+            _emit_json(payload)
+            return
+        console.print(f"[green]Проект уже подключён[/green] к воркспейсу «{ws.label}» "
+                      f"[dim](папка резолвится сюда)[/dim]")
+        for p_ in ws.paths:
+            chips = f"   [cyan]{' '.join('#' + t for t in p_.tags)}[/cyan]" if p_.tags else ""
+            console.print(f"  📁 {p_.path}{chips}")
+        console.print("Добавить репозиторий: [cyan]jwu workspace add-path <DIR> --tag <тег>[/cyan]"
+                      "   ·   теги: [cyan]jwu workspace tag <DIR> --add <тег>[/cyan]")
+        return
+
+    # Папка не привязана, но воркспейсы уже есть — возможно, её надо привязать к одному
+    # из них, а не плодить новый. Молча не решаем.
+    existing = [w for w in store.list_workspaces()]
+    if attach:
+        target = workspaces.find_workspace(store, attach)
+        if target is None:
+            err.print(f"[red]Воркспейс «{attach}» не найден.[/red] Список: jwu workspace list")
+            raise typer.Exit(code=1)
+        for folder in sg.suggested_paths:
+            workspaces.add_path(store, target, folder, tags=sg.suggested_tags.get(folder, []))
+        workspaces.set_active(store, target)
+        target = store.get_workspace(target.id) or target
+        if json_out:
+            _emit_json(_ws_json(store, target))
+            return
+        console.print(f"[green]Папки привязаны[/green] к воркспейсу «{target.label}» "
+                      f"(папок теперь {len(target.paths)})")
+        return
+
+    target_slug = slug or sg.slug
+    if json_out and not yes:
+        _emit_json({
+            "ok": False, "reason": "confirm_required", "path": sg.path,
+            "suggested": {"slug": target_slug, "name": name or sg.name,
+                          "paths": sg.suggested_paths, "tags": sg.suggested_tags,
+                          "jira": jira, "bitbucket": bitbucket},
+            "repos": [{"root": r.root, "name": r.name, "branch": r.branch} for r in sg.repos],
+            # альтернатива созданию: привязать папку к уже существующему контуру
+            "existing_workspaces": [{"slug": w.slug, "name": w.name,
+                                     "paths": len(w.paths)} for w in existing],
+        })
+        raise typer.Exit(code=0)
+
+    # Превью — только для человека: при --json на stdout должен быть ТОЛЬКО JSON.
+    if not json_out:
+        console.print(f"[b]Подключаю проект[/b] {sg.path}")
+        console.print(f"  воркспейс: [cyan]{target_slug}[/cyan]"
+                      f"   Jira: {_yes_no(jira)}   Bitbucket: {_yes_no(bitbucket)}")
+        if sg.repos:
+            console.print(f"  найдено репозиториев: {len(sg.repos)}")
+        for folder in sg.suggested_paths:
+            tags = sg.suggested_tags.get(folder, [])
+            chips = f"   [cyan]{' '.join('#' + t for t in tags)}[/cyan]" if tags else ""
+            console.print(f"  📁 {folder}{chips}")
+        if not sg.repos:
+            console.print("  [dim]git-репозиториев не нашлось — привяжу папку как есть[/dim]")
+        if existing:
+            console.print(f"[dim]уже есть воркспейсы: {', '.join(w.slug for w in existing)}. "
+                          f"Привязать папку к одному из них: jwu init --attach <slug>[/dim]")
+
+    if not yes and not typer.confirm("Всё верно?", default=True):
+        console.print("[dim]Отменено. Можно задать своё: jwu init --slug … --name …[/dim]")
+        raise typer.Exit(code=1)
+
+    try:
+        ws = workspaces.create(store, target_slug, name=name or sg.name,
+                               jira=jira, bitbucket=bitbucket)
+        for folder in sg.suggested_paths:
+            workspaces.add_path(store, ws, folder, tags=sg.suggested_tags.get(folder, []))
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    workspaces.set_active(store, ws)
+    ws = store.get_workspace(ws.id) or ws
+
+    if json_out:
+        _emit_json(_ws_json(store, ws))
+        return
+    console.print(f"\n[green]Готово:[/green] воркспейс «{ws.label}», папок {len(ws.paths)}")
+    console.print("Дальше: [cyan]jwu dashboard[/cyan]   ·   "
+                  "фичи: [cyan]jwu feature add \"…\"[/cyan]")
+    if jira or bitbucket:
+        console.print(f"Доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
+
+
+@workspace_app.command("use")
+def workspace_use(
+    slug: str = typer.Argument(..., help="Slug или id воркспейса."),
+) -> None:
+    """Сделать воркспейс активным (для команд вне зарегистрированных папок)."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red] Список: jwu workspace list")
+        raise typer.Exit(code=1)
+    workspaces.set_active(store, ws)
+    console.print(f"[green]Активный воркспейс: {ws.label}[/green]")
+
+
+@workspace_app.command("current")
+def workspace_current(
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Какой воркспейс сейчас активен и почему."""
+    store = _open_store()
+    try:
+        res = workspaces.resolve(store, explicit=_WORKSPACE_ARG)
+    except workspaces.WorkspaceError as exc:
+        if json_out:
+            _emit_json({"workspace": None, "error": str(exc), "cwd": str(Path.cwd())})
+            raise typer.Exit(code=1)
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    store.use_workspace(res.workspace.id)
+    if json_out:
+        payload = _ws_json(store, res.workspace)
+        payload.update({"source": res.source, "matched_path": res.matched_path,
+                        "cwd": str(Path.cwd())})
+        _emit_json(payload)
+        return
+    ws = res.workspace
+    console.print(f"[b]{ws.label}[/b]   [dim]({res.source_human})[/dim]")
+    console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
+
+
+@workspace_app.command("migrate")
+def workspace_migrate() -> None:
+    """Перенести старый config.toml и секреты из keyring в БД (обычно происходит само)."""
+    store = _open_store()
+    ws = store.get_workspace_by_slug("work") or _resolve_workspace(store)
+    fields, moved = workspaces.migrate_legacy_config(store, ws)
+    if not fields and not moved:
+        console.print("[dim]Переносить нечего — это уже сделано ранее.[/dim]")
+        return
+    console.print(f"[green]Перенесено в «{ws.label}»[/green]: настроек {fields}, "
+                  f"секретов {moved}. Keyring не тронут (остаётся как фолбэк).")
+    for warn in warn_if_cloud_path(db_path()):
+        err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+
+@workspace_app.command("show")
+def workspace_show(
+    slug: Optional[str] = typer.Argument(None, help="Slug/id; без него — активный."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+    show_secrets: bool = typer.Option(
+        False, "--show-secrets", help="Показать секреты в открытом виде."
+    ),
+) -> None:
+    """Карточка воркспейса: папки, интеграции, счётчики, настройки."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug) if slug else _resolve_workspace(store)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red]")
+        raise typer.Exit(code=1)
+    store.use_workspace(ws.id)
+    if json_out:
+        payload = _ws_json(store, ws)
+        payload["settings"] = store.workspace_settings(ws.id)
+        payload["secrets"] = {
+            slot: (value if show_secrets else "****")
+            for slot, value in store.workspace_secrets(ws.id).items()
+        }
+        _emit_json(payload)
+        return
+    console.print(f"[b]{ws.label}[/b]")
+    console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
+    jobs_all = store.list_jobs()
+    active_jobs = [j for j in jobs_all if j.status == "active"]
+    console.print(f"Работ: {len(jobs_all)} (активных {len(active_jobs)})   ·   "
+                  f"Анализов: {len(store.list_analyses())}")
+    if ws.paths:
+        console.print("\n[b]Папки[/b]")
+        for p in ws.paths:
+            mark = "" if Path(p.path).exists() else "  [yellow](нет на диске)[/yellow]"
+            label = f"  [dim]{p.label}[/dim]" if p.label else ""
+            tags = f"  [cyan]{' '.join('#' + t for t in p.tags)}[/cyan]" if p.tags else ""
+            console.print(f"  📁 {p.path}{tags}{label}{mark}")
+    else:
+        console.print("\n[dim]Папок нет. Привязать текущую: jwu workspace add-path .[/dim]")
+
+    settings = {k: v for k, v in store.workspace_settings(ws.id).items()
+                if not k.startswith("features.") and v}
+    if settings:
+        console.print("\n[b]Настройки[/b]")
+        for key in sorted(settings):
+            if key.startswith("jira.views."):
+                continue  # JQL длинный и шумный — виден в --json
+            console.print(f"  [dim]{key}[/dim] = {settings[key]}")
+    stored = store.workspace_secrets(ws.id)
+    if stored:
+        console.print("\n[b]Секреты[/b] [dim](в БД, открытым текстом)[/dim]")
+        for slot in sorted(stored):
+            value = stored[slot] if show_secrets else "****"
+            console.print(f"  [dim]{slot}[/dim] = {value}")
+
+
+@workspace_app.command("add-path")
+def workspace_add_path(
+    path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
+    label: str = typer.Option("", "--label", help="Пометка (например «бэкенд»)."),
+    tag: list[str] = typer.Option(
+        [], "--tag", "-t",
+        help="Тег для поиска (можно несколько): legacy-бэкенд, новая-версия, фронт."),
+) -> None:
+    """Привязать папку к воркспейсу — по ней он и будет определяться автоматически."""
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    try:
+        norm, warn = workspaces.add_path(store, ws, path, label, tags=list(tag))
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    tags_note = f"   [cyan]{' '.join('#' + t for t in tag)}[/cyan]" if tag else ""
+    console.print(f"[green]{norm}[/green] → воркспейс «{ws.label}»{tags_note}")
+    if warn:
+        err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+
+@workspace_app.command("tag")
+def workspace_tag(
+    path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
+    add: list[str] = typer.Option([], "--add", "-a", help="Добавить тег (можно несколько)."),
+    remove: list[str] = typer.Option([], "--remove", "-r", help="Убрать тег."),
+    set_: list[str] = typer.Option([], "--set", help="Заменить весь набор тегов."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Теги папки: по ним потом искать, где что лежит (legacy-бэкенд, новая-версия…)."""
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    norm = workspaces.normalize_path(path)
+    row = next((p for p in store.workspace_paths(ws.id) if p.path == norm), None)
+    if row is None:
+        err.print(f"[red]Папка {norm} не привязана к воркспейсу «{ws.label}».[/red]\n"
+                  f"Привязать: [cyan]jwu workspace add-path {path}[/cyan]")
+        raise typer.Exit(code=1)
+    if set_:
+        tags = store.set_path_tags(row.id, list(set_))
+    else:
+        if add:
+            store.add_path_tags(row.id, list(add))
+        tags = store.remove_path_tags(row.id, list(remove)) if remove \
+            else store._path_tags([row.id]).get(row.id, [])
+    if json_out:
+        _emit_json({"path": norm, "tags": tags})
+        return
+    console.print(f"{norm}   [cyan]{' '.join('#' + t for t in tags) or '— без тегов'}[/cyan]")
+
+
+@workspace_app.command("paths")
+def workspace_paths(
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Только папки с этим тегом."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Папки воркспейса (с тегами). С --tag — поиск: где лежит legacy-бэкенд и т.п."""
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    rows = store.workspace_paths(ws.id, tag=tag)
+    if json_out:
+        _emit_json({"workspace": ws.slug, "tag": tag,
+                    "paths": [p.model_dump() for p in rows],
+                    "known_tags": store.all_tags(ws.id)})
+        return
+    if not rows:
+        what = f" с тегом «{tag}»" if tag else ""
+        console.print(f"[dim]Папок{what} нет.[/dim]")
+        raise typer.Exit(code=1 if tag else 0)
+    table = Table(box=None, pad_edge=False)
+    for col in ("Папка", "Теги", "Метка"):
+        table.add_column(col)
+    for row in rows:
+        table.add_row(row.path,
+                      " ".join(f"#{t}" for t in row.tags) or "—",
+                      row.label or "—")
+    console.print(table)
+    known = store.all_tags(ws.id)
+    if known and not tag:
+        console.print("[dim]теги: " + "  ".join(f"#{t}({n})" for t, n in known.items()) + "[/dim]")
+
+
+@workspace_app.command("remove-path")
+def workspace_remove_path(
+    path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
+) -> None:
+    """Отвязать папку от воркспейса."""
+    store = _open_store()
+    norm = workspaces.normalize_path(path)
+    if not store.remove_workspace_path(norm):
+        err.print(f"[yellow]Папка {norm} ни к одному воркспейсу не привязана.[/yellow]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Отвязано:[/green] {norm}")
+
+
+@workspace_app.command("rename")
+def workspace_rename(
+    slug: str = typer.Argument(..., help="Текущий slug/id."),
+    new_slug: str = typer.Argument(..., help="Новый slug."),
+    name: Optional[str] = typer.Option(None, "--name", help="Новое название."),
+) -> None:
+    """Переименовать воркспейс."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red]")
+        raise typer.Exit(code=1)
+    try:
+        target = workspaces.normalize_slug(new_slug)
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if target != ws.slug and store.get_workspace_by_slug(target) is not None:
+        err.print(f"[red]Воркспейс «{target}» уже есть.[/red]")
+        raise typer.Exit(code=1)
+    fields = {"slug": target}
+    if name is not None:
+        fields["name"] = name
+    store.update_workspace(ws.id, **fields)
+    if (store.get_meta(workspaces.ACTIVE_META_KEY) or "") == ws.slug:
+        store.set_meta(workspaces.ACTIVE_META_KEY, target)
+    console.print(f"[green]«{ws.slug}» → «{target}»[/green]")
+
+
+@workspace_app.command("delete")
+def workspace_delete(
+    slug: str = typer.Argument(..., help="Slug/id воркспейса."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    keep_data: bool = typer.Option(
+        False, "--keep-data", help="Оставить работы/заметки/анализы в БД (осиротевшими)."
+    ),
+) -> None:
+    """Удалить воркспейс вместе с его локальными данными."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red]")
+        raise typer.Exit(code=1)
+    if len(store.list_workspaces(include_archived=True)) == 1:
+        err.print("[red]Это единственный воркспейс — удалять нечего, останется пустая БД.[/red]")
+        raise typer.Exit(code=1)
+    store.use_workspace(ws.id)
+    jobs_count = len(store.list_jobs())
+    if not yes:
+        what = "вместе со всеми данными" if not keep_data else "оставив данные в БД"
+        confirm = typer.confirm(
+            f"Удалить воркспейс «{ws.label}» {what}? Работ: {jobs_count}", default=False
+        )
+        if not confirm:
+            console.print("[dim]Отменено.[/dim]")
+            raise typer.Exit(code=1)
+    store.delete_workspace(ws.id, keep_data=keep_data)
+    if (store.get_meta(workspaces.ACTIVE_META_KEY) or "") == ws.slug:
+        store.set_meta(workspaces.ACTIVE_META_KEY, "")
+    console.print(f"[green]Воркспейс «{ws.label}» удалён.[/green]")
+
+
 def _render_issues(issues: list[Issue]) -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("Key", style="cyan", no_wrap=True)
@@ -456,7 +1086,7 @@ def tasks(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Список задач по вью или произвольному JQL."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         try:
             issues = svc.tasks(view, jql=jql)
         except (ValueError, JiraError) as exc:
@@ -474,7 +1104,7 @@ def task(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Полная карточка задачи: описание, все комменты, статус, links, dev-панель."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         issue = svc.issue(key)
         notes = svc.get_notes(key)
         jobs_list = svc.jobs_for_task(key)
@@ -562,7 +1192,7 @@ def attachments(
     Видео всегда только в списке (не качаются). Для Claude: --download качает файлы,
     печатает локальные пути — изображения/логи/pdf затем читаются через Read.
     """
-    with _service() as svc:
+    with _service_with_jira() as svc:
         issue = svc.issue(key)
         dest_dir = Path(dest) if dest else svc.attachments_dir(key)
         downloaded: list[tuple] = []
@@ -646,7 +1276,7 @@ def prs(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """PR из Bitbucket по роли (мои / на ревью) со статусом merge-конфликта."""
-    with _service() as svc:
+    with _service_with_bitbucket() as svc:
         if mine_reviews or on is not None:
             day = datetime.now().date().isoformat() if (on or "").lower() == "today" else on
             prs_list = svc.my_reviews(on=day)
@@ -666,7 +1296,7 @@ def pr(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Детали одного PR + статус merge-конфликта + комментарии ревью."""
-    with _service() as svc:
+    with _service_with_bitbucket() as svc:
         detail = svc.pr_detail(project, repo, pr_id)
         pull = detail.pr
         jobs_list = svc.jobs_for_pr(pr_id, project or "", repo or "")
@@ -791,8 +1421,16 @@ def _render_deltas(deltas: list[Delta]) -> None:
 def sync(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Синк по команде: тянет вью + PR, пишет снапшот в память, считает дельты."""
+    """Синк по команде: тянет вью + PR, пишет снапшот в память, считает дельты.
+
+    Секции отключённых интеграций пропускаются: воркспейсу без Jira синкать
+    задачи неоткуда, и это не ошибка.
+    """
     with _service() as svc:
+        if svc.jira is None and svc.bitbucket is None:
+            slug = svc.workspace.slug if svc.workspace else "?"
+            err.print(f"[yellow]В воркспейсе «{slug}» нет подключённых интеграций — синкать нечего.[/yellow]")
+            raise typer.Exit(code=1)
         result = svc.sync()
     if json_out:
         _emit_json({
@@ -838,7 +1476,9 @@ def _full_sync_dashboard() -> DashboardData:
     а не печатает в stderr поверх TUI (иначе в уведомление прилетала пустая строка).
     """
     _prepare_db()
-    with Service.from_config(load_config()) as svc:
+    with Store(str(db_path())) as probe:
+        ws = workspaces.resolve_workspace(probe, explicit=_WORKSPACE_ARG)
+    with Service.for_workspace(ws) as svc:
         svc.sync()
         return svc.dashboard()
 
@@ -877,6 +1517,10 @@ def dashboard(
         900.0, "--slow-interval", help="Интервал авто-синка сетевых таблиц (задачи/PR), сек. Отсчёт ведётся от ОКОНЧАНИЯ предыдущего синка."),
     detail_interval: float = typer.Option(
         60.0, "--detail-interval", help="Интервал авто-дотягивания открытой задачи/PR из сети, сек."),
+    index_interval: float = typer.Option(
+        120.0, "--index-interval",
+        help="Интервал переиндексации папок воркспейса (git-ветки в «Структуре»), сек. "
+             "0 — только при открытии дашборда. Работает и без -a: индексация локальная."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON вместо TUI (для Claude)."),
 ) -> None:
     """Дашборд: задачи на мне, упоминания, PR и изменения. По умолчанию — из памяти."""
@@ -895,14 +1539,26 @@ def dashboard(
         return
 
     # TUI: начальные данные — из памяти (без токенов); refresh активной вкладки — по сети, лениво.
-    if do_sync:
-        data = _initial_sync()
-    else:
-        with _store() as store:
-            data = dashboard_from_memory(store)
-    cfg = load_config()
+    # Если воркспейс определить не удалось (папка ни к одному не привязана и активного нет) —
+    # не падаем, а стартуем с экрана выбора: дашборд без контура показывать нечего.
+    needs_picker = False
+    try:
+        with _open_store() as store:
+            ws = workspaces.resolve_workspace(store, explicit=_WORKSPACE_ARG)
+            store.use_workspace(ws.id)
+            data = _initial_sync() if do_sync else dashboard_from_memory(store)
+            cfg = workspaces.config_for_workspace(store, ws)
+    except workspaces.WorkspaceNotSelected:
+        needs_picker = True
+        data = DashboardData()
+        cfg = load_config()
 
     from .dashboard import JwuDashboard  # ленивый импорт textual
+
+    env_label = ""
+    if cfg.jira.base_url:
+        env_label = (f"{cfg.jira.project} @ "
+                     f"{urlparse(cfg.jira.base_url).netloc or cfg.jira.base_url}")
 
     JwuDashboard(
         data,
@@ -916,24 +1572,38 @@ def dashboard(
         job_status_fn=_job_set_status,
         ack_changes_fn=_ack_changes,
         clear_changes_fn=_clear_changes,
+        workspaces_fn=_tui_workspaces,
+        workspace_switch_fn=_tui_switch_workspace,
+        workspace_create_fn=_tui_create_workspace,
+        workspace_delete_fn=_tui_delete_workspace,
+        path_add_fn=_tui_add_path,
+        path_remove_fn=_tui_remove_path,
+        feature_get_fn=_feature_get,
+        feature_jobs_fn=_feature_jobs,
+        feature_create_fn=_feature_create,
+        feature_status_fn=_feature_set_status,
+        feature_edit_fn=_feature_set_title,
+        cwd=str(Path.cwd()),
+        start_with_picker=needs_picker,
         jira_base=cfg.jira.base_url,
-        env_label=f"{cfg.jira.project} @ {urlparse(cfg.jira.base_url).netloc or cfg.jira.base_url}",
+        env_label=env_label,
         auto_update=auto_update,
         fast_interval=fast_interval,
         slow_interval=slow_interval,
         detail_interval=detail_interval,
+        index_interval=index_interval,
     ).run()
 
 
 def _pr_detail(project: str, repo: str, pr_id: int):
     """Лениво подтянуть детали PR для экрана PR."""
-    with _service() as svc:
+    with _service_with_bitbucket() as svc:
         return svc.pr_detail(project, repo, pr_id)
 
 
 def _issue_detail(key: str) -> Issue:
     """Дотянуть свежую карточку задачи из сети (для авто-рефреша открытого экрана)."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         return svc.issue(key)
 
 
@@ -959,6 +1629,104 @@ def _job_set_status(job_id: int, status: str) -> None:
     """Сменить статус работы (для кнопки «закрыть» в TUI)."""
     with _store() as store:
         store.set_job_status(job_id, status)
+
+
+# --- колбэки TUI по воркспейсам и фичам ------------------------------------- #
+# Смена воркспейса в TUI = подмена глобального выбора для последующих вызовов:
+# все остальные колбэки ходят через _store(), который читает _WORKSPACE_ARG.
+
+
+def _tui_workspaces() -> list[Workspace]:
+    """Список воркспейсов со счётчиком работ (для экрана выбора)."""
+    with _open_store() as store:
+        items = store.list_workspaces()
+        for ws in items:
+            store.use_workspace(ws.id)
+            ws.jobs_count = len(store.list_jobs())
+        return items
+
+
+def _tui_switch_workspace(workspace_id: int) -> DashboardData:
+    global _WORKSPACE_ARG
+    with _open_store() as store:
+        ws = store.get_workspace(workspace_id)
+        if ws is None:
+            raise ValueError(f"воркспейс #{workspace_id} не найден")
+        _WORKSPACE_ARG = ws.slug
+        workspaces.set_active(store, ws)
+        store.use_workspace(ws.id)
+        return dashboard_from_memory(store)
+
+
+def _tui_create_workspace(slug: str) -> None:
+    with _open_store() as store:
+        workspaces.create(store, slug)
+
+
+def _tui_delete_workspace(workspace_id: int) -> DashboardData:
+    """Удалить воркспейс из TUI и вернуть снимок уже другого (активного) контура."""
+    global _WORKSPACE_ARG
+    with _open_store() as store:
+        ws = store.get_workspace(workspace_id)
+        if ws is None:
+            raise ValueError(f"воркспейс #{workspace_id} не найден")
+        if len(store.list_workspaces(include_archived=True)) <= 1:
+            raise ValueError("это единственный воркспейс — удалять нечего")
+        store.delete_workspace(workspace_id)
+        if (store.get_meta(workspaces.ACTIVE_META_KEY) or "") == ws.slug:
+            store.set_meta(workspaces.ACTIVE_META_KEY, "")
+        if _WORKSPACE_ARG == ws.slug:
+            _WORKSPACE_ARG = None
+        # переезжаем в первый оставшийся, иначе дашборду нечего показывать
+        rest = store.list_workspaces()
+        target = rest[0] if rest else None
+        if target is not None:
+            _WORKSPACE_ARG = target.slug
+            workspaces.set_active(store, target)
+            store.use_workspace(target.id)
+        return dashboard_from_memory(store)
+
+
+def _tui_add_path(workspace_id: int, path: str) -> DashboardData:
+    with _open_store() as store:
+        ws = store.get_workspace(workspace_id)
+        if ws is None:
+            raise ValueError(f"воркспейс #{workspace_id} не найден")
+        workspaces.add_path(store, ws, path)
+        store.use_workspace(ws.id)
+        return dashboard_from_memory(store)
+
+
+def _tui_remove_path(workspace_id: int, path: str) -> DashboardData:
+    with _open_store() as store:
+        store.remove_workspace_path(path, workspace_id)
+        store.use_workspace(workspace_id)
+        return dashboard_from_memory(store)
+
+
+def _feature_get(feature_id: int):
+    with _store() as store:
+        return store.get_feature(feature_id)
+
+
+def _feature_jobs(feature_id: int) -> list[Job]:
+    with _store() as store:
+        return store.list_jobs(feature_id=feature_id)
+
+
+def _feature_create(title: str) -> None:
+    with _store() as store:
+        store.create_feature(title)
+
+
+def _feature_set_status(feature_id: int, status: str) -> None:
+    with _store() as store:
+        store.update_feature(feature_id, status=status)
+
+
+def _feature_set_title(feature_id: int, title: str) -> None:
+    with _store() as store:
+        store.update_feature(feature_id, title=title)
 
 
 # --------------------------------------------------------------------------- #
@@ -1071,7 +1839,7 @@ def _day_context_json(ctx: DayContext) -> dict:
 @action_app.command("day-analyze")
 def day_analyze(json_out: bool = typer.Option(False, "--json", help="Вывести JSON-контекст.")) -> None:
     """Фулл-синк + расширенный контекст и промпт для дневного анализа (для Claude Code)."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         ctx = svc.collect_day_context()
     if json_out:
         _emit_json(_day_context_json(ctx))
@@ -1187,7 +1955,7 @@ def worklog(
 ) -> None:
     """Залогировать время по задаче в таймтрекер Jira (worklog)."""
     try:
-        with _service() as svc:
+        with _service_with_jira() as svc:
             result = svc.add_worklog(key, time, comment=comment, started=started)
     except JiraError as exc:
         if json_out:
@@ -1209,7 +1977,7 @@ def worklogs(
 ) -> None:
     """Мои уже залогированные worklog'и по задачам за день (проверка двойного трека)."""
     day = datetime.now().date().isoformat() if on.lower() == "today" else on
-    with _service() as svc:
+    with _service_with_jira() as svc:
         data = svc.my_worklogs_on(keys, day)
     if json_out:
         _emit_json(data)
@@ -1241,33 +2009,57 @@ def _render_jobs_table(jobs: list[Job]) -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Статус")
-    table.add_column("Задача")
+    table.add_column("Якорь")
     table.add_column("Записей", justify="right")
     table.add_column("PR")
     table.add_column("Title")
     for j in jobs:
         prs = ", ".join(str(p.pr_id) for p in j.prs) or "—"
-        table.add_row(str(j.id), j.status, j.task_key, str(len(j.records)), prs, j.title)
+        table.add_row(str(j.id), j.status, j.anchor, str(len(j.records)), prs, j.title)
     console.print(table)
     console.print(f"[dim]Всего: {len(jobs)}[/dim]")
 
 
 @job_app.command("start")
 def job_start(
-    task_key: str = typer.Argument(..., help="Ключ задачи-якоря, напр. PROJ-399."),
+    task_key: Optional[str] = typer.Argument(
+        None, help="Ключ задачи Jira, напр. PROJ-399. Без него — работа по фиче или без якоря."
+    ),
+    feature: Optional[str] = typer.Option(
+        None, "--feature", "-f", help="Локальная фича как якорь (id или ключ HOMEJWU-1)."
+    ),
     title: str = typer.Option("", "--title", "-t", help="Короткий заголовок работы."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Начать новую работу по задаче (цикл работы). Дубликаты не блокируются."""
+    """Начать новую работу: по задаче Jira, по локальной фиче либо вовсе без якоря."""
+    if task_key and feature:
+        err.print("[red]Нужно что-то одно: ключ задачи Jira ИЛИ --feature.[/red]")
+        raise typer.Exit(code=1)
+    if not task_key and not feature and not title:
+        err.print("[red]Работе без якоря нужен --title, иначе её не опознать.[/red]")
+        raise typer.Exit(code=1)
     with _store() as store:
-        existing = store.jobs_for_task(task_key)
-        job = store.create_job(task_key, title)
+        feature_row = None
+        if feature:
+            feature_row = store.get_feature(feature)
+            if feature_row is None:
+                err.print(f"[red]Фича «{feature}» не найдена.[/red] Список: jwu feature list")
+                raise typer.Exit(code=1)
+        existing = (
+            store.jobs_for_task(task_key) if task_key
+            else store.list_jobs(feature_id=feature_row.id) if feature_row
+            else []
+        )
+        job = store.create_job(
+            task_key or "", title, feature_id=feature_row.id if feature_row else None
+        )
     if json_out:
         _emit_json(job.model_dump())
         return
-    console.print(f"[green]Работа #{job.id}[/green] начата по {task_key}")
+    where = f" по {job.anchor}" if (task_key or feature_row) else ""
+    console.print(f"[green]Работа #{job.id}[/green] начата{where}")
     if existing:
-        console.print(f"[dim]По задаче уже есть работы: "
+        console.print(f"[dim]Уже есть работы: "
                       f"{', '.join(f'#{j.id}[{j.status}]' for j in existing)}[/dim]")
 
 
@@ -1373,8 +2165,12 @@ def job_show(
     if json_out:
         _emit_json(job.model_dump())
         return
-    console.print(f"[bold cyan]Работа #{job.id}[/bold cyan] [{job.status}]  {job.title or '—'}")
-    console.print(f"[dim]задача:[/dim] {job.task_key}   [dim]обновлена:[/dim] {fmt_dt(job.updated_at)}")
+    # \[ — иначе rich съедает [active] как разметку
+    console.print(f"[bold cyan]Работа #{job.id}[/bold cyan] \\[{job.status}]  {job.title or '—'}")
+    anchor_label = "задача" if job.task_key else ("фича" if job.feature_key else "якорь")
+    anchor = job.task_key or job.feature_key or "— (работа без задачи)"
+    console.print(f"[dim]{anchor_label}:[/dim] {anchor}   "
+                  f"[dim]обновлена:[/dim] {fmt_dt(job.updated_at)}")
     if job.prs:
         prs = ", ".join(f"{p.project}/{p.repo}#{p.pr_id}" if p.project else f"#{p.pr_id}" for p in job.prs)
         console.print(f"[dim]PR:[/dim] {prs}")
@@ -1395,17 +2191,179 @@ def job_show(
 @app.command()
 def jobs(
     task: Optional[str] = typer.Option(None, "--task", help="Фильтр по ключу задачи."),
+    feature: Optional[str] = typer.Option(
+        None, "--feature", "-f", help="Фильтр по локальной фиче (id или ключ)."
+    ),
     pr: Optional[int] = typer.Option(None, "--pr", help="Фильтр по id PR."),
     status: Optional[str] = typer.Option(None, "--status", help="active | done | paused."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Список работ (по задаче / PR / статусу)."""
+    """Список работ текущего воркспейса (по задаче / фиче / PR / статусу)."""
     with _store() as store:
-        items = store.list_jobs(task_key=task, pr_id=pr, status=status)
+        feature_id = None
+        if feature:
+            row = store.get_feature(feature)
+            if row is None:
+                err.print(f"[red]Фича «{feature}» не найдена.[/red]")
+                raise typer.Exit(code=1)
+            feature_id = row.id
+        items = store.list_jobs(task_key=task, pr_id=pr, status=status, feature_id=feature_id)
     if json_out:
         _emit_json([j.model_dump() for j in items])
     else:
         _render_jobs_table(items)
+
+
+# --------------------------------------------------------------------------- #
+# Локальные фичи (мини-трекер воркспейса без Jira)
+# --------------------------------------------------------------------------- #
+
+
+def _render_features(items: list[LocalFeature]) -> None:
+    if not items:
+        console.print("[dim]Фич нет. Завести: jwu feature add \"название\"[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Ключ", style="cyan", no_wrap=True)
+    table.add_column("Статус")
+    table.add_column("Приоритет")
+    table.add_column("Название")
+    for f in items:
+        label, color = LOCAL_FEATURE_BADGES.get(f.status, (f.status, "white"))
+        table.add_row(f.key, f"[{color}]{label}[/{color}]", f.priority or "—", f.title)
+    console.print(table)
+    console.print(f"[dim]Всего: {len(items)}[/dim]")
+
+
+@feature_app.command("add")
+def feature_add(
+    title: str = typer.Argument(..., help="Название фичи."),
+    desc: str = typer.Option("", "--desc", "-d", help="Описание / что нужно сделать."),
+    priority: str = typer.Option("", "--priority", "-p", help="Приоритет (свободный текст)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Завести локальную фичу — якорь для работ там, где нет Jira."""
+    with _store() as store:
+        feature = store.create_feature(title, description=desc, priority=priority)
+    if json_out:
+        _emit_json(feature.model_dump())
+    else:
+        console.print(f"[green]{feature.key}[/green] · {feature.title}")
+
+
+@feature_app.command("list")
+def feature_list(
+    status: Optional[str] = typer.Option(
+        None, "--status", "-s", help=" | ".join(LOCAL_FEATURE_STATUSES),
+        click_type=click.Choice(LOCAL_FEATURE_STATUSES),
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Список локальных фич воркспейса."""
+    with _store() as store:
+        items = store.list_features(status=status)
+    if json_out:
+        _emit_json([f.model_dump() for f in items])
+    else:
+        _render_features(items)
+
+
+@feature_app.command("show")
+def feature_show(
+    ref: str = typer.Argument(..., help="Ключ (HOMEJWU-1) или id."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Карточка фичи вместе со связанными работами."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        linked = store.list_jobs(feature_id=feature.id)
+    if json_out:
+        payload = feature.model_dump()
+        payload["jobs"] = [j.model_dump() for j in linked]
+        _emit_json(payload)
+        return
+    label, color = LOCAL_FEATURE_BADGES.get(feature.status, (feature.status, "white"))
+    console.print(f"[bold cyan]{feature.key}[/bold cyan] [{color}]{label}[/{color}]  {feature.title}")
+    if feature.priority:
+        console.print(f"[dim]приоритет:[/dim] {feature.priority}")
+    console.print(f"[dim]обновлена:[/dim] {fmt_dt(feature.updated_at)}")
+    if feature.description:
+        console.print(f"\n{feature.description}")
+    if linked:
+        console.print("\n[bold]Работы[/bold]")
+        for j in linked:
+            console.print(f"  #{j.id} \\[{j.status}] {j.title or '—'} "
+                          f"[dim]({len(j.records)} записей)[/dim]")
+
+
+@feature_app.command("status")
+def feature_status(
+    ref: str = typer.Argument(..., help="Ключ или id фичи."),
+    status: str = typer.Argument(
+        ..., help=" | ".join(LOCAL_FEATURE_STATUSES),
+        click_type=click.Choice(LOCAL_FEATURE_STATUSES),
+    ),
+) -> None:
+    """Сменить статус фичи."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        store.update_feature(feature.id, status=status)
+    console.print(f"[green]{feature.key}[/green]: {feature.status} → {status}")
+
+
+@feature_app.command("edit")
+def feature_edit(
+    ref: str = typer.Argument(..., help="Ключ или id фичи."),
+    title: Optional[str] = typer.Option(None, "--title", "-t", help="Новое название."),
+    desc: Optional[str] = typer.Option(None, "--desc", "-d", help="Новое описание."),
+    priority: Optional[str] = typer.Option(None, "--priority", "-p", help="Новый приоритет."),
+) -> None:
+    """Изменить название / описание / приоритет фичи."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        store.update_feature(feature.id, title=title, description=desc, priority=priority)
+    console.print(f"[green]{feature.key} обновлена.[/green]")
+
+
+@feature_app.command("rm")
+def feature_rm(
+    ref: str = typer.Argument(..., help="Ключ или id фичи."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Удалить фичу. Работы по ней остаются, но теряют якорь."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        linked = store.list_jobs(feature_id=feature.id)
+        if not yes and not typer.confirm(
+            f"Удалить фичу {feature.key}? Работ по ней: {len(linked)}", default=False
+        ):
+            raise typer.Exit(code=1)
+        store.delete_feature(feature.id)
+    console.print(f"[red]{feature.key}[/red] удалена")
+
+
+@app.command()
+def features(
+    status: Optional[str] = typer.Option(
+        None, "--status", "-s", help=" | ".join(LOCAL_FEATURE_STATUSES),
+        click_type=click.Choice(LOCAL_FEATURE_STATUSES),
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Список локальных фич (алиас `jwu feature list`)."""
+    feature_list(status=status, json_out=json_out)
 
 
 if __name__ == "__main__":  # pragma: no cover

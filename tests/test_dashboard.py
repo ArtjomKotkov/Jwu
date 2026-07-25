@@ -11,6 +11,7 @@ from jwu.cli.copy_modal import (
     copy_items_for_pr,
 )
 from jwu.cli.dashboard import JwuDashboard, _fmt_ago
+from jwu.cli.workspace_screens import WorkspaceTree
 from jwu.core.models import Issue, Job, PR
 from jwu.core.service import DashboardData, dashboard_from_memory
 from jwu.core.store import Store
@@ -476,7 +477,8 @@ def test_auto_update_off_only_status_ticker():
 
     async def run() -> None:
         async with app.run_test():
-            assert len(intervals) == 1  # только статус-тикер, без авто-синков
+            # статус-тикер + переиндексация папок; сетевых авто-синков нет
+            assert len(intervals) == 2
 
     asyncio.run(run())
 
@@ -596,8 +598,9 @@ def test_check_action_scopes_job_buttons():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            assert app.check_action("delete_job", ()) is None      # на «Мои задачи» скрыто
-            assert app.check_action("finish_job", ()) is None
+            # False (а не None) — только оно реально прячет кнопку и освобождает клавишу
+            assert app.check_action("delete_job", ()) is False      # на «Мои задачи» скрыто
+            assert app.check_action("finish_job", ()) is False
             assert app.check_action("refresh", ()) is True
             app.query_one("#tabs", TabbedContent).active = "tab-jobs"
             await pilot.pause()
@@ -1507,9 +1510,7 @@ def test_hjkl_moves_table_cursor():
 
 
 def test_bracket_keys_switch_tabs():
-    """[ и ] переключают вкладки по кругу."""
-    from jwu.cli.dashboard import _TAB_ORDER
-
+    """[ и ] переключают вкладки по кругу — только по видимым."""
     data = _dash_data()
     app = JwuDashboard(data, jira_base="https://jira.test")
 
@@ -1521,9 +1522,13 @@ def test_bracket_keys_switch_tabs():
             assert tabs.active == "tab-mentions"
             await pilot.press("[")
             assert tabs.active == "tab-mine"
-            for _ in range(len(_TAB_ORDER)):
+            # полный круг по ВИДИМЫМ вкладкам возвращает на исходную
+            for _ in range(len(app._visible_tabs())):
                 await pilot.press("]")
             assert tabs.active == "tab-mine"
+            # «Фичи» при подключённой Jira скрыты (их роль — заменять задачи, а не дублировать)
+            assert "tab-features" not in app._visible_tabs()
+            assert "tab-workspaces" in app._visible_tabs()
             await pilot.press("q")
 
     asyncio.run(run())
@@ -1702,6 +1707,684 @@ def test_copy_modal_navigation_and_enter(monkeypatch):
             await pilot.press("j")
             await pilot.press("enter")
             assert copied == ["https://jira.test/browse/A-1"]
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# Воркспейсы и локальные фичи в TUI
+# --------------------------------------------------------------------------- #
+
+
+def _home_data(store, ws):
+    """Снимок личного воркспейса (без Jira/Bitbucket) прямо из памяти."""
+    store.use_workspace(ws.id)
+    return dashboard_from_memory(store)
+
+
+def test_tabs_hidden_for_workspace_without_integrations(tmp_path):
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home", name="Личное")
+    store.use_workspace(ws.id)
+    store.create_feature("Тёмная тема")
+    data = _home_data(store, ws)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            visible = app._visible_tabs()
+            assert "tab-mine" not in visible and "tab-prs-review" not in visible
+            assert "tab-features" in visible and "tab-workspaces" in visible
+            assert "tab-structure" in visible
+            # стартуем на «Фичах»: задач Jira тут нет
+            tabs = app.query_one("#tabs", TabbedContent)
+            assert tabs.active == "tab-features"
+            # [ и ] не заходят на скрытые вкладки
+            for _ in range(len(visible) * 2):
+                await pilot.press("]")
+                assert tabs.active in visible
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_features_tab_renders_local_features(tmp_path):
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home")
+    store.use_workspace(ws.id)
+    store.create_feature("Тёмная тема", priority="high")
+    data = _home_data(store, ws)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            table = app.query_one("#t-features", DataTable)
+            assert table.row_count == 1
+            row = table.get_row_at(0)
+            assert str(row[0]) == "HOME-1"
+            assert "открыта" in str(row[2])
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_workspace_tab_shows_paths_and_head(tmp_path):
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home", name="Личное")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, ws, folder)
+    ws = store.get_workspace(ws.id)
+    data = _home_data(store, ws)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")  # с «Фич» влево — на «Структуру»
+            await pilot.pause()
+            assert app.query_one("#tabs", TabbedContent).active == "tab-structure"
+            tree = app.query_one("#t-structure", WorkspaceTree)
+            roots = [str(n.label) for n in tree.root.children]
+            assert roots == [str(folder.resolve())]
+            head = app.query_one("#structure-head").render()
+            assert "Личное" in str(head)
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_add_path_from_workspace_tab(tmp_path):
+    """Клавиша a на вкладке Workspace добавляет папку через переданный callable."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home")
+    data = _home_data(store, ws)
+    added = []
+
+    def add_path(workspace_id, path):
+        added.append((workspace_id, path))
+        return data
+
+    app = JwuDashboard(data, path_add_fn=add_path, cwd=str(tmp_path))
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")  # с «Фич» влево — на «Структуру»
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.press("enter")  # поле предзаполнено текущей папкой
+            await pilot.pause()
+            await pilot.press("q")
+
+    asyncio.run(run())
+    store.close()
+    assert added == [(ws.id, str(tmp_path))]
+
+
+def test_workspace_picker_switches_workspace(tmp_path):
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home", name="Личное")
+    work = store.get_workspace_by_slug("work")
+    store.use_workspace(work.id)
+    work_data = dashboard_from_memory(store)
+    home_data = _home_data(store, home)
+    store.close()
+
+    switched = []
+
+    def switch(workspace_id):
+        switched.append(workspace_id)
+        return home_data
+
+    app = JwuDashboard(
+        work_data,
+        workspaces_fn=lambda: [work, home],
+        workspace_switch_fn=switch,
+    )
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("W")
+            await pilot.pause()
+            # пикер — модальный экран, поэтому ищем в нём, а не в дефолтном
+            table = app.screen.query_one("#ws-table", DataTable)
+            assert table.row_count == 2
+            table.move_cursor(row=1)  # home
+            await pilot.press("enter")
+            await pilot.pause()
+            # после переключения вкладки Jira скрылись — это данные личного воркспейса
+            assert "tab-mine" not in app._visible_tabs()
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert switched == [home.id]
+
+
+def test_picker_opens_at_startup_when_workspace_unknown():
+    """Без воркспейса дашборд стартует с экрана выбора, а не падает."""
+    app = JwuDashboard(
+        DashboardData(),
+        workspaces_fn=lambda: [],
+        workspace_switch_fn=lambda wid: DashboardData(),
+        start_with_picker=True,
+    )
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.query_one("#ws-table") is not None  # пикер поверх дашборда
+            await pilot.press("escape")  # в стартовом режиме escape закрывает приложение
+
+    asyncio.run(run())
+
+
+def test_jobs_tab_shows_feature_anchor(tmp_path):
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home")
+    store.use_workspace(ws.id)
+    feature = store.create_feature("Тёмная тема")
+    store.create_job("", "по фиче", feature_id=feature.id)
+    store.create_job("", "без якоря")
+    data = _home_data(store, ws)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("]")  # Фичи → Анализ
+            await pilot.press("]")  # Анализ → Работы
+            await pilot.pause()
+            assert app.query_one("#tabs", TabbedContent).active == "tab-jobs"
+            table = app.query_one("#t-jobs", DataTable)
+            anchors = {str(table.get_row_at(i)[3]) for i in range(table.row_count)}
+            assert feature.key in anchors
+            assert any(a.startswith("#") for a in anchors)  # работа без якоря
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_picker_shows_job_counts(tmp_path, monkeypatch):
+    """Счётчик работ в пикере: у Workspace должно быть поле для него (pydantic строгий)."""
+    from jwu.cli import main as cli
+    from jwu.core import workspaces
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    home = workspaces.create(store, "home")
+    store.use_workspace(home.id)
+    store.create_job("", "домашняя")
+    store.close()
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+
+    items = cli._tui_workspaces()
+    counts = {ws.slug: ws.jobs_count for ws in items}
+    assert counts == {"work": 0, "home": 1}
+
+    app = JwuDashboard(DashboardData(), workspaces_fn=cli._tui_workspaces,
+                       workspace_switch_fn=lambda wid: DashboardData())
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("W")
+            await pilot.pause()
+            table = app.screen.query_one("#ws-table", DataTable)
+            assert table.row_count == 2
+            await pilot.press("escape")
+
+    asyncio.run(run())
+
+
+def test_workspace_tab_owns_D_key_and_hides_job_buttons(tmp_path):
+    """На вкладке Workspace `D` отвязывает папку, а не удаляет работу (клавиша общая)."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, ws, folder)
+    ws = store.get_workspace(ws.id)
+    store.use_workspace(ws.id)
+    store.create_job("", "домашняя")
+    data = dashboard_from_memory(store)
+    store.close()
+
+    removed = []
+    app = JwuDashboard(
+        data,
+        path_remove_fn=lambda wid, path: (removed.append((wid, path)), data)[1],
+        job_delete_fn=lambda jid: removed.append(("job", jid)),
+    )
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")  # Фичи → Структура
+            await pilot.pause()
+            app.query_one("#t-structure", WorkspaceTree).focus()
+            await pilot.pause()
+            assert app.check_action("delete_job", ()) is False   # прячется, не «серая»
+            assert app.check_action("remove_path", ()) is True
+            await pilot.press("D")
+            await pilot.pause()
+            await pilot.press("enter")  # подтверждение ConfirmScreen
+            await pilot.pause()
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert removed == [(ws.id, str(folder.resolve()))]
+
+
+def test_workspace_and_structure_tabs_are_separate(tmp_path):
+    """«Workspace» — управление контурами, «Структура» — папки активного."""
+    from jwu.core import workspaces
+    from textual.widgets import TabbedContent as TC
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home", name="Личное")
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            label = str(app.query_one("#tabs", TC).get_tab("tab-workspaces").label)
+            # счётчик вкладки = число контуров (work + home), а не папок
+            assert label == "Workspace (2)"
+            assert str(app.query_one("#tabs", TC).get_tab("tab-structure").label) == "Структура (0)"
+            head = str(app.query_one("#structure-head").render())
+            assert "Папок нет" in head          # пустое состояние объясняет, что делать
+            assert "a" in head and "добавить" in head
+            # создание нового контура живёт на вкладке управления
+            ws_head = str(app.query_one("#ws-head").render())
+            assert "создать" in ws_head and "переключиться" in ws_head
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_workspaces_tab_lists_and_switches(tmp_path):
+    """Вкладка Workspace — управление: список контуров, enter переключает."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home", name="Личное")
+    work = store.get_workspace_by_slug("work")
+    store.use_workspace(work.id)
+    work_data = dashboard_from_memory(store)
+    store.use_workspace(home.id)
+    home_data = dashboard_from_memory(store)
+    store.close()
+
+    switched = []
+    app = JwuDashboard(
+        work_data,
+        workspace_switch_fn=lambda wid: (switched.append(wid), home_data)[1],
+    )
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")   # Мои задачи → Структура
+            await pilot.press("[")   # Структура → Workspace
+            await pilot.pause()
+            assert app.query_one("#tabs", TabbedContent).active == "tab-workspaces"
+            table = app.query_one("#t-workspaces", DataTable)
+            assert table.row_count == 2
+            slugs = [str(table.get_row_at(i)[1]) for i in range(table.row_count)]
+            assert slugs == ["work", "home"]
+            assert str(table.get_row_at(0)[0]).strip() == "→"   # маркер активного
+            table.move_cursor(row=1)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert switched == [home.id]
+
+
+def test_workspaces_tab_creates_and_deletes(tmp_path):
+    """N создаёт контур, D удаляет (с подтверждением) — прямо со вкладки."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home", name="Личное")
+    store.use_workspace(home.id)
+    data = dashboard_from_memory(store)
+    store.close()
+
+    created, deleted = [], []
+    app = JwuDashboard(
+        data,
+        workspace_create_fn=created.append,
+        workspace_delete_fn=lambda wid: (deleted.append(wid), data)[1],
+    )
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.press("[")
+            await pilot.pause()
+            assert app.check_action("new_workspace", ()) is True
+            assert app.check_action("add_path", ()) is False   # это на «Структуре»
+            await pilot.press("N")
+            await pilot.pause()
+            for ch in "pet":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            table = app.query_one("#t-workspaces", DataTable)
+            table.move_cursor(row=1)          # home, не единственный
+            await pilot.press("D")
+            await pilot.pause()
+            await pilot.press("enter")        # подтверждение
+            await pilot.pause()
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert created == ["pet"]
+    assert deleted == [home.id]
+
+
+def test_delete_refuses_when_single_workspace(tmp_path):
+    store = Store(tmp_path / "state.db")
+    data = dashboard_from_memory(store)   # только «work»
+    store.close()
+
+    deleted = []
+    app = JwuDashboard(data, workspace_delete_fn=deleted.append)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.press("[")
+            await pilot.pause()
+            await pilot.press("D")
+            await pilot.pause()
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert deleted == []   # единственный контур не удаляем
+
+
+def _repo(path, *, branch="main"):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ".git").mkdir()
+    (path / ".git" / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+    return path
+
+
+def test_structure_tab_shows_git_marker_after_indexing(tmp_path):
+    """Рядом с папкой-репозиторием видно имя/ветку; индексация идёт в фоне."""
+    from jwu.core import workspaces
+
+    repo = _repo(tmp_path / "backend", branch="release-10.7")
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "dev", paths=[str(repo)])
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.pause()
+            for _ in range(10):   # ждём фонового индексатора
+                await pilot.pause()
+                if app._git_index:
+                    break
+            assert app._git_index[str(repo)][0].label == "backend/release-10.7"
+            # маркер рисуется прямо в метке узла дерева
+            tree = app.query_one("#t-structure", WorkspaceTree)
+            node = tree.root.children[0]
+            label = tree.render_label(node, tree.get_component_styles("tree--label").rich_style,
+                                      tree.get_component_styles("tree--label").rich_style)
+            assert "backend/release-10.7" in str(label)
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_tree_expands_with_arrow_keys(tmp_path):
+    """Дерево видно сразу, подпапки свёрнуты, → раскрывает, ← сворачивает."""
+    from jwu.core import workspaces
+
+    root = tmp_path / "proj"
+    (root / "src" / "deep").mkdir(parents=True)
+    (root / "README.md").write_text("x")
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "dev", paths=[str(root)])
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.pause()
+            tree = app.query_one("#t-structure", WorkspaceTree)
+            tree.focus()
+            await pilot.pause()
+            node = tree.root.children[0]
+            assert not node.is_expanded          # по умолчанию свёрнуто
+
+            await pilot.press("right")           # → раскрывает
+            await pilot.pause()
+            assert node.is_expanded
+            names = [str(c.label) for c in node.children]
+            assert "src" in names and "README.md" in names
+
+            await pilot.press("left")            # ← сворачивает
+            await pilot.pause()
+            assert not node.is_expanded
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_missing_folder_yields_empty_tree(tmp_path):
+    """Пропавшая папка остаётся в списке, но раскрывать нечего — и это не падение."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "dev")
+    store.add_workspace_path(ws.id, str(tmp_path / "gone"))
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.pause()
+            tree = app.query_one("#t-structure", WorkspaceTree)
+            tree.focus()
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            assert len(tree.root.children[0].children) == 0
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_added_path_appears_without_restart(tmp_path, monkeypatch):
+    """Регресс: после ввода пути таблица обновлялась только после перезапуска."""
+    from jwu.cli import main as cli
+    from jwu.core import workspaces
+    import jwu.core.config as cfgmod
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    ws = workspaces.create(store, "dev")
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    store.close()
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    monkeypatch.setattr(cfgmod, "db_path", lambda cfg=None: db)
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+
+    app = JwuDashboard(data, path_add_fn=cli._tui_add_path, cwd=str(tmp_path))
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.pause()
+            assert len(app.query_one("#t-structure", WorkspaceTree).root.children) == 0
+            await pilot.press("a")
+            await pilot.pause()
+            for ch in "/repo":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            tree = app.query_one("#t-structure", WorkspaceTree)
+            assert [str(n.label) for n in tree.root.children] == [str(folder.resolve())]
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_tree_rebuild_keeps_expanded_nodes(tmp_path):
+    """Регресс: повторная сборка дерева (добавили папку) роняла дашборд.
+
+    Ошибка вылезала только при НЕПУСТОМ дереве, поэтому раскрываем узел заранее.
+    """
+    from jwu.core import workspaces
+    from jwu.core.models import WorkspacePath
+
+    first = tmp_path / "one"
+    (first / "src").mkdir(parents=True)
+    second = tmp_path / "two"
+    second.mkdir()
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "dev", paths=[str(first)])
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("[")
+            await pilot.pause()
+            tree = app.query_one("#t-structure", WorkspaceTree)
+            tree.focus()
+            await pilot.pause()
+            await pilot.press("right")      # раскрыли первую папку
+            await pilot.pause()
+            assert tree.root.children[0].is_expanded
+
+            # добавилась вторая папка → набор корней изменился → пересборка
+            app.data.paths = list(app.data.paths) + [
+                WorkspacePath(id=2, workspace_id=ws.id, path=str(second))
+            ]
+            app._render()
+            await pilot.pause()
+
+            roots = {str(n.label): n for n in tree.root.children}
+            assert set(roots) == {str(first), str(second)}
+            # раскрытое состояние пережило пересборку
+            assert roots[str(first)].is_expanded
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_workspace_switch_shows_loading_marker(tmp_path):
+    """Смена контура не должна выглядеть зависанием: сразу показываем маркер."""
+    import threading
+
+    from jwu.core import workspaces
+    from textual.widgets import Static
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home", name="Личное")
+    store.use_workspace(home.id)
+    home_data = dashboard_from_memory(store)
+    work = store.get_workspace_by_slug("work")
+    store.use_workspace(work.id)
+    work_data = dashboard_from_memory(store)
+    store.close()
+
+    release = threading.Event()
+    seen: list[str] = []
+
+    def slow_switch(workspace_id):
+        release.wait(timeout=5)      # имитируем медленное чтение большой базы
+        return home_data
+
+    app = JwuDashboard(work_data, workspace_switch_fn=slow_switch)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._switch_workspace(home.id)
+            await pilot.pause()
+            seen.append(str(app.query_one("#status", Static).render()))
+            release.set()
+            for _ in range(20):      # ждём завершения фонового чтения
+                await pilot.pause()
+                if not app._loading_workspace:
+                    break
+            seen.append(str(app.query_one("#status", Static).render()))
+            assert app.data.workspace.slug == "home"
+            await pilot.press("q")
+
+    asyncio.run(run())
+    assert "переключаю воркспейс" in seen[0]        # пока грузится — явный маркер
+    assert "переключаю воркспейс" not in seen[1]    # после загрузки маркер снят
+
+
+def test_workspace_switch_error_clears_marker(tmp_path):
+    """Ошибка чтения не должна оставить дашборд с вечным «загружаю»."""
+    store = Store(tmp_path / "state.db")
+    data = dashboard_from_memory(store)
+    store.close()
+
+    def failing(workspace_id):
+        raise RuntimeError("БД недоступна")
+
+    app = JwuDashboard(data, workspace_switch_fn=failing)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._switch_workspace(42)
+            for _ in range(20):
+                await pilot.pause()
+                if not app._loading_workspace:
+                    break
+            assert app._loading_workspace is False
             await pilot.press("q")
 
     asyncio.run(run())
