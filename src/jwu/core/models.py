@@ -515,10 +515,55 @@ class JobPRLink(BaseModel):
 
 class Job(BaseModel):
     id: int = 0
-    task_key: str = ""
+    task_key: str = ""          # ключ Jira; пусто — работа без задачи Jira
     title: str = ""
     status: str = "active"      # active | done | paused
     created_at: str = ""
     updated_at: str = ""
+    # Локальная фича как якорь работы (воркспейс без Jira). Взаимоисключимо с task_key.
+    feature_id: Optional[int] = None
+    feature_key: str = ""       # денормализация для рендера (JOIN при чтении)
     records: list[JobRecord] = Field(default_factory=list)
     prs: list[JobPRLink] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def anchor(self) -> str:
+        """К чему привязана работа: задача Jira, локальная фича либо ничего."""
+        return self.task_key or self.feature_key or f"#{self.id}"
+
+
+# --------------------------------------------------------------------------- #
+# Локальные фичи (мини-трекер воркспейса без Jira)
+# --------------------------------------------------------------------------- #
+
+
+# Статусы локальной фичи — единый источник для CLI-валидации и рендера.
+LOCAL_FEATURE_STATUSES = ["open", "in_progress", "review", "done", "cancelled"]
+
+# статус -> (подпись, цвет rich)
+LOCAL_FEATURE_BADGES: dict[str, tuple[str, str]] = {
+    "open":        ("открыта", "white"),
+    "in_progress": ("в работе", "yellow"),
+    "review":      ("на ревью", "blue"),
+    "done":        ("готова", "green"),
+    "cancelled":   ("отменена", "dim"),
+}
+
+
+class LocalFeature(BaseModel):
+    """Задача локального трекера воркспейса — замена карточки Jira, когда Jira нет.
+
+    Ключ (``HOMEJWU-1``) намеренно совместим по формату с ключами Jira: имя ветки
+    ``HOMEJWU-1-dark-theme`` тогда даёт префикс коммита по той же регулярке, что и раньше.
+    """
+
+    id: int = 0
+    workspace_id: int = 0
+    key: str = ""
+    title: str = ""
+    status: str = "open"
+    priority: str = ""
+    description: str = ""
+    created_at: str = ""
+    updated_at: str = ""

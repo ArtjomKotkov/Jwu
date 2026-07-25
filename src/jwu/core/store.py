@@ -12,14 +12,19 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import (
-    Analysis, Delta, Issue, Job, JobPRLink, JobRecord, Note, PR, Workspace, WorkspacePath,
+    Analysis, Delta, Issue, Job, JobPRLink, JobRecord, LocalFeature, Note, PR,
+    Workspace, WorkspacePath,
 )
+
+# Префикс ключей локальных фич должен читаться как ключ Jira: HOMEJWU-1, FEAT-3.
+_FEATURE_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]{1,7}$")
 
 # Воркспейс, в который уезжают данные, накопленные до появления воркспейсов.
 DEFAULT_WORKSPACE_SLUG = "work"
@@ -114,6 +119,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_key);
+CREATE TABLE IF NOT EXISTS local_features (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    key          TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'open',
+    priority     TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_local_features_key ON local_features(workspace_id, key);
+CREATE INDEX IF NOT EXISTS idx_local_features_status ON local_features(workspace_id, status);
 CREATE TABLE IF NOT EXISTS job_records (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER NOT NULL,
@@ -190,7 +208,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -249,8 +267,19 @@ def _m002_workspaces(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
 
+def _m003_features(conn: sqlite3.Connection) -> None:
+    """v2 → v3: локальный трекер фич и работы без задачи Jira.
+
+    ``jobs.task_key`` намеренно остаётся NOT NULL (пустая строка = «задачи нет») —
+    так не нужно пересобирать таблицу; якорем может быть локальная фича.
+    """
+    _add_column(conn, "jobs", "feature_id", "INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_feature ON jobs(feature_id)")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
+    (3, _m003_features),
 ]
 
 
@@ -1026,18 +1055,141 @@ class Store:
         return Analysis(id=row["id"], created_at=row["created_at"],
                         title=row["title"], content=row["content"])
 
-    # --- работы (jobs) -------------------------------------------------- #
+    # --- локальные фичи (мини-трекер воркспейса) ------------------------- #
 
-    def create_job(self, task_key: str, title: str = "") -> Job:
+    def feature_prefix(self) -> str:
+        """Префикс ключей фич: настройка воркспейса либо производная от его slug.
+
+        Формат обязан подходить под ту же регулярку, что и ключи Jira
+        (``[A-Z][A-Z0-9]+-\\d+``) — иначе перестанет работать вытаскивание ключа из
+        имени ветки в скиллах.
+        """
+        settings = self.workspace_settings(self.workspace_id)
+        explicit = (settings.get("features.prefix") or "").strip().upper()
+        if _FEATURE_PREFIX_RE.match(explicit):
+            return explicit
+        row = self.conn.execute(
+            "SELECT slug FROM workspaces WHERE id = ?", (self.workspace_id,)
+        ).fetchone()
+        cleaned = re.sub(r"[^A-Z0-9]", "", (row["slug"] if row else "").upper())[:8]
+        if _FEATURE_PREFIX_RE.match(cleaned):
+            return cleaned
+        cleaned = f"F{cleaned}"[:8]
+        return cleaned if _FEATURE_PREFIX_RE.match(cleaned) else "FEAT"
+
+    def _next_feature_key(self) -> str:
+        """Следующий ключ фичи. Счётчик монотонный: номера удалённых фич не переиспользуются.
+
+        Иначе ветка ``HOME-2`` от удалённой фичи начала бы указывать на другую фичу.
+        Счётчик хранится в настройках воркспейса, но подстраховывается максимумом по
+        существующим ключам — на случай, если настройку потеряли.
+        """
+        prefix = self.feature_prefix()
+        settings = self.workspace_settings(self.workspace_id)
+        seq = int(settings.get("features.seq") or 0)
+        for row in self.conn.execute(
+            "SELECT key FROM local_features WHERE workspace_id = ?", (self.workspace_id,)
+        ):
+            head, _, tail = (row["key"] or "").rpartition("-")
+            if head == prefix and tail.isdigit():
+                seq = max(seq, int(tail))
+        seq += 1
+        self.set_workspace_settings(self.workspace_id, {"features.seq": str(seq)})
+        return f"{prefix}-{seq}"
+
+    @staticmethod
+    def _feature_from_row(row) -> LocalFeature:
+        return LocalFeature(
+            id=row["id"], workspace_id=row["workspace_id"], key=row["key"], title=row["title"],
+            status=row["status"], priority=row["priority"], description=row["description"],
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def create_feature(self, title: str, *, description: str = "",
+                       priority: str = "") -> LocalFeature:
         ts = _now()
+        key = self._next_feature_key()
         cur = self.conn.execute(
-            "INSERT INTO jobs (task_key, title, status, created_at, updated_at, workspace_id)"
-            " VALUES (?, ?, 'active', ?, ?, ?)",
-            (task_key, title, ts, ts, self.workspace_id),
+            "INSERT INTO local_features"
+            " (workspace_id, key, title, status, priority, description, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'open', ?, ?, ?, ?)",
+            (self.workspace_id, key, title, priority, description, ts, ts),
         )
         self.conn.commit()
+        return LocalFeature(id=int(cur.lastrowid), workspace_id=self.workspace_id, key=key,
+                            title=title, status="open", priority=priority,
+                            description=description, created_at=ts, updated_at=ts)
+
+    def get_feature(self, ref: int | str) -> LocalFeature | None:
+        """Фича по id либо по ключу (регистр ключа не важен)."""
+        if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
+            row = self.conn.execute(
+                "SELECT * FROM local_features WHERE id = ? AND workspace_id = ?",
+                (int(ref), self.workspace_id),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM local_features WHERE UPPER(key) = ? AND workspace_id = ?",
+                (str(ref).upper(), self.workspace_id),
+            ).fetchone()
+        return self._feature_from_row(row) if row else None
+
+    def list_features(self, *, status: str | None = None) -> list[LocalFeature]:
+        sql = "SELECT * FROM local_features WHERE workspace_id = ?"
+        params: list = [self.workspace_id]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC"
+        return [self._feature_from_row(r) for r in self.conn.execute(sql, params)]
+
+    def update_feature(self, feature_id: int, **fields) -> None:
+        allowed = {"title", "status", "priority", "description"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"Неизвестное поле фичи: {key}")
+            if value is None:
+                continue
+            sets.append(f"{key} = ?")
+            params.append(value)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.extend([_now(), feature_id, self.workspace_id])
+        self.conn.execute(
+            f"UPDATE local_features SET {', '.join(sets)} WHERE id = ? AND workspace_id = ?",
+            params,
+        )
+        self.conn.commit()
+
+    def delete_feature(self, feature_id: int) -> None:
+        """Удалить фичу; привязанные работы остаются, но теряют якорь."""
+        self.conn.execute(
+            "UPDATE jobs SET feature_id = NULL WHERE feature_id = ? AND workspace_id = ?",
+            (feature_id, self.workspace_id),
+        )
+        self.conn.execute(
+            "DELETE FROM local_features WHERE id = ? AND workspace_id = ?",
+            (feature_id, self.workspace_id),
+        )
+        self.conn.commit()
+
+    # --- работы (jobs) -------------------------------------------------- #
+
+    def create_job(self, task_key: str, title: str = "",
+                   feature_id: int | None = None) -> Job:
+        ts = _now()
+        cur = self.conn.execute(
+            "INSERT INTO jobs (task_key, title, status, created_at, updated_at, workspace_id,"
+            " feature_id) VALUES (?, ?, 'active', ?, ?, ?, ?)",
+            (task_key, title, ts, ts, self.workspace_id, feature_id),
+        )
+        self.conn.commit()
+        feature = self.get_feature(feature_id) if feature_id else None
         return Job(id=int(cur.lastrowid), task_key=task_key, title=title,
-                   status="active", created_at=ts, updated_at=ts)
+                   status="active", created_at=ts, updated_at=ts,
+                   feature_id=feature_id, feature_key=feature.key if feature else "")
 
     def _touch_job(self, job_id: int) -> None:
         """Обновить updated_at. БЕЗ commit — вызывающий коммитит сам."""
@@ -1119,26 +1271,34 @@ class Store:
         return [JobPRLink(pr_id=r["pr_id"], project=r["project"], repo=r["repo"]) for r in rows]
 
     def _job_from_row(self, row, *, with_records: bool) -> Job:
+        keys = row.keys()
         job = Job(id=row["id"], task_key=row["task_key"], title=row["title"],
-                  status=row["status"], created_at=row["created_at"], updated_at=row["updated_at"])
+                  status=row["status"], created_at=row["created_at"], updated_at=row["updated_at"],
+                  feature_id=row["feature_id"] if "feature_id" in keys else None,
+                  feature_key=(row["feature_key"] or "") if "feature_key" in keys else "")
         job.prs = self._job_prs(job.id)
         if with_records:
             job.records = self._job_records(job.id)
         return job
 
+    _JOB_COLUMNS = (
+        "j.id, j.task_key, j.title, j.status, j.created_at, j.updated_at, j.feature_id,"
+        " f.key AS feature_key"
+    )
+    _JOB_FEATURE_JOIN = " LEFT JOIN local_features f ON f.id = j.feature_id"
+
     def get_job(self, job_id: int) -> Job | None:
         row = self.conn.execute(
-            "SELECT id, task_key, title, status, created_at, updated_at FROM jobs"
-            " WHERE id = ? AND workspace_id = ?",
+            f"SELECT {self._JOB_COLUMNS} FROM jobs j{self._JOB_FEATURE_JOIN}"
+            " WHERE j.id = ? AND j.workspace_id = ?",
             (job_id, self.workspace_id),
         ).fetchone()
         return self._job_from_row(row, with_records=True) if row else None
 
     def list_jobs(self, *, task_key: str | None = None, pr_id: int | None = None,
                   status: str | None = None, project: str | None = None,
-                  repo: str | None = None) -> list[Job]:
-        sql = ("SELECT DISTINCT j.id, j.task_key, j.title, j.status, j.created_at, j.updated_at"
-               " FROM jobs j")
+                  repo: str | None = None, feature_id: int | None = None) -> list[Job]:
+        sql = f"SELECT DISTINCT {self._JOB_COLUMNS} FROM jobs j{self._JOB_FEATURE_JOIN}"
         params: list = []
         if pr_id is not None:
             join = " JOIN job_prs p ON p.job_id = j.id AND p.pr_id = ?"
@@ -1154,6 +1314,8 @@ class Store:
         params.append(self.workspace_id)
         if task_key is not None:
             conds.append("j.task_key = ?"); params.append(task_key)
+        if feature_id is not None:
+            conds.append("j.feature_id = ?"); params.append(feature_id)
         if status is not None:
             conds.append("j.status = ?"); params.append(status)
         sql += " WHERE " + " AND ".join(conds)
