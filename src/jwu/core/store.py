@@ -3,68 +3,115 @@
 Один файл БД (по умолчанию ~/.local/share/jwu/state.db). Каждый ``sync``
 создаёт запись в ``sync_runs`` и кладёт снапшот по каждой задаче/PR. Дельты считаются
 сравнением последнего снапшота сущности с предыдущим (по предыдущему синку, где она встречалась).
+
+Все локальные данные принадлежат воркспейсу (``workspace_id``): работы, заметки, анализы,
+снапшоты, накопленные изменения и прогоны синка. ``Store`` открывается в скоупе одного
+воркспейса и сам подставляет фильтр во все запросы — снаружи API методов от этого не зависит.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import Analysis, Delta, Issue, Job, JobPRLink, JobRecord, Note, PR
+from .models import (
+    Analysis, Delta, Issue, Job, JobPRLink, JobRecord, Note, PR, Workspace, WorkspacePath,
+)
+
+# Воркспейс, в который уезжают данные, накопленные до появления воркспейсов.
+DEFAULT_WORKSPACE_SLUG = "work"
+DEFAULT_WORKSPACE_NAME = "Работа"
+
+# Таблицы, скоупнутые по воркспейсу (у каждой есть колонка workspace_id).
+WORKSPACE_SCOPED_TABLES = (
+    "sync_runs", "issue_snapshots", "pr_snapshots",
+    "notes", "analyses", "jobs", "pending_changes",
+)
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspaces (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug              TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL DEFAULT '',
+    jira_enabled      INTEGER NOT NULL DEFAULT 0,
+    bitbucket_enabled INTEGER NOT NULL DEFAULT 0,
+    archived          INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workspace_paths (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    path         TEXT NOT NULL UNIQUE,
+    label        TEXT NOT NULL DEFAULT '',
+    added_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ws_paths_ws ON workspace_paths(workspace_id);
+CREATE TABLE IF NOT EXISTS workspace_settings (
+    workspace_id INTEGER NOT NULL,
+    key          TEXT NOT NULL,
+    value        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (workspace_id, key)
+);
 CREATE TABLE IF NOT EXISTS sync_runs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at  TEXT NOT NULL,
-    views       TEXT NOT NULL,
-    counts      TEXT NOT NULL DEFAULT '{}'
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   TEXT NOT NULL,
+    views        TEXT NOT NULL,
+    counts       TEXT NOT NULL DEFAULT '{}',
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS issue_snapshots (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    sync_run_id INTEGER NOT NULL,
-    key         TEXT NOT NULL,
-    signature   TEXT NOT NULL,
-    fields      TEXT NOT NULL,
-    views       TEXT NOT NULL DEFAULT '[]',
-    fetched_at  TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_run_id  INTEGER NOT NULL,
+    key          TEXT NOT NULL,
+    signature    TEXT NOT NULL,
+    fields       TEXT NOT NULL,
+    views        TEXT NOT NULL DEFAULT '[]',
+    fetched_at   TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_issue_snap_key ON issue_snapshots(key, sync_run_id);
 CREATE TABLE IF NOT EXISTS pr_snapshots (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    sync_run_id INTEGER NOT NULL,
-    pr_id       INTEGER NOT NULL,
-    project     TEXT NOT NULL DEFAULT '',
-    repo        TEXT NOT NULL DEFAULT '',
-    conflicted  INTEGER,
-    fields      TEXT NOT NULL,
-    signature   TEXT NOT NULL DEFAULT '{}',
-    views       TEXT NOT NULL DEFAULT '[]',
-    fetched_at  TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_run_id  INTEGER NOT NULL,
+    pr_id        INTEGER NOT NULL,
+    project      TEXT NOT NULL DEFAULT '',
+    repo         TEXT NOT NULL DEFAULT '',
+    conflicted   INTEGER,
+    fields       TEXT NOT NULL,
+    signature    TEXT NOT NULL DEFAULT '{}',
+    views        TEXT NOT NULL DEFAULT '[]',
+    fetched_at   TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pr_snap_id ON pr_snapshots(pr_id, sync_run_id);
 CREATE TABLE IF NOT EXISTS notes (
-    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    key    TEXT NOT NULL,
-    author TEXT NOT NULL DEFAULT 'claude',
-    text   TEXT NOT NULL,
-    ts     TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    key          TEXT NOT NULL,
+    author       TEXT NOT NULL DEFAULT 'claude',
+    text         TEXT NOT NULL,
+    ts           TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_notes_key ON notes(key);
 CREATE TABLE IF NOT EXISTS analyses (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TEXT NOT NULL,
-    title      TEXT NOT NULL DEFAULT '',
-    content    TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    content      TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS jobs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_key    TEXT NOT NULL,
-    title       TEXT NOT NULL DEFAULT '',
-    status      TEXT NOT NULL DEFAULT 'active',
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key     TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_key);
 CREATE TABLE IF NOT EXISTS job_records (
@@ -84,19 +131,32 @@ CREATE TABLE IF NOT EXISTS job_prs (
     PRIMARY KEY (job_id, pr_id, project, repo)
 );
 CREATE TABLE IF NOT EXISTS pending_changes (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id  INTEGER NOT NULL,
-    key     TEXT NOT NULL,
-    kind    TEXT NOT NULL,
-    summary TEXT NOT NULL DEFAULT '',
-    detail  TEXT NOT NULL DEFAULT '',
-    section TEXT NOT NULL DEFAULT '',
-    ts      TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       INTEGER NOT NULL,
+    key          TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    summary      TEXT NOT NULL DEFAULT '',
+    detail       TEXT NOT NULL DEFAULT '',
+    section      TEXT NOT NULL DEFAULT '',
+    ts           TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+
+# Индексы по workspace_id живут ОТДЕЛЬНО от SCHEMA: на старой БД колонки ещё нет в момент
+# executescript(SCHEMA), и CREATE INDEX по ней упал бы. Создаются в шаге миграции, после ALTER.
+WORKSPACE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_issue_snap_ws ON issue_snapshots(workspace_id, key, sync_run_id);
+CREATE INDEX IF NOT EXISTS idx_pr_snap_ws    ON pr_snapshots(workspace_id, pr_id, sync_run_id);
+CREATE INDEX IF NOT EXISTS idx_sync_runs_ws  ON sync_runs(workspace_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_ws       ON jobs(workspace_id, task_key);
+CREATE INDEX IF NOT EXISTS idx_notes_ws      ON notes(workspace_id, key);
+CREATE INDEX IF NOT EXISTS idx_analyses_ws   ON analyses(workspace_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pending_ws    ON pending_changes(workspace_id);
 """
 
 
@@ -125,33 +185,154 @@ def _pr_signature(pr: PR) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Миграции схемы
+# --------------------------------------------------------------------------- #
+
+# Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
+SCHEMA_VERSION = 2
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """ALTER TABLE … ADD COLUMN, если колонки ещё нет (шаг идемпотентен)."""
+    if column not in _columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _insert_workspace(
+    conn: sqlite3.Connection, slug: str, *, name: str = "",
+    jira: bool = False, bitbucket: bool = False,
+) -> int:
+    """Создать воркспейс (или вернуть id существующего с таким slug)."""
+    row = conn.execute("SELECT id FROM workspaces WHERE slug = ?", (slug,)).fetchone()
+    if row:
+        return int(row["id"])
+    ts = _now()
+    cur = conn.execute(
+        "INSERT INTO workspaces (slug, name, jira_enabled, bitbucket_enabled, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (slug, name or slug, int(jira), int(bitbucket), ts, ts),
+    )
+    return int(cur.lastrowid)
+
+
+def _m002_workspaces(conn: sqlite3.Connection) -> None:
+    """v1 → v2: воркспейсы. Всё накопленное уезжает в воркспейс «Работа».
+
+    Уже существующие данные заведомо рабочие (Jira + Bitbucket были единственным
+    режимом jwu), поэтому мигрированному воркспейсу обе интеграции включаются.
+    """
+    for table in WORKSPACE_SCOPED_TABLES:
+        _add_column(conn, table, "workspace_id", "INTEGER NOT NULL DEFAULT 0")
+    conn.executescript(WORKSPACE_INDEXES)
+
+    wid = _insert_workspace(
+        conn, DEFAULT_WORKSPACE_SLUG, name=DEFAULT_WORKSPACE_NAME, jira=True, bitbucket=True
+    )
+    for table in WORKSPACE_SCOPED_TABLES:
+        conn.execute(f"UPDATE {table} SET workspace_id = ? WHERE workspace_id = 0", (wid,))
+
+    # Пер-воркспейсные ключи meta переезжают под префикс воркспейса; ui.theme — глобальный.
+    for key in ("identity", "pr_task_aliases"):
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            continue
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (f"w{wid}:{key}", row["value"]),
+        )
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+
+_MIGRATIONS: list[tuple[int, object]] = [
+    (2, _m002_workspaces),
+]
+
+
 class Store:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, workspace_id: int | None = None) -> None:
         self.path = str(path)
+        self.migration_notes: list[str] = []
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.commit()
+        self.workspace_id = workspace_id or self._default_workspace_id()
+
+    def use_workspace(self, workspace_id: int) -> None:
+        """Переключить скоуп уже открытого соединения (смена воркспейса в TUI)."""
+        self.workspace_id = workspace_id
+
+    # --- миграции ------------------------------------------------------- #
 
     def _migrate(self) -> None:
-        """Доезд старых БД: добавить недостающие колонки."""
+        """Довести схему до ``SCHEMA_VERSION``, сняв копию БД перед структурной миграцией."""
+        self._legacy_column_migrations()
+        current = int(self.get_meta("schema_version") or 0) or 1
+        if current > SCHEMA_VERSION:
+            print(
+                f"⚠ БД версии схемы {current} новее, чем понимает эта версия jwu "
+                f"({SCHEMA_VERSION}) — обнови jwu, иначе возможны странности.",
+                file=sys.stderr,
+            )
+            return
+        pending = [(v, step) for v, step in _MIGRATIONS if v > current]
+        if not pending:
+            return
+        self._backup_before_migration(pending[-1][0])
+        for version, step in pending:
+            step(self.conn)  # type: ignore[operator]
+            self.conn.commit()
+            self.set_meta("schema_version", str(version))
+
+    def _legacy_column_migrations(self) -> None:
+        """Доезд старых БД (до появления версионирования): недостающие колонки."""
         for table in ("issue_snapshots", "pr_snapshots"):
-            cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
-            if "views" not in cols:
+            if "views" not in _columns(self.conn, table):
                 self.conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN views TEXT NOT NULL DEFAULT '[]'"
                 )
-        pr_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(pr_snapshots)")}
-        if "signature" not in pr_cols:
+        if "signature" not in _columns(self.conn, "pr_snapshots"):
             self.conn.execute(
                 "ALTER TABLE pr_snapshots ADD COLUMN signature TEXT NOT NULL DEFAULT '{}'"
             )
-        pc_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(pending_changes)")}
-        if "section" not in pc_cols:
+        if "section" not in _columns(self.conn, "pending_changes"):
             self.conn.execute(
                 "ALTER TABLE pending_changes ADD COLUMN section TEXT NOT NULL DEFAULT ''"
             )
+
+    def _has_any_data(self) -> bool:
+        for table in ("sync_runs", "jobs", "notes", "analyses"):
+            row = self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+            if row:
+                return True
+        return False
+
+    def _backup_before_migration(self, to_version: int) -> None:
+        """Копия БД перед структурной миграцией — на случай, если что-то пойдёт не так.
+
+        Пустую (только что созданную) базу не бэкапим. Ошибку бэкапа не считаем фатальной,
+        но громко сообщаем: миграция всё равно пойдёт, а пользователь должен знать.
+        """
+        if not self._has_any_data():
+            return
+        from . import maintenance  # локально: maintenance тянет config, а тот — не Store
+
+        try:
+            dest = maintenance.backup_before_migration(Path(self.path), to_version=to_version)
+        except Exception as exc:  # noqa: BLE001 — бэкап не должен блокировать работу
+            note = f"⚠ не удалось сделать бэкап БД перед миграцией схемы: {exc}"
+        else:
+            note = f"бэкап БД перед миграцией схемы: {dest.name}" if dest else ""
+        if note:
+            self.migration_notes.append(note)
+            print(note, file=sys.stderr)
 
     def close(self) -> None:
         self.conn.close()
@@ -162,20 +343,175 @@ class Store:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    # --- воркспейсы ----------------------------------------------------- #
+
+    def _default_workspace_id(self) -> int:
+        """Воркспейс по умолчанию для Store без явного скоупа: «Работа» либо первый."""
+        row = self.conn.execute(
+            "SELECT id FROM workspaces WHERE slug = ?", (DEFAULT_WORKSPACE_SLUG,)
+        ).fetchone()
+        if row:
+            return int(row["id"])
+        row = self.conn.execute("SELECT id FROM workspaces ORDER BY id LIMIT 1").fetchone()
+        if row:
+            return int(row["id"])
+        wid = _insert_workspace(
+            self.conn, DEFAULT_WORKSPACE_SLUG, name=DEFAULT_WORKSPACE_NAME,
+            jira=True, bitbucket=True,
+        )
+        self.conn.commit()
+        return wid
+
+    @staticmethod
+    def _workspace_from_row(row) -> Workspace:
+        return Workspace(
+            id=row["id"], slug=row["slug"], name=row["name"],
+            jira_enabled=bool(row["jira_enabled"]),
+            bitbucket_enabled=bool(row["bitbucket_enabled"]),
+            archived=bool(row["archived"]),
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def _fill_paths(self, ws: Workspace) -> Workspace:
+        ws.paths = self.workspace_paths(ws.id)
+        return ws
+
+    def create_workspace(
+        self, slug: str, *, name: str = "", jira_enabled: bool = False,
+        bitbucket_enabled: bool = False,
+    ) -> Workspace:
+        wid = _insert_workspace(
+            self.conn, slug, name=name, jira=jira_enabled, bitbucket=bitbucket_enabled
+        )
+        self.conn.commit()
+        ws = self.get_workspace(wid)
+        assert ws is not None
+        return ws
+
+    def get_workspace(self, workspace_id: int) -> Workspace | None:
+        row = self.conn.execute(
+            "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+        ).fetchone()
+        return self._fill_paths(self._workspace_from_row(row)) if row else None
+
+    def get_workspace_by_slug(self, slug: str) -> Workspace | None:
+        row = self.conn.execute("SELECT * FROM workspaces WHERE slug = ?", (slug,)).fetchone()
+        return self._fill_paths(self._workspace_from_row(row)) if row else None
+
+    def list_workspaces(self, *, include_archived: bool = False) -> list[Workspace]:
+        sql = "SELECT * FROM workspaces"
+        if not include_archived:
+            sql += " WHERE archived = 0"
+        sql += " ORDER BY id"
+        return [
+            self._fill_paths(self._workspace_from_row(r)) for r in self.conn.execute(sql)
+        ]
+
+    def update_workspace(self, workspace_id: int, **fields) -> None:
+        """Точечно обновить поля воркспейса (name/slug/jira_enabled/bitbucket_enabled/archived)."""
+        allowed = {"slug", "name", "jira_enabled", "bitbucket_enabled", "archived"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"Неизвестное поле воркспейса: {key}")
+            sets.append(f"{key} = ?")
+            params.append(int(value) if isinstance(value, bool) else value)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.extend([_now(), workspace_id])
+        self.conn.execute(f"UPDATE workspaces SET {', '.join(sets)} WHERE id = ?", params)
+        self.conn.commit()
+
+    def delete_workspace(self, workspace_id: int, *, keep_data: bool = False) -> None:
+        """Удалить воркспейс; без keep_data — вместе со всеми его локальными данными."""
+        if not keep_data:
+            job_ids = [
+                r["id"] for r in self.conn.execute(
+                    "SELECT id FROM jobs WHERE workspace_id = ?", (workspace_id,)
+                )
+            ]
+            for jid in job_ids:
+                self.conn.execute("DELETE FROM job_records WHERE job_id = ?", (jid,))
+                self.conn.execute("DELETE FROM job_prs WHERE job_id = ?", (jid,))
+            for table in WORKSPACE_SCOPED_TABLES:
+                self.conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace_id,))
+        self.conn.execute("DELETE FROM workspace_paths WHERE workspace_id = ?", (workspace_id,))
+        self.conn.execute("DELETE FROM workspace_settings WHERE workspace_id = ?", (workspace_id,))
+        self.conn.execute(
+            "DELETE FROM meta WHERE key LIKE ?", (f"w{workspace_id}:%",)
+        )
+        self.conn.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+        self.conn.commit()
+
+    # --- папки воркспейса ------------------------------------------------ #
+
+    def add_workspace_path(self, workspace_id: int, path: str, label: str = "") -> WorkspacePath:
+        ts = _now()
+        cur = self.conn.execute(
+            "INSERT INTO workspace_paths (workspace_id, path, label, added_at) VALUES (?, ?, ?, ?)",
+            (workspace_id, path, label, ts),
+        )
+        self.conn.commit()
+        return WorkspacePath(id=int(cur.lastrowid), workspace_id=workspace_id, path=path,
+                             label=label, added_at=ts)
+
+    def remove_workspace_path(self, path: str, workspace_id: int | None = None) -> bool:
+        sql, params = "DELETE FROM workspace_paths WHERE path = ?", [path]
+        if workspace_id is not None:
+            sql += " AND workspace_id = ?"
+            params.append(workspace_id)
+        cur = self.conn.execute(sql, params)
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def workspace_paths(self, workspace_id: int) -> list[WorkspacePath]:
+        rows = self.conn.execute(
+            "SELECT id, workspace_id, path, label, added_at FROM workspace_paths"
+            " WHERE workspace_id = ? ORDER BY path",
+            (workspace_id,),
+        ).fetchall()
+        return [WorkspacePath(id=r["id"], workspace_id=r["workspace_id"], path=r["path"],
+                              label=r["label"], added_at=r["added_at"]) for r in rows]
+
+    def all_workspace_paths(self) -> list[WorkspacePath]:
+        """Все зарегистрированные папки (для резолва воркспейса по текущей директории)."""
+        rows = self.conn.execute(
+            "SELECT id, workspace_id, path, label, added_at FROM workspace_paths"
+        ).fetchall()
+        return [WorkspacePath(id=r["id"], workspace_id=r["workspace_id"], path=r["path"],
+                              label=r["label"], added_at=r["added_at"]) for r in rows]
+
+    # --- настройки воркспейса (плоский KV: 'jira.base_url' → значение) ---- #
+
+    def workspace_settings(self, workspace_id: int) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT key, value FROM workspace_settings WHERE workspace_id = ?", (workspace_id,)
+        ).fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def set_workspace_settings(self, workspace_id: int, values: dict[str, str]) -> None:
+        self.conn.executemany(
+            "INSERT INTO workspace_settings (workspace_id, key, value) VALUES (?, ?, ?)"
+            " ON CONFLICT(workspace_id, key) DO UPDATE SET value = excluded.value",
+            [(workspace_id, k, v) for k, v in values.items()],
+        )
+        self.conn.commit()
+
     # --- запись синка --------------------------------------------------- #
 
     def start_sync_run(self, views: list[str]) -> int:
         cur = self.conn.execute(
-            "INSERT INTO sync_runs (started_at, views) VALUES (?, ?)",
-            (_now(), json.dumps(views)),
+            "INSERT INTO sync_runs (started_at, views, workspace_id) VALUES (?, ?, ?)",
+            (_now(), json.dumps(views), self.workspace_id),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
     def finish_sync_run(self, run_id: int, counts: dict) -> None:
         self.conn.execute(
-            "UPDATE sync_runs SET counts = ? WHERE id = ?",
-            (json.dumps(counts), run_id),
+            "UPDATE sync_runs SET counts = ? WHERE id = ? AND workspace_id = ?",
+            (json.dumps(counts), run_id, self.workspace_id),
         )
         self.conn.commit()
 
@@ -183,8 +519,9 @@ class Store:
         self, run_id: int, issue: Issue, views: list[str] | None = None
     ) -> None:
         self.conn.execute(
-            "INSERT INTO issue_snapshots (sync_run_id, key, signature, fields, views, fetched_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO issue_snapshots"
+            " (sync_run_id, key, signature, fields, views, fetched_at, workspace_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 issue.key,
@@ -192,14 +529,16 @@ class Store:
                 issue.model_dump_json(),
                 json.dumps(sorted(views or [])),
                 _now(),
+                self.workspace_id,
             ),
         )
         self.conn.commit()
 
     def save_pr_snapshot(self, run_id: int, pr: PR, views: list[str] | None = None) -> None:
         self.conn.execute(
-            "INSERT INTO pr_snapshots (sync_run_id, pr_id, project, repo, conflicted, fields, signature, views, fetched_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO pr_snapshots (sync_run_id, pr_id, project, repo, conflicted, fields,"
+            " signature, views, fetched_at, workspace_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 pr.id,
@@ -210,6 +549,7 @@ class Store:
                 json.dumps(_pr_signature(pr)),
                 json.dumps(sorted(views or [])),
                 _now(),
+                self.workspace_id,
             ),
         )
         self.conn.commit()
@@ -217,18 +557,22 @@ class Store:
     # --- чтение --------------------------------------------------------- #
 
     def latest_run_id(self) -> int | None:
-        row = self.conn.execute("SELECT MAX(id) AS m FROM sync_runs").fetchone()
+        row = self.conn.execute(
+            "SELECT MAX(id) AS m FROM sync_runs WHERE workspace_id = ?", (self.workspace_id,)
+        ).fetchone()
         return row["m"] if row and row["m"] is not None else None
 
     def last_sync_at(self, token: str | None = None) -> str | None:
         """Время последнего синка; с token — последнего синка секции (значение в views)."""
         if token is None:
             row = self.conn.execute(
-                "SELECT started_at FROM sync_runs ORDER BY id DESC LIMIT 1"
+                "SELECT started_at FROM sync_runs WHERE workspace_id = ? ORDER BY id DESC LIMIT 1",
+                (self.workspace_id,),
             ).fetchone()
             return row["started_at"] if row else None
         for row in self.conn.execute(
-            "SELECT started_at, views FROM sync_runs ORDER BY id DESC"
+            "SELECT started_at, views FROM sync_runs WHERE workspace_id = ? ORDER BY id DESC",
+            (self.workspace_id,),
         ):
             if token in json.loads(row["views"]):
                 return row["started_at"]
@@ -251,7 +595,8 @@ class Store:
         """
         fallback: int | None = None
         for row in self.conn.execute(
-            "SELECT id, views, counts FROM sync_runs ORDER BY id DESC"
+            "SELECT id, views, counts FROM sync_runs WHERE workspace_id = ? ORDER BY id DESC",
+            (self.workspace_id,),
         ):
             if before is not None and row["id"] >= before:
                 continue
@@ -268,7 +613,8 @@ class Store:
         return {
             r["key"]
             for r in self.conn.execute(
-                "SELECT key, views FROM issue_snapshots WHERE sync_run_id = ?", (run_id,)
+                "SELECT key, views FROM issue_snapshots WHERE sync_run_id = ? AND workspace_id = ?",
+                (run_id, self.workspace_id),
             )
             if view in json.loads(r["views"])
         }
@@ -278,7 +624,8 @@ class Store:
         return {
             r["pr_id"]
             for r in self.conn.execute(
-                "SELECT pr_id, views FROM pr_snapshots WHERE sync_run_id = ?", (run_id,)
+                "SELECT pr_id, views FROM pr_snapshots WHERE sync_run_id = ? AND workspace_id = ?",
+                (run_id, self.workspace_id),
             )
             if view in json.loads(r["views"])
         }
@@ -297,7 +644,9 @@ class Store:
             if run_id is not None:
                 live = self._issue_members_in_run(run_id, view)
         rows = self.conn.execute(
-            "SELECT key, fields, views, MAX(sync_run_id) FROM issue_snapshots GROUP BY key"
+            "SELECT key, fields, views, MAX(sync_run_id) FROM issue_snapshots"
+            " WHERE workspace_id = ? GROUP BY key",
+            (self.workspace_id,),
         ).fetchall()
         issues: list[Issue] = []
         for row in rows:
@@ -323,7 +672,9 @@ class Store:
             if run_id is not None:
                 live = self._pr_members_in_run(run_id, view)
         rows = self.conn.execute(
-            "SELECT pr_id, fields, views, MAX(sync_run_id) FROM pr_snapshots GROUP BY pr_id"
+            "SELECT pr_id, fields, views, MAX(sync_run_id) FROM pr_snapshots"
+            " WHERE workspace_id = ? GROUP BY pr_id",
+            (self.workspace_id,),
         ).fetchall()
         prs: list[PR] = []
         for row in rows:
@@ -339,15 +690,16 @@ class Store:
     def snapshotted_issue_keys(self, run_id: int) -> set[str]:
         """Ключи задач, уже снапшотнутые в этом прогоне (чтобы не плодить дубли)."""
         rows = self.conn.execute(
-            "SELECT DISTINCT key FROM issue_snapshots WHERE sync_run_id = ?", (run_id,)
+            "SELECT DISTINCT key FROM issue_snapshots WHERE sync_run_id = ? AND workspace_id = ?",
+            (run_id, self.workspace_id),
         ).fetchall()
         return {r["key"] for r in rows}
 
     def _prev_issue_signature(self, key: str, before_run: int) -> dict | None:
         row = self.conn.execute(
             "SELECT signature FROM issue_snapshots WHERE key = ? AND sync_run_id < ?"
-            " ORDER BY sync_run_id DESC LIMIT 1",
-            (key, before_run),
+            " AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
+            (key, before_run, self.workspace_id),
         ).fetchone()
         return json.loads(row["signature"]) if row else None
 
@@ -359,9 +711,10 @@ class Store:
         строки без поля dev_ok считаем достоверными (COALESCE → 1)."""
         row = self.conn.execute(
             "SELECT signature FROM issue_snapshots WHERE key = ? AND sync_run_id < ?"
+            " AND workspace_id = ?"
             " AND COALESCE(json_extract(signature, '$.dev_ok'), 1) = 1"
             " ORDER BY sync_run_id DESC LIMIT 1",
-            (key, before_run),
+            (key, before_run, self.workspace_id),
         ).fetchone()
         if not row:
             return None
@@ -370,8 +723,8 @@ class Store:
     def _prev_pr_signature(self, pr_id: int, before_run: int) -> dict | None:
         row = self.conn.execute(
             "SELECT signature FROM pr_snapshots WHERE pr_id = ? AND sync_run_id < ?"
-            " ORDER BY sync_run_id DESC LIMIT 1",
-            (pr_id, before_run),
+            " AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
+            (pr_id, before_run, self.workspace_id),
         ).fetchone()
         if not row:
             return None
@@ -389,8 +742,9 @@ class Store:
 
         # задачи
         rows = self.conn.execute(
-            "SELECT key, signature, fields FROM issue_snapshots WHERE sync_run_id = ?",
-            (run_id,),
+            "SELECT key, signature, fields FROM issue_snapshots"
+            " WHERE sync_run_id = ? AND workspace_id = ?",
+            (run_id, self.workspace_id),
         ).fetchall()
         for row in rows:
             key = row["key"]
@@ -431,8 +785,9 @@ class Store:
 
         # PR: новые комменты/коммиты, апрувы, конфликт
         pr_rows = self.conn.execute(
-            "SELECT pr_id, project, repo, signature, fields FROM pr_snapshots WHERE sync_run_id = ?",
-            (run_id,),
+            "SELECT pr_id, project, repo, signature, fields FROM pr_snapshots"
+            " WHERE sync_run_id = ? AND workspace_id = ?",
+            (run_id, self.workspace_id),
         ).fetchall()
         for row in pr_rows:
             cur = json.loads(row["signature"])
@@ -470,17 +825,17 @@ class Store:
 
     def _last_issue_summary(self, key: str) -> str:
         row = self.conn.execute(
-            "SELECT fields FROM issue_snapshots WHERE key = ?"
+            "SELECT fields FROM issue_snapshots WHERE key = ? AND workspace_id = ?"
             " ORDER BY sync_run_id DESC LIMIT 1",
-            (key,),
+            (key, self.workspace_id),
         ).fetchone()
         return json.loads(row["fields"]).get("summary", "") if row else ""
 
     def _last_pr_ref(self, pr_id: int) -> tuple[str, str]:
         row = self.conn.execute(
-            "SELECT project, repo, fields FROM pr_snapshots WHERE pr_id = ?"
+            "SELECT project, repo, fields FROM pr_snapshots WHERE pr_id = ? AND workspace_id = ?"
             " ORDER BY sync_run_id DESC LIMIT 1",
-            (pr_id,),
+            (pr_id, self.workspace_id),
         ).fetchone()
         if not row:
             return "", f"#{pr_id}"
@@ -496,7 +851,8 @@ class Store:
         Если сущность всё ещё видна в другой вкладке — не считаем её исчезнувшей.
         """
         run = self.conn.execute(
-            "SELECT views, counts FROM sync_runs WHERE id = ?", (run_id,)
+            "SELECT views, counts FROM sync_runs WHERE id = ? AND workspace_id = ?",
+            (run_id, self.workspace_id),
         ).fetchone()
         if run is None:
             return []
@@ -549,15 +905,19 @@ class Store:
         """Дописать дельты синка в накопитель (показываются, пока не очистят)."""
         ts = _now()
         self.conn.executemany(
-            "INSERT INTO pending_changes (run_id, key, kind, summary, detail, section, ts)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [(run_id, d.key, d.kind, d.summary, d.detail, d.section, ts) for d in deltas],
+            "INSERT INTO pending_changes"
+            " (run_id, key, kind, summary, detail, section, ts, workspace_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(run_id, d.key, d.kind, d.summary, d.detail, d.section, ts, self.workspace_id)
+             for d in deltas],
         )
         self.conn.commit()
 
     def pending_changes(self) -> list[Delta]:
         rows = self.conn.execute(
-            "SELECT key, kind, summary, detail, section FROM pending_changes ORDER BY id"
+            "SELECT key, kind, summary, detail, section FROM pending_changes"
+            " WHERE workspace_id = ? ORDER BY id",
+            (self.workspace_id,),
         ).fetchall()
         return [
             Delta(key=r["key"], kind=r["kind"], summary=r["summary"], detail=r["detail"],
@@ -568,10 +928,13 @@ class Store:
     def clear_pending_changes(self, pairs: list[tuple[str, str]] | None = None) -> None:
         """Очистить накопленные изменения: все (pairs=None) или только по (key, kind)."""
         if pairs is None:
-            self.conn.execute("DELETE FROM pending_changes")
+            self.conn.execute(
+                "DELETE FROM pending_changes WHERE workspace_id = ?", (self.workspace_id,)
+            )
         elif pairs:
             self.conn.executemany(
-                "DELETE FROM pending_changes WHERE key = ? AND kind = ?", pairs
+                "DELETE FROM pending_changes WHERE key = ? AND kind = ? AND workspace_id = ?",
+                [(key, kind, self.workspace_id) for key, kind in pairs],
             )
         self.conn.commit()
 
@@ -589,21 +952,32 @@ class Store:
         )
         self.conn.commit()
 
+    def workspace_meta_key(self, key: str) -> str:
+        """Ключ meta в пространстве текущего воркспейса (``identity`` → ``w3:identity``)."""
+        return f"w{self.workspace_id}:{key}"
+
+    def get_workspace_meta(self, key: str) -> str | None:
+        return self.get_meta(self.workspace_meta_key(key))
+
+    def set_workspace_meta(self, key: str, value: str) -> None:
+        self.set_meta(self.workspace_meta_key(key), value)
+
     # --- заметки -------------------------------------------------------- #
 
     def add_note(self, key: str, text: str, author: str = "claude") -> Note:
         ts = _now()
         self.conn.execute(
-            "INSERT INTO notes (key, author, text, ts) VALUES (?, ?, ?, ?)",
-            (key, author, text, ts),
+            "INSERT INTO notes (key, author, text, ts, workspace_id) VALUES (?, ?, ?, ?, ?)",
+            (key, author, text, ts, self.workspace_id),
         )
         self.conn.commit()
         return Note(key=key, author=author, text=text, ts=ts)
 
     def get_notes(self, key: str) -> list[Note]:
         rows = self.conn.execute(
-            "SELECT key, author, text, ts FROM notes WHERE key = ? ORDER BY ts",
-            (key,),
+            "SELECT key, author, text, ts FROM notes WHERE key = ? AND workspace_id = ?"
+            " ORDER BY ts",
+            (key, self.workspace_id),
         ).fetchall()
         return [
             Note(key=r["key"], author=r["author"], text=r["text"], ts=r["ts"])
@@ -615,8 +989,8 @@ class Store:
     def save_analysis(self, content: str, title: str = "") -> Analysis:
         ts = _now()
         cur = self.conn.execute(
-            "INSERT INTO analyses (created_at, title, content) VALUES (?, ?, ?)",
-            (ts, title, content),
+            "INSERT INTO analyses (created_at, title, content, workspace_id) VALUES (?, ?, ?, ?)",
+            (ts, title, content, self.workspace_id),
         )
         self.conn.commit()
         return Analysis(id=int(cur.lastrowid), created_at=ts, title=title, content=content)
@@ -624,8 +998,9 @@ class Store:
     def list_analyses(self, limit: int = 50) -> list[Analysis]:
         """Список без полного content (только метаданные), новые сверху."""
         rows = self.conn.execute(
-            "SELECT id, created_at, title FROM analyses ORDER BY id DESC LIMIT ?",
-            (limit,),
+            "SELECT id, created_at, title FROM analyses WHERE workspace_id = ?"
+            " ORDER BY id DESC LIMIT ?",
+            (self.workspace_id, limit),
         ).fetchall()
         return [
             Analysis(id=r["id"], created_at=r["created_at"], title=r["title"])
@@ -636,12 +1011,15 @@ class Store:
         """Анализ по id; без id — последний."""
         if analysis_id is None:
             row = self.conn.execute(
-                "SELECT id, created_at, title, content FROM analyses ORDER BY id DESC LIMIT 1"
+                "SELECT id, created_at, title, content FROM analyses WHERE workspace_id = ?"
+                " ORDER BY id DESC LIMIT 1",
+                (self.workspace_id,),
             ).fetchone()
         else:
             row = self.conn.execute(
-                "SELECT id, created_at, title, content FROM analyses WHERE id = ?",
-                (analysis_id,),
+                "SELECT id, created_at, title, content FROM analyses"
+                " WHERE id = ? AND workspace_id = ?",
+                (analysis_id, self.workspace_id),
             ).fetchone()
         if not row:
             return None
@@ -653,9 +1031,9 @@ class Store:
     def create_job(self, task_key: str, title: str = "") -> Job:
         ts = _now()
         cur = self.conn.execute(
-            "INSERT INTO jobs (task_key, title, status, created_at, updated_at)"
-            " VALUES (?, ?, 'active', ?, ?)",
-            (task_key, title, ts, ts),
+            "INSERT INTO jobs (task_key, title, status, created_at, updated_at, workspace_id)"
+            " VALUES (?, ?, 'active', ?, ?, ?)",
+            (task_key, title, ts, ts, self.workspace_id),
         )
         self.conn.commit()
         return Job(id=int(cur.lastrowid), task_key=task_key, title=title,
@@ -665,8 +1043,19 @@ class Store:
         """Обновить updated_at. БЕЗ commit — вызывающий коммитит сам."""
         self.conn.execute("UPDATE jobs SET updated_at = ? WHERE id = ?", (_now(), job_id))
 
+    def _require_own_job(self, job_id: int) -> None:
+        """Не дать писать в работу чужого воркспейса (id работ сквозные по всей БД)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM jobs WHERE id = ? AND workspace_id = ?", (job_id, self.workspace_id)
+        ).fetchone()
+        if not row:
+            slug = self.job_workspace_slug(job_id)
+            hint = f" (она в воркспейсе «{slug}»)" if slug else ""
+            raise ValueError(f"Работа #{job_id} не найдена в текущем воркспейсе{hint}.")
+
     def add_job_record(self, job_id: int, text: str, kind: str = "note",
                        status: str | None = None) -> JobRecord:
+        self._require_own_job(job_id)
         ts = _now()
         cur = self.conn.execute(
             "INSERT INTO job_records (job_id, kind, text, status, ts) VALUES (?, ?, ?, ?, ?)",
@@ -678,6 +1067,7 @@ class Store:
                          text=text, status=status, ts=ts)
 
     def link_job_pr(self, job_id: int, pr_id: int, project: str = "", repo: str = "") -> None:
+        self._require_own_job(job_id)
         self.conn.execute(
             "INSERT OR IGNORE INTO job_prs (job_id, pr_id, project, repo) VALUES (?, ?, ?, ?)",
             (job_id, pr_id, project, repo),
@@ -687,17 +1077,31 @@ class Store:
 
     def set_job_status(self, job_id: int, status: str) -> None:
         self.conn.execute(
-            "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
-            (status, _now(), job_id),
+            "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?",
+            (status, _now(), job_id, self.workspace_id),
         )
         self.conn.commit()
 
     def delete_job(self, job_id: int) -> None:
-        """Удалить работу вместе с записями и связями с PR."""
+        """Удалить работу вместе с записями и связями с PR (в пределах воркспейса)."""
+        row = self.conn.execute(
+            "SELECT id FROM jobs WHERE id = ? AND workspace_id = ?", (job_id, self.workspace_id)
+        ).fetchone()
+        if not row:
+            return
         self.conn.execute("DELETE FROM job_records WHERE job_id = ?", (job_id,))
         self.conn.execute("DELETE FROM job_prs WHERE job_id = ?", (job_id,))
         self.conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         self.conn.commit()
+
+    def job_workspace_slug(self, job_id: int) -> str | None:
+        """В каком воркспейсе живёт работа (для подсказки «работа #N в воркспейсе X»)."""
+        row = self.conn.execute(
+            "SELECT w.slug AS slug FROM jobs j JOIN workspaces w ON w.id = j.workspace_id"
+            " WHERE j.id = ?",
+            (job_id,),
+        ).fetchone()
+        return row["slug"] if row else None
 
     def _job_records(self, job_id: int) -> list[JobRecord]:
         rows = self.conn.execute(
@@ -724,8 +1128,9 @@ class Store:
 
     def get_job(self, job_id: int) -> Job | None:
         row = self.conn.execute(
-            "SELECT id, task_key, title, status, created_at, updated_at FROM jobs WHERE id = ?",
-            (job_id,),
+            "SELECT id, task_key, title, status, created_at, updated_at FROM jobs"
+            " WHERE id = ? AND workspace_id = ?",
+            (job_id, self.workspace_id),
         ).fetchone()
         return self._job_from_row(row, with_records=True) if row else None
 
@@ -745,13 +1150,13 @@ class Store:
                 join += " AND p.repo = ?"
                 params.append(repo)
             sql += join
-        conds: list[str] = []
+        conds: list[str] = ["j.workspace_id = ?"]
+        params.append(self.workspace_id)
         if task_key is not None:
             conds.append("j.task_key = ?"); params.append(task_key)
         if status is not None:
             conds.append("j.status = ?"); params.append(status)
-        if conds:
-            sql += " WHERE " + " AND ".join(conds)
+        sql += " WHERE " + " AND ".join(conds)
         sql += " ORDER BY j.updated_at DESC, j.id DESC"
         rows = self.conn.execute(sql, params).fetchall()
         # records грузим тоже: список работ невелик (CLI/дашборд), а потребители

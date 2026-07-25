@@ -376,3 +376,86 @@ def test_configure_export_then_import_cli(monkeypatch, tmp_path):
     assert store[("jira-proxy-basic", "gw")] == "GPW"
     assert store[("bitbucket-pat", "bitbucket")] == "BTOK"
     assert cfgmod.load_config(cfg_path).jira.proxy_basic_user == "gw"
+
+
+# --------------------------------------------------------------------------- #
+# Воркспейсы
+# --------------------------------------------------------------------------- #
+
+
+def _patch_open_store(monkeypatch, tmp_path):
+    """Подменить обе фабрики Store: команды воркспейсов ходят через _open_store."""
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+
+    def _scoped():
+        store = Store(db)
+        store.use_workspace(cli._resolve_workspace(store).id)
+        return store
+
+    monkeypatch.setattr(cli, "_store", _scoped)
+    monkeypatch.setattr(cli, "_WORKSPACE_ARG", None)
+    return db
+
+
+def test_workspace_create_list_and_current(monkeypatch, tmp_path):
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    _patch_open_store(monkeypatch, tmp_path)
+    folder = tmp_path / "pet"
+    folder.mkdir()
+
+    res = runner.invoke(cli.app, ["workspace", "create", "home", "--name", "Личное",
+                                  "--path", str(folder), "--no-jira", "--json"])
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["slug"] == "home" and payload["jira_enabled"] is False
+
+    res = runner.invoke(cli.app, ["workspace", "list", "--json"])
+    slugs = [w["slug"] for w in json.loads(res.stdout)["workspaces"]]
+    assert slugs == ["work", "home"]
+
+    # активным стал созданный (--use по умолчанию)
+    res = runner.invoke(cli.app, ["workspace", "current", "--json"])
+    assert json.loads(res.stdout)["slug"] == "home"
+
+
+def test_workspace_scopes_jobs(monkeypatch, tmp_path):
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    _patch_open_store(monkeypatch, tmp_path)
+    assert runner.invoke(cli.app, ["workspace", "create", "home", "--no-use"]).exit_code == 0
+    # воркспейсов стало два, текущая папка ни к одному не привязана — нужен явный выбор
+    res = runner.invoke(cli.app, ["jobs", "--json"])
+    assert res.exit_code == 1 and "в каком воркспейсе" in res.output
+    assert runner.invoke(cli.app, ["workspace", "use", "work"]).exit_code == 0
+
+    res = runner.invoke(cli.app, ["job", "start", "PROJ-1", "--title", "рабочая", "--json"])
+    assert res.exit_code == 0, res.output
+
+    res = runner.invoke(cli.app, ["-W", "home", "jobs", "--json"])
+    assert json.loads(res.stdout) == []
+
+    res = runner.invoke(cli.app, ["-W", "work", "jobs", "--json"])
+    assert [j["title"] for j in json.loads(res.stdout)] == ["рабочая"]
+
+
+def test_unknown_workspace_flag_fails_clearly(monkeypatch, tmp_path):
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    _patch_open_store(monkeypatch, tmp_path)
+    res = runner.invoke(cli.app, ["-W", "nope", "jobs", "--json"])
+    assert res.exit_code == 1
+    assert "не найден" in res.output
+
+
+def test_workspace_add_and_remove_path(monkeypatch, tmp_path):
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    _patch_open_store(monkeypatch, tmp_path)
+    folder = tmp_path / "repo"
+    folder.mkdir()
+
+    assert runner.invoke(cli.app, ["workspace", "add-path", str(folder)]).exit_code == 0
+    res = runner.invoke(cli.app, ["workspace", "show", "--json"])
+    assert [p["path"] for p in json.loads(res.stdout)["paths"]] == [str(folder.resolve())]
+
+    assert runner.invoke(cli.app, ["workspace", "remove-path", str(folder)]).exit_code == 0
+    res = runner.invoke(cli.app, ["workspace", "show", "--json"])
+    assert json.loads(res.stdout)["paths"] == []
