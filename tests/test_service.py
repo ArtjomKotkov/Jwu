@@ -336,7 +336,8 @@ def test_dashboard_from_memory_reads_cached_identity(tmp_path):
     from jwu.core.service import _IDENTITY_META, dashboard_from_memory
 
     store = Store(tmp_path / "state.db")
-    store.set_meta(_IDENTITY_META, json.dumps({
+    # личность кэшируется в пространстве воркспейса (зависит от Jira-инстанса)
+    store.set_workspace_meta(_IDENTITY_META, json.dumps({
         "fp": "x", "user": "alice", "display_name": "Alice", "email": "a@example.com"}))
     d = dashboard_from_memory(store)
     store.close()

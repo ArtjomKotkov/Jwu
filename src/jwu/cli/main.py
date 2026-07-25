@@ -26,10 +26,13 @@ from ..skills_install import (
     install_skills,
 )
 from ..core.jira import JiraError
-from ..core.models import JOB_RECORD_BADGES, JOB_RECORD_KINDS, Delta, Issue, Job, Note, PR
+from ..core.models import (
+    JOB_RECORD_BADGES, JOB_RECORD_KINDS, Delta, Issue, Job, Note, PR, Workspace,
+)
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
 from .dashboard import render_jira_text
 from ..core.store import Store
+from ..core import workspaces
 
 app = typer.Typer(
     add_completion=False,
@@ -44,9 +47,29 @@ analysis_app = typer.Typer(help="Сохранённые анализы/план�
 app.add_typer(analysis_app, name="analysis")
 job_app = typer.Typer(help="Работы (jobs): цикл работы над задачей, прогресс и связи с PR.")
 app.add_typer(job_app, name="job")
+workspace_app = typer.Typer(
+    help="Воркспейсы: контуры работы (папки + свои интеграции и данные)."
+)
+app.add_typer(workspace_app, name="workspace")
 
 console = Console()
 err = Console(stderr=True)
+
+# Значение глобального флага --workspace/-W: заполняется корневым колбэком ДО команды
+# и читается фабриками _store()/_service(). Через параметр не пробросить — команд много.
+_WORKSPACE_ARG: Optional[str] = None
+
+
+@app.callback()
+def _root(
+    workspace: Optional[str] = typer.Option(
+        None, "--workspace", "-W", envvar=workspaces.ENV_VAR,
+        help="Воркспейс (slug или id). По умолчанию определяется по текущей папке.",
+    ),
+) -> None:
+    """jwu — Jira + Bitbucket с памятью, разложенной по воркспейсам."""
+    global _WORKSPACE_ARG
+    _WORKSPACE_ARG = workspace
 
 
 def _prepare_db() -> None:
@@ -58,10 +81,31 @@ def _prepare_db() -> None:
         err.print(f"[dim]{msg}[/dim]")
 
 
+def _open_store() -> Store:
+    """Store без скоупа воркспейса — для команд про сами воркспейсы."""
+    try:
+        _prepare_db()
+    except ConfigError as exc:
+        err.print(f"[red]Ошибка БД:[/red] {exc}")
+        raise typer.Exit(code=1)
+    return Store(str(db_path()))
+
+
+def _resolve_workspace(store: Store) -> Workspace:
+    """Активный воркспейс для текущего вызова (или внятный отказ)."""
+    try:
+        return workspaces.resolve_workspace(store, explicit=_WORKSPACE_ARG)
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
 def _service() -> Service:
     try:
         _prepare_db()
-        return Service.from_config(load_config())
+        with Store(str(db_path())) as probe:
+            ws = _resolve_workspace(probe)
+        return Service.from_config(load_config(), workspace_id=ws.id)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -74,7 +118,9 @@ def _builds_service() -> Service:
     """Сервис для команд сборок: только Bitbucket + Jenkins, без зависимости от Jira."""
     try:
         _prepare_db()
-        return Service.for_builds(load_config())
+        with Store(str(db_path())) as probe:
+            ws = _resolve_workspace(probe)
+        return Service.for_builds(load_config(), workspace_id=ws.id)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -84,13 +130,10 @@ def _builds_service() -> Service:
 
 
 def _store() -> Store:
-    """Только память — без токенов/сети (для note/notes/changes)."""
-    try:
-        _prepare_db()
-    except ConfigError as exc:
-        err.print(f"[red]Ошибка БД:[/red] {exc}")
-        raise typer.Exit(code=1)
-    return Store(str(db_path()))
+    """Только память — без токенов/сети (для note/notes/changes), в скоупе воркспейса."""
+    store = _open_store()
+    store.use_workspace(_resolve_workspace(store).id)
+    return store
 
 
 def _emit_json(payload: object) -> None:
@@ -435,6 +478,260 @@ def install_claude_skills(
 # --------------------------------------------------------------------------- #
 # tasks / task
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Воркспейсы
+# --------------------------------------------------------------------------- #
+
+
+def _ws_json(store: Store, ws: Workspace) -> dict:
+    """Воркспейс для --json. Счётчики считаются в его же скоупе (store переключается)."""
+    store.use_workspace(ws.id)
+    jobs = store.list_jobs()
+    return {
+        "id": ws.id,
+        "slug": ws.slug,
+        "name": ws.name,
+        "jira_enabled": ws.jira_enabled,
+        "bitbucket_enabled": ws.bitbucket_enabled,
+        "archived": ws.archived,
+        "paths": [{"path": p.path, "label": p.label} for p in ws.paths],
+        "jobs": len(jobs),
+        "jobs_active": len([j for j in jobs if j.status == "active"]),
+        "created_at": ws.created_at,
+        "updated_at": ws.updated_at,
+    }
+
+
+def _yes_no(flag: bool) -> str:
+    return "[green]да[/green]" if flag else "[dim]нет[/dim]"
+
+
+@workspace_app.command("list")
+def workspace_list(
+    all_ws: bool = typer.Option(False, "--all", help="Показать и архивные."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Список воркспейсов."""
+    store = _open_store()
+    items = store.list_workspaces(include_archived=all_ws)
+    active = store.get_meta(workspaces.ACTIVE_META_KEY) or ""
+    if json_out:
+        _emit_json({"active": active, "workspaces": [_ws_json(store, w) for w in items]})
+        return
+    if not items:
+        console.print("[dim]Воркспейсов нет. Создать: jwu workspace create <slug>[/dim]")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("", "Slug", "Название", "Jira", "Bitbucket", "Папок", "Работ"):
+        table.add_column(col)
+    for ws in items:
+        store.use_workspace(ws.id)
+        table.add_row(
+            "→" if ws.slug == active else " ",
+            ws.slug, ws.name,
+            _yes_no(ws.jira_enabled), _yes_no(ws.bitbucket_enabled),
+            str(len(ws.paths)), str(len(store.list_jobs())),
+        )
+    console.print(table)
+
+
+@workspace_app.command("create")
+def workspace_create(
+    slug: str = typer.Argument(..., help="Короткое имя (латиница): work, home-jwu."),
+    name: str = typer.Option("", "--name", help="Человекочитаемое название."),
+    paths: list[str] = typer.Option([], "--path", help="Папка воркспейса (можно несколько)."),
+    jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключена ли Jira."),
+    bitbucket: bool = typer.Option(
+        False, "--bitbucket/--no-bitbucket", help="Подключён ли Bitbucket."
+    ),
+    use: bool = typer.Option(True, "--use/--no-use", help="Сделать активным."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Создать воркспейс. Интеграции объявляются явно — по умолчанию их нет."""
+    store = _open_store()
+    try:
+        ws = workspaces.create(
+            store, slug, name=name, jira=jira, bitbucket=bitbucket, paths=list(paths)
+        )
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if use:
+        workspaces.set_active(store, ws)
+    if json_out:
+        _emit_json(_ws_json(store, ws))
+        return
+    console.print(f"[green]Воркспейс «{ws.label}» создан.[/green]")
+    for p in ws.paths:
+        console.print(f"  📁 {p.path}")
+    if jira or bitbucket:
+        console.print(f"Настроить доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
+
+
+@workspace_app.command("use")
+def workspace_use(
+    slug: str = typer.Argument(..., help="Slug или id воркспейса."),
+) -> None:
+    """Сделать воркспейс активным (для команд вне зарегистрированных папок)."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red] Список: jwu workspace list")
+        raise typer.Exit(code=1)
+    workspaces.set_active(store, ws)
+    console.print(f"[green]Активный воркспейс: {ws.label}[/green]")
+
+
+@workspace_app.command("current")
+def workspace_current(
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Какой воркспейс сейчас активен и почему."""
+    store = _open_store()
+    try:
+        res = workspaces.resolve(store, explicit=_WORKSPACE_ARG)
+    except workspaces.WorkspaceError as exc:
+        if json_out:
+            _emit_json({"workspace": None, "error": str(exc), "cwd": str(Path.cwd())})
+            raise typer.Exit(code=1)
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    store.use_workspace(res.workspace.id)
+    if json_out:
+        payload = _ws_json(store, res.workspace)
+        payload.update({"source": res.source, "matched_path": res.matched_path,
+                        "cwd": str(Path.cwd())})
+        _emit_json(payload)
+        return
+    ws = res.workspace
+    console.print(f"[b]{ws.label}[/b]   [dim]({res.source_human})[/dim]")
+    console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
+
+
+@workspace_app.command("show")
+def workspace_show(
+    slug: Optional[str] = typer.Argument(None, help="Slug/id; без него — активный."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Карточка воркспейса: папки, интеграции, счётчики."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug) if slug else _resolve_workspace(store)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red]")
+        raise typer.Exit(code=1)
+    store.use_workspace(ws.id)
+    if json_out:
+        _emit_json(_ws_json(store, ws))
+        return
+    console.print(f"[b]{ws.label}[/b]")
+    console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
+    jobs_all = store.list_jobs()
+    active_jobs = [j for j in jobs_all if j.status == "active"]
+    console.print(f"Работ: {len(jobs_all)} (активных {len(active_jobs)})   ·   "
+                  f"Анализов: {len(store.list_analyses())}")
+    if ws.paths:
+        console.print("\n[b]Папки[/b]")
+        for p in ws.paths:
+            mark = "" if Path(p.path).exists() else "  [yellow](нет на диске)[/yellow]"
+            label = f"  [dim]{p.label}[/dim]" if p.label else ""
+            console.print(f"  📁 {p.path}{label}{mark}")
+    else:
+        console.print("\n[dim]Папок нет. Привязать текущую: jwu workspace add-path .[/dim]")
+
+
+@workspace_app.command("add-path")
+def workspace_add_path(
+    path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
+    label: str = typer.Option("", "--label", help="Пометка (например «бэкенд»)."),
+) -> None:
+    """Привязать папку к воркспейсу — по ней он и будет определяться автоматически."""
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    try:
+        norm, warn = workspaces.add_path(store, ws, path, label)
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]{norm}[/green] → воркспейс «{ws.label}»")
+    if warn:
+        err.print(f"[yellow]⚠ {warn}[/yellow]")
+
+
+@workspace_app.command("remove-path")
+def workspace_remove_path(
+    path: str = typer.Argument(".", help="Папка (по умолчанию — текущая)."),
+) -> None:
+    """Отвязать папку от воркспейса."""
+    store = _open_store()
+    norm = workspaces.normalize_path(path)
+    if not store.remove_workspace_path(norm):
+        err.print(f"[yellow]Папка {norm} ни к одному воркспейсу не привязана.[/yellow]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Отвязано:[/green] {norm}")
+
+
+@workspace_app.command("rename")
+def workspace_rename(
+    slug: str = typer.Argument(..., help="Текущий slug/id."),
+    new_slug: str = typer.Argument(..., help="Новый slug."),
+    name: Optional[str] = typer.Option(None, "--name", help="Новое название."),
+) -> None:
+    """Переименовать воркспейс."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red]")
+        raise typer.Exit(code=1)
+    try:
+        target = workspaces.normalize_slug(new_slug)
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if target != ws.slug and store.get_workspace_by_slug(target) is not None:
+        err.print(f"[red]Воркспейс «{target}» уже есть.[/red]")
+        raise typer.Exit(code=1)
+    fields = {"slug": target}
+    if name is not None:
+        fields["name"] = name
+    store.update_workspace(ws.id, **fields)
+    if (store.get_meta(workspaces.ACTIVE_META_KEY) or "") == ws.slug:
+        store.set_meta(workspaces.ACTIVE_META_KEY, target)
+    console.print(f"[green]«{ws.slug}» → «{target}»[/green]")
+
+
+@workspace_app.command("delete")
+def workspace_delete(
+    slug: str = typer.Argument(..., help="Slug/id воркспейса."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    keep_data: bool = typer.Option(
+        False, "--keep-data", help="Оставить работы/заметки/анализы в БД (осиротевшими)."
+    ),
+) -> None:
+    """Удалить воркспейс вместе с его локальными данными."""
+    store = _open_store()
+    ws = workspaces.find_workspace(store, slug)
+    if ws is None:
+        err.print(f"[red]Воркспейс «{slug}» не найден.[/red]")
+        raise typer.Exit(code=1)
+    if len(store.list_workspaces(include_archived=True)) == 1:
+        err.print("[red]Это единственный воркспейс — удалять нечего, останется пустая БД.[/red]")
+        raise typer.Exit(code=1)
+    store.use_workspace(ws.id)
+    jobs_count = len(store.list_jobs())
+    if not yes:
+        what = "вместе со всеми данными" if not keep_data else "оставив данные в БД"
+        confirm = typer.confirm(
+            f"Удалить воркспейс «{ws.label}» {what}? Работ: {jobs_count}", default=False
+        )
+        if not confirm:
+            console.print("[dim]Отменено.[/dim]")
+            raise typer.Exit(code=1)
+    store.delete_workspace(ws.id, keep_data=keep_data)
+    if (store.get_meta(workspaces.ACTIVE_META_KEY) or "") == ws.slug:
+        store.set_meta(workspaces.ACTIVE_META_KEY, "")
+    console.print(f"[green]Воркспейс «{ws.label}» удалён.[/green]")
 
 
 def _render_issues(issues: list[Issue]) -> None:

@@ -58,7 +58,7 @@ _PR_TASK_ALIAS_META = "pr_task_aliases"
 
 
 def _load_pr_task_aliases(store: Store) -> dict[str, str]:
-    raw = store.get_meta(_PR_TASK_ALIAS_META)
+    raw = store.get_workspace_meta(_PR_TASK_ALIAS_META)
     if not raw:
         return {}
     try:
@@ -189,7 +189,7 @@ _IDENTITY_META = "identity"
 
 def _read_identity(store: Store) -> dict:
     """Кэш личности (user/display_name/email + отпечаток кредов) из памяти."""
-    raw = store.get_meta(_IDENTITY_META)
+    raw = store.get_workspace_meta(_IDENTITY_META)
     if not raw:
         return {}
     try:
@@ -263,7 +263,8 @@ class Service:
         self._cred_fp: str | None = None  # кэш отпечатка кредов
 
     @classmethod
-    def from_config(cls, cfg: Config | None = None, *, db_path: str | None = None) -> "Service":
+    def from_config(cls, cfg: Config | None = None, *, db_path: str | None = None,
+                    workspace_id: int | None = None) -> "Service":
         from .config import db_path as default_db_path
 
         cfg = cfg or load_config()
@@ -286,11 +287,12 @@ class Service:
         # Jenkins опционален: клиент создаётся всегда (для парсинга/единообразия),
         # но без токена — без auth, и глубокие вызовы вернут 401/403, что мы ловим.
         jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
-        store = Store(db_path or str(default_db_path()))
+        store = Store(db_path or str(default_db_path()), workspace_id)
         return cls(cfg, jira, bitbucket, store, jenkins, sdesk_factory=sdesk_factory)
 
     @classmethod
-    def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None) -> "Service":
+    def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None,
+                   workspace_id: int | None = None) -> "Service":
         """Лёгкий сервис для CI-сборок: только Bitbucket + Jenkins, без логина в Jira.
 
         Разбор упавших сборок нужен ровно тогда, когда CI красный, — и не должен зависеть
@@ -301,7 +303,7 @@ class Service:
         cfg = cfg or load_config()
         bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
         jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
-        store = Store(db_path or str(default_db_path()))
+        store = Store(db_path or str(default_db_path()), workspace_id)
         return cls(cfg, None, bitbucket, store, jenkins)
 
     def close(self) -> None:
@@ -400,7 +402,7 @@ class Service:
         display = me.get("displayName", "") or ""
         email = me.get("emailAddress", "") or ""
         if login:
-            self.store.set_meta(_IDENTITY_META, json.dumps({
+            self.store.set_workspace_meta(_IDENTITY_META, json.dumps({
                 "fp": fp, "user": login,
                 "display_name": display, "email": email,
             }))
@@ -661,7 +663,7 @@ class Service:
                 aliases.pop(key, None)
                 changed = True
         if changed:
-            self.store.set_meta(_PR_TASK_ALIAS_META, json.dumps(aliases, ensure_ascii=False))
+            self.store.set_workspace_meta(_PR_TASK_ALIAS_META, json.dumps(aliases, ensure_ascii=False))
 
     def sync(self) -> SyncResult:
         """Полный синк всех секций в одном прогоне (для `jwu sync`)."""

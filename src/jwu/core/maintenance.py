@@ -31,6 +31,34 @@ def ensure_db_available(db_file: Path) -> None:
     # файла нет вовсе — это первый запуск; Store создаст новую БД (это ок)
 
 
+def backup_before_migration(
+    db_file: Path, *, to_version: int, backups_dir: Path | None = None
+) -> Path | None:
+    """Снять копию БД перед структурной миграцией схемы; вернуть путь копии или None.
+
+    Копия делается через sqlite backup API (консистентно даже при активном WAL) и НЕ попадает
+    под ротацию ежедневных бэкапов (другое имя) — она должна пережить любые последующие
+    проблемы. Пустую только что созданную БД не копируем.
+    """
+    if not db_file.exists() or db_file.stat().st_size == 0:
+        return None
+    bdir = backups_dir or (data_dir() / "backups")
+    bdir.mkdir(parents=True, exist_ok=True)
+    dest = bdir / f"{db_file.name}.pre-v{to_version}-{date.today().isoformat()}"
+    if dest.exists():
+        return dest
+    src = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(str(dest))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    return dest
+
+
 def run_daily_maintenance(
     db_file: Path, *, backups_dir: Path | None = None, keep: int = 7
 ) -> list[str]:

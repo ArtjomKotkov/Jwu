@@ -401,6 +401,45 @@ class PR(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Воркспейсы
+# --------------------------------------------------------------------------- #
+
+
+class WorkspacePath(BaseModel):
+    """Папка, отнесённая к воркспейсу (абсолютный путь после resolve)."""
+
+    id: int = 0
+    workspace_id: int = 0
+    path: str = ""
+    label: str = ""
+    added_at: str = ""
+
+
+class Workspace(BaseModel):
+    """Контур работы: набор папок + свой конфиг интеграций + свои локальные данные.
+
+    ``jira_enabled``/``bitbucket_enabled`` объявляются ЯВНО при создании, а не выводятся
+    из наличия токена: воркспейс без Jira должен вести себя предсказуемо (скрытые вкладки,
+    внятные отказы Jira-команд) ещё до того, как креды вообще настроены.
+    """
+
+    id: int = 0
+    slug: str = ""
+    name: str = ""
+    jira_enabled: bool = False
+    bitbucket_enabled: bool = False
+    archived: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+    paths: list[WorkspacePath] = Field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        """Как показывать воркспейс человеку: «Название (slug)» либо просто slug."""
+        return f"{self.name} ({self.slug})" if self.name and self.name != self.slug else self.slug
+
+
+# --------------------------------------------------------------------------- #
 # Память: дельты и заметки
 # --------------------------------------------------------------------------- #
 
