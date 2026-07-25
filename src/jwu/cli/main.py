@@ -104,11 +104,12 @@ def _resolve_workspace(store: Store) -> Workspace:
 
 
 def _service() -> Service:
+    """Сервис активного воркспейса. Клиенты создаются только для его интеграций."""
     try:
         _prepare_db()
         with Store(str(db_path())) as probe:
             ws = _resolve_workspace(probe)
-        return Service.from_config(load_config(), workspace_id=ws.id)
+        return Service.for_workspace(ws, load_config())
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -123,6 +124,7 @@ def _builds_service() -> Service:
         _prepare_db()
         with Store(str(db_path())) as probe:
             ws = _resolve_workspace(probe)
+        _require_bitbucket(ws)
         return Service.for_builds(load_config(), workspace_id=ws.id)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
@@ -130,6 +132,49 @@ def _builds_service() -> Service:
     except (JiraError, BitbucketError) as exc:
         err.print(f"[red]Ошибка авторизации:[/red] {exc}")
         raise typer.Exit(code=1)
+
+
+def _require_jira(svc: Service) -> None:
+    """Отказать внятно, если команда требует Jira, а в воркспейсе её нет."""
+    if svc.jira is not None:
+        return
+    slug = svc.workspace.slug if svc.workspace else "?"
+    err.print(
+        f"[red]В воркспейсе «{slug}» Jira не подключена.[/red]\n"
+        f"Подключить: [cyan]jwu workspace configure {slug} --jira-host …[/cyan]\n"
+        f"Локальные фичи: [cyan]jwu feature list[/cyan]   ·   "
+        f"работа без задачи: [cyan]jwu job start --title \"…\"[/cyan]"
+    )
+    svc.close()
+    raise typer.Exit(code=1)
+
+
+def _require_bitbucket(ws: Workspace) -> None:
+    """Отказать внятно, если команда требует Bitbucket, а в воркспейсе его нет."""
+    if ws.bitbucket_enabled:
+        return
+    err.print(
+        f"[red]В воркспейсе «{ws.slug}» Bitbucket не подключён.[/red]\n"
+        f"Подключить: [cyan]jwu workspace configure {ws.slug} --bitbucket-token …[/cyan]"
+    )
+    raise typer.Exit(code=1)
+
+
+def _service_with_jira() -> Service:
+    """Сервис для команд, которым Jira обязательна."""
+    svc = _service()
+    _require_jira(svc)
+    return svc
+
+
+def _service_with_bitbucket() -> Service:
+    """Сервис для команд, которым обязателен Bitbucket."""
+    svc = _service()
+    if svc.bitbucket is None:
+        ws = svc.workspace
+        svc.close()
+        _require_bitbucket(ws or Workspace(slug="?"))
+    return svc
 
 
 def _store() -> Store:
@@ -756,7 +801,7 @@ def tasks(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Список задач по вью или произвольному JQL."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         try:
             issues = svc.tasks(view, jql=jql)
         except (ValueError, JiraError) as exc:
@@ -774,7 +819,7 @@ def task(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Полная карточка задачи: описание, все комменты, статус, links, dev-панель."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         issue = svc.issue(key)
         notes = svc.get_notes(key)
         jobs_list = svc.jobs_for_task(key)
@@ -862,7 +907,7 @@ def attachments(
     Видео всегда только в списке (не качаются). Для Claude: --download качает файлы,
     печатает локальные пути — изображения/логи/pdf затем читаются через Read.
     """
-    with _service() as svc:
+    with _service_with_jira() as svc:
         issue = svc.issue(key)
         dest_dir = Path(dest) if dest else svc.attachments_dir(key)
         downloaded: list[tuple] = []
@@ -946,7 +991,7 @@ def prs(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """PR из Bitbucket по роли (мои / на ревью) со статусом merge-конфликта."""
-    with _service() as svc:
+    with _service_with_bitbucket() as svc:
         if mine_reviews or on is not None:
             day = datetime.now().date().isoformat() if (on or "").lower() == "today" else on
             prs_list = svc.my_reviews(on=day)
@@ -966,7 +1011,7 @@ def pr(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Детали одного PR + статус merge-конфликта + комментарии ревью."""
-    with _service() as svc:
+    with _service_with_bitbucket() as svc:
         detail = svc.pr_detail(project, repo, pr_id)
         pull = detail.pr
         jobs_list = svc.jobs_for_pr(pr_id, project or "", repo or "")
@@ -1091,8 +1136,16 @@ def _render_deltas(deltas: list[Delta]) -> None:
 def sync(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Синк по команде: тянет вью + PR, пишет снапшот в память, считает дельты."""
+    """Синк по команде: тянет вью + PR, пишет снапшот в память, считает дельты.
+
+    Секции отключённых интеграций пропускаются: воркспейсу без Jira синкать
+    задачи неоткуда, и это не ошибка.
+    """
     with _service() as svc:
+        if svc.jira is None and svc.bitbucket is None:
+            slug = svc.workspace.slug if svc.workspace else "?"
+            err.print(f"[yellow]В воркспейсе «{slug}» нет подключённых интеграций — синкать нечего.[/yellow]")
+            raise typer.Exit(code=1)
         result = svc.sync()
     if json_out:
         _emit_json({
@@ -1227,13 +1280,13 @@ def dashboard(
 
 def _pr_detail(project: str, repo: str, pr_id: int):
     """Лениво подтянуть детали PR для экрана PR."""
-    with _service() as svc:
+    with _service_with_bitbucket() as svc:
         return svc.pr_detail(project, repo, pr_id)
 
 
 def _issue_detail(key: str) -> Issue:
     """Дотянуть свежую карточку задачи из сети (для авто-рефреша открытого экрана)."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         return svc.issue(key)
 
 
@@ -1371,7 +1424,7 @@ def _day_context_json(ctx: DayContext) -> dict:
 @action_app.command("day-analyze")
 def day_analyze(json_out: bool = typer.Option(False, "--json", help="Вывести JSON-контекст.")) -> None:
     """Фулл-синк + расширенный контекст и промпт для дневного анализа (для Claude Code)."""
-    with _service() as svc:
+    with _service_with_jira() as svc:
         ctx = svc.collect_day_context()
     if json_out:
         _emit_json(_day_context_json(ctx))
@@ -1487,7 +1540,7 @@ def worklog(
 ) -> None:
     """Залогировать время по задаче в таймтрекер Jira (worklog)."""
     try:
-        with _service() as svc:
+        with _service_with_jira() as svc:
             result = svc.add_worklog(key, time, comment=comment, started=started)
     except JiraError as exc:
         if json_out:
@@ -1509,7 +1562,7 @@ def worklogs(
 ) -> None:
     """Мои уже залогированные worklog'и по задачам за день (проверка двойного трека)."""
     day = datetime.now().date().isoformat() if on.lower() == "today" else on
-    with _service() as svc:
+    with _service_with_jira() as svc:
         data = svc.my_worklogs_on(keys, day)
     if json_out:
         _emit_json(data)

@@ -164,8 +164,13 @@ from jwu.core.models import Issue as _Issue
 class _FakeSvc:
     def __init__(self, store):
         self._store = store
+        # CLI проверяет наличие клиентов, чтобы отказать в воркспейсе без интеграции
+        self.jira = object()
+        self.bitbucket = object()
+        self.workspace = None
     def __enter__(self): return self
     def __exit__(self, *exc): pass
+    def close(self): pass
     def issue(self, key): return _Issue(key=key, summary="S", status="In Progress")
     def get_notes(self, key): return []
     def jobs_for_task(self, key): return self._store.jobs_for_task(key)
@@ -459,3 +464,40 @@ def test_workspace_add_and_remove_path(monkeypatch, tmp_path):
     assert runner.invoke(cli.app, ["workspace", "remove-path", str(folder)]).exit_code == 0
     res = runner.invoke(cli.app, ["workspace", "show", "--json"])
     assert json.loads(res.stdout)["paths"] == []
+
+
+def test_jira_commands_refuse_in_workspace_without_jira(monkeypatch, tmp_path):
+    """В воркспейсе без Jira команды не падают трейсбеком, а объясняют, что делать."""
+    monkeypatch.delenv("JWU_WORKSPACE", raising=False)
+    db = _patch_open_store(monkeypatch, tmp_path)
+
+    from jwu.core.service import Service
+
+    monkeypatch.setattr(
+        cli, "_service",
+        lambda: Service.for_workspace(
+            cli._resolve_workspace(Store(db)), _cfg_stub(), db_path=str(db)
+        ),
+    )
+    assert runner.invoke(cli.app, ["workspace", "create", "home", "--no-jira",
+                                   "--no-bitbucket"]).exit_code == 0
+
+    res = runner.invoke(cli.app, ["-W", "home", "tasks"])
+    assert res.exit_code == 1
+    assert "Jira не подключена" in res.output
+    assert "jwu feature list" in res.output
+
+    res = runner.invoke(cli.app, ["-W", "home", "prs"])
+    assert res.exit_code == 1
+    assert "Bitbucket не подключён" in res.output
+
+    res = runner.invoke(cli.app, ["-W", "home", "sync"])
+    assert res.exit_code == 1
+    assert "синкать нечего" in res.output
+
+
+def _cfg_stub():
+    """Конфиг с дефолтами: воркспейсу без интеграций креды не нужны вовсе."""
+    from jwu.core.config import Config
+
+    return Config()
