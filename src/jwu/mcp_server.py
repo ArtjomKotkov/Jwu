@@ -31,6 +31,7 @@ from mcp.server.fastmcp import FastMCP
 
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
+from . import __version__
 from .core import workspaces as ws_mod
 from .core.config import db_path
 from .core.maintenance import ensure_db_available
@@ -98,8 +99,18 @@ def _store_only(workspace: Optional[str] = None) -> Store:
 
 
 def _version() -> str:
-    """Версия jwu в ЭТОМ процессе. Сервер живёт долго, и после обновления пакета
-    в памяти может остаться старый код — по расхождению версий это сразу видно."""
+    """Версия ИСПОЛНЯЕМОГО кода — из ``jwu.__version__``, а не из метаданных пакета.
+
+    Метаданные при editable-установке остаются от момента установки и врут: сервер
+    может крутить свежий код, отчитываясь старой версией (и наоборот). Сервер живёт
+    долго, поэтому расхождение с установленной версией — главный признак того, что
+    сессию пора перезапустить.
+    """
+    return __version__
+
+
+def _installed_version() -> str:
+    """Версия по метаданным пакета — для контраста с версией кода."""
     try:
         return _pkg_version("jwu")
     except PackageNotFoundError:  # запуск из исходников
@@ -186,7 +197,8 @@ async def jwu_workspace_current() -> dict:
         return {"workspace": None, "error": str(exc), "cwd": str(Path.cwd())}
     payload = _workspace_payload(store, res.workspace)
     payload.update({"source": res.source, "matched_path": res.matched_path,
-                    "cwd": str(Path.cwd()), "jwu_version": _version()})
+                    "cwd": str(Path.cwd()), "jwu_version": _version(),
+                    "installed_version": _installed_version()})
     return payload
 
 
