@@ -27,7 +27,8 @@ from ..skills_install import (
 )
 from ..core.jira import JiraError
 from ..core.models import (
-    JOB_RECORD_BADGES, JOB_RECORD_KINDS, Delta, Issue, Job, Note, PR, Workspace,
+    JOB_RECORD_BADGES, JOB_RECORD_KINDS, LOCAL_FEATURE_BADGES, LOCAL_FEATURE_STATUSES,
+    Delta, Issue, Job, LocalFeature, Note, PR, Workspace,
 )
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
 from .dashboard import render_jira_text
@@ -51,6 +52,8 @@ workspace_app = typer.Typer(
     help="Воркспейсы: контуры работы (папки + свои интеграции и данные)."
 )
 app.add_typer(workspace_app, name="workspace")
+feature_app = typer.Typer(help="Локальные фичи: мини-трекер воркспейса, когда Jira нет.")
+app.add_typer(feature_app, name="feature")
 
 console = Console()
 err = Console(stderr=True)
@@ -1538,33 +1541,57 @@ def _render_jobs_table(jobs: list[Job]) -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Статус")
-    table.add_column("Задача")
+    table.add_column("Якорь")
     table.add_column("Записей", justify="right")
     table.add_column("PR")
     table.add_column("Title")
     for j in jobs:
         prs = ", ".join(str(p.pr_id) for p in j.prs) or "—"
-        table.add_row(str(j.id), j.status, j.task_key, str(len(j.records)), prs, j.title)
+        table.add_row(str(j.id), j.status, j.anchor, str(len(j.records)), prs, j.title)
     console.print(table)
     console.print(f"[dim]Всего: {len(jobs)}[/dim]")
 
 
 @job_app.command("start")
 def job_start(
-    task_key: str = typer.Argument(..., help="Ключ задачи-якоря, напр. PROJ-399."),
+    task_key: Optional[str] = typer.Argument(
+        None, help="Ключ задачи Jira, напр. PROJ-399. Без него — работа по фиче или без якоря."
+    ),
+    feature: Optional[str] = typer.Option(
+        None, "--feature", "-f", help="Локальная фича как якорь (id или ключ HOMEJWU-1)."
+    ),
     title: str = typer.Option("", "--title", "-t", help="Короткий заголовок работы."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Начать новую работу по задаче (цикл работы). Дубликаты не блокируются."""
+    """Начать новую работу: по задаче Jira, по локальной фиче либо вовсе без якоря."""
+    if task_key and feature:
+        err.print("[red]Нужно что-то одно: ключ задачи Jira ИЛИ --feature.[/red]")
+        raise typer.Exit(code=1)
+    if not task_key and not feature and not title:
+        err.print("[red]Работе без якоря нужен --title, иначе её не опознать.[/red]")
+        raise typer.Exit(code=1)
     with _store() as store:
-        existing = store.jobs_for_task(task_key)
-        job = store.create_job(task_key, title)
+        feature_row = None
+        if feature:
+            feature_row = store.get_feature(feature)
+            if feature_row is None:
+                err.print(f"[red]Фича «{feature}» не найдена.[/red] Список: jwu feature list")
+                raise typer.Exit(code=1)
+        existing = (
+            store.jobs_for_task(task_key) if task_key
+            else store.list_jobs(feature_id=feature_row.id) if feature_row
+            else []
+        )
+        job = store.create_job(
+            task_key or "", title, feature_id=feature_row.id if feature_row else None
+        )
     if json_out:
         _emit_json(job.model_dump())
         return
-    console.print(f"[green]Работа #{job.id}[/green] начата по {task_key}")
+    where = f" по {job.anchor}" if (task_key or feature_row) else ""
+    console.print(f"[green]Работа #{job.id}[/green] начата{where}")
     if existing:
-        console.print(f"[dim]По задаче уже есть работы: "
+        console.print(f"[dim]Уже есть работы: "
                       f"{', '.join(f'#{j.id}[{j.status}]' for j in existing)}[/dim]")
 
 
@@ -1670,8 +1697,12 @@ def job_show(
     if json_out:
         _emit_json(job.model_dump())
         return
-    console.print(f"[bold cyan]Работа #{job.id}[/bold cyan] [{job.status}]  {job.title or '—'}")
-    console.print(f"[dim]задача:[/dim] {job.task_key}   [dim]обновлена:[/dim] {fmt_dt(job.updated_at)}")
+    # \[ — иначе rich съедает [active] как разметку
+    console.print(f"[bold cyan]Работа #{job.id}[/bold cyan] \\[{job.status}]  {job.title or '—'}")
+    anchor_label = "задача" if job.task_key else ("фича" if job.feature_key else "якорь")
+    anchor = job.task_key or job.feature_key or "— (работа без задачи)"
+    console.print(f"[dim]{anchor_label}:[/dim] {anchor}   "
+                  f"[dim]обновлена:[/dim] {fmt_dt(job.updated_at)}")
     if job.prs:
         prs = ", ".join(f"{p.project}/{p.repo}#{p.pr_id}" if p.project else f"#{p.pr_id}" for p in job.prs)
         console.print(f"[dim]PR:[/dim] {prs}")
@@ -1692,17 +1723,179 @@ def job_show(
 @app.command()
 def jobs(
     task: Optional[str] = typer.Option(None, "--task", help="Фильтр по ключу задачи."),
+    feature: Optional[str] = typer.Option(
+        None, "--feature", "-f", help="Фильтр по локальной фиче (id или ключ)."
+    ),
     pr: Optional[int] = typer.Option(None, "--pr", help="Фильтр по id PR."),
     status: Optional[str] = typer.Option(None, "--status", help="active | done | paused."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Список работ (по задаче / PR / статусу)."""
+    """Список работ текущего воркспейса (по задаче / фиче / PR / статусу)."""
     with _store() as store:
-        items = store.list_jobs(task_key=task, pr_id=pr, status=status)
+        feature_id = None
+        if feature:
+            row = store.get_feature(feature)
+            if row is None:
+                err.print(f"[red]Фича «{feature}» не найдена.[/red]")
+                raise typer.Exit(code=1)
+            feature_id = row.id
+        items = store.list_jobs(task_key=task, pr_id=pr, status=status, feature_id=feature_id)
     if json_out:
         _emit_json([j.model_dump() for j in items])
     else:
         _render_jobs_table(items)
+
+
+# --------------------------------------------------------------------------- #
+# Локальные фичи (мини-трекер воркспейса без Jira)
+# --------------------------------------------------------------------------- #
+
+
+def _render_features(items: list[LocalFeature]) -> None:
+    if not items:
+        console.print("[dim]Фич нет. Завести: jwu feature add \"название\"[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Ключ", style="cyan", no_wrap=True)
+    table.add_column("Статус")
+    table.add_column("Приоритет")
+    table.add_column("Название")
+    for f in items:
+        label, color = LOCAL_FEATURE_BADGES.get(f.status, (f.status, "white"))
+        table.add_row(f.key, f"[{color}]{label}[/{color}]", f.priority or "—", f.title)
+    console.print(table)
+    console.print(f"[dim]Всего: {len(items)}[/dim]")
+
+
+@feature_app.command("add")
+def feature_add(
+    title: str = typer.Argument(..., help="Название фичи."),
+    desc: str = typer.Option("", "--desc", "-d", help="Описание / что нужно сделать."),
+    priority: str = typer.Option("", "--priority", "-p", help="Приоритет (свободный текст)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Завести локальную фичу — якорь для работ там, где нет Jira."""
+    with _store() as store:
+        feature = store.create_feature(title, description=desc, priority=priority)
+    if json_out:
+        _emit_json(feature.model_dump())
+    else:
+        console.print(f"[green]{feature.key}[/green] · {feature.title}")
+
+
+@feature_app.command("list")
+def feature_list(
+    status: Optional[str] = typer.Option(
+        None, "--status", "-s", help=" | ".join(LOCAL_FEATURE_STATUSES),
+        click_type=click.Choice(LOCAL_FEATURE_STATUSES),
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Список локальных фич воркспейса."""
+    with _store() as store:
+        items = store.list_features(status=status)
+    if json_out:
+        _emit_json([f.model_dump() for f in items])
+    else:
+        _render_features(items)
+
+
+@feature_app.command("show")
+def feature_show(
+    ref: str = typer.Argument(..., help="Ключ (HOMEJWU-1) или id."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Карточка фичи вместе со связанными работами."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        linked = store.list_jobs(feature_id=feature.id)
+    if json_out:
+        payload = feature.model_dump()
+        payload["jobs"] = [j.model_dump() for j in linked]
+        _emit_json(payload)
+        return
+    label, color = LOCAL_FEATURE_BADGES.get(feature.status, (feature.status, "white"))
+    console.print(f"[bold cyan]{feature.key}[/bold cyan] [{color}]{label}[/{color}]  {feature.title}")
+    if feature.priority:
+        console.print(f"[dim]приоритет:[/dim] {feature.priority}")
+    console.print(f"[dim]обновлена:[/dim] {fmt_dt(feature.updated_at)}")
+    if feature.description:
+        console.print(f"\n{feature.description}")
+    if linked:
+        console.print("\n[bold]Работы[/bold]")
+        for j in linked:
+            console.print(f"  #{j.id} \\[{j.status}] {j.title or '—'} "
+                          f"[dim]({len(j.records)} записей)[/dim]")
+
+
+@feature_app.command("status")
+def feature_status(
+    ref: str = typer.Argument(..., help="Ключ или id фичи."),
+    status: str = typer.Argument(
+        ..., help=" | ".join(LOCAL_FEATURE_STATUSES),
+        click_type=click.Choice(LOCAL_FEATURE_STATUSES),
+    ),
+) -> None:
+    """Сменить статус фичи."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        store.update_feature(feature.id, status=status)
+    console.print(f"[green]{feature.key}[/green]: {feature.status} → {status}")
+
+
+@feature_app.command("edit")
+def feature_edit(
+    ref: str = typer.Argument(..., help="Ключ или id фичи."),
+    title: Optional[str] = typer.Option(None, "--title", "-t", help="Новое название."),
+    desc: Optional[str] = typer.Option(None, "--desc", "-d", help="Новое описание."),
+    priority: Optional[str] = typer.Option(None, "--priority", "-p", help="Новый приоритет."),
+) -> None:
+    """Изменить название / описание / приоритет фичи."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        store.update_feature(feature.id, title=title, description=desc, priority=priority)
+    console.print(f"[green]{feature.key} обновлена.[/green]")
+
+
+@feature_app.command("rm")
+def feature_rm(
+    ref: str = typer.Argument(..., help="Ключ или id фичи."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Удалить фичу. Работы по ней остаются, но теряют якорь."""
+    with _store() as store:
+        feature = store.get_feature(ref)
+        if feature is None:
+            err.print(f"[red]Фича «{ref}» не найдена.[/red]")
+            raise typer.Exit(code=1)
+        linked = store.list_jobs(feature_id=feature.id)
+        if not yes and not typer.confirm(
+            f"Удалить фичу {feature.key}? Работ по ней: {len(linked)}", default=False
+        ):
+            raise typer.Exit(code=1)
+        store.delete_feature(feature.id)
+    console.print(f"[red]{feature.key}[/red] удалена")
+
+
+@app.command()
+def features(
+    status: Optional[str] = typer.Option(
+        None, "--status", "-s", help=" | ".join(LOCAL_FEATURE_STATUSES),
+        click_type=click.Choice(LOCAL_FEATURE_STATUSES),
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Список локальных фич (алиас `jwu feature list`)."""
+    feature_list(status=status, json_out=json_out)
 
 
 if __name__ == "__main__":  # pragma: no cover
