@@ -19,7 +19,8 @@ from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
 from ..core.dates import fmt_ago, fmt_dt
 from ..core.maintenance import (
-    ensure_db_available, run_daily_maintenance, warn_if_cloud_path,
+    AUTO_PRUNE_DAYS, ensure_db_available, run_daily_maintenance, run_daily_prune,
+    warn_if_cloud_path,
 )
 from ..skills_install import (
     default_agents_dest as _agents_dest,
@@ -30,7 +31,8 @@ from ..skills_install import (
 from ..core.jira import JiraError
 from ..core.models import (
     JOB_RECORD_BADGES, JOB_RECORD_KINDS, LOCAL_FEATURE_BADGES, LOCAL_FEATURE_STATUSES,
-    Delta, Issue, Job, LocalFeature, Note, PR, Workspace,
+    WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS,
+    Delta, Issue, Job, LocalFeature, PR, Workspace,
 )
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
 from .dashboard import render_jira_text
@@ -46,16 +48,20 @@ auth_app = typer.Typer(help="Проверка доступа.")
 app.add_typer(auth_app, name="auth")
 action_app = typer.Typer(help="Действия для Claude Code (контекст + промпт).")
 app.add_typer(action_app, name="action")
-analysis_app = typer.Typer(help="Сохранённые анализы/планы.")
-app.add_typer(analysis_app, name="analysis")
 job_app = typer.Typer(help="Работы (jobs): цикл работы над задачей, прогресс и связи с PR.")
 app.add_typer(job_app, name="job")
 workspace_app = typer.Typer(
     help="Воркспейсы: контуры работы (папки + свои интеграции и данные)."
 )
 app.add_typer(workspace_app, name="workspace")
+db_app = typer.Typer(help="Файл БД: сколько занимает, чистка старых снапшотов, VACUUM.")
+app.add_typer(db_app, name="db")
 feature_app = typer.Typer(help="Локальные фичи: мини-трекер воркспейса, когда Jira нет.")
 app.add_typer(feature_app, name="feature")
+rule_app = typer.Typer(
+    help="Правила воркспейса: запреты, инструкции и общая инфа для агента."
+)
+app.add_typer(rule_app, name="rule")
 
 console = Console()
 err = Console(stderr=True)
@@ -93,7 +99,12 @@ def _open_store() -> Store:
     except ConfigError as exc:
         err.print(f"[red]Ошибка БД:[/red] {exc}")
         raise typer.Exit(code=1)
-    return Store(str(db_path()))
+    store = Store(str(db_path()))
+    # Чистка снапшотов — строго ПОСЛЕ бэкапа из _prepare_db (она необратима) и только
+    # раз в день на разросшейся базе; на обычной молча возвращает пустой список.
+    for msg in run_daily_prune(store, db_path()):
+        err.print(f"[dim]{msg}[/dim]")
+    return store
 
 
 def _resolve_workspace(store: Store) -> Workspace:
@@ -605,9 +616,11 @@ def _ws_json(store: Store, ws: Workspace) -> dict:
         "jira_enabled": ws.jira_enabled,
         "bitbucket_enabled": ws.bitbucket_enabled,
         "archived": ws.archived,
-        "paths": [{"path": p.path, "label": p.label, "tags": p.tags} for p in ws.paths],
         "jobs": len(jobs),
         "jobs_active": len([j for j in jobs if j.status == "active"]),
+        # Тот же контекст и в той же форме, что отдаёт MCP: скиллы ходят сюда фолбэком,
+        # когда MCP-сервера нет, и видеть они должны ровно то же самое.
+        **store.workspace_context(),
         "created_at": ws.created_at,
         "updated_at": ws.updated_at,
     }
@@ -881,8 +894,7 @@ def workspace_show(
     console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
     jobs_all = store.list_jobs()
     active_jobs = [j for j in jobs_all if j.status == "active"]
-    console.print(f"Работ: {len(jobs_all)} (активных {len(active_jobs)})   ·   "
-                  f"Анализов: {len(store.list_analyses())}")
+    console.print(f"Работ: {len(jobs_all)} (активных {len(active_jobs)})")
     if ws.paths:
         console.print("\n[b]Папки[/b]")
         for p in ws.paths:
@@ -1503,16 +1515,23 @@ def _clear_changes(pairs: list[tuple[str, str]]) -> DashboardData:
         return dashboard_from_memory(store)
 
 
+def _mentions_seen(mention_ids: Optional[list[int]]) -> DashboardData:
+    """Пометить упоминания прочитанными: перечисленные либо все (None)."""
+    with _store() as store:
+        store.mark_mentions_seen(mention_ids)
+        return dashboard_from_memory(store)
+
+
 @app.command()
 def dashboard(
     do_sync: bool = typer.Option(False, "--sync", help="Сначала синхронизировать все секции."),
     auto_update: bool = typer.Option(
         False, "--auto-update", "-a",
-        help="Авто-обновление: локальные вкладки (Работы/Анализ) — раз в 5с, "
+        help="Авто-обновление: локальные вкладки (Работы/Фичи) — раз в 5с, "
              "сетевые таблицы — раз в 10 мин, открытая задача/PR — раз в минуту.",
     ),
     fast_interval: float = typer.Option(
-        5.0, "--fast-interval", help="Интервал авто-обновления локальных вкладок (Работы/Анализ), сек."),
+        5.0, "--fast-interval", help="Интервал авто-обновления локальных вкладок (Работы/Фичи), сек."),
     slow_interval: float = typer.Option(
         900.0, "--slow-interval", help="Интервал авто-синка сетевых таблиц (задачи/PR), сек. Отсчёт ведётся от ОКОНЧАНИЯ предыдущего синка."),
     detail_interval: float = typer.Option(
@@ -1544,7 +1563,14 @@ def dashboard(
     needs_picker = False
     try:
         with _open_store() as store:
-            ws = workspaces.resolve_workspace(store, explicit=_WORKSPACE_ARG)
+            # Дашборд открывается там, где его закрыли (prefer_active): его держат одним
+            # окном и переключают воркспейс руками — папка запуска тут не указ. Выбор
+            # сразу и закрепляем, чтобы следующий запуск был предсказуем без «W».
+            global _WORKSPACE_ARG
+            ws = workspaces.resolve_workspace(
+                store, explicit=_WORKSPACE_ARG, prefer_active=True)
+            workspaces.set_active(store, ws)
+            _WORKSPACE_ARG = ws.slug
             store.use_workspace(ws.id)
             data = _initial_sync() if do_sync else dashboard_from_memory(store)
             cfg = workspaces.config_for_workspace(store, ws)
@@ -1566,12 +1592,12 @@ def dashboard(
         full_sync_fn=_full_sync_dashboard,
         pr_detail_fn=_pr_detail,
         issue_get_fn=_issue_detail,
-        analysis_get_fn=_analysis_get,
         job_get_fn=_job_get,
         job_delete_fn=_job_delete,
         job_status_fn=_job_set_status,
         ack_changes_fn=_ack_changes,
         clear_changes_fn=_clear_changes,
+        mentions_seen_fn=_mentions_seen,
         workspaces_fn=_tui_workspaces,
         workspace_switch_fn=_tui_switch_workspace,
         workspace_create_fn=_tui_create_workspace,
@@ -1583,6 +1609,11 @@ def dashboard(
         feature_create_fn=_feature_create,
         feature_status_fn=_feature_set_status,
         feature_edit_fn=_feature_set_title,
+        rule_get_fn=_rule_get,
+        rule_create_fn=_rule_create,
+        rule_edit_fn=_rule_apply_edit,
+        rule_delete_fn=_rule_delete,
+        tags_fn=_workspace_tags,
         cwd=str(Path.cwd()),
         start_with_picker=needs_picker,
         jira_base=cfg.jira.base_url,
@@ -1605,12 +1636,6 @@ def _issue_detail(key: str) -> Issue:
     """Дотянуть свежую карточку задачи из сети (для авто-рефреша открытого экрана)."""
     with _service_with_jira() as svc:
         return svc.issue(key)
-
-
-def _analysis_get(analysis_id: int):
-    """Прочитать сохранённый анализ из памяти (для экрана анализа в TUI)."""
-    with _store() as store:
-        return store.get_analysis(analysis_id)
 
 
 def _job_get(job_id: int):
@@ -1729,6 +1754,34 @@ def _feature_set_title(feature_id: int, title: str) -> None:
         store.update_feature(feature_id, title=title)
 
 
+def _rule_get(rule_id: int):
+    with _store() as store:
+        return store.get_rule(rule_id)
+
+
+def _rule_create(values: dict) -> None:
+    with _store() as store:
+        store.add_rule(values.get("title", ""), text=values.get("text", ""),
+                       kind=values.get("kind", "info"), tag=values.get("tag", ""))
+
+
+def _rule_apply_edit(rule_id: int, values: dict) -> None:
+    with _store() as store:
+        store.update_rule(rule_id, **values)
+
+
+def _rule_delete(rule_id: int) -> None:
+    with _store() as store:
+        store.delete_rule(rule_id)
+
+
+def _workspace_tags() -> list[str]:
+    """Теги папок контура — подсказка при выборе области действия правила."""
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        return list(store.all_tags(ws.id))
+
+
 # --------------------------------------------------------------------------- #
 # action: day-analyze (контекст + промпт для Claude Code)
 # --------------------------------------------------------------------------- #
@@ -1741,10 +1794,9 @@ _DAY_PROMPT = """## Что нужно сделать
 - PR `апрувы собраны`, без NEEDS_WORK/конфликта, а задача не на тестах → перевести задачу на тесты.
 - PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
 - PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
-- Упоминание (не на мне), особенно `· ждёт ответа` → уточнить, что от меня хотят, и ответить.
+- Упоминание с пометкой `· новое` → прочитать, понять, что от меня хотят, и ответить.
 - База — дельты: новые комменты, смена статуса, апрувы, новые PR; `resolved` → закрыть работу.
-Пиши сжато, маркерами, без воды; группируй по действиям. Затем сохрани план:
-`jwu analysis save --title "День <дата>"` — передав текст плана в stdin."""
+Пиши сжато, маркерами, без воды; группируй по действиям."""
 
 
 def _pr_state(pr: PR) -> str:
@@ -1799,22 +1851,15 @@ def _render_day_context_md(ctx: DayContext) -> str:
                 text = " ".join((c.text or "").split())[:200]
                 L.append(f"    - {loc}{c.author}: {text}")
 
-    L.append(f"\n## Упоминания ({len(ctx.mentions)})")
+    fresh = [m for m in ctx.mentions if not m.seen]
+    L.append(f"\n## Упоминания ({len(ctx.mentions)}, новых {len(fresh)})")
     if not ctx.mentions:
         L.append("- нет")
-    for issue, texts in ctx.mentions:
-        # ждёт ответа: последний комментарий не мой (мяч на моей стороне)
-        last = issue.comments[-1] if issue.comments else None
-        awaiting = (
-            " · ждёт ответа"
-            if last and ctx.me_display and last.author and last.author != ctx.me_display
-            else ""
-        )
-        L.append(
-            f"- {issue.key} [{issue.status}] assignee: {issue.assignee or '—'}{awaiting} — {issue.summary}"
-        )
-        for t in texts:
-            L.append(f"  > {' '.join((t or '').split())[:300]}")
+    for m in ctx.mentions:
+        mark = " · новое" if not m.seen else ""
+        when = fmt_dt(m.created) if m.created else "—"
+        L.append(f"- {m.task_key} [{when}] от {m.author or '—'}{mark} — {m.summary}")
+        L.append(f"  > {' '.join((m.text or '').split())[:300]}")
     return "\n".join(L)
 
 
@@ -1827,9 +1872,7 @@ def _day_context_json(ctx: DayContext) -> dict:
         "mine": [i.model_dump() for i in ctx.mine],
         "prs_mine": [p.model_dump() for p in ctx.prs_mine],
         "prs_review": [p.model_dump() for p in ctx.prs_review],
-        "mentions": [
-            {"issue": issue.model_dump(), "texts": texts} for issue, texts in ctx.mentions
-        ],
+        "mentions": [m.model_dump() for m in ctx.mentions],
         "pr_comments": {
             str(pid): [c.model_dump() for c in cs] for pid, cs in ctx.pr_comments.items()
         },
@@ -1848,61 +1891,122 @@ def day_analyze(json_out: bool = typer.Option(False, "--json", help="Вывес�
 
 
 # --------------------------------------------------------------------------- #
-# analysis: сохранённые планы
+# db: размер файла, чистка снапшотов, VACUUM
 # --------------------------------------------------------------------------- #
 
 
-@analysis_app.command("save")
-def analysis_save(
-    title: str = typer.Option("", "--title", "-t", help="Заголовок."),
-    text: Optional[str] = typer.Option(None, "--text", help="Текст (иначе читается stdin)."),
-) -> None:
-    """Сохранить план/анализ (текст из --text или stdin)."""
-    content = (text if text is not None else sys.stdin.read()).strip()
-    if not content:
-        err.print("[red]Пустой текст — нечего сохранять.[/red]")
-        raise typer.Exit(code=1)
-    with _store() as store:
-        a = store.save_analysis(content, title)
-    console.print(f"[green]Сохранено[/green] #{a.id} {a.title}")
+def _size_human(n: int) -> str:
+    size = float(max(0, n))
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} Б"
 
 
-@analysis_app.command("list")
-def analysis_list(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
-    """Список сохранённых анализов."""
-    with _store() as store:
-        items = store.list_analyses()
+@db_app.command("stats")
+def db_stats(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Сколько занимает БД и из чего она состоит (по воркспейсам)."""
+    with _open_store() as store:
+        current = store.workspace_id
+        rows = []
+        for ws in store.list_workspaces(include_archived=True):
+            store.use_workspace(ws.id)
+            rows.append((ws.slug, store.snapshot_counts()))
+        store.use_workspace(current)
+        payload = {
+            "path": str(db_path()),
+            "size": store.db_size(),
+            "free_ratio": round(store.free_ratio(), 4),
+            "workspaces": {slug: counts for slug, counts in rows},
+        }
     if json_out:
-        _emit_json([a.model_dump() for a in items])
+        _emit_json(payload)
         return
-    if not items:
-        console.print("[dim]Анализов пока нет.[/dim]")
-        return
+    console.print(f"[b]{payload['path']}[/b]")
+    console.print(f"Размер: {_size_human(payload['size'])}   ·   "
+                  f"свободно внутри файла: {payload['free_ratio'] * 100:.1f}% "
+                  f"[dim](вернёт jwu db vacuum)[/dim]")
     table = Table(show_header=True, header_style="bold")
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Дата")
-    table.add_column("Заголовок")
-    for a in items:
-        table.add_row(str(a.id), fmt_dt(a.created_at), a.title)
+    table.add_column("Воркспейс", style="cyan")
+    table.add_column("Снапшотов задач", justify="right")
+    table.add_column("Задач", justify="right")
+    table.add_column("Снапшотов PR", justify="right")
+    table.add_column("PR", justify="right")
+    table.add_column("Прогонов", justify="right")
+    for slug, c in rows:
+        table.add_row(slug, str(c["issue_snapshots"]), str(c["issue_keys"]),
+                      str(c["pr_snapshots"]), str(c["pr_ids"]), str(c["sync_runs"]))
     console.print(table)
 
 
-@analysis_app.command("show")
-def analysis_show(
-    analysis_id: Optional[int] = typer.Argument(None, help="ID (по умолчанию — последний)."),
+@db_app.command("prune")
+def db_prune(
+    days: int = typer.Option(AUTO_PRUNE_DAYS, "--days",
+                             help="Удалять снапшоты старше стольких дней."),
+    apply: bool = typer.Option(False, "--apply",
+                               help="Выполнить удаление. Без флага — только показать."),
+    vacuum: bool = typer.Option(False, "--vacuum",
+                                help="После удаления пересобрать файл (долго на большой БД)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Показать анализ по ID (или последний)."""
-    with _store() as store:
-        a = store.get_analysis(analysis_id)
-    if a is None:
-        err.print("[red]Анализ не найден.[/red]")
-        raise typer.Exit(code=1)
+    """Снести старые снапшоты во ВСЕХ воркспейсах. По умолчанию — сухой прогон.
+
+    Сохраняется всё, на чём держатся дельты: свежайший снапшот каждой задачи и PR и
+    последние надёжные прогоны каждой вкладки. Остальное старше `--days` — под нож.
+    """
+    with _open_store() as store:
+        before = store.db_size()
+        reports = store.prune_all_workspaces(days=days, dry_run=not apply)
+        freed = store.vacuum() if (apply and vacuum) else 0
+        payload = {
+            "dry_run": not apply,
+            "days": days,
+            "size_before": before,
+            "size_after": store.db_size(),
+            "freed": freed,
+            "workspaces": {
+                slug: {"issue_snapshots": r.issue_snapshots, "pr_snapshots": r.pr_snapshots,
+                       "sync_runs": r.sync_runs, "protected_runs": r.protected_runs}
+                for slug, r in reports.items()
+            },
+        }
     if json_out:
-        _emit_json(a.model_dump())
+        _emit_json(payload)
         return
-    console.print(f"[bold cyan]#{a.id}[/bold cyan] [dim]{fmt_dt(a.created_at)}[/dim]  {a.title}\n")
-    console.print(a.content)
+    total = sum(r.total for r in reports.values())
+    head = ("[yellow]Сухой прогон[/yellow]" if not apply else "[green]Удалено[/green]")
+    console.print(f"{head}: {total} записей старше {days} дн.")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Воркспейс", style="cyan")
+    table.add_column("Снапшотов задач", justify="right")
+    table.add_column("Снапшотов PR", justify="right")
+    table.add_column("Прогонов", justify="right")
+    table.add_column("Защищено прогонов", justify="right")
+    for slug, r in reports.items():
+        table.add_row(slug, str(r.issue_snapshots), str(r.pr_snapshots),
+                      str(r.sync_runs), str(r.protected_runs))
+    console.print(table)
+    if not apply:
+        console.print("[dim]Ничего не удалено. Повтори с [/dim][cyan]--apply[/cyan]"
+                      "[dim]; место вернёт [/dim][cyan]--vacuum[/cyan][dim] "
+                      "(или jwu db vacuum).[/dim]")
+    elif freed:
+        console.print(f"VACUUM: файл похудел на {_size_human(freed)}")
+    elif vacuum:
+        console.print("[dim]VACUUM ничего не вернул.[/dim]")
+
+
+@db_app.command("vacuum")
+def db_vacuum() -> None:
+    """Пересобрать файл БД, вернув освободившееся место ОС (долго на большой базе)."""
+    with _open_store() as store:
+        before, ratio = store.db_size(), store.free_ratio()
+        console.print(f"Пересобираю {_size_human(before)} "
+                      f"[dim](свободно внутри: {ratio * 100:.1f}%)[/dim]…")
+        freed = store.vacuum()
+        console.print(f"[green]Готово[/green]: {_size_human(store.db_size())} "
+                      f"(освободилось {_size_human(freed)})")
 
 
 # --------------------------------------------------------------------------- #
@@ -2364,6 +2468,157 @@ def features(
 ) -> None:
     """Список локальных фич (алиас `jwu feature list`)."""
     feature_list(status=status, json_out=json_out)
+
+
+# --------------------------------------------------------------------------- #
+# rules: правила воркспейса
+# --------------------------------------------------------------------------- #
+
+
+def _read_rule_text(text: Optional[str], file: Optional[str]) -> Optional[str]:
+    """Текст правила из --text либо из --file (`-` — stdin, для многострочного)."""
+    if file is None:
+        return text
+    if file == "-":
+        return sys.stdin.read().strip()
+    return Path(file).read_text(encoding="utf-8").strip()
+
+
+def _render_rules(items: list) -> None:
+    if not items:
+        console.print("[dim]Правил пока нет. Завести: jwu rule add \"…\" --kind constraint[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Тип", no_wrap=True)
+    table.add_column("Тег", no_wrap=True)
+    table.add_column("Правило")
+    for r in items:
+        label, color = WORKSPACE_RULE_BADGES.get(r.kind, (r.kind, "white"))
+        title = r.title + (" [dim]…[/dim]" if r.text else "")
+        table.add_row(str(r.id), f"[{color}]{label}[/{color}]",
+                      r.tag or "[dim]общее[/dim]", title)
+    console.print(table)
+
+
+@rule_app.command("add")
+def rule_add(
+    title: str = typer.Argument(..., help="Короткая суть правила (одной строкой)."),
+    kind: str = typer.Option(
+        "info", "--kind", "-k", help=" | ".join(WORKSPACE_RULE_KINDS),
+        click_type=click.Choice(WORKSPACE_RULE_KINDS),
+    ),
+    tag: str = typer.Option("", "--tag", "-t",
+                            help="Тег папки; без него правило общее для воркспейса."),
+    text: Optional[str] = typer.Option(None, "--text", help="Подробности."),
+    file: Optional[str] = typer.Option(
+        None, "--file", "-f", help="Взять подробности из файла; `-` — из stdin."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Завести правило воркспейса — то, что агент обязан знать о проекте."""
+    with _store() as store:
+        rule = store.add_rule(title, text=_read_rule_text(text, file) or "",
+                              kind=kind, tag=tag)
+    if json_out:
+        _emit_json(rule.model_dump())
+        return
+    label, color = WORKSPACE_RULE_BADGES.get(rule.kind, (rule.kind, "white"))
+    scope = f" [dim]({rule.tag})[/dim]" if rule.tag else ""
+    console.print(f"[green]Правило #{rule.id}[/green] [{color}]{label}[/{color}]{scope}  {rule.title}")
+
+
+@rule_app.command("list")
+def rule_list(
+    kind: Optional[str] = typer.Option(
+        None, "--kind", "-k", help=" | ".join(WORKSPACE_RULE_KINDS),
+        click_type=click.Choice(WORKSPACE_RULE_KINDS),
+    ),
+    tag: Optional[str] = typer.Option(
+        None, "--tag", "-t", help="Правила этого тега И общие; пустая строка — только общие."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Правила воркспейса."""
+    with _store() as store:
+        items = store.list_rules(kind=kind, tag=tag)
+    if json_out:
+        _emit_json([r.model_dump() for r in items])
+        return
+    _render_rules(items)
+
+
+@rule_app.command("show")
+def rule_show(
+    rule_id: int = typer.Argument(..., help="ID правила."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Правило целиком, вместе с подробностями."""
+    with _store() as store:
+        rule = store.get_rule(rule_id)
+    if rule is None:
+        err.print(f"[red]Правило #{rule_id} не найдено.[/red]")
+        raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(rule.model_dump())
+        return
+    label, color = WORKSPACE_RULE_BADGES.get(rule.kind, (rule.kind, "white"))
+    console.print(f"[bold cyan]#{rule.id}[/bold cyan] [{color}]{label}[/{color}]  {rule.title}")
+    console.print(f"[dim]область:[/dim] {rule.tag or 'весь воркспейс'}   "
+                  f"[dim]обновлено:[/dim] {fmt_dt(rule.updated_at)}")
+    if rule.text:
+        console.print(f"\n{rule.text}")
+
+
+@rule_app.command("edit")
+def rule_edit(
+    rule_id: int = typer.Argument(..., help="ID правила."),
+    title: Optional[str] = typer.Option(None, "--title", help="Новая суть."),
+    kind: Optional[str] = typer.Option(
+        None, "--kind", "-k", help=" | ".join(WORKSPACE_RULE_KINDS),
+        click_type=click.Choice(WORKSPACE_RULE_KINDS),
+    ),
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Новый тег («» — сделать общим)."),
+    text: Optional[str] = typer.Option(None, "--text", help="Новые подробности."),
+    file: Optional[str] = typer.Option(
+        None, "--file", "-f", help="Взять подробности из файла; `-` — из stdin."),
+) -> None:
+    """Изменить правило."""
+    with _store() as store:
+        if store.get_rule(rule_id) is None:
+            err.print(f"[red]Правило #{rule_id} не найдено.[/red]")
+            raise typer.Exit(code=1)
+        store.update_rule(rule_id, title=title, kind=kind, tag=tag,
+                          text=_read_rule_text(text, file))
+    console.print(f"[green]Правило #{rule_id} обновлено.[/green]")
+
+
+@rule_app.command("rm")
+def rule_rm(
+    rule_id: int = typer.Argument(..., help="ID правила."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Удалить правило."""
+    with _store() as store:
+        rule = store.get_rule(rule_id)
+        if rule is None:
+            err.print(f"[red]Правило #{rule_id} не найдено.[/red]")
+            raise typer.Exit(code=1)
+        if not yes and not typer.confirm(f"Удалить правило «{rule.title}»?", default=False):
+            raise typer.Exit(code=1)
+        store.delete_rule(rule_id)
+    console.print(f"[red]Правило #{rule_id}[/red] удалено")
+
+
+@app.command()
+def rules(
+    kind: Optional[str] = typer.Option(
+        None, "--kind", "-k", help=" | ".join(WORKSPACE_RULE_KINDS),
+        click_type=click.Choice(WORKSPACE_RULE_KINDS),
+    ),
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Правила тега И общие."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Правила воркспейса (алиас `jwu rule list`)."""
+    rule_list(kind=kind, tag=tag, json_out=json_out)
 
 
 if __name__ == "__main__":  # pragma: no cover

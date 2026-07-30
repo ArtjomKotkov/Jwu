@@ -182,7 +182,7 @@ def test_gone_deltas_ignore_other_workspace_runs(two_workspaces):
     assert [d.kind for d in store.compute_changes(r3)] == []
 
 
-def test_prs_notes_analyses_jobs_and_pending_are_isolated(two_workspaces):
+def test_prs_notes_jobs_and_pending_are_isolated(two_workspaces):
     store, work_id, home_id = two_workspaces
 
     store.use_workspace(work_id)
@@ -190,14 +190,12 @@ def test_prs_notes_analyses_jobs_and_pending_are_isolated(two_workspaces):
     store.save_pr_snapshot(run, _pr(), ["mine"])
     store.finish_sync_run(run, {"prs:mine": 1})
     store.add_note("PROJ-1", "рабочая заметка")
-    store.save_analysis("рабочий анализ", "план")
     store.create_job("PROJ-1", "рабочая работа")
     store.add_pending_changes(run, [])
 
     store.use_workspace(home_id)
     assert store.latest_prs("mine") == []
     assert store.get_notes("PROJ-1") == []
-    assert store.list_analyses() == []
     assert store.list_jobs() == []
     assert store.pending_changes() == []
     assert store.latest_run_id() is None
@@ -414,4 +412,46 @@ def test_tags_are_isolated_between_workspaces(tmp_path):
 
     assert store.all_tags(work.id) == {"общий": 1}
     assert [p.path for p in store.workspace_paths(work.id, tag="общий")] == [str(a.resolve())]
+    store.close()
+
+
+def test_dashboard_prefers_last_choice_over_cwd(tmp_path):
+    """Дашборд открывается там, где его закрыли, — папка запуска его не перебивает."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home")
+    work = workspaces.create(store, "work2")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder)
+    workspaces.set_active(store, work)   # руками выбрали work2 и закрыли дашборд
+
+    # обычная команда из этой папки по-прежнему работает в контуре папки
+    assert workspaces.resolve(store, cwd=folder).source == "cwd"
+    assert workspaces.resolve_workspace(store, cwd=folder).slug == "home"
+
+    # дашборд — наоборот: помнит выбор
+    res = workspaces.resolve(store, cwd=folder, prefer_active=True)
+    assert res.source == "active" and res.workspace.slug == "work2"
+
+    # явное -W сильнее и того и другого
+    assert workspaces.resolve_workspace(
+        store, explicit="home", cwd=folder, prefer_active=True).slug == "home"
+    store.close()
+
+
+def test_dashboard_falls_back_to_cwd_without_saved_choice(tmp_path):
+    """Выбора ещё не делали — дашборд открывается по папке (иначе открывать нечего)."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home")
+    workspaces.create(store, "work2")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder)
+
+    res = workspaces.resolve(store, cwd=folder, prefer_active=True)
+    assert res.source == "cwd" and res.workspace.slug == "home"
     store.close()

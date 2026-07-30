@@ -2,7 +2,7 @@ import asyncio
 import sqlite3
 
 import pytest
-from textual.widgets import DataTable, TabbedContent
+from textual.widgets import DataTable
 
 from jwu.cli.copy_modal import (
     CopyModalScreen,
@@ -87,16 +87,20 @@ def test_migration_adds_views_column(tmp_path):
 
 
 def test_dashboard_from_memory_splits(store):
-    run = store.start_sync_run(["mine", "mentions"])
+    from jwu.core.models import Mention
+
+    run = store.start_sync_run(["mine"])
     store.save_issue_snapshot(run, _issue("M-1"), ["mine"])
-    store.save_issue_snapshot(run, _issue("X-1"), ["mentions"])
     store.save_pr_snapshot(run, PR(id=1, project="P", repository="r"), ["mine"])
     store.save_pr_snapshot(run, PR(id=2, project="P", repository="r"), ["review"])
+    # упоминания приходят не из снапшотов, а из своей таблицы
+    store.add_mentions([Mention(task_key="X-1", comment_id="9", author="Bob",
+                                text="эй [~alice]", created="2026-05-21T10:00")])
 
     d = dashboard_from_memory(store, user="alice")
     assert d.user == "alice"
     assert [i.key for i in d.mine] == ["M-1"]
-    assert [i.key for i in d.mentions] == ["X-1"]
+    assert [m.task_key for m in d.mentions] == ["X-1"]
     assert [p.id for p in d.prs_mine] == [1]
     assert [p.id for p in d.prs_review] == [2]
     assert "mine" in d.to_json_dict()
@@ -275,7 +279,7 @@ def test_deltas_by_section_and_tab_badge():
             assert [d.key for d in app._deltas_by_section["mine"]] == ["A-1"]
             assert [d.key for d in app._deltas_by_section["prs_review"]] == ["P/r#5"]
             assert app._deltas_by_section["mentions"] == []
-            tabs = app.query_one("#tabs", TabbedContent)
+            tabs = app._tabs
             assert "●1" in str(tabs.get_tab("tab-mine").label)
             assert "●1" in str(tabs.get_tab("tab-prs-review").label)
             assert "●" not in str(tabs.get_tab("tab-mentions").label)
@@ -328,21 +332,18 @@ def test_changes_panel_survives_bracket_in_truncated_summary():
 def test_scoped_changes_panel_shows_only_active_section():
     from textual.widgets import Static
 
-    from jwu.core.models import Comment, Delta
+    from jwu.core.models import Delta
 
     data = _dash_data()  # активная вкладка по умолчанию — «Мои задачи» (A-1, A-2)
-    mention_issue = _issue("X-1")
-    mention_issue.comments = [Comment(id="9", author="Z", body="[~alice]")]
-    data.mentions = [mention_issue]
-    # дельта относится только к упоминаниям, не к активной вкладке «Мои задачи»
-    data.deltas = [Delta(key="X-1", kind="new_comment", summary="s")]
+    # дельта относится к PR на ревью, не к активной вкладке «Мои задачи»
+    data.deltas = [Delta(key="P/r#5", kind="new_conflict", summary="t")]
     app = JwuDashboard(data, jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test():
             panel = str(app.query_one("#changes", Static).render())
             assert "Мои задачи" in panel and "нет" in panel.lower()  # активной нет дельт
-            assert app._deltas_by_section["mentions"][0].key == "X-1"  # но они есть у упоминаний
+            assert app._deltas_by_section["prs_review"][0].key == "P/r#5"
 
     asyncio.run(run())
 
@@ -383,7 +384,7 @@ def test_failed_sync_marks_status_and_notifies():
         async with app.run_test():
             notes = []
             app.notify = lambda *a, **k: notes.append((a, k))  # type: ignore[method-assign]
-            app.query_one("#tabs", TabbedContent).active = "tab-mine"
+            app._tabs.active = "tab-mine"
             app._after_refresh(None, "Jira недоступна")
             assert app._sync_failed is True
             assert app._auto_paused is False  # первая ошибка — ещё ретраим
@@ -564,7 +565,7 @@ def test_tui_job_close_and_delete():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            app.query_one("#tabs", TabbedContent).active = "tab-jobs"
+            app._tabs.active = "tab-jobs"
             await pilot.pause()
             app.query_one("#t-jobs", DataTable).focus()
             await pilot.pause()
@@ -602,7 +603,7 @@ def test_check_action_scopes_job_buttons():
             assert app.check_action("delete_job", ()) is False      # на «Мои задачи» скрыто
             assert app.check_action("finish_job", ()) is False
             assert app.check_action("refresh", ()) is True
-            app.query_one("#tabs", TabbedContent).active = "tab-jobs"
+            app._tabs.active = "tab-jobs"
             await pilot.pause()
             app.query_one("#t-jobs", DataTable).focus()
             await pilot.pause()
@@ -668,7 +669,8 @@ def test_pressing_enter_clears_change_mark_end_to_end():
     asyncio.run(run())
 
 
-def test_status_lives_inside_changes_column():
+def test_status_lives_outside_the_hidden_panel():
+    """Статус — снизу, а не в панели: панель скрыта, и вместе с ней он бы пропал."""
     from textual.widgets import Static
 
     data = _dash_data()
@@ -677,13 +679,14 @@ def test_status_lives_inside_changes_column():
 
     async def run() -> None:
         async with app.run_test():
-            # статус-строка теперь ВНУТРИ правой колонки (нижняя секция), а не отдельным баром
             col = app.query_one("#changes-col")
-            assert list(col.query("#status"))            # #status вложен в колонку
-            # панель без дельт — без кнопок «скрыть»/«очистить», колонка не прячется
+            assert not list(col.query("#status"))        # не внутри панели
+            assert col.display is False                  # панель по умолчанию скрыта
+            status = str(app.query_one("#status", Static).render())
+            assert "последний синк" in status and "из памяти" in status
+            assert "? — клавиши" in status               # легенды на экране больше нет
             panel = str(app.query_one("#changes", Static).render())
-            assert "нет" in panel.lower() and "скрыть" not in panel
-            assert not hasattr(app, "action_toggle_changes")
+            assert "нет" in panel.lower()
 
     asyncio.run(run())
 
@@ -709,19 +712,10 @@ def test_splitter_drag_resizes_changes_column():
     asyncio.run(run())
 
 
-def test_sort_analysis_and_jobs():
-    from jwu.core.models import Analysis, Job
+def test_sort_jobs():
+    from jwu.core.models import Job
 
     app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
-
-    analyses = [
-        Analysis(id=1, created_at="2026-05-20T10:00", title="b"),
-        Analysis(id=2, created_at="2026-05-22T10:00", title="a"),
-    ]
-    app._sort["t-analysis"] = (1, False)  # по «Дата/время», возр.
-    assert [a.id for a in app._sorted("t-analysis", "analysis", analyses)] == [1, 2]
-    app._sort["t-analysis"] = (1, True)   # убыв. — свежие сверху
-    assert [a.id for a in app._sorted("t-analysis", "analysis", analyses)] == [2, 1]
 
     jobs = [
         Job(id=1, task_key="A-1", updated_at="2026-05-20T10:00", status="active"),
@@ -970,7 +964,7 @@ def test_tui_pr_tab_enter_opens_pr_detail():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            app.query_one("#tabs", TabbedContent).active = "tab-prs-review"
+            app._tabs.active = "tab-prs-review"
             await pilot.pause()
             app.query_one("#t-prs-review", DataTable).focus()
             await pilot.pause()
@@ -1010,63 +1004,48 @@ def test_tui_issue_to_pr_navigation_via_p():
 
 def test_render_day_context_md():
     from jwu.cli.main import _render_day_context_md
-    from jwu.core.models import Delta, Reviewer
+    from jwu.core.models import Delta, Mention, Reviewer
     from jwu.core.service import DayContext
-
-    from jwu.core.models import Comment
 
     issue = _issue("WM-1")
     issue.comments = []
     issue.assignee = "Alice"
     pr = PR(id=7, project="P", repository="r", title="fix", conflicted=True,
             reviewers=[Reviewer(name="rev", status="NEEDS_WORK")], comment_count=2)
-    # упоминание, где последний коммент НЕ мой → должно пометиться «ждёт ответа»
-    mention = _issue("WM-2")
-    mention.assignee = "Боб"
-    mention.comments = [Comment(id="1", author="Боб", body="эй [~alice] глянь")]
+    # упоминание — самостоятельная запись, а не задача
+    mention = Mention(id=1, task_key="WM-2", comment_id="1", author="Боб",
+                      summary="что-то важное", created="2026-05-21T09:00",
+                      text="эй [~alice] глянь\nвторая строка")
     ctx = DayContext(
         user="alice", me_display="Alice", synced_at="2026-05-21T10:00",
         deltas=[Delta(key="WM-1", kind="new_comment", summary="s", detail="+1")],
         mine=[issue], prs_mine=[pr], prs_review=[],
-        mentions=[(mention, ["эй [~alice] глянь\nвторая строка"])],
+        mentions=[mention],
         pr_comments={7: []},
     )
     md = _render_day_context_md(ctx)
     assert "## Изменения с прошлого синка (1)" in md
     assert "## Мои задачи (1)" in md
     assert "КОНФЛИКТ" in md and "NEEDS_WORK" in md
-    assert "## Упоминания (1)" in md
+    assert "## Упоминания (1, новых 1)" in md
+    assert "WM-2" in md and "от Боб" in md and "· новое" in md
     # новые обогащения контекста
     assert "состояние: конфликт" in md         # готовность PR (конфликт приоритетнее)
     assert "обновлён:" in md                    # возраст PR
     assert "assignee: Alice" in md              # assignee задачи
-    assert "· ждёт ответа" in md                # последний коммент не мой
     # перенос строки в упоминании схлопнут в пробел
     assert "вторая строка" in md and "глянь\nвторая" not in md
 
 
-def test_tui_analysis_tab_opens_screen():
-    from jwu.core.models import Analysis
+def test_analysis_tab_and_screen_are_gone():
+    """Вкладка «Анализ» и её экран убраны из дашборда целиком."""
+    import jwu.cli.dashboard as dash
 
-    data = _dash_data()
-    data.analyses = [Analysis(id=1, created_at="2026-05-21T10:00", title="День 1")]
-    full = Analysis(id=1, created_at="2026-05-21T10:00", title="День 1", content="# План\n- пункт")
-    app = JwuDashboard(data,
-                       analysis_get_fn=lambda i: full, jira_base="https://jira.test")
+    from jwu.core.service import DashboardData
 
-    async def run() -> None:
-        async with app.run_test() as pilot:
-            assert app.query_one("#t-analysis", DataTable).row_count == 1
-            app.query_one("#tabs", TabbedContent).active = "tab-analysis"
-            await pilot.pause()
-            app.query_one("#t-analysis", DataTable).focus()
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            from jwu.cli.dashboard import AnalysisScreen
-            assert isinstance(app.screen, AnalysisScreen)
-
-    asyncio.run(run())
+    assert "tab-analysis" not in dash.TABS
+    assert not hasattr(dash, "AnalysisScreen")
+    assert not hasattr(DashboardData, "analyses")
 
 
 def test_issue_detail_two_column_layout():
@@ -1139,7 +1118,7 @@ def test_dashboard_jobs_tab_renders():
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one("#t-jobs")
-            assert table.row_count == 1
+            assert table.row_count == 2          # работа + заголовок её дня
 
     asyncio.run(run())
 
@@ -1160,7 +1139,7 @@ def test_tui_jobs_tab_enter_opens_job_detail():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            app.query_one("#tabs", TabbedContent).active = "tab-jobs"
+            app._tabs.active = "tab-jobs"
             await pilot.pause()
             app.query_one("#t-jobs", DataTable).focus()
             await pilot.pause()
@@ -1264,7 +1243,7 @@ def test_job_detail_live_refresh_refetches_from_memory():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            app.query_one("#tabs", TabbedContent).active = "tab-jobs"
+            app._tabs.active = "tab-jobs"
             await pilot.pause()
             app.query_one("#t-jobs", DataTable).focus()
             await pilot.pause()
@@ -1293,7 +1272,7 @@ def test_local_detail_refresh_off_without_auto_update():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            app.query_one("#tabs", TabbedContent).active = "tab-jobs"
+            app._tabs.active = "tab-jobs"
             await pilot.pause()
             app.query_one("#t-jobs", DataTable).focus()
             await pilot.pause()
@@ -1370,9 +1349,9 @@ def test_search_opens_issue_detail_for_normalized_key():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            inp = app.query_one("#search", Input)
-            inp.focus()
+            await pilot.press("/")               # поиск живёт в модалке
             await pilot.pause()
+            inp = app.screen.query_one("#prompt-input", Input)
             inp.value = "  proj-25 "
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -1380,7 +1359,6 @@ def test_search_opens_issue_detail_for_normalized_key():
             assert calls == ["PROJ-25"]
             assert isinstance(app.screen, IssueDetailScreen)
             assert app.screen.issue.key == "PROJ-25"
-            assert inp.value == ""  # поле очищено после сабмита
             await pilot.press("escape")
             await pilot.press("q")
 
@@ -1406,9 +1384,9 @@ def test_search_opens_card_immediately_then_loads():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            inp = app.query_one("#search", Input)
-            inp.focus()
+            await pilot.press("/")               # поиск живёт в модалке
             await pilot.pause()
+            inp = app.screen.query_one("#prompt-input", Input)
             inp.value = "B-2"
             await pilot.press("enter")
             await pilot.pause()
@@ -1442,9 +1420,9 @@ def test_search_empty_input_does_not_fetch():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            inp = app.query_one("#search", Input)
-            inp.focus()
+            await pilot.press("/")               # поиск живёт в модалке
             await pilot.pause()
+            inp = app.screen.query_one("#prompt-input", Input)
             inp.value = "   "
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -1469,9 +1447,9 @@ def test_search_missing_issue_notifies_and_survives():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            inp = app.query_one("#search", Input)
-            inp.focus()
+            await pilot.press("/")               # поиск живёт в модалке
             await pilot.pause()
+            inp = app.screen.query_one("#prompt-input", Input)
             inp.value = "NOPE-1"
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -1483,11 +1461,12 @@ def test_search_missing_issue_notifies_and_survives():
 
 
 def test_hjkl_moves_table_cursor():
-    """hjkl на таблице двигают курсор; в поле поиска h/j/k/l — обычный ввод."""
+    """hjkl на таблице двигают курсор; в поле ввода h/j/k/l — обычный текст."""
     from textual.widgets import Input
 
     data = _dash_data()  # mine=[A-1, A-2]
-    app = JwuDashboard(data, jira_base="https://jira.test")
+    app = JwuDashboard(data, issue_get_fn=lambda k: _issue(k),
+                       jira_base="https://jira.test")
 
     async def run() -> None:
         async with app.run_test() as pilot:
@@ -1498,12 +1477,13 @@ def test_hjkl_moves_table_cursor():
             await pilot.press("k")
             assert table.cursor_row == 0
 
-            inp = app.query_one("#search", Input)
-            inp.focus()
+            await pilot.press("/")               # поиск живёт в модалке
             await pilot.pause()
+            inp = app.screen.query_one("#prompt-input", Input)
             await pilot.press("j")
             assert inp.value == "j"
             assert table.cursor_row == 0
+            await pilot.press("escape")
             await pilot.press("q")
 
     asyncio.run(run())
@@ -1516,7 +1496,7 @@ def test_bracket_keys_switch_tabs():
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            tabs = app.query_one("#tabs", TabbedContent)
+            tabs = app._tabs
             assert tabs.active == "tab-mine"
             await pilot.press("]")
             assert tabs.active == "tab-mentions"
@@ -1605,7 +1585,7 @@ def test_y_ignored_on_pr_tab(monkeypatch):
         async with app.run_test() as pilot:
             for _ in range(3):  # mine → mentions → prs-mine → prs-review
                 await pilot.press("]")
-            assert app.query_one("#tabs", TabbedContent).active == "tab-prs-review"
+            assert app._tabs.active == "tab-prs-review"
             await pilot.press("y")
             assert copied == []
             await pilot.press("q")
@@ -1665,7 +1645,7 @@ def test_Y_copy_modal_on_pr_tab(monkeypatch):
         async with app.run_test() as pilot:
             for _ in range(3):  # mine → mentions → prs-mine → prs-review
                 await pilot.press("]")
-            assert app.query_one("#tabs", TabbedContent).active == "tab-prs-review"
+            assert app._tabs.active == "tab-prs-review"
             await pilot.press("Y")
             await pilot.pause()
             assert isinstance(app.screen, CopyModalScreen)
@@ -1742,7 +1722,7 @@ def test_tabs_hidden_for_workspace_without_integrations(tmp_path):
             assert "tab-features" in visible and "tab-workspaces" in visible
             assert "tab-structure" in visible
             # стартуем на «Фичах»: задач Jira тут нет
-            tabs = app.query_one("#tabs", TabbedContent)
+            tabs = app._tabs
             assert tabs.active == "tab-features"
             # [ и ] не заходят на скрытые вкладки
             for _ in range(len(visible) * 2):
@@ -1793,9 +1773,9 @@ def test_workspace_tab_shows_paths_and_head(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")  # с «Фич» влево — на «Структуру»
+            app._tabs.active = "tab-structure"
             await pilot.pause()
-            assert app.query_one("#tabs", TabbedContent).active == "tab-structure"
+            assert app._tabs.active == "tab-structure"
             tree = app.query_one("#t-structure", WorkspaceTree)
             roots = [str(n.label) for n in tree.root.children]
             assert roots == [str(folder.resolve())]
@@ -1823,7 +1803,7 @@ def test_add_path_from_workspace_tab(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")  # с «Фич» влево — на «Структуру»
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             await pilot.press("a")
             await pilot.pause()
@@ -1911,10 +1891,9 @@ def test_jobs_tab_shows_feature_anchor(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("]")  # Фичи → Анализ
-            await pilot.press("]")  # Анализ → Работы
+            await pilot.press("]")  # Фичи → Работы
             await pilot.pause()
-            assert app.query_one("#tabs", TabbedContent).active == "tab-jobs"
+            assert app._tabs.active == "tab-jobs"
             table = app.query_one("#t-jobs", DataTable)
             anchors = {str(table.get_row_at(i)[3]) for i in range(table.row_count)}
             assert feature.key in anchors
@@ -1979,7 +1958,7 @@ def test_workspace_tab_owns_D_key_and_hides_job_buttons(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")  # Фичи → Структура
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             app.query_one("#t-structure", WorkspaceTree).focus()
             await pilot.pause()
@@ -1995,10 +1974,91 @@ def test_workspace_tab_owns_D_key_and_hides_job_buttons(tmp_path):
     assert removed == [(ws.id, str(folder.resolve()))]
 
 
+def test_tabs_split_into_global_and_project_rows():
+    """Две полосы: наверху выбор контура, внизу — всё его содержимое."""
+    from textual.widgets import Tabs
+
+    from jwu.cli.dashboard import _bar_id
+
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            deck = app._tabs
+            top = deck.query_one("#tabs-global", Tabs)
+            bottom = deck.query_one("#tabs-project", Tabs)
+            assert [t.id for t in top.query("Tab")] == ["bar-workspaces"]
+            # «Структура» и «Правила» открывают нижний ряд: с них начинают в новом контуре
+            assert [t.id for t in bottom.query("Tab")][:3] == [
+                "bar-structure", "bar-rules", "bar-mine"]
+            assert "bar-workspaces" not in [t.id for t in bottom.query("Tab")]
+            # стартуем на проектной вкладке → верхняя полоса погашена
+            assert deck.active == "tab-mine"
+            assert top.has_class("-row-idle") and not bottom.has_class("-row-idle")
+            # переход на общую вкладку гасит уже нижнюю полосу
+            deck.active = "tab-workspaces"
+            await pilot.pause()
+            assert bottom.has_class("-row-idle") and not top.has_class("-row-idle")
+            assert top.active == _bar_id("tab-workspaces")
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_clicking_tab_in_other_row_switches_pane():
+    """Клик по вкладке в соседней полосе переключает панель — даже если она там подсвечена.
+
+    Регресс: подсветка в неактивной полосе никуда не девается, поэтому клик по ней не
+    меняет `Tabs.active` и штатного события активации не даёт. Панель всё равно должна
+    переключиться — иначе вкладка выглядит нажатой, но ничего не происходит.
+    """
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            deck = app._tabs
+            assert deck.active == "tab-mine"                  # стартуем в проектной полосе
+            assert deck.query_one("#tabs-global").active == "bar-workspaces"
+            await pilot.click("#bar-workspaces")              # уже подсвечена в своей полосе
+            await pilot.pause()
+            assert deck.active == "tab-workspaces"
+            assert deck.query_one("#panes").current == "tab-workspaces"
+            await pilot.click("#bar-structure")               # назад в проектную полосу
+            await pilot.pause()
+            assert deck.active == "tab-structure"
+            await pilot.click("#bar-rules")                   # соседняя вкладка той же полосы
+            await pilot.pause()
+            assert deck.active == "tab-rules"
+            assert deck.query_one("#panes").current == "tab-rules"
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_tab_cycling_walks_both_rows():
+    """`[` / `]` листают все видимые вкладки подряд — обе полосы одним кольцом."""
+    app = JwuDashboard(_dash_data(), jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            assert app._tabs.active == "tab-mine"
+            await pilot.press("[")                    # назад — в общую полосу
+            await pilot.pause()
+            assert app._tabs.active == "tab-rules"
+            await pilot.press("[")
+            await pilot.pause()
+            assert app._tabs.active == "tab-structure"
+            await pilot.press("]")
+            await pilot.pause()
+            assert app._tabs.active == "tab-rules"
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
 def test_workspace_and_structure_tabs_are_separate(tmp_path):
     """«Workspace» — управление контурами, «Структура» — папки активного."""
     from jwu.core import workspaces
-    from textual.widgets import TabbedContent as TC
 
     store = Store(tmp_path / "state.db")
     ws = workspaces.create(store, "home", name="Личное")
@@ -2010,16 +2070,18 @@ def test_workspace_and_structure_tabs_are_separate(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            label = str(app.query_one("#tabs", TC).get_tab("tab-workspaces").label)
+            label = str(app._tabs.get_tab("tab-workspaces").label)
             # счётчик вкладки = число контуров (work + home), а не папок
             assert label == "Workspace (2)"
-            assert str(app.query_one("#tabs", TC).get_tab("tab-structure").label) == "Структура (0)"
+            assert str(app._tabs.get_tab("tab-structure").label) == "Структура (0)"
             head = str(app.query_one("#structure-head").render())
+            assert "Личное" in head and "работ: 0" in head     # шапка — про состояние
             assert "Папок нет" in head          # пустое состояние объясняет, что делать
-            assert "a" in head and "добавить" in head
-            # создание нового контура живёт на вкладке управления
+            # перечня клавиш в шапках больше нет — он живёт в легенде по «?»
+            assert "отвязать" not in head
             ws_head = str(app.query_one("#ws-head").render())
-            assert "создать" in ws_head and "переключиться" in ws_head
+            assert "Воркспейсов: 2" in ws_head
+            assert "создать" not in ws_head and "переключиться" not in ws_head
             await pilot.press("q")
 
     asyncio.run(run())
@@ -2046,10 +2108,9 @@ def test_workspaces_tab_lists_and_switches(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")   # Мои задачи → Структура
-            await pilot.press("[")   # Структура → Workspace
+            app._tabs.active = "tab-workspaces"
             await pilot.pause()
-            assert app.query_one("#tabs", TabbedContent).active == "tab-workspaces"
+            assert app._tabs.active == "tab-workspaces"
             table = app.query_one("#t-workspaces", DataTable)
             assert table.row_count == 2
             slugs = [str(table.get_row_at(i)[1]) for i in range(table.row_count)]
@@ -2083,8 +2144,7 @@ def test_workspaces_tab_creates_and_deletes(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
-            await pilot.press("[")
+            app._tabs.active = "tab-workspaces"
             await pilot.pause()
             assert app.check_action("new_workspace", ()) is True
             assert app.check_action("add_path", ()) is False   # это на «Структуре»
@@ -2118,8 +2178,7 @@ def test_delete_refuses_when_single_workspace(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
-            await pilot.press("[")
+            app._tabs.active = "tab-workspaces"
             await pilot.pause()
             await pilot.press("D")
             await pilot.pause()
@@ -2151,7 +2210,7 @@ def test_structure_tab_shows_git_marker_after_indexing(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             for _ in range(10):   # ждём фонового индексатора
                 await pilot.pause()
@@ -2186,7 +2245,7 @@ def test_tree_expands_with_arrow_keys(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             tree = app.query_one("#t-structure", WorkspaceTree)
             tree.focus()
@@ -2223,7 +2282,7 @@ def test_missing_folder_yields_empty_tree(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             tree = app.query_one("#t-structure", WorkspaceTree)
             tree.focus()
@@ -2257,7 +2316,7 @@ def test_added_path_appears_without_restart(tmp_path, monkeypatch):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             assert len(app.query_one("#t-structure", WorkspaceTree).root.children) == 0
             await pilot.press("a")
@@ -2297,7 +2356,7 @@ def test_tree_rebuild_keeps_expanded_nodes(tmp_path):
 
     async def run() -> None:
         async with app.run_test() as pilot:
-            await pilot.press("[")
+            app._tabs.active = "tab-structure"
             await pilot.pause()
             tree = app.query_one("#t-structure", WorkspaceTree)
             tree.focus()
@@ -2385,6 +2444,621 @@ def test_workspace_switch_error_clears_marker(tmp_path):
                 if not app._loading_workspace:
                     break
             assert app._loading_workspace is False
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def _mention(mid=1, key="X-1", comment_id="9", seen=False, text="эй [~alice] глянь"):
+    from jwu.core.models import Mention
+
+    return Mention(id=mid, task_key=key, comment_id=comment_id, author="Боб",
+                   text=text, created="2026-05-21T10:00", summary="Заголовок задачи",
+                   seen=seen)
+
+
+def test_mentions_tab_lists_mentions_not_issues():
+    """Строка вкладки — само упоминание: когда · задача · автор · текст."""
+    data = _dash_data()
+    data.mentions = [_mention(), _mention(mid=2, comment_id="10", seen=True,
+                                          text="и ещё [~alice] вот")]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            table = app.query_one("#t-mentions", DataTable)
+            assert table.row_count == 2
+            row = [str(c) for c in table.get_row_at(0)]
+            assert "X-1" in row[1] and row[2] == "Боб" and "глянь" in row[3]
+            assert "●" in row[1]                      # непрочитанное помечено
+            assert "●" not in str(table.get_row_at(1)[1])
+            # бейдж вкладки считает непрочитанные, а не дельты
+            assert "●1" in str(app._tabs.get_tab("tab-mentions").label)
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_opening_mention_marks_it_read_and_loads_issue():
+    """Заход внутрь: упоминание становится прочитанным, карточка задачи тянется из сети."""
+    from jwu.cli.dashboard import IssueDetailScreen
+
+    data = _dash_data()
+    data.mentions = [_mention()]
+    seen: list = []
+    loaded: list = []
+
+    def mark(ids):
+        seen.append(ids)
+        fresh = _dash_data()
+        fresh.mentions = [_mention(seen=True)]
+        return fresh
+
+    def get_issue(key):
+        loaded.append(key)
+        return _issue(key)
+
+    app = JwuDashboard(data, mentions_seen_fn=mark, issue_get_fn=get_issue,
+                       jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-mentions"
+            await pilot.pause()
+            app.query_one("#t-mentions", DataTable).focus()
+            await pilot.pause()
+            assert loaded == []                      # до входа задачу не грузим
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert seen == [[1]]                     # прочитано ровно это упоминание
+            assert loaded == ["X-1"]
+            assert isinstance(app.screen, IssueDetailScreen)
+            assert app.screen.issue.key == "X-1"
+
+    asyncio.run(run())
+
+
+def test_mentions_panel_lists_unread_and_c_marks_all_read():
+    """Панель на вкладке упоминаний показывает непрочитанные; `c` — «прочитано»."""
+    from textual.widgets import Static
+
+    data = _dash_data()
+    data.mentions = [_mention(), _mention(mid=2, comment_id="10", text="[~alice] второе")]
+    calls: list = []
+
+    def mark(ids):
+        calls.append(ids)
+        fresh = _dash_data()
+        fresh.mentions = [_mention(seen=True), _mention(mid=2, comment_id="10", seen=True)]
+        return fresh
+
+    app = JwuDashboard(data, mentions_seen_fn=mark, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-mentions"
+            await pilot.pause()
+            panel = app.query_one("#changes", Static)
+            rendered = str(panel.render())
+            assert "X-1" in rendered and "глянь" in rendered and "второе" in rendered
+            assert "прочитано" in rendered           # у упоминаний своя подпись действия
+            app.query_one("#t-mentions", DataTable).focus()
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert calls == [None]                   # None = «все»
+            assert "нет" in str(panel.render()).lower()
+
+    asyncio.run(run())
+
+
+def test_changes_panel_groups_by_task():
+    """Панель изменений: одна сущность — один блок «ключ: название» + список того, что в ней."""
+    from textual.widgets import Static
+
+    from jwu.core.models import Delta
+
+    data = _dash_data()  # активная вкладка — «Мои задачи» (A-1, A-2)
+    data.deltas = [
+        Delta(key="A-1", kind="new_comment", summary="Первая задача", detail="+3 комм."),
+        Delta(key="A-1", kind="status_change", summary="Первая задача", detail="Open → In Progress"),
+        Delta(key="A-2", kind="resolved", summary="Вторая задача", detail="Fixed"),
+    ]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test():
+            lines = str(app.query_one("#changes", Static).render()).splitlines()
+            body = [ln.strip() for ln in lines if ln.strip()]
+            assert body[0].startswith("Изменения · Мои задачи (3)")
+            # ключ появляется РОВНО один раз на сущность, изменения — отдельными строками
+            assert sum(1 for ln in body if ln.startswith("A-1:")) == 1
+            assert "A-1: Первая задача" in body
+            assert "💬 +3 комм." in body
+            assert "🔁 Open → In Progress" in body
+            assert "A-2: Вторая задача" in body
+            # голое значение дельты снабжается подписью, иначе строка — ребус
+            assert "✅ решена: Fixed" in body
+
+    asyncio.run(run())
+
+
+def test_changes_panel_caps_groups_and_items():
+    """Длинный список не растёт бесконечно: и групп, и строк внутри группы есть потолок."""
+    from textual.widgets import Static
+
+    from jwu.core.models import Delta
+
+    data = _dash_data()
+    data.mine = [_issue(f"A-{i}") for i in range(1, 13)]
+    data.deltas = [
+        Delta(key=f"A-{i}", kind="new_comment", summary=f"задача {i}", detail=f"+{i} комм.")
+        for i in range(1, 13)
+    ] + [
+        Delta(key="A-1", kind="new_pr", summary="задача 1", detail=str(n))
+        for n in range(10)
+    ]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test():
+            body = [ln.strip() for ln in
+                    str(app.query_one("#changes", Static).render()).splitlines() if ln.strip()]
+            heads = [ln for ln in body if ln.startswith("A-")]
+            assert len(heads) == app.MAX_CHANGE_GROUPS
+            assert any("…ещё 4 шт." in ln for ln in body)          # 12 задач - 8 показанных
+            assert any(ln.startswith("…ещё 6") for ln in body)     # 11 изменений A-1 - 5
+
+    asyncio.run(run())
+
+
+def _job_at(days_ago, job_id, title="работа"):
+    from datetime import datetime, timedelta, timezone
+
+    from jwu.core.models import Job
+
+    ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+    return Job(id=job_id, task_key=f"A-{job_id}", title=title, status="active", updated_at=ts)
+
+
+def test_jobs_tab_splits_rows_by_day():
+    """Между днями — строка-разделитель с датой; сами работы остаются кликабельными."""
+    from jwu.core.models import Job
+
+    data = _dash_data()
+    data.jobs = [_job_at(0, 3), _job_at(0, 2), _job_at(1, 1)]
+    app = JwuDashboard(data, job_get_fn=lambda i: None, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-jobs"
+            await pilot.pause()
+            table = app.query_one("#t-jobs", DataTable)
+            # 3 работы + 2 заголовка дня + пустая строка между днями
+            assert table.row_count == 6
+            rows = app._rows["t-jobs"]
+            assert [r is None for r in rows] == [True, False, False, True, True, False]
+            assert [getattr(r, "id", None) for r in rows] == [None, 3, 2, None, None, 1]
+            # заголовок дня — в колонке «Обновлено»: сначала словами, потом дата
+            head = str(table.get_row_at(0)[1])
+            assert head.startswith("─ Сегодня — ") and "." in head
+            assert str(table.get_row_at(4)[1]).startswith("─ Вчера — ")
+            assert str(table.get_row_at(3)[1]) == ""      # пустая строка отбивает день
+            # курсор не застревает на разделителе — проезжает на ближайшую работу
+            table.move_cursor(row=0)
+            await pilot.pause()
+            assert table.cursor_row == 1
+            assert isinstance(app._selected_obj(), Job)
+            table.move_cursor(row=3)     # пустая строка + заголовок дня, шли вниз
+            await pilot.pause()
+            assert table.cursor_row == 5
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_jobs_day_split_off_when_sorted_by_other_column():
+    """Сортировка не по времени → разделителей нет: «дальше другой день» было бы неправдой."""
+    data = _dash_data()
+    data.jobs = [_job_at(0, 2), _job_at(1, 1)]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-jobs"
+            await pilot.pause()
+            # 2 работы + 2 заголовка дня + пустая строка между ними
+            assert app.query_one("#t-jobs", DataTable).row_count == 5
+            app._sort["t-jobs"] = (5, False)     # по «Title»
+            app._render()
+            await pilot.pause()
+            table = app.query_one("#t-jobs", DataTable)
+            assert table.row_count == 2
+            assert all(r is not None for r in app._rows["t-jobs"])
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_day_divider_reads_word_then_date():
+    """Заголовок дня: сначала словами («Сегодня»), потом дата — и то и другое выделено."""
+    from jwu.cli.dashboard import _day_color, _day_label
+
+    data = _dash_data()
+    data.jobs = [_job_at(0, 1), _job_at(1, 2), _job_at(5, 3)]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    assert _day_label(_job_at(0, 1).updated_at).startswith("Сегодня — ")
+    assert _day_label(_job_at(1, 2).updated_at).startswith("Вчера — ")
+    # свежесть считывается цветом: сегодня зелёным, вчера жёлтым, дальше — ровно
+    assert _day_color(_job_at(0, 1).updated_at) == "green"
+    assert _day_color(_job_at(1, 2).updated_at) == "yellow"
+    assert _day_color(_job_at(5, 3).updated_at) == "cyan"
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-jobs"
+            await pilot.pause()
+            table = app.query_one("#t-jobs", DataTable)
+            head = table.get_row_at(0)[1]
+            # слово и дата — жирные и цветные, черта вокруг — приглушённая
+            styles = [str(sp.style) for sp in head.spans]
+            assert any("bold green" in st for st in styles)
+            assert any("bold cyan" in st for st in styles)
+            # черта смыкается с соседними колонками (ширина колонки = длине заголовка)
+            assert head.cell_len == len(str(table.get_row_at(0)[1]))
+            assert str(table.get_row_at(0)[0]).startswith("─")
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_jobs_tab_survives_empty_list():
+    """Пустой список работ не должен ронять расчёт ширины заголовка дня."""
+    data = _dash_data()
+    data.jobs = []
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-jobs"
+            await pilot.pause()
+            assert app.query_one("#t-jobs", DataTable).row_count == 0
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def _screen_text(app) -> str:
+    """Что реально нарисовано на экране (у Static с Group `render()` отдаёт обёртку)."""
+    return "\n".join(
+        "".join(seg.text for seg in strip)
+        for strip in app.screen._compositor.render_strips()
+    )
+
+
+def _rule(rid=1, kind="constraint", title="Не пушить в develop", tag="", text=""):
+    from jwu.core.models import WorkspaceRule
+
+    return WorkspaceRule(id=rid, kind=kind, title=title, tag=tag, text=text,
+                         updated_at="2026-07-30T10:00")
+
+
+def test_rules_tab_opens_project_row():
+    """«Правила» — содержимое контура, поэтому стоят в нижнем ряду, сразу за «Структурой»."""
+    from jwu.cli.dashboard import GLOBAL_TABS, PROJECT_TABS
+
+    assert GLOBAL_TABS == ("tab-workspaces",)          # наверху только выбор контура
+    assert PROJECT_TABS[:2] == ("tab-structure", "tab-rules")
+
+    data = _dash_data()
+    data.rules = [_rule(), _rule(2, "howto", "Как поднять стенд", "legacy-бэкенд", "шаги")]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-rules"
+            await pilot.pause()
+            table = app.query_one("#t-rules", DataTable)
+            assert table.row_count == 2
+            first = [str(c) for c in table.get_row_at(0)]
+            assert "ЗАПРЕТ" in first[0] and first[1] == "общее"
+            second = [str(c) for c in table.get_row_at(1)]
+            assert second[1] == "legacy-бэкенд"
+            assert second[2].endswith("…")          # есть подробности — смотри карточку
+            assert "Правил: 2" in str(app.query_one("#rules-head").render())
+            assert "запретов: 1" in str(app.query_one("#rules-head").render())
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_rule_keys_are_scoped_to_its_tab():
+    """N/e/D работают на «Правилах» и спрятаны на других вкладках (клавиши общие)."""
+    data = _dash_data()
+    data.rules = [_rule()]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            assert app.check_action("new_rule", ()) is False     # «Мои задачи»
+            assert app.check_action("delete_rule", ()) is False
+            app._tabs.active = "tab-rules"
+            await pilot.pause()
+            assert app.check_action("new_rule", ()) is True
+            assert app.check_action("edit_rule", ()) is True
+            assert app.check_action("delete_rule", ()) is True
+            assert app.check_action("new_workspace", ()) is False  # чужая вкладка
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_rule_detail_shows_full_text():
+    """В строке только суть; многострочная инструкция открывается по enter."""
+    from jwu.cli.workspace_screens import RuleDetailScreen
+
+    rule = _rule(2, "howto", "Как поднять стенд", "legacy-бэкенд",
+                 "1. docker compose up\n2. ./manage.py migrate")
+    data = _dash_data()
+    data.rules = [rule]
+    app = JwuDashboard(data, rule_get_fn=lambda i: rule, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._tabs.active = "tab-rules"
+            await pilot.pause()
+            app.query_one("#t-rules", DataTable).focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RuleDetailScreen)
+            body = _screen_text(app)
+            assert "docker compose up" in body and "./manage.py migrate" in body
+            assert "legacy-бэкенд" in body
+            await pilot.press("escape")
+
+    asyncio.run(run())
+
+
+def test_creating_and_deleting_rule_from_tab():
+    from jwu.cli.dashboard import ConfirmScreen
+    from jwu.cli.workspace_screens import RuleEditScreen
+
+    data = _dash_data()
+    data.rules = [_rule()]
+    calls: dict = {}
+    app = JwuDashboard(
+        data,
+        memory_fn=lambda: data,
+        rule_create_fn=lambda values: calls.__setitem__("created", values),
+        rule_delete_fn=lambda rid: calls.__setitem__("deleted", rid),
+        tags_fn=lambda: ["фронт", "legacy-бэкенд"],
+        jira_base="https://jira.test",
+    )
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-rules"
+            await pilot.pause()
+            app.query_one("#t-rules", DataTable).focus()
+            await pilot.pause()
+
+            await pilot.press("N")
+            await pilot.pause()
+            assert isinstance(app.screen, RuleEditScreen)
+            app.screen.query_one("#rule-name").value = "Ревью до коммита"
+            app.screen.query_one("#rule-tag").value = "фронт"
+            app.screen.query_one("#rule-text").text = "и никак иначе"
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert calls["created"] == {"kind": "info", "tag": "фронт",
+                                        "title": "Ревью до коммита", "text": "и никак иначе"}
+
+            await pilot.press("D")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            await pilot.pause()
+            assert calls["deleted"] == 1
+
+    asyncio.run(run())
+
+
+def test_rule_edit_screen_requires_a_title():
+    """Правило без сути — это заметка ни о чём: не сохраняем и говорим почему."""
+    from jwu.cli.workspace_screens import RuleEditScreen
+
+    data = _dash_data()
+    data.rules = []
+    saved: list = []
+    app = JwuDashboard(data, memory_fn=lambda: data,
+                       rule_create_fn=lambda v: saved.append(v),
+                       jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            app._tabs.active = "tab-rules"
+            await pilot.pause()
+            app.query_one("#t-rules", DataTable).focus()
+            await pilot.pause()
+            await pilot.press("N")
+            await pilot.pause()
+            await pilot.press("ctrl+s")          # суть не введена
+            await pilot.pause()
+            assert isinstance(app.screen, RuleEditScreen)   # модалка не закрылась
+            assert saved == []
+
+    asyncio.run(run())
+
+
+# --- скрываемая панель, модалки поиска и легенды --------------------------- #
+
+
+def test_changes_panel_hidden_by_default_and_toggled_by_b():
+    from jwu.core.models import Delta
+
+    data = _dash_data()
+    data.deltas = [Delta(key="A-1", kind="new_comment", summary="s", detail="+1 комм.")]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            col, splitter = app.query_one("#changes-col"), app.query_one("#splitter")
+            assert col.display is False and splitter.display is False
+            # даже скрытая панель наполнена — счётчик вкладки про изменения не врёт
+            assert "●1" in str(app._tabs.get_tab("tab-mine").label)
+
+            await pilot.press("b")
+            await pilot.pause()
+            assert col.display is True and splitter.display is True
+            await pilot.press("b")
+            await pilot.pause()
+            assert col.display is False and splitter.display is False
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_search_modal_opens_by_slash_and_cancels_cleanly():
+    from jwu.cli.workspace_screens import TextPromptScreen
+
+    calls: list = []
+    data = DashboardData(user="alice", mine=[_issue("A-1")])
+    app = JwuDashboard(data, issue_get_fn=lambda k: calls.append(k) or _issue(k),
+                       jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("/")
+            await pilot.pause()
+            assert isinstance(app.screen, TextPromptScreen)
+            await pilot.press("escape")          # передумал — ничего не грузим
+            await pilot.pause()
+            assert not isinstance(app.screen, TextPromptScreen)
+            assert calls == []
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_search_says_so_when_jira_is_off():
+    """Воркспейс без Jira: искать нечего — говорим прямо, а не открываем пустую модалку."""
+    from jwu.cli.workspace_screens import TextPromptScreen
+
+    data = DashboardData(user="alice", jira_enabled=False, bitbucket_enabled=False)
+    app = JwuDashboard(data)                     # issue_get_fn не передан
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            notes: list = []
+            app.notify = lambda *a, **k: notes.append(a)  # type: ignore[method-assign]
+            await pilot.press("/")
+            await pilot.pause()
+            assert not isinstance(app.screen, TextPromptScreen)
+            assert notes and "Jira" in notes[0][0]
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_legend_splits_page_keys_from_common():
+    """Легенда: сверху клавиши текущей вкладки, ниже общие; клавиши — символами."""
+    from jwu.cli.workspace_screens import LegendScreen
+
+    data = _dash_data()
+    data.jobs = [_job_at(0, 7)]
+    app = JwuDashboard(data, job_get_fn=lambda i: None, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            page, common, where = app._legend_sections()
+            assert where == "Мои задачи"
+            assert ("enter", "Открыть карточку задачи") in page   # основное действие вкладки
+            assert ("?", "Клавиши") in common and ("/", "Поиск задачи") in common
+            assert not any(k == "question_mark" for k, _ in common)  # не имена, а символы
+            # клавиши работ на вкладке задач не предлагаем
+            assert not any("Удалить работу" in d for _, d in page + common)
+
+            app._tabs.active = "tab-jobs"
+            await pilot.pause()
+            page, common, where = app._legend_sections()
+            assert where == "Работы"
+            assert ("D", "✕ Удалить работу") in page
+            assert ("x", "Закрыть работу") in page
+            assert ("?", "Клавиши") in common          # общие никуда не делись
+
+            await pilot.press("?")
+            await pilot.pause()
+            assert isinstance(app.screen, LegendScreen)
+            shown = _screen_text(app)
+            assert "На этой странице — Работы" in shown and "Общие" in shown
+            assert "Удалить работу" in shown
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, LegendScreen)
+
+    asyncio.run(run())
+
+
+def test_legend_on_detail_screen_shows_its_own_keys_once():
+    """В карточке свои клавиши, и перекрытые ими общие не дублируются ниже."""
+    app = JwuDashboard(_dash_data(), pr_detail_fn=_pr_detail_stub,
+                       jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("enter")           # карточка задачи
+            await pilot.pause()
+            page, common, where = app._legend_sections()
+            assert where == "карточка задачи"
+            assert ("esc / backspace", "← Назад") in page
+            assert ("p", "Открыть PR") in page
+            # `o` и `y` карточка перекрывает своими — в «Общих» их быть не должно
+            page_keys = {k for k, _ in page}
+            assert "o" in page_keys and "y" in page_keys
+            assert not (page_keys & {k for k, _ in common})
+            assert ("?", "Клавиши") in common
+            await pilot.press("escape")
+
+    asyncio.run(run())
+
+
+def test_tab_heads_carry_state_not_key_hints():
+    """Шапки вкладок — про состояние; перечень клавиш живёт только в легенде по «?»."""
+    data = _dash_data()
+    data.rules = [_rule()]
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            for selector in ("#ws-head", "#structure-head", "#rules-head"):
+                head = str(app.query_one(selector).render())
+                for hint in ("— добавить", "— удалить", "— править", "— переключиться",
+                             "— раскрыть", "— отвязать", "— открыть"):
+                    assert hint not in head, f"{selector}: {hint}"
+            assert "Правил: 1" in str(app.query_one("#rules-head").render())
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_empty_rules_tab_explains_itself():
+    """Пустая вкладка правил объясняет, зачем она; когда правила есть — не мозолит глаза."""
+    data = _dash_data()
+    data.rules = []
+    app = JwuDashboard(data, jira_base="https://jira.test")
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            head = str(app.query_one("#rules-head").render())
+            assert "Правил нет" in head and "агент обязан знать" in head
+            app.data.rules = [_rule()]
+            app._render()
+            await pilot.pause()
+            head = str(app.query_one("#rules-head").render())
+            assert "агент обязан знать" not in head and "Правил: 1" in head
             await pilot.press("q")
 
     asyncio.run(run())

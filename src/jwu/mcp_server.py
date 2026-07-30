@@ -5,10 +5,10 @@
 и — главное — ПЕРЕИСПОЛЬЗУЕМАЯ сессия. Сервис создаётся лениво и живёт на процесс,
 поэтому вход в Jira/SDESK (в т.ч. сессионный за гейтом) выполняется один раз.
 
-Read: workspaces, workspace_current, workspace_paths, workspace_suggest, task, prs, pr, builds, build, attachments, jobs,
-features. Write: workspace_create, workspace_add_path, workspace_remove_path,
-workspace_tag, workspace_use, note, worklog, job_start, job_add, job_link, job_status, feature_add,
-feature_status. Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
+Read: workspaces, workspace_current, workspace_paths, workspace_suggest, rules, tasks, task, changes,
+prs, pr, builds, build, attachments, jobs, features. Write: workspace_create, workspace_add_path, workspace_remove_path,
+workspace_tag, workspace_use, rule_add, rule_edit, rule_rm, note, worklog, job_start, job_add,
+job_link, job_status, feature_add, feature_status, feature_edit, feature_rm. Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
 только у `jwu_worklog` (таймтрекер Jira/SDESK) — вызывать по явному подтверждению.
 
 Всё работает в контексте ВОРКСПЕЙСА. По умолчанию он определяется по рабочей папке
@@ -35,7 +35,9 @@ from . import __version__
 from .core import workspaces as ws_mod
 from .core.config import db_path
 from .core.maintenance import ensure_db_available
-from .core.models import JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, Workspace
+from .core.models import (
+    JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, WORKSPACE_RULE_KINDS, Workspace,
+)
 from .core.service import Service
 from .core.store import Store
 
@@ -152,20 +154,29 @@ def _cleanup() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _workspace_payload(store: Store, ws: Workspace) -> dict:
+def _workspace_payload(store: Store, ws: Workspace, *, with_context: bool = True) -> dict:
+    """Карточка воркспейса. ``with_context=False`` — без правил и папок: в списке ВСЕХ
+    контуров они лишние (на вопрос «какие есть воркспейсы» не должны приезжать правила
+    каждого проекта), там хватает счётчиков."""
     store.use_workspace(ws.id)
     jobs = store.list_jobs()
-    return {
+    payload = {
         "id": ws.id,
         "slug": ws.slug,
         "name": ws.name,
         "jira_enabled": ws.jira_enabled,
         "bitbucket_enabled": ws.bitbucket_enabled,
-        "paths": [p.path for p in ws.paths],
         "jobs": len(jobs),
         "jobs_active": len([j for j in jobs if j.status == "active"]),
         "features": len(store.list_features()),
+        "rules": len(store.list_rules()),
     }
+    if with_context:
+        # Контекст проекта одним куском: папки с тегами (где что лежит) и правила
+        # текстом (как тут принято). Общие правила целиком, у остальных — только
+        # заголовки; полный текст правил своего репозитория — jwu_rules(tag=…).
+        payload.update(store.workspace_context())
+    return payload
 
 
 @mcp.tool()
@@ -176,7 +187,7 @@ async def jwu_workspaces() -> list[dict]:
     """
     store = _registry()
     items = store.list_workspaces()
-    payload = [_workspace_payload(store, ws) for ws in items]
+    payload = [_workspace_payload(store, ws, with_context=False) for ws in items]
     store.use_workspace(store._default_workspace_id())
     return payload
 
@@ -217,6 +228,36 @@ async def jwu_features(
                          f"Допустимо: {', '.join(LOCAL_FEATURE_STATUSES)}")
     store = _store_only(workspace)
     return [f.model_dump() for f in store.list_features(status=status)]
+
+
+@mcp.tool()
+async def jwu_tasks(
+    view: str = "mine",
+    jql: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> list[dict]:
+    """Список задач Jira по вью или произвольному JQL — то же, что `jwu tasks`.
+
+    ХОДИТ В СЕТЬ (в отличие от jwu_jobs/jwu_changes, которые читают память).
+    view: mine — задачи на мне. jql перекрывает view.
+
+    Про упоминания: `view="mentions"` идёт по СТАРОМУ пути (JQL + дотягивание карточки
+    каждого кандидата) и отдаёт ЗАДАЧИ, а не записи упоминаний. Сами упоминания —
+    отдельная сущность, она копится при синке и видна на вкладке «Упоминания» дашборда.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return [i.model_dump() for i in svc.tasks(view, jql=jql)]
+
+
+@mcp.tool()
+async def jwu_changes(workspace: Optional[str] = None) -> list[dict]:
+    """Накопленные изменения с прошлого синка — то же, что `jwu changes`. Без сети.
+
+    Дельты копятся, пока их не закроют явно (в дашборде — `c` / `C`): новые комментарии,
+    смена статуса, новые PR и коммиты, апрувы, merge-конфликты, исчезновение из выборки.
+    Полезно как быстрый ответ на «что поменялось, пока меня не было».
+    """
+    return [d.model_dump() for d in _store_only(workspace).pending_changes()]
 
 
 @mcp.tool()
@@ -546,6 +587,97 @@ async def jwu_workspace_tag(
 
 
 @mcp.tool()
+async def jwu_rules(
+    kind: Optional[str] = None,
+    tag: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ПРАВИЛА ВОРКСПЕЙСА целиком: что нельзя делать, как что делается, общая инфа.
+
+    Это знание о проекте, которого нет в коде: запреты (⛔ constraint — обязательны
+    к исполнению), инструкции (howto — как поднять стенд, прогнать тесты), соглашения
+    (convention — ветки, формат коммита), грабли (gotcha) и справка (info).
+
+    tag — тег папки («legacy-бэкенд», «фронт»): вернёт правила ЭТОГО репозитория ПЛЮС
+    общие. Вызывай с тегом, как только понял, где именно правишь: в
+    jwu_workspace_current правила с тегами приходят только списком, без текста.
+    """
+    if kind is not None and kind not in WORKSPACE_RULE_KINDS:
+        raise ValueError(f"Недопустимый тип {kind!r}. "
+                         f"Допустимо: {', '.join(WORKSPACE_RULE_KINDS)}")
+    store = _store_only(workspace)
+    if kind is not None:
+        rows = store.list_rules(kind=kind, tag=tag)
+        body = "\n".join(f"- #{r.id} {r.title}" + (f"\n      {r.text}" if r.text else "")
+                          for r in rows) or "правил такого типа нет"
+        return {"workspace": _resolve(workspace).slug, "kind": kind, "tag": tag,
+                "rules_md": body, "known_tags": store.all_tags(store.workspace_id)}
+    return {
+        "workspace": _resolve(workspace).slug,
+        "tag": tag,
+        "rules_md": store.rules_markdown(tag=tag) or "правил в этом воркспейсе нет",
+        "known_tags": store.all_tags(store.workspace_id),
+    }
+
+
+@mcp.tool()
+async def jwu_rule_add(
+    title: str,
+    text: str = "",
+    kind: str = "info",
+    tag: str = "",
+    workspace: Optional[str] = None,
+) -> dict:
+    """Записать правило воркспейса — то, что должно пережить эту сессию.
+
+    Зови, когда пользователь формулирует что-то про ПРОЕКТ, а не про текущую задачу:
+    «никогда не пушь в develop», «стенд поднимается так-то», «фронт лежит там-то».
+    Разовое ограничение конкретного цикла работы — это jwu_job_add(kind='constraint'),
+    а не правило.
+
+    title — суть одной строкой (её видно в списках), text — подробности (можно
+    многострочные). kind: constraint | howto | info | convention | gotcha.
+    tag — тег папки, если правило только про этот репозиторий; иначе правило общее.
+    """
+    if kind not in WORKSPACE_RULE_KINDS:
+        raise ValueError(f"Недопустимый тип {kind!r}. "
+                         f"Допустимо: {', '.join(WORKSPACE_RULE_KINDS)}")
+    store = _store_only(workspace)
+    return store.add_rule(title, text=text, kind=kind, tag=tag).model_dump()
+
+
+@mcp.tool()
+async def jwu_rule_edit(
+    rule_id: int,
+    title: Optional[str] = None,
+    text: Optional[str] = None,
+    kind: Optional[str] = None,
+    tag: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Изменить правило воркспейса. Передавай только те поля, что меняешь."""
+    if kind is not None and kind not in WORKSPACE_RULE_KINDS:
+        raise ValueError(f"Недопустимый тип {kind!r}. "
+                         f"Допустимо: {', '.join(WORKSPACE_RULE_KINDS)}")
+    store = _store_only(workspace)
+    if store.get_rule(rule_id) is None:
+        raise ValueError(f"Правило #{rule_id} не найдено в этом воркспейсе")
+    store.update_rule(rule_id, title=title, text=text, kind=kind, tag=tag)
+    return store.get_rule(rule_id).model_dump()
+
+
+@mcp.tool()
+async def jwu_rule_rm(rule_id: int, workspace: Optional[str] = None) -> dict:
+    """Удалить правило воркспейса (правило устарело / больше не действует)."""
+    store = _store_only(workspace)
+    rule = store.get_rule(rule_id)
+    if rule is None:
+        raise ValueError(f"Правило #{rule_id} не найдено в этом воркспейсе")
+    store.delete_rule(rule_id)
+    return {"removed": rule.model_dump()}
+
+
+@mcp.tool()
 async def jwu_workspace_use(workspace: str) -> dict:
     """Сделать воркспейс активным по умолчанию.
 
@@ -607,6 +739,44 @@ async def jwu_note(key: str, text: str, workspace: Optional[str] = None) -> dict
 
 
 @mcp.tool()
+async def jwu_feature_edit(
+    ref: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    priority: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Изменить локальную фичу (ref — id или ключ вида HOMEJWU-1).
+
+    Передавай только те поля, что меняешь. Смена статуса — отдельный jwu_feature_status.
+    """
+    store = _store_only(workspace)
+    feature = store.get_feature(ref)
+    if feature is None:
+        raise ValueError(f"Фича {ref!r} не найдена в этом воркспейсе")
+    store.update_feature(feature.id, title=title, description=description,
+                         priority=priority)
+    return _stamp(store.get_feature(feature.id).model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_feature_rm(ref: str, workspace: Optional[str] = None) -> dict:
+    """Удалить локальную фичу. Работы по ней остаются, но теряют якорь.
+
+    Необратимо — зови только по явной просьбе пользователя. Если фича просто больше
+    не актуальна, честнее сменить статус на cancelled (jwu_feature_status).
+    """
+    store = _store_only(workspace)
+    feature = store.get_feature(ref)
+    if feature is None:
+        raise ValueError(f"Фича {ref!r} не найдена в этом воркспейсе")
+    linked = store.list_jobs(feature_id=feature.id)
+    store.delete_feature(feature.id)
+    return _stamp({"removed": feature.model_dump(), "jobs_unanchored": len(linked)},
+                  _resolve(workspace))
+
+
+@mcp.tool()
 async def jwu_job_start(
     task_key: str = "",
     title: str = "",
@@ -636,6 +806,9 @@ async def jwu_job_start(
     payload["existing_jobs"] = [
         {"id": j.id, "status": j.status, "title": j.title} for j in existing
     ]
+    # Контекст проекта приезжает ровно в момент старта работы: даже если скилл пропустил
+    # шаг с jwu_workspace_current, папки с тегами и правила окажутся в контексте ДО правок.
+    payload.update(store.workspace_context())
     return _stamp(payload, _resolve(workspace))
 
 

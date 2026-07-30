@@ -4,7 +4,7 @@
 создаёт запись в ``sync_runs`` и кладёт снапшот по каждой задаче/PR. Дельты считаются
 сравнением последнего снапшота сущности с предыдущим (по предыдущему синку, где она встречалась).
 
-Все локальные данные принадлежат воркспейсу (``workspace_id``): работы, заметки, анализы,
+Все локальные данные принадлежат воркспейсу (``workspace_id``): работы, заметки, упоминания,
 снапшоты, накопленные изменения и прогоны синка. ``Store`` открывается в скоупе одного
 воркспейса и сам подставляет фильтр во все запросы — снаружи API методов от этого не зависит.
 """
@@ -15,12 +15,13 @@ import json
 import re
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import (
-    Analysis, Delta, Issue, Job, JobPRLink, JobRecord, LocalFeature, Note, PR,
-    Workspace, WorkspacePath,
+    WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS, Delta, Issue, Job, JobPRLink,
+    JobRecord, LocalFeature, Mention, Note, PR, Workspace, WorkspacePath, WorkspaceRule,
 )
 
 # Префикс ключей локальных фич должен читаться как ключ Jira: HOMEJWU-1, FEAT-3.
@@ -33,7 +34,7 @@ DEFAULT_WORKSPACE_NAME = "Работа"
 # Таблицы, скоупнутые по воркспейсу (у каждой есть колонка workspace_id).
 WORKSPACE_SCOPED_TABLES = (
     "sync_runs", "issue_snapshots", "pr_snapshots",
-    "notes", "analyses", "jobs", "pending_changes",
+    "notes", "mentions", "mention_scans", "workspace_rules", "jobs", "pending_changes",
 )
 
 SCHEMA = """
@@ -115,12 +116,40 @@ CREATE TABLE IF NOT EXISTS notes (
     workspace_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_notes_key ON notes(key);
-CREATE TABLE IF NOT EXISTS analyses (
+CREATE TABLE IF NOT EXISTS workspace_rules (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at   TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'info',
     title        TEXT NOT NULL DEFAULT '',
-    content      TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0
+    text         TEXT NOT NULL DEFAULT '',
+    tag          TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ws_rules ON workspace_rules(workspace_id, kind, id);
+CREATE TABLE IF NOT EXISTS mentions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    task_key     TEXT NOT NULL,
+    comment_id   TEXT NOT NULL,
+    author       TEXT NOT NULL DEFAULT '',
+    text         TEXT NOT NULL DEFAULT '',
+    created      TEXT NOT NULL DEFAULT '',
+    summary      TEXT NOT NULL DEFAULT '',
+    seen         INTEGER NOT NULL DEFAULT 0,
+    added_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mentions_comment
+    ON mentions(workspace_id, task_key, comment_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_ws ON mentions(workspace_id, id DESC);
+-- До какой версии задачи мы уже разобрали её комментарии. Без этого каждый синк
+-- пришлось бы заново тянуть карточку по всем кандидатам из JQL.
+CREATE TABLE IF NOT EXISTS mention_scans (
+    workspace_id  INTEGER NOT NULL,
+    task_key      TEXT NOT NULL,
+    issue_updated TEXT NOT NULL DEFAULT '',
+    scanned_at    TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, task_key)
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,13 +215,28 @@ CREATE INDEX IF NOT EXISTS idx_pr_snap_ws    ON pr_snapshots(workspace_id, pr_id
 CREATE INDEX IF NOT EXISTS idx_sync_runs_ws  ON sync_runs(workspace_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_ws       ON jobs(workspace_id, task_key);
 CREATE INDEX IF NOT EXISTS idx_notes_ws      ON notes(workspace_id, key);
-CREATE INDEX IF NOT EXISTS idx_analyses_ws   ON analyses(workspace_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_pending_ws    ON pending_changes(workspace_id);
 """
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class PruneReport:
+    """Что унесла (или унесла бы — при dry_run) чистка снапшотов."""
+
+    issue_snapshots: int = 0
+    pr_snapshots: int = 0
+    sync_runs: int = 0
+    protected_runs: int = 0
+    days: int = 0
+    dry_run: bool = True
+
+    @property
+    def total(self) -> int:
+        return self.issue_snapshots + self.pr_snapshots + self.sync_runs
 
 
 def _issue_signature(issue: Issue) -> dict:
@@ -221,7 +265,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -316,11 +360,23 @@ def _m005_path_tags(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_path_tags_tag ON workspace_path_tags(tag)")
 
 
+def _m006_drop_analyses(conn: sqlite3.Connection) -> None:
+    """v5 → v6: «анализы» (сохранённые планы дня) убраны из продукта целиком.
+
+    Их писал только `jwu analysis save`, читала одна вкладка дашборда — а ценность
+    дублировалась работами (jobs). Таблицу сносим: половина функции хуже её отсутствия.
+    Резервная копия БД снимается автоматически перед структурной миграцией.
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_analyses_ws")
+    conn.execute("DROP TABLE IF EXISTS analyses")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
     (4, _m004_secrets),
     (5, _m005_path_tags),
+    (6, _m006_drop_analyses),
 ]
 
 
@@ -392,7 +448,7 @@ class Store:
             )
 
     def _has_any_data(self) -> bool:
-        for table in ("sync_runs", "jobs", "notes", "analyses"):
+        for table in ("sync_runs", "jobs", "notes"):
             row = self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
             if row:
                 return True
@@ -1082,12 +1138,14 @@ class Store:
         cur_counts = json.loads(run["counts"] or "{}")
         out: list[Delta] = []
 
+        # Только «мои задачи»: упоминания больше не задачи в выборке, а самостоятельные
+        # записи (таблица mentions) — «уйти из выборки» им попросту некуда.
         live_issues: set[str] = set()
-        for v in ("mine", "mentions"):
+        for v in ("mine",):
             r = self._membership_run(v, f"tasks:{v}")
             if r is not None:
                 live_issues |= self._issue_members_in_run(r, v)
-        for v in ("mine", "mentions"):
+        for v in ("mine",):
             if v not in cur_views or f"tasks:{v}" not in cur_counts:
                 continue
             prev_run = self._membership_run(v, f"tasks:{v}", before=run_id)
@@ -1120,6 +1178,157 @@ class Store:
                     detail="пропал из списка (вероятно смержен / отклонён)",
                 ))
         return out
+
+    # --- чистка снапшотов ------------------------------------------------ #
+
+    def _protected_run_ids(self) -> set[int]:
+        """Прогоны, которые удалять нельзя: на них держится расчёт дельт.
+
+        Это последний прогон вообще плюс, по каждой вкладке, последний прогон с ней
+        в ``views`` и последний НАДЁЖНЫЙ (см. ``_membership_run``). Без них
+        ``_gone_deltas`` теряет базу сравнения и на следующем же синке объявляет
+        «ушла из выборки» всё, что там было.
+        """
+        keep: set[int] = set()
+        latest = self.latest_run_id()
+        if latest is not None:
+            keep.add(latest)
+        last_by_token: dict[str, int] = {}
+        for row in self.conn.execute(
+            "SELECT id, views FROM sync_runs WHERE workspace_id = ? ORDER BY id DESC",
+            (self.workspace_id,),
+        ):
+            for token in json.loads(row["views"]):
+                last_by_token.setdefault(token, row["id"])
+        keep |= set(last_by_token.values())
+        for token in last_by_token:
+            # ключ в counts у задач и PR назван по-разному (см. _sync_tasks/_sync_prs)
+            count_key = token if token.startswith("prs:") else f"tasks:{token}"
+            reliable = self._membership_run(token, count_key)
+            if reliable is not None:
+                keep.add(reliable)
+        return keep
+
+    def prune_snapshots(self, *, days: int = 30, dry_run: bool = True) -> PruneReport:
+        """Удалить снапшоты текущего воркспейса старше ``days`` дней.
+
+        Снапшоты нужны ровно для сравнения соседних синков, но копятся вечно — на
+        рабочей базе это десятки тысяч строк и гигабайт файла. Удаляем по возрасту,
+        сохраняя всё, без чего поедут дельты:
+
+        - свежайший снапшот КАЖДОЙ сущности (иначе на следующем синке она «новая»);
+        - свежайший снапшот задачи с достоверной dev-панелью — база для ``new_pr``
+          (см. ``_prev_reliable_pr_ids``);
+        - всё, что принадлежит защищённым прогонам (``_protected_run_ids``).
+
+        ``dry_run`` считает то же самое по-настоящему и откатывает транзакцию, поэтому
+        цифры отчёта точные, а не оценка. Операция необратима — по умолчанию сухая.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        protected = self._protected_run_ids() or {-1}
+        holes = ",".join("?" * len(protected))
+        runs = list(protected)
+        wid = self.workspace_id
+        report = PruneReport(dry_run=dry_run, days=days, protected_runs=len(protected))
+
+        issues = self.conn.execute(
+            f"DELETE FROM issue_snapshots WHERE workspace_id = ? AND fetched_at < ?"
+            f" AND sync_run_id NOT IN ({holes})"
+            "  AND id NOT IN (SELECT MAX(id) FROM issue_snapshots"
+            "                 WHERE workspace_id = ? GROUP BY key)"
+            "  AND id NOT IN (SELECT MAX(id) FROM issue_snapshots WHERE workspace_id = ?"
+            "                 AND COALESCE(json_extract(signature, '$.dev_ok'), 1) = 1"
+            "                 GROUP BY key)",
+            [wid, cutoff, *runs, wid, wid],
+        )
+        report.issue_snapshots = issues.rowcount
+
+        prs = self.conn.execute(
+            f"DELETE FROM pr_snapshots WHERE workspace_id = ? AND fetched_at < ?"
+            f" AND sync_run_id NOT IN ({holes})"
+            "  AND id NOT IN (SELECT MAX(id) FROM pr_snapshots"
+            "                 WHERE workspace_id = ? GROUP BY pr_id)",
+            [wid, cutoff, *runs, wid],
+        )
+        report.pr_snapshots = prs.rowcount
+
+        # Прогоны сносим последними и только опустевшие: пустая запись прогона стоит
+        # копейки, но каждый её обход — это скан в _membership_run на каждом чтении.
+        empty = self.conn.execute(
+            f"DELETE FROM sync_runs WHERE workspace_id = ? AND started_at < ?"
+            f" AND id NOT IN ({holes})"
+            "  AND id NOT IN (SELECT sync_run_id FROM issue_snapshots WHERE workspace_id = ?)"
+            "  AND id NOT IN (SELECT sync_run_id FROM pr_snapshots WHERE workspace_id = ?)",
+            [wid, cutoff, *runs, wid, wid],
+        )
+        report.sync_runs = empty.rowcount
+
+        if dry_run:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        return report
+
+    def prune_all_workspaces(
+        self, *, days: int = 30, dry_run: bool = True
+    ) -> dict[str, PruneReport]:
+        """Чистка по всем контурам: файл БД общий, и растёт он от всех сразу."""
+        current = self.workspace_id
+        out: dict[str, PruneReport] = {}
+        try:
+            for ws in self.list_workspaces(include_archived=True):
+                self.use_workspace(ws.id)
+                out[ws.slug] = self.prune_snapshots(days=days, dry_run=dry_run)
+        finally:
+            self.use_workspace(current)
+        return out
+
+    def snapshot_counts(self) -> dict[str, int]:
+        """Сколько снапшотов и прогонов лежит в текущем воркспейсе."""
+        def count(sql: str) -> int:
+            return self.conn.execute(sql, (self.workspace_id,)).fetchone()[0]
+
+        return {
+            "issue_snapshots": count(
+                "SELECT COUNT(*) FROM issue_snapshots WHERE workspace_id = ?"),
+            "issue_keys": count(
+                "SELECT COUNT(DISTINCT key) FROM issue_snapshots WHERE workspace_id = ?"),
+            "pr_snapshots": count(
+                "SELECT COUNT(*) FROM pr_snapshots WHERE workspace_id = ?"),
+            "pr_ids": count(
+                "SELECT COUNT(DISTINCT pr_id) FROM pr_snapshots WHERE workspace_id = ?"),
+            "sync_runs": count("SELECT COUNT(*) FROM sync_runs WHERE workspace_id = ?"),
+        }
+
+    # --- размер файла и VACUUM ------------------------------------------- #
+
+    def db_size(self) -> int:
+        """Размер файла БД в байтах (0 — если файла ещё нет)."""
+        try:
+            return Path(self.path).stat().st_size
+        except OSError:
+            return 0
+
+    def free_ratio(self) -> float:
+        """Доля страниц, освободившихся после удалений (их и вернёт VACUUM)."""
+        free = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        total = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        return (free / total) if total else 0.0
+
+    def vacuum(self) -> int:
+        """Пересобрать файл БД, вернув место ОС. Отдаёт, сколько байт освободилось.
+
+        Дорого (для гигабайта — десятки секунд и двойной объём на диске), поэтому
+        зовётся по порогу, а не после каждой чистки.
+        """
+        before = self.db_size()
+        previous = self.conn.isolation_level
+        self.conn.isolation_level = None  # VACUUM нельзя выполнить внутри транзакции
+        try:
+            self.conn.execute("VACUUM")
+        finally:
+            self.conn.isolation_level = previous
+        return max(0, before - self.db_size())
 
     # --- накопленные изменения (копятся, пока не закрыты явно) ----------- #
 
@@ -1206,47 +1415,255 @@ class Store:
             for r in rows
         ]
 
-    # --- анализы (дневные планы) ---------------------------------------- #
+    # --- упоминания ------------------------------------------------------ #
 
-    def save_analysis(self, content: str, title: str = "") -> Analysis:
-        ts = _now()
-        cur = self.conn.execute(
-            "INSERT INTO analyses (created_at, title, content, workspace_id) VALUES (?, ?, ?, ?)",
-            (ts, title, content, self.workspace_id),
+    @staticmethod
+    def _mention_from_row(row) -> Mention:
+        return Mention(
+            id=row["id"], task_key=row["task_key"], comment_id=row["comment_id"],
+            author=row["author"], text=row["text"], created=row["created"],
+            summary=row["summary"], seen=bool(row["seen"]), added_at=row["added_at"],
         )
-        self.conn.commit()
-        return Analysis(id=int(cur.lastrowid), created_at=ts, title=title, content=content)
 
-    def list_analyses(self, limit: int = 50) -> list[Analysis]:
-        """Список без полного content (только метаданные), новые сверху."""
+    def add_mentions(self, mentions: list[Mention]) -> list[Mention]:
+        """Дописать упоминания, пропуская уже известные. Возвращает только новые.
+
+        Повтор определяется парой (задача, комментарий): один и тот же комментарий,
+        увиденный в десяти синках подряд, остаётся одной записью.
+        """
+        added: list[Mention] = []
+        ts = _now()
+        for m in mentions:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO mentions"
+                " (workspace_id, task_key, comment_id, author, text, created, summary,"
+                "  seen, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (self.workspace_id, m.task_key, m.comment_id, m.author, m.text,
+                 m.created, m.summary, ts),
+            )
+            if cur.rowcount:
+                added.append(m.model_copy(update={"id": int(cur.lastrowid), "added_at": ts}))
+        self.conn.commit()
+        return added
+
+    def list_mentions(self, limit: int = 200) -> list[Mention]:
+        """Упоминания, свежие сверху (по дате комментария, затем по порядку появления)."""
         rows = self.conn.execute(
-            "SELECT id, created_at, title FROM analyses WHERE workspace_id = ?"
-            " ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM mentions WHERE workspace_id = ?"
+            " ORDER BY created DESC, id DESC LIMIT ?",
             (self.workspace_id, limit),
         ).fetchall()
-        return [
-            Analysis(id=r["id"], created_at=r["created_at"], title=r["title"])
-            for r in rows
-        ]
+        return [self._mention_from_row(r) for r in rows]
 
-    def get_analysis(self, analysis_id: int | None = None) -> Analysis | None:
-        """Анализ по id; без id — последний."""
-        if analysis_id is None:
-            row = self.conn.execute(
-                "SELECT id, created_at, title, content FROM analyses WHERE workspace_id = ?"
-                " ORDER BY id DESC LIMIT 1",
-                (self.workspace_id,),
-            ).fetchone()
-        else:
-            row = self.conn.execute(
-                "SELECT id, created_at, title, content FROM analyses"
-                " WHERE id = ? AND workspace_id = ?",
-                (analysis_id, self.workspace_id),
-            ).fetchone()
-        if not row:
-            return None
-        return Analysis(id=row["id"], created_at=row["created_at"],
-                        title=row["title"], content=row["content"])
+    def unseen_mentions(self) -> list[Mention]:
+        rows = self.conn.execute(
+            "SELECT * FROM mentions WHERE workspace_id = ? AND seen = 0"
+            " ORDER BY created DESC, id DESC",
+            (self.workspace_id,),
+        ).fetchall()
+        return [self._mention_from_row(r) for r in rows]
+
+    def mark_mentions_seen(self, mention_ids: list[int] | None = None) -> None:
+        """Пометить упоминания прочитанными: все (None) или перечисленные."""
+        if mention_ids is None:
+            self.conn.execute(
+                "UPDATE mentions SET seen = 1 WHERE workspace_id = ?", (self.workspace_id,)
+            )
+        elif mention_ids:
+            self.conn.executemany(
+                "UPDATE mentions SET seen = 1 WHERE id = ? AND workspace_id = ?",
+                [(mid, self.workspace_id) for mid in mention_ids],
+            )
+        self.conn.commit()
+
+    def mention_scan_state(self) -> dict[str, str]:
+        """task_key → значение поля updated задачи на момент последнего разбора."""
+        rows = self.conn.execute(
+            "SELECT task_key, issue_updated FROM mention_scans WHERE workspace_id = ?",
+            (self.workspace_id,),
+        ).fetchall()
+        return {r["task_key"]: r["issue_updated"] for r in rows}
+
+    def set_mention_scans(self, scans: list[tuple[str, str]]) -> None:
+        """Отметить разобранные задачи пачкой: (task_key, issue_updated).
+
+        Одним коммитом, а не по строке: на первом синке кандидатов из JQL — сотня,
+        и сотня коммитов подряд ничего не даёт, кроме нагрузки. Потеря пачки при
+        падении безопасна — задачи просто разберутся заново на следующем синке.
+        """
+        if not scans:
+            return
+        ts = _now()
+        self.conn.executemany(
+            "INSERT INTO mention_scans (workspace_id, task_key, issue_updated, scanned_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(workspace_id, task_key) DO UPDATE SET"
+            "   issue_updated = excluded.issue_updated, scanned_at = excluded.scanned_at",
+            [(self.workspace_id, key, updated, ts) for key, updated in scans],
+        )
+        self.conn.commit()
+
+    def set_mention_scan(self, task_key: str, issue_updated: str) -> None:
+        self.set_mention_scans([(task_key, issue_updated)])
+
+    # --- правила воркспейса ---------------------------------------------- #
+
+    @staticmethod
+    def _rule_from_row(row) -> WorkspaceRule:
+        return WorkspaceRule(
+            id=row["id"], workspace_id=row["workspace_id"], kind=row["kind"],
+            title=row["title"], text=row["text"], tag=row["tag"],
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _check_rule_kind(kind: str) -> str:
+        if kind not in WORKSPACE_RULE_KINDS:
+            raise ValueError(
+                f"Неизвестный тип правила: {kind!r}. "
+                f"Допустимо: {', '.join(WORKSPACE_RULE_KINDS)}"
+            )
+        return kind
+
+    def add_rule(self, title: str, *, text: str = "", kind: str = "info",
+                 tag: str = "") -> WorkspaceRule:
+        """Завести правило контура. ``tag`` пустой — правило общее для воркспейса."""
+        self._check_rule_kind(kind)
+        ts = _now()
+        cur = self.conn.execute(
+            "INSERT INTO workspace_rules"
+            " (workspace_id, kind, title, text, tag, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.workspace_id, kind, title, text, tag.strip(), ts, ts),
+        )
+        self.conn.commit()
+        return WorkspaceRule(
+            id=int(cur.lastrowid), workspace_id=self.workspace_id, kind=kind,
+            title=title, text=text, tag=tag.strip(), created_at=ts, updated_at=ts,
+        )
+
+    def list_rules(self, *, kind: str | None = None,
+                   tag: str | None = None) -> list[WorkspaceRule]:
+        """Правила контура. ``tag=""`` — только общие, ``tag="x"`` — общие И правила тега.
+
+        Правила тега без общих не отдаём намеренно: общие действуют везде, и выдача
+        «только по тегу» подталкивала бы агента считать, что кроме них ничего нет.
+        """
+        conds, params = ["workspace_id = ?"], [self.workspace_id]
+        if kind is not None:
+            conds.append("kind = ?")
+            params.append(self._check_rule_kind(kind))
+        if tag is not None:
+            tag = tag.strip()
+            if tag:
+                conds.append("(tag = '' OR tag = ?)")
+                params.append(tag)
+            else:
+                conds.append("tag = ''")
+        rows = self.conn.execute(
+            f"SELECT * FROM workspace_rules WHERE {' AND '.join(conds)}"
+            " ORDER BY tag, kind, id",
+            params,
+        ).fetchall()
+        return [self._rule_from_row(r) for r in rows]
+
+    def get_rule(self, rule_id: int) -> WorkspaceRule | None:
+        row = self.conn.execute(
+            "SELECT * FROM workspace_rules WHERE id = ? AND workspace_id = ?",
+            (rule_id, self.workspace_id),
+        ).fetchone()
+        return self._rule_from_row(row) if row else None
+
+    def update_rule(self, rule_id: int, **fields) -> None:
+        allowed = {"kind", "title", "text", "tag"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"Неизвестное поле правила: {key}")
+            if value is None:
+                continue
+            if key == "kind":
+                self._check_rule_kind(value)
+            sets.append(f"{key} = ?")
+            params.append(value.strip() if key == "tag" else value)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.extend([_now(), rule_id, self.workspace_id])
+        self.conn.execute(
+            f"UPDATE workspace_rules SET {', '.join(sets)} WHERE id = ? AND workspace_id = ?",
+            params,
+        )
+        self.conn.commit()
+
+    def delete_rule(self, rule_id: int) -> None:
+        self.conn.execute(
+            "DELETE FROM workspace_rules WHERE id = ? AND workspace_id = ?",
+            (rule_id, self.workspace_id),
+        )
+        self.conn.commit()
+
+    def rules_markdown(self, *, tag: str | None = None) -> str:
+        """Правила контура текстом — их не парсят, их читают и исполняют.
+
+        JSON тут проигрывает по всем статьям: служебные поля (workspace_id, даты) агенту
+        не нужны и просто занимают контекст, многострочная инструкция превращается в
+        строку с \n-эскейпами, а «⛔ ЗАПРЕТ», поданный как ``"kind": "constraint"``,
+        теряет весь нажим. Идентификаторы в тексте оставляем — по ним правят и удаляют.
+
+        Общие правила выводятся целиком; правила с тегами — только заголовками, а с
+        ``tag`` целиком выводится ещё и запрошенный тег (см. jwu_rules).
+        """
+        rules = self.list_rules()
+        if not rules:
+            return ""
+        tag = (tag or "").strip()
+
+        def block(rule: WorkspaceRule, *, full: bool) -> str:
+            label = WORKSPACE_RULE_BADGES.get(rule.kind, (rule.kind, ""))[0]
+            scope = f" [#{rule.tag}]" if rule.tag else ""
+            head = f"- #{rule.id} {label}{scope} — {rule.title}"
+            if full and rule.text:
+                body = "\n".join(f"      {line}" for line in rule.text.splitlines())
+                return f"{head}\n{body}"
+            return head
+
+        out = ["### Правила воркспейса", ""]
+        general = [r for r in rules if not r.tag]
+        if general:
+            out.append("**Общие** — действуют во всех папках контура:")
+            out += [block(r, full=True) for r in general]
+            out.append("")
+        scoped = [r for r in rules if r.tag]
+        if tag:
+            here = [r for r in scoped if r.tag == tag]
+            if here:
+                out.append(f"**Только для #{tag}:**")
+                out += [block(r, full=True) for r in here]
+                out.append("")
+            scoped = [r for r in scoped if r.tag != tag]
+        if scoped:
+            out.append("**У других тегов** (полный текст — `jwu_rules(tag=…)`):")
+            out += [block(r, full=False) for r in scoped]
+            out.append("")
+        return "\n".join(out).strip()
+
+    def workspace_context(self, *, tag: str | None = None) -> dict:
+        """Общая инфа о контуре для агента: ГДЕ код и КАК тут принято работать.
+
+        Один блок на оба вопроса — папки с тегами (по ним понятно, что где лежит) и
+        правила. Собран здесь, а не в вызывающих, чтобы MCP, CLI и ответ на старт работы
+        давали агенту ровно один и тот же контекст: расхождения тут — это когда агент
+        через один путь видит теги, а через другой нет.
+        """
+        paths = self.workspace_paths(self.workspace_id)
+        return {
+            # структуру агент фильтрует («папка с тегом фронт») — тут JSON на месте
+            "paths": [{"path": p.path, "label": p.label, "tags": p.tags} for p in paths],
+            "known_tags": self.all_tags(self.workspace_id),
+            # правила агент читает и исполняет — тут текст дешевле и доходчивее
+            "rules_md": self.rules_markdown(tag=tag),
+        }
 
     # --- локальные фичи (мини-трекер воркспейса) ------------------------- #
 

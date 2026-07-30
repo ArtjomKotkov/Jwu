@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import date
 
 import pytest
 
@@ -73,3 +74,78 @@ def test_ensure_available_raises_on_icloud_placeholder(tmp_path):
     (tmp_path / ".state.db.icloud").write_text("")  # iCloud выгрузил файл
     with pytest.raises(ConfigError):
         ensure_db_available(db)
+
+
+# --- ежедневная чистка снапшотов ------------------------------------------ #
+
+
+def _store_with_old_snapshots(db, runs=6):
+    """Store с историей снапшотов, состаренной на 60 дней."""
+    from datetime import datetime, timedelta, timezone
+
+    from jwu.core.models import Issue
+    from jwu.core.store import Store
+
+    store = Store(db)
+    old = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    for n in range(runs):
+        run = store.start_sync_run(["mine"])
+        store.save_issue_snapshot(run, Issue(key="PROJ-1", summary="s" * 500), ["mine"])
+        store.finish_sync_run(run, {"tasks:mine": 1})
+        store.conn.execute("UPDATE sync_runs SET started_at = ? WHERE id = ?", (old, run))
+        store.conn.execute(
+            "UPDATE issue_snapshots SET fetched_at = ? WHERE sync_run_id = ?", (old, run))
+    store.conn.commit()
+    return store
+
+
+def test_daily_prune_skips_small_db(tmp_path):
+    """Маленькую базу не трогаем вовсе — необратимая операция без нужды не нужна."""
+    from jwu.core.maintenance import run_daily_prune
+
+    db = tmp_path / "state.db"
+    store = _store_with_old_snapshots(db)
+    bdir = tmp_path / "backups"
+    bdir.mkdir()
+    (bdir / f"state.db.bak-{date.today().isoformat()}").write_text("x")
+    before = store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0]
+
+    assert run_daily_prune(store, db, backups_dir=bdir) == []
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == before
+    store.close()
+
+
+def test_daily_prune_refuses_without_todays_backup(tmp_path):
+    """Нет сегодняшнего бэкапа — не чистим: откатываться было бы некуда."""
+    from jwu.core.maintenance import run_daily_prune
+
+    db = tmp_path / "state.db"
+    store = _store_with_old_snapshots(db)
+    bdir = tmp_path / "backups"
+    bdir.mkdir()
+    before = store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0]
+
+    msgs = run_daily_prune(store, db, backups_dir=bdir, min_bytes=0)
+    assert msgs and "бэкапа" in msgs[0]
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == before
+    store.close()
+
+
+def test_daily_prune_runs_once_a_day(tmp_path):
+    from jwu.core.maintenance import run_daily_prune
+
+    db = tmp_path / "state.db"
+    store = _store_with_old_snapshots(db)
+    bdir = tmp_path / "backups"
+    bdir.mkdir()
+    (bdir / f"state.db.bak-{date.today().isoformat()}").write_text("x")
+
+    msgs = run_daily_prune(store, db, backups_dir=bdir, min_bytes=0)
+    assert msgs and "чистка снапшотов" in msgs[0]
+    assert store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == 1
+
+    # второй вызов в тот же день — молча ничего не делает
+    assert run_daily_prune(store, db, backups_dir=bdir, min_bytes=0) == []
+    store.close()

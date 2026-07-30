@@ -421,3 +421,66 @@ def test_my_worklogs_on_filters_author_and_date(tmp_path):
     assert data["PROJ-1"][0]["time"] == "2h"
     assert data["PROJ-1"][0]["comment"] == "Ревью"
     svc.close()
+
+
+@respx.mock
+def test_collect_mentions_records_event_once(tmp_path):
+    """Упоминание — событие: запись создаётся один раз и не пересоздаётся на каждом синке."""
+    issue = jira_issue_raw(comments=[
+        {"id": 1, "author": "Боб", "body": "обычный коммент"},
+        {"id": 2, "author": "Кэрол", "body": "глянь [~alice] плиз"},
+    ])
+    respx.get(f"{JIRA}/rest/api/2/search").mock(
+        return_value=httpx.Response(200, json=jira_search_raw([issue]))
+    )
+    detail = respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1").mock(
+        return_value=httpx.Response(200, json=issue)
+    )
+
+    svc = _service(tmp_path)
+    svc.cfg.jira.username = "alice"
+    try:
+        added = svc.collect_mentions()
+        assert [(m.task_key, m.comment_id, m.author) for m in added] == [
+            ("PROJ-1", "2", "Кэрол")
+        ]
+        assert svc.store.list_mentions()[0].text == "глянь [~alice] плиз"
+        assert svc.store.list_mentions()[0].seen is False
+
+        calls = detail.call_count
+        # задача не менялась → карточку заново не тянем и дубля не создаём
+        assert svc.collect_mentions() == []
+        assert detail.call_count == calls
+        assert len(svc.store.list_mentions()) == 1
+    finally:
+        svc.close()
+
+
+@respx.mock
+def test_collect_mentions_rescans_changed_issue(tmp_path):
+    """Задача обновилась → карточку перечитываем и подхватываем новое упоминание."""
+    first = jira_issue_raw(comments=[{"id": 1, "author": "Кэрол", "body": "[~alice] раз"}])
+    second = jira_issue_raw(comments=[
+        {"id": 1, "author": "Кэрол", "body": "[~alice] раз"},
+        {"id": 2, "author": "Дэйв", "body": "[~alice] два"},
+    ])
+    second["fields"]["updated"] = "2026-05-21T10:00:00.000+0300"
+
+    search = respx.get(f"{JIRA}/rest/api/2/search").mock(
+        return_value=httpx.Response(200, json=jira_search_raw([first]))
+    )
+    detail = respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+
+    svc = _service(tmp_path)
+    svc.cfg.jira.username = "alice"
+    try:
+        assert len(svc.collect_mentions()) == 1
+        search.mock(return_value=httpx.Response(200, json=jira_search_raw([second])))
+        detail.mock(return_value=httpx.Response(200, json=second))
+        added = svc.collect_mentions()
+        assert [m.comment_id for m in added] == ["2"]     # только новое
+        assert len(svc.store.list_mentions()) == 2
+    finally:
+        svc.close()

@@ -14,6 +14,11 @@
 5. единственный воркспейс в БД;
 6. иначе — ``WorkspaceNotSelected`` (CLI печатает подсказку, TUI показывает экран выбора).
 
+``prefer_active=True`` меняет местами шаги 3 и 4 — это режим ДАШБОРДА. Дашборд держат
+открытым одним окном на всю работу и переключают воркспейс руками; открываться он обязан
+там, где его закрыли, а не там, куда указывает папка запуска. Всем остальным (командам,
+скиллам, MCP) папка нужнее: они работают в контексте проекта, из которого их позвали.
+
 Cwd-матч намеренно НЕ переписывает ``active_workspace``: иначе ``cd`` в другую папку молча
 менял бы дефолт для команд, запускаемых вне зарегистрированных папок.
 """
@@ -121,9 +126,13 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 
 def resolve(
-    store: Store, *, explicit: str | None = None, cwd: str | Path | None = None
+    store: Store, *, explicit: str | None = None, cwd: str | Path | None = None,
+    prefer_active: bool = False,
 ) -> Resolution:
-    """Определить активный воркспейс (см. порядок в докстринге модуля)."""
+    """Определить активный воркспейс (см. порядок в докстринге модуля).
+
+    ``prefer_active`` поднимает «последний выбранный» выше текущей папки — режим дашборда.
+    """
     if explicit:
         ws = find_workspace(store, explicit)
         if ws is None:
@@ -143,16 +152,25 @@ def resolve(
             )
         return Resolution(ws, "env")
 
-    match = workspace_for_path(store, cwd or Path.cwd())
-    if match is not None:
+    def by_cwd() -> Resolution | None:
+        match = workspace_for_path(store, cwd or Path.cwd())
+        if match is None:
+            return None
         ws, path = match
         return Resolution(ws, "cwd", matched_path=path)
 
-    active = store.get_meta(ACTIVE_META_KEY)
-    if active:
+    def by_active() -> Resolution | None:
+        active = store.get_meta(ACTIVE_META_KEY)
+        if not active:
+            return None
         ws = find_workspace(store, active)
-        if ws is not None:
-            return Resolution(ws, "active")
+        return Resolution(ws, "active") if ws is not None else None
+
+    steps = (by_active, by_cwd) if prefer_active else (by_cwd, by_active)
+    for step in steps:
+        found = step()
+        if found is not None:
+            return found
 
     all_ws = store.list_workspaces()
     if len(all_ws) == 1:
@@ -166,10 +184,11 @@ def resolve(
 
 
 def resolve_workspace(
-    store: Store, *, explicit: str | None = None, cwd: str | Path | None = None
+    store: Store, *, explicit: str | None = None, cwd: str | Path | None = None,
+    prefer_active: bool = False,
 ) -> Workspace:
     """Как ``resolve``, но сразу возвращает воркспейс (когда источник не важен)."""
-    return resolve(store, explicit=explicit, cwd=cwd).workspace
+    return resolve(store, explicit=explicit, cwd=cwd, prefer_active=prefer_active).workspace
 
 
 def set_active(store: Store, workspace: Workspace) -> None:

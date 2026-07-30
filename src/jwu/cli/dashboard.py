@@ -17,20 +17,21 @@ from typing import Callable, Optional
 
 from rich import box
 from rich.console import Group, RenderableType
-from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
+from textual.widgets import (
+    ContentSwitcher, DataTable, Header, Static, Tab, Tabs,
+)
 
 from ..core import gitinfo
-from ..core.bitbucket import BitbucketError
 from ..core.jira import JiraError
 from .copy_modal import (
     copy_items_for_issue,
@@ -42,12 +43,13 @@ from .copy_modal import (
 from ..core.models import (
     JOB_RECORD_BADGES,
     LOCAL_FEATURE_BADGES,
-    Analysis,
-    Comment,
+    WORKSPACE_RULE_BADGES,
     Issue,
     Job,
     LocalFeature,
+    Mention,
     PR,
+    WorkspaceRule,
     PRComment,
     Workspace,
     WorkspacePath,
@@ -55,6 +57,9 @@ from ..core.models import (
 )
 from .workspace_screens import (
     FeatureDetailScreen,
+    LegendScreen,
+    RuleDetailScreen,
+    RuleEditScreen,
     TextPromptScreen,
     WorkspacePickerScreen,
     WorkspaceTree,
@@ -90,6 +95,33 @@ DELTA_ICON = {
     "pr_gone": "🏁",
 }
 
+# Чем подписать изменение, если у дельты нет своего detail (обычно он есть и точнее).
+DELTA_LABEL = {
+    "new_issue": "новая задача",
+    "status_change": "смена статуса",
+    "new_comment": "новые комментарии",
+    "new_pr": "новый PR",
+    "new_pr_comment": "новые комментарии",
+    "new_pr_commit": "новый коммит",
+    "reviewer_approved": "апрув",
+    "new_conflict": "merge-конфликт",
+    "resolved": "решена",
+    "gone": "ушла из выборки",
+    "pr_gone": "смержен / отклонён",
+}
+
+# Дельты, у которых detail — голое значение («10564», «Fixed»), а не фраза: им нужна
+# подпись, иначе строка в панели читается как ребус.
+DELTA_PREFIXED = {"new_pr", "resolved"}
+
+
+def delta_chip(kind: str, detail: str) -> str:
+    """Что именно случилось — одной строкой для панели изменений."""
+    label = DELTA_LABEL.get(kind, kind)
+    if not detail:
+        return label
+    return f"{label}: {detail}" if kind in DELTA_PREFIXED else detail
+
 # Иконка по виду вложения (Attachment.kind) — для правой колонки карточки задачи.
 ATTACH_ICON = {"image": "🖼", "log": "📄", "doc": "📕", "archive": "🗜", "video": "🎬", "other": "📎"}
 
@@ -99,19 +131,101 @@ ATTACH_ICON = {"image": "🖼", "log": "📄", "doc": "📕", "archive": "🗜",
 TABS = {
     "tab-workspaces": ("t-workspaces", "workspace", "workspaces"),
     "tab-structure": ("t-structure", "tree", "structure"),
+    "tab-rules": ("t-rules", "rule", "rules"),
     "tab-mine": ("t-mine", "issue", "mine"),
     "tab-mentions": ("t-mentions", "mention", "mentions"),
     "tab-features": ("t-features", "feature", "features"),
     "tab-prs-mine": ("t-prs-mine", "pr", "prs_mine"),
     "tab-prs-review": ("t-prs-review", "pr", "prs_review"),
-    "tab-analysis": ("t-analysis", "analysis", "analysis"),
     "tab-jobs": ("t-jobs", "job", "jobs"),
 }
-_TAB_ORDER = tuple(TABS.keys())
+
+_TAB_TITLE = {
+    "tab-workspaces": "Workspace",
+    "tab-structure": "Структура",
+    "tab-rules": "Правила",
+    "tab-mine": "Мои задачи",
+    "tab-mentions": "Упоминания",
+    "tab-features": "Фичи",
+    "tab-prs-mine": "PR: мои",
+    "tab-prs-review": "PR: на ревью",
+    "tab-jobs": "Работы",
+}
+
+# Две полосы вкладок: наверху — выбор контура (единственное, что не зависит от того,
+# какой воркспейс активен), внизу — всё его содержимое. Разделение именно рядами, а не
+# разделителем внутри одной полосы: так видно, что переключение вверху меняет контекст
+# для всего, что внизу. «Структура» и «Правила» идут первыми в нижнем ряду — это ответ
+# на вопросы «где код» и «как тут принято», с них начинается работа в незнакомом контуре.
+GLOBAL_TABS = ("tab-workspaces",)
+PROJECT_TABS = ("tab-structure", "tab-rules", "tab-mine", "tab-mentions", "tab-features",
+                "tab-prs-mine", "tab-prs-review", "tab-jobs")
+TAB_ROWS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("tabs-global", GLOBAL_TABS),
+    ("tabs-project", PROJECT_TABS),
+)
+_TAB_ORDER = GLOBAL_TABS + PROJECT_TABS
+_ROW_OF_PANE = {pane: row for row, panes in TAB_ROWS for pane in panes}
 
 # Вкладки, которые видны только при подключённой интеграции воркспейса.
 JIRA_TABS = ("tab-mine", "tab-mentions")
 BITBUCKET_TABS = ("tab-prs-mine", "tab-prs-review")
+
+
+# Textual зовёт клавиши по именам («question_mark»), человек — символами.
+_KEY_LABEL = {
+    "question_mark": "?", "slash": "/", "backslash": "\\", "escape": "esc",
+    "left_square_bracket": "[", "right_square_bracket": "]",
+    "full_stop": ".", "comma": ",", "minus": "-", "plus": "+", "underscore": "_",
+    "space": "пробел", "enter": "enter", "backspace": "backspace",
+}
+
+
+def _key_label(keys: str) -> str:
+    """«question_mark» → «?», «escape,backspace,q» → «esc / backspace / q»."""
+    return " / ".join(_KEY_LABEL.get(k.strip(), k.strip()) for k in keys.split(",") if k.strip())
+
+
+# Клавиши, которых нет в BINDINGS (их обрабатывают сами виджеты), но без которых
+# легенда врёт: enter в таблице — основное действие вкладки.
+_TAB_HINTS = {
+    "workspaces": [("enter", "Переключиться на этот воркспейс")],
+    "structure": [("→ / ←", "Раскрыть / свернуть узел дерева (или мышью)")],
+    "rules": [("enter", "Открыть правило целиком")],
+    "mine": [("enter", "Открыть карточку задачи")],
+    "mentions": [("enter", "Открыть задачу и пометить упоминание прочитанным")],
+    "features": [("enter", "Открыть фичу")],
+    "prs_mine": [("enter", "Открыть PR")],
+    "prs_review": [("enter", "Открыть PR")],
+    "jobs": [("enter", "Открыть работу")],
+}
+
+# Как назвать детальный экран в шапке легенды (иначе туда уедет имя класса).
+_SCREEN_TITLE = {
+    "IssueDetailScreen": "карточка задачи",
+    "PRDetailScreen": "карточка PR",
+    "JobDetailScreen": "карточка работы",
+    "FeatureDetailScreen": "карточка фичи",
+    "RuleDetailScreen": "карточка правила",
+}
+
+
+def _binding_parts(binding) -> tuple[str, str, str]:
+    """(клавиша, действие, подпись) из Binding либо из кортежа — в BINDINGS бывает и то и то."""
+    if isinstance(binding, tuple):
+        key, action, description = (list(binding) + ["", "", ""])[:3]
+        return str(key), str(action), str(description)
+    return (str(binding.key), str(binding.action),
+            str(getattr(binding, "description", "") or ""))
+
+
+def _bar_id(pane_id: str) -> str:
+    """id кнопки вкладки в полосе по id её панели («tab-mine» → «bar-mine»)."""
+    return "bar-" + pane_id[len("tab-"):]
+
+
+def _pane_id(bar_id: str) -> str:
+    return "tab-" + bar_id[len("bar-"):]
 
 
 class DashboardTable(DataTable):
@@ -123,19 +237,171 @@ class DashboardTable(DataTable):
         Binding("l", "cursor_right", show=False),
     ]
 
+
+class TabBar(Tabs):
+    """Полоса вкладок, которая сообщает о ВЫБОРЕ пользователя, а не о смене подсветки.
+
+    Штатный ``Tabs.TabActivated`` для деки не годится сразу с двух сторон: он летит и
+    при авто-активации первой вкладки на монтировании (это не выбор), и НЕ летит, когда
+    кликают по уже подсвеченной вкладке — а для второй полосы это как раз полноценный
+    выбор («вернуться сюда»). Поэтому ловим ровно пользовательские жесты.
+    """
+
+    class Picked(Message):
+        def __init__(self, bar: "TabBar", tab_id: str) -> None:
+            super().__init__()
+            self.bar = bar
+            self.tab_id = tab_id
+
+    async def _on_tab_clicked(self, event: Tab.Clicked) -> None:
+        tab_id = event.tab.id or ""
+        await super()._on_tab_clicked(event)
+        self.post_message(self.Picked(self, tab_id))
+
+    def _on_underline_clicked(self, event) -> None:
+        super()._on_underline_clicked(event)
+        self.post_message(self.Picked(self, self.active))
+
+    def action_next_tab(self) -> None:
+        super().action_next_tab()
+        self.post_message(self.Picked(self, self.active))
+
+    def action_previous_tab(self) -> None:
+        super().action_previous_tab()
+        self.post_message(self.Picked(self, self.active))
+
+
+class TabDeck(Vertical):
+    """Две полосы вкладок над общим переключателем панелей.
+
+    ``TabbedContent`` даёт ровно одну полосу, а нам нужны два ряда: общие вкладки
+    сверху, проектные под ними. Поэтому полосы (``Tabs``) и содержимое
+    (``ContentSwitcher``) собираются вручную, а этот виджет держит их согласованными
+    и отдаёт наружу простой API: ``active``, ``get_tab``, ``set_pane_visible``.
+
+    Полоса, которой активная панель НЕ принадлежит, гасится (``-row-idle``): её
+    подсвеченная вкладка — это «куда вернёшься», а не «где ты сейчас».
+    """
+
+    DEFAULT_CSS = """
+    TabDeck { height: 1fr; }
+    TabDeck > TabBar { height: 2; }
+    TabDeck > TabBar.-row-idle { opacity: 55%; }
+    TabDeck > ContentSwitcher { height: 1fr; }
+    """
+
+    class Activated(Message):
+        """Сменилась активная панель (клик по вкладке или программно)."""
+
+        def __init__(self, deck: "TabDeck", pane: str) -> None:
+            super().__init__()
+            self.deck = deck
+            self.pane = pane
+
+        @property
+        def control(self) -> "TabDeck":
+            return self.deck
+
+    def __init__(self, *children, id: str | None = None) -> None:
+        super().__init__(*children, id=id)
+        self._active = ""
+
+    # --- состояние ------------------------------------------------------- #
+
+    @property
+    def active(self) -> str:
+        return self._active
+
+    @active.setter
+    def active(self, pane_id: str) -> None:
+        if pane_id and pane_id != self._active:
+            self._activate(pane_id)
+
+    def _activate(self, pane_id: str) -> None:
+        self._active = pane_id
+        self._sync_bars()
+        self.post_message(self.Activated(self, pane_id))
+
+    def _sync_bars(self) -> None:
+        """Подтянуть полосы и переключатель под текущую активную панель."""
+        try:
+            self.query_one("#panes", ContentSwitcher).current = self._active
+        except Exception:  # noqa: BLE001 — панель могла не смонтироваться (тестовая сборка)
+            return
+        for row_id, panes in TAB_ROWS:
+            try:
+                tabs = self.query_one(f"#{row_id}", TabBar)
+            except Exception:  # noqa: BLE001
+                continue
+            owns = self._active in panes
+            tabs.set_class(not owns, "-row-idle")
+            if owns:
+                tabs.active = _bar_id(self._active)
+
+    def on_tab_bar_picked(self, event: TabBar.Picked) -> None:
+        """Пользователь выбрал вкладку в любой из полос → показать её панель."""
+        event.stop()
+        pane = _pane_id(event.tab_id)
+        if pane in TABS and pane != self._active:
+            self._activate(pane)
+
+    # --- вкладки --------------------------------------------------------- #
+
+    def get_tab(self, pane_id: str) -> Tab:
+        return self.query_one(f"#{_bar_id(pane_id)}", Tab)
+
+    def set_pane_visible(self, pane_id: str, visible: bool) -> None:
+        """Показать/спрятать вкладку. Класс ставим сами, а не через Tabs.hide():
+        тот при скрытии активной вкладки сам выбирает следующую и шлёт событие —
+        то есть уводит панель из-под рук, пока мы ещё пересобираем видимость."""
+        try:
+            tab = self.get_tab(pane_id)
+        except Exception:  # noqa: BLE001
+            return
+        tab.set_class(not visible, "-hidden")
+        row = self._row(pane_id)
+        if row is not None:
+            # подчёркивание активной вкладки живёт в координатах строки — после
+            # смены её состава его надо пересчитать (так же делает сам Tabs.hide)
+            highlight = getattr(row, "_highlight_active", None)
+            if highlight is not None:
+                row.call_after_refresh(highlight)
+
+    def _row(self, pane_id: str) -> Optional[TabBar]:
+        try:
+            return self.query_one(f"#{_ROW_OF_PANE[pane_id]}", TabBar)
+        except Exception:  # noqa: BLE001
+            return None
+
 ISSUE_COLUMNS = ["Key", "Статус", "Приоритет", "Summary"]
-MENTION_COLUMNS = ["Когда", "Задача", "Упоминание"]
+MENTION_COLUMNS = ["Когда", "Задача", "От кого", "Упоминание"]
 # «Мои PR» — с контекстом задачи (кому уже не моя, кому ушла), на ревью — без него.
 PR_MINE_COLUMNS = ["PR", "Конфликт", "Задача", "Назначен", "Статус", "Title", "Ревью"]
 PR_REVIEW_COLUMNS = ["PR", "Конфликт", "Title", "Ревью"]
-ANALYSIS_COLUMNS = ["ID", "Дата/время", "Заголовок"]
 JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Якорь", "PR", "Title"]
 WORKSPACE_COLUMNS = ["", "Workspace", "Название", "Jira", "Bitbucket", "Папок", "Работ"]
 PATH_COLUMNS = ["Папка", "Git", "Метка", "Состояние", "Добавлена"]
 FEATURE_COLUMNS = ["Ключ", "Обновлена", "Статус", "Приоритет", "Название"]
+RULE_COLUMNS = ["Тип", "Тег", "Правило", "Обновлено"]
 
 
-from ..core.dates import fmt_ago as _fmt_ago, fmt_dt as _fmt_dt  # noqa: E402
+from ..core.dates import (  # noqa: E402
+    day_key as _day_key,
+    day_name as _day_name,
+    fmt_ago as _fmt_ago,
+    fmt_day as _fmt_day,
+    fmt_dt as _fmt_dt,
+)
+
+
+def _day_label(when: str) -> str:
+    """Заголовок дня для разделителя: «Сегодня — 30.07.2026»."""
+    return f"{_day_name(when).capitalize()} — {_fmt_day(when)}"
+
+
+def _day_color(when: str) -> str:
+    """Цвет названия дня: свежее — заметнее (сегодня зелёным, вчера жёлтым)."""
+    return {"сегодня": "green", "вчера": "yellow"}.get(_day_name(when), "cyan")
 
 
 def _human_size(n: int) -> str:
@@ -627,7 +893,7 @@ class IssueDetailScreen(Screen):
     """
     BINDINGS = [
         Binding("escape,backspace", "app.pop_screen", "← Назад"),
-        Binding("o", "open", "В браузере"),
+        Binding("o", "open", "Открыть (браузер / папку)"),
         Binding("p", "open_first_pr", "Открыть PR"),
         Binding("y", "copy_issue_key", "Копировать ключ"),
         Binding("Y", "copy_menu", "Копировать…"),
@@ -681,7 +947,6 @@ class IssueDetailScreen(Screen):
                 yield Static(self._attachments_markup(), id="attachments")
                 yield Static(Rule("Работы", align="left", style="cyan"), classes="sec")
                 yield Static(self._jobs_markup(), id="jobs")
-        yield Footer()
 
     def on_mount(self) -> None:
         if self._issue_get_fn is not None:
@@ -912,7 +1177,7 @@ class PRDetailScreen(Screen):
     CSS = "VerticalScroll { padding: 1 2; } Rule { margin: 1 0 0 0; }"
     BINDINGS = [
         Binding("escape,backspace", "app.pop_screen", "← Назад"),
-        Binding("o", "open", "В браузере"),
+        Binding("o", "open", "Открыть (браузер / папку)"),
         Binding("Y", "copy_menu", "Копировать…"),
     ]
 
@@ -934,7 +1199,6 @@ class PRDetailScreen(Screen):
             Static(self._head(), id="pr-head"),
             Static("[dim]загрузка комментов…[/dim]", id="pr-body"),
         )
-        yield Footer()
 
     def on_mount(self) -> None:
         if self._detail_fn is None:
@@ -1024,41 +1288,6 @@ class PRDetailScreen(Screen):
         open_copy_modal(self, copy_items_for_pr(self.pr))
 
 
-class AnalysisScreen(Screen):
-    CSS = "VerticalScroll { padding: 1 2; }"
-    BINDINGS = [Binding("escape,backspace,q", "app.pop_screen", "← Назад")]
-
-    def __init__(self, analysis_id: int, *, get_fn: Optional[Callable[[int], Optional[Analysis]]],
-                 refresh_interval: float = 0.0) -> None:
-        super().__init__()
-        self.analysis_id = analysis_id
-        self._get_fn = get_fn
-        self._refresh_interval = refresh_interval
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield VerticalScroll(Static(id="analysis-body"))
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self._reload()
-        if self._refresh_interval:
-            self.set_interval(self._refresh_interval, self._reload)
-
-    def _reload(self) -> None:
-        a = self._get_fn(self.analysis_id) if self._get_fn else None
-        body = self.query_one("#analysis-body", Static)
-        if a is None:
-            body.update("[dim]анализ не найден[/dim]")
-            return
-        self.sub_title = a.title or f"#{a.id}"
-        body.update(Group(
-            Text.from_markup(f"[b cyan]#{a.id}[/b cyan] [dim]{escape(_fmt_dt(a.created_at))}[/dim]  {escape(a.title)}"),
-            Rule(style="cyan"),
-            Markdown(a.content or ""),
-        ))
-
-
 class JobDetailScreen(Screen):
     CSS = "VerticalScroll { padding: 1 2; } .sec { margin-top: 1; }"
     BINDINGS = [
@@ -1117,7 +1346,6 @@ class JobDetailScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield VerticalScroll(Static(id="job-body"))
-        yield Footer()
 
     def on_mount(self) -> None:
         self._reload()
@@ -1229,20 +1457,21 @@ class JwuDashboard(App):
     #splitter { width: 1; height: 1fr; background: $panel; }
     #splitter:hover { background: $accent; }
     #changes-col { width: 42; height: 1fr; border: round $accent; }
-    #search { height: 3; margin: 0 1; }
-    #changes-pane { width: 100%; height: 3fr; padding: 0 1; border-top: solid $accent; }
+    #changes-pane { width: 100%; height: 1fr; padding: 0 1; }
     #changes { height: auto; }
-    #status { height: 1fr; padding: 0 1; color: $text-muted; border-top: solid $accent; }
-    TabbedContent { height: 1fr; }
+    #status { height: auto; padding: 0 1; color: $text-muted; border-top: solid $accent; }
     DataTable { height: 1fr; }
     """
 
-    LOCAL_SECTIONS = ("jobs", "analysis")  # читаются из памяти, без сети
+    LOCAL_SECTIONS = ("jobs",)  # читаются из памяти, без сети
 
     BINDINGS = [
         Binding("q", "quit", "Выход"),
+        Binding("question_mark", "show_legend", "Клавиши"),
+        Binding("slash", "search_issue", "Поиск задачи"),
+        Binding("b", "toggle_changes", "Панель изменений"),
         Binding("R", "refresh_all", "Обновить всё"),
-        Binding("o", "open", "В браузере"),
+        Binding("o", "open", "Открыть (браузер / папку)"),
         Binding("c", "clear_section", "Очистить"),
         Binding("C", "ack_changes", "Очистить всё"),
         Binding("x", "close_job", "Закрыть работу"),
@@ -1253,6 +1482,9 @@ class JwuDashboard(App):
         Binding("W", "pick_workspace", "Воркспейс"),
         Binding("N", "new_workspace", "＋ Воркспейс"),
         Binding("N", "new_feature", "＋ Фича"),
+        Binding("N", "new_rule", "＋ Правило"),
+        Binding("e", "edit_rule", "Править правило"),
+        Binding("D", "delete_rule", "✕ Удалить правило"),
         Binding("a", "add_path", "Добавить папку"),
         Binding("[", "tab_prev", "← вкладка"),
         Binding("]", "tab_next", "→ вкладка"),
@@ -1268,12 +1500,12 @@ class JwuDashboard(App):
         full_sync_fn: Optional[Callable[[], DashboardData]] = None,
         pr_detail_fn: Optional[Callable[[str, str, int], PRDetail]] = None,
         issue_get_fn: Optional[Callable[[str], Issue]] = None,
-        analysis_get_fn: Optional[Callable[[int], Optional[Analysis]]] = None,
         job_get_fn: Optional[Callable[[int], Optional[Job]]] = None,
         job_delete_fn: Optional[Callable[[int], None]] = None,
         job_status_fn: Optional[Callable[[int, str], None]] = None,
         ack_changes_fn: Optional[Callable[[], DashboardData]] = None,
         clear_changes_fn: Optional[Callable[[list[tuple[str, str]]], DashboardData]] = None,
+        mentions_seen_fn: Optional[Callable[[Optional[list[int]]], DashboardData]] = None,
         # воркспейсы и локальные фичи — тоже только через callable (TUI не знает про БД)
         workspaces_fn: Optional[Callable[[], list]] = None,
         workspace_switch_fn: Optional[Callable[[int], DashboardData]] = None,
@@ -1286,6 +1518,11 @@ class JwuDashboard(App):
         feature_create_fn: Optional[Callable[[str], None]] = None,
         feature_status_fn: Optional[Callable[[int, str], None]] = None,
         feature_edit_fn: Optional[Callable[[int, str], None]] = None,
+        rule_get_fn: Optional[Callable[[int], object]] = None,
+        rule_create_fn: Optional[Callable[[dict], None]] = None,
+        rule_edit_fn: Optional[Callable[[int, dict], None]] = None,
+        rule_delete_fn: Optional[Callable[[int], None]] = None,
+        tags_fn: Optional[Callable[[], list]] = None,
         cwd: str = "",
         start_with_picker: bool = False,
         jira_base: str = "",
@@ -1307,12 +1544,12 @@ class JwuDashboard(App):
         self._full_sync_fn = full_sync_fn
         self._pr_detail_fn = pr_detail_fn
         self._issue_get_fn = issue_get_fn
-        self._analysis_get_fn = analysis_get_fn
         self._job_get_fn = job_get_fn
         self._job_delete_fn = job_delete_fn
         self._job_status_fn = job_status_fn
         self._ack_changes_fn = ack_changes_fn
         self._clear_changes_fn = clear_changes_fn
+        self._mentions_seen_fn = mentions_seen_fn
         self._workspaces_fn = workspaces_fn
         self._workspace_switch_fn = workspace_switch_fn
         self._workspace_create_fn = workspace_create_fn
@@ -1324,6 +1561,11 @@ class JwuDashboard(App):
         self._feature_create_fn = feature_create_fn
         self._feature_status_fn = feature_status_fn
         self._feature_edit_fn = feature_edit_fn
+        self._rule_get_fn = rule_get_fn
+        self._rule_create_fn = rule_create_fn
+        self._rule_edit_fn = rule_edit_fn
+        self._rule_delete_fn = rule_delete_fn
+        self._tags_fn = tags_fn
         self.cwd = cwd
         self._start_with_picker = start_with_picker
         self.jira_base = jira_base.rstrip("/")
@@ -1339,6 +1581,7 @@ class JwuDashboard(App):
         self._tree_roots: list[str] = []   # корни дерева структуры (папки воркспейса)
         self._loading_workspace = False    # идёт смена контура (показываем маркер)
         self._rows: dict[str, list] = {}        # table id -> объекты (Issue|PR) по строкам
+        self._last_row: dict[str, int | None] = {}  # где был курсор — чтобы знать сторону движения
         self._sort: dict[str, tuple[int, bool]] = {}  # table id -> (колонка, reverse)
         self._changed_issue_keys: set[str] = set()
         self._changed_pr_ids: set[int] = set()
@@ -1361,38 +1604,43 @@ class JwuDashboard(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
-            with TabbedContent(id="tabs"):
-                with TabPane("Workspace", id="tab-workspaces"):
+            with TabDeck(id="tabs"):
+                for row_id, panes in TAB_ROWS:
+                    yield TabBar(
+                        *(Tab(_TAB_TITLE[p], id=_bar_id(p)) for p in panes),
+                        id=row_id,
+                    )
+                with ContentSwitcher(id="panes"):
                     # управление контурами: список всех, переключение, создание, удаление
-                    with Vertical():
+                    with Vertical(id="tab-workspaces"):
                         yield Static(id="ws-head")
                         yield DashboardTable(id="t-workspaces")
-                with TabPane("Структура", id="tab-structure"):
                     # содержимое активного контура: папки и их вложенная структура
-                    with Vertical():
+                    with Vertical(id="tab-structure"):
                         yield Static(id="structure-head")
                         yield WorkspaceTree(id="t-structure")
-                with TabPane("Мои задачи", id="tab-mine"):
-                    yield DashboardTable(id="t-mine")
-                with TabPane("Упоминания", id="tab-mentions"):
-                    yield DashboardTable(id="t-mentions")
-                with TabPane("Фичи", id="tab-features"):
-                    yield DashboardTable(id="t-features")
-                with TabPane("PR: мои", id="tab-prs-mine"):
-                    yield DashboardTable(id="t-prs-mine")
-                with TabPane("PR: на ревью", id="tab-prs-review"):
-                    yield DashboardTable(id="t-prs-review")
-                with TabPane("Анализ", id="tab-analysis"):
-                    yield DashboardTable(id="t-analysis")
-                with TabPane("Работы", id="tab-jobs"):
-                    yield DashboardTable(id="t-jobs")
+                    # что агент обязан знать о проекте: запреты, инструкции, общая инфа
+                    with Vertical(id="tab-rules"):
+                        yield Static(id="rules-head")
+                        yield DashboardTable(id="t-rules")
+                    with Vertical(id="tab-mine"):
+                        yield DashboardTable(id="t-mine")
+                    with Vertical(id="tab-mentions"):
+                        yield DashboardTable(id="t-mentions")
+                    with Vertical(id="tab-features"):
+                        yield DashboardTable(id="t-features")
+                    with Vertical(id="tab-prs-mine"):
+                        yield DashboardTable(id="t-prs-mine")
+                    with Vertical(id="tab-prs-review"):
+                        yield DashboardTable(id="t-prs-review")
+                    with Vertical(id="tab-jobs"):
+                        yield DashboardTable(id="t-jobs")
             yield Splitter()
             with Vertical(id="changes-col"):
-                yield Input(id="search", placeholder="Поиск: KEY-123 → Enter")
-                # верх (≈3/4) — уведомления, низ (≈1/4) — статус-строка (раньше была отдельным баром)
                 yield VerticalScroll(Static(id="changes"), id="changes-pane")
-                yield Static(id="status")
-        yield Footer()
+        # Статус живёт внизу, а НЕ в боковой панели: панель по умолчанию скрыта, и вместе
+        # с ней пропала бы вся обратная связь по синку. Легенда клавиш — по «?».
+        yield Static(id="status")
 
     def on_mount(self) -> None:
         self.title = "jwu"
@@ -1413,13 +1661,15 @@ class JwuDashboard(App):
                 if kind == "tree":
                     continue  # дерево наполняется само, колонок у него нет
                 cols = {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS,
-                        "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS,
+                        "job": JOB_COLUMNS,
                         "workspace": WORKSPACE_COLUMNS,
-                        "feature": FEATURE_COLUMNS}[kind]
+                        "feature": FEATURE_COLUMNS,
+                        "rule": RULE_COLUMNS}[kind]
             for col in cols:
                 table.add_column(col, key=col)
         self._apply_tab_visibility()
-        self.query_one("#tabs", TabbedContent).active = self._initial_tab()
+        self._show_changes(False)   # панель изменений открывается по «b», когда нужна
+        self._tabs.active = self._initial_tab()
         self._render()
         self._focus_active_table()
         if self._start_with_picker:
@@ -1445,9 +1695,13 @@ class JwuDashboard(App):
         if new and new != old:
             save_ui_prefs(UIPrefs(theme=new))
 
-    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+    @property
+    def _tabs(self) -> TabDeck:
+        return self.query_one("#tabs", TabDeck)
+
+    def on_tab_deck_activated(self, event: TabDeck.Activated) -> None:
         """При смене вкладки — фокус на её таблицу, обновить статус и панель изменений."""
-        spec = TABS.get(self.query_one("#tabs", TabbedContent).active)
+        spec = TABS.get(event.pane)
         if spec:
             try:
                 self.query_one(f"#{spec[0]}", DataTable).focus()
@@ -1455,8 +1709,8 @@ class JwuDashboard(App):
                 pass
         self._render_changes()
         self._update_status()
-        # Набор кнопок зависит от вкладки (см. check_action). Footer подписан на сигнал
-        # ЭКРАНА, поэтому дёргаем его: иначе футер остался бы от предыдущей вкладки.
+        # Набор доступных действий зависит от вкладки (см. check_action) — пересчитываем,
+        # чтобы легенда по «?» показывала клавиши той вкладки, где ты сейчас.
         self.screen.refresh_bindings()
 
     # --- рендеринг ------------------------------------------------------ #
@@ -1465,12 +1719,12 @@ class JwuDashboard(App):
         return {
             "workspaces": self.data.workspaces,
             "structure": self.data.paths,
+            "rules": self.data.rules,
             "mine": self.data.mine,
             "mentions": self.data.mentions,
             "features": self.data.features,
             "prs_mine": self.data.prs_mine,
             "prs_review": self.data.prs_review,
-            "analysis": self.data.analyses,
             "jobs": self.data.jobs,
         }[section]
 
@@ -1505,18 +1759,15 @@ class JwuDashboard(App):
         return visible[0] if visible else "tab-workspace"
 
     def _apply_tab_visibility(self) -> None:
-        tabs = self.query_one("#tabs", TabbedContent)
+        tabs = self._tabs
         visible = self._visible_tabs()
         for pane_id in _TAB_ORDER:
-            try:
-                (tabs.show_tab if pane_id in visible else tabs.hide_tab)(pane_id)
-            except Exception:  # noqa: BLE001 — вкладки может не быть в урезанной сборке
-                pass
+            tabs.set_pane_visible(pane_id, pane_id in visible)
         if visible and tabs.active not in visible:
             tabs.active = self._initial_tab()
 
     def _focus_active_table(self) -> None:
-        spec = TABS.get(self.query_one("#tabs", TabbedContent).active)
+        spec = TABS.get(self._tabs.active)
         if not spec:
             return
         try:
@@ -1532,12 +1783,11 @@ class JwuDashboard(App):
         }
         self._changed_pr_ids = set()
         mine_keys = {i.key for i in self.data.mine}
-        ment_keys = {i.key for i in self.data.mentions}
         prm_ids = {p.id for p in self.data.prs_mine}
         prr_ids = {p.id for p in self.data.prs_review}
         by: dict[str, list] = {s: [] for s in
-                               ("workspaces", "structure", "mine", "mentions", "features",
-                                "prs_mine", "prs_review", "analysis", "jobs")}
+                               ("workspaces", "structure", "rules", "mine", "mentions",
+                                "features", "prs_mine", "prs_review", "jobs")}
         for d in deltas:
             if d.section:  # дельта исчезновения (gone/pr_gone) — сущности в списке уже нет
                 if d.section in by:
@@ -1554,8 +1804,6 @@ class JwuDashboard(App):
             else:
                 if d.key in mine_keys:
                     by["mine"].append(d)
-                if d.key in ment_keys:
-                    by["mentions"].append(d)
         self._deltas_by_section = by
 
     def _render(self) -> None:
@@ -1576,15 +1824,17 @@ class JwuDashboard(App):
                 self._fill_workspaces(table_id, items)
             elif kind == "tree":
                 self._fill_tree(table_id, items)
-            elif kind == "feature":
-                self._fill_features(table_id, items)
+            elif kind == "rule":
+                self._fill_rules(table_id, items)
             else:
-                self._fill_analyses(table_id, items)
-            badge = len(self._deltas_by_section.get(section, []))
+                self._fill_features(table_id, items)
+            # У упоминаний нет дельт: «новое» для них — непрочитанные записи.
+            badge = (sum(1 for m in self.data.mentions if not m.seen) if section == "mentions"
+                     else len(self._deltas_by_section.get(section, [])))
             label = f"{_TAB_TITLE[pane_id]} ({len(items)})"
             if badge:
                 label += f" ●{badge}"
-            self.query_one("#tabs", TabbedContent).get_tab(pane_id).label = label
+            self._tabs.get_tab(pane_id).label = label
         self._update_status()
 
     def _next_memory_hint(self, *, label: str = "след.") -> str:
@@ -1649,37 +1899,79 @@ class JwuDashboard(App):
         if self._loading_workspace:
             status.update("[yellow]⟳ переключаю воркспейс, читаю данные…[/yellow]")
             return
-        user_block = self._user_block()
-        # Две строки состояния показываются всегда — состояние памяти и состояние сети
-        # независимы. Если идёт один из синков — подменяется только его строка.
-        status.update(
-            f"{self._network_line()}\n{self._memory_line()}\n{user_block}"
-        )
+        # Внизу на всю ширину — значит в строку: состояние сети и памяти независимы и
+        # показываются оба, а «?» тут потому, что легенды на экране больше нет.
+        line = f"{self._network_line()}   ·   {self._memory_line()}"
+        status.update(f"{line}\n{self._user_block()}   ·   [dim]? — клавиши[/dim]")
+
+    # Сколько сущностей и сколько изменений внутри одной сущности показывать в панели.
+    MAX_CHANGE_GROUPS = 8
+    MAX_CHANGES_PER_GROUP = 5
 
     def _render_changes(self) -> None:
-        """Панель «Изменения» — только дельты активной вкладки."""
+        """Панель «Изменения» активной вкладки — сгруппированная по задачам/PR.
+
+        Плоский список дельт на узкой колонке читался как лента: ключ задачи повторялся
+        в каждой строке, а сами изменения тонули. Здесь одна сущность — один блок:
+        заголовок «ключ: название» и под ним компактный список того, что в ней случилось.
+        """
         panel = self.query_one("#changes", Static)
         try:
-            active = self.query_one("#tabs", TabbedContent).active
+            active = self._tabs.active
         except Exception:  # noqa: BLE001
             active = ""
         section = TABS.get(active, (None, None, None))[2]
         title = _TAB_TITLE.get(active, "")
-        deltas = self._deltas_by_section.get(section, [])
-        if not deltas:
+        if section == "mentions":
+            groups, total = self._mention_groups()
+            action = "прочитано"
+        else:
+            groups, total = self._delta_groups(section)
+            action = "очистить"
+        if not groups:
             panel.update(f"[b]Изменения · {title}[/b]\n[dim]Изменений нет.[/dim]")
             return
-        close = "[@click=app.clear_section][b yellow]\\[✕ очистить][/b yellow][/]"
-        lines = [f"[b]Изменения · {title} ({len(deltas)})[/b]   {close}"]
-        for d in deltas[:12]:
-            icon = DELTA_ICON.get(d.kind, "•")
-            detail = f" [dim]{escape(d.detail)}[/dim]" if d.detail else ""
-            label = f"[cyan u]{escape(d.key)}[/cyan u]{detail}  {_msafe(d.summary[:50])}"
-            # вся строка кликабельна → открыть карточку задачи/PR, к которому относится изменение
-            lines.append(f"{icon} [@click=app.open_delta('{escape(d.key)}')]{label}[/]")
-        if len(deltas) > 12:
-            lines.append(f"[dim]…ещё {len(deltas) - 12}[/dim]")
+        close = f"[@click=app.clear_section][b yellow]\\[✕ {action}][/b yellow][/]"
+        lines = [f"[b]Изменения · {title} ({total})[/b]   {close}"]
+        for key, summary, items in groups[:self.MAX_CHANGE_GROUPS]:
+            head = f"[cyan u]{escape(key)}[/cyan u][dim]:[/dim] {_msafe(summary[:60])}"
+            lines.append(f"[@click=app.open_delta('{escape(key)}')]{head}[/]")
+            for icon, text in items[:self.MAX_CHANGES_PER_GROUP]:
+                lines.append(f"   {icon} [dim]{_msafe(text)}[/dim]")
+            if len(items) > self.MAX_CHANGES_PER_GROUP:
+                lines.append(f"   [dim]…ещё {len(items) - self.MAX_CHANGES_PER_GROUP}[/dim]")
+        if len(groups) > self.MAX_CHANGE_GROUPS:
+            lines.append(f"[dim]…ещё {len(groups) - self.MAX_CHANGE_GROUPS} шт.[/dim]")
         panel.update("\n".join(lines))
+
+    def _delta_groups(self, section: str) -> tuple[list[tuple[str, str, list]], int]:
+        """Дельты вкладки → [(ключ, название, [(иконка, что случилось), …])] + их общее число.
+
+        Порядок групп — по первому появлению сущности в дельтах: свежие события синка
+        идут последними, но «первым замеченным» остаётся то, что случилось раньше.
+        """
+        groups: dict[str, tuple[str, list]] = {}
+        deltas = self._deltas_by_section.get(section, [])
+        for d in deltas:
+            summary, items = groups.setdefault(d.key, (d.summary, []))
+            if not summary and d.summary:  # заголовок мог прийти только с частью дельт
+                groups[d.key] = (d.summary, items)
+            items.append((DELTA_ICON.get(d.kind, "•"), delta_chip(d.kind, d.detail)))
+        return [(key, summary, items) for key, (summary, items) in groups.items()], len(deltas)
+
+    def _mention_groups(self) -> tuple[list[tuple[str, str, list]], int]:
+        """Непрочитанные упоминания, сгруппированные по задаче.
+
+        У упоминаний нет дельт: их «изменение» — это само появление новой записи,
+        поэтому панель показывает именно непрочитанные (см. _fill_mentions).
+        """
+        groups: dict[str, tuple[str, list]] = {}
+        fresh = [m for m in self.data.mentions if not m.seen]
+        for m in fresh:
+            summary, items = groups.setdefault(m.task_key, (m.summary, []))
+            author = f"{m.author}: " if m.author else ""
+            items.append(("💬", f"{author}{self._mention_text(m)[:80]}"))
+        return [(key, summary, items) for key, (summary, items) in groups.items()], len(fresh)
 
     def _sorted(self, table_id: str, kind: str, items: list) -> list:
         state = self._sort.get(table_id)
@@ -1688,11 +1980,12 @@ class JwuDashboard(App):
         col, reverse = state
         if kind == "issue":
             keyfns = [lambda i: i.key, lambda i: i.status, lambda i: i.priority, lambda i: i.summary]
-        elif kind == "mention":  # Когда · Задача · Упоминание
+        elif kind == "mention":  # Когда · Задача · От кого · Упоминание
             keyfns = [
-                lambda i: getattr(self._mention_comment(i), "created", "") or "",
-                lambda i: i.key,
-                lambda i: (getattr(self._mention_comment(i), "body", "") or "").lower(),
+                lambda m: m.created or "",
+                lambda m: m.task_key,
+                lambda m: (m.author or "").casefold(),
+                lambda m: (m.text or "").casefold(),
             ]
         elif kind == "pr":
             # Колонки разные для «PR: мои» (7) и «PR: на ревью» (4) — см. PR_MINE_COLUMNS / PR_REVIEW_COLUMNS.
@@ -1718,8 +2011,13 @@ class JwuDashboard(App):
                     title_key,
                     reviewers_approved,
                 ]
-        elif kind == "analysis":  # ID · Дата/время · Заголовок
-            keyfns = [lambda a: a.id, lambda a: a.created_at, lambda a: a.title.lower()]
+        elif kind == "rule":      # Тип · Тег · Правило · Обновлено
+            keyfns = [
+                lambda r: r.kind,
+                lambda r: (r.tag or "").casefold(),
+                lambda r: (r.title or "").casefold(),
+                lambda r: r.updated_at,
+            ]
         elif kind == "job":       # ID · Обновлено · Статус · Задача · PR · Title
             keyfns = [
                 lambda j: j.id,
@@ -1763,41 +2061,36 @@ class JwuDashboard(App):
         self._rows[table_id] = list(issues)
         self._restore_cursor(table, cur)
 
-    def _mention_comment(self, issue: Issue) -> Optional[Comment]:
-        """Последний коммент задачи, где упомянут текущий пользователь ([~login])."""
-        user = self._user or self.data.user
-        if not user:
-            return None
-        marker = f"[~{user}]"
-        hits = [c for c in issue.comments if marker in (c.body or "")]
-        return hits[-1] if hits else None
-
     @staticmethod
-    def _mention_text(comment: Comment) -> str:
-        """Тело коммента-упоминания одной строкой (схлопнуть переводы/пробелы).
+    def _mention_text(mention: Mention) -> str:
+        """Тело упоминания одной строкой (схлопнуть переводы и лишние пробелы).
 
-        Упоминания [~login], вложения и ссылки оформляются дальше в _inline_segments.
+        Сами маркеры [~login], вложения и ссылки оформляются дальше в _inline_segments.
         """
-        return " ".join((comment.body or "").split())
+        return " ".join((mention.text or "").split())
 
-    def _fill_mentions(self, table_id: str, issues: list[Issue]) -> None:
-        """Вкладка «Упоминания»: когда упомянули · задача · текст коммента (обрезанный)."""
+    def _fill_mentions(self, table_id: str, mentions: list[Mention]) -> None:
+        """Вкладка «Упоминания»: когда · задача · автор · текст комментария.
+
+        Строка — само упоминание, а не задача: непрочитанные помечены точкой, и
+        пометка снимается заходом внутрь, а не обновлением задачи.
+        """
         table = self.query_one(f"#{table_id}", DataTable)
         cur = table.cursor_row
         table.clear()
-        for it in issues:
-            changed = it.key in self._changed_issue_keys
-            c = self._mention_comment(it)
-            when = _fmt_dt(c.created) if c else "—"
-            base = "yellow" if changed else ""
-            if c:
-                # вложения/картинки/ссылки в тексте упоминания оформляем (некликабельно)
-                cell = _inline_segments(self._mention_text(c), base, None, clickable=False)
-            else:
-                cell = Text(it.summary or "—", style=base)
+        for m in mentions:
+            fresh = not m.seen
+            base = "yellow" if fresh else ""
+            # вложения/картинки/ссылки в тексте упоминания оформляем (некликабельно)
+            cell = _inline_segments(self._mention_text(m), base, None, clickable=False)
             cell.truncate(80, overflow="ellipsis")
-            table.add_row(Text(when, style="dim"), self._key_cell(it.key, changed), cell)
-        self._rows[table_id] = list(issues)
+            table.add_row(
+                Text(_fmt_dt(m.created), style="dim"),
+                self._key_cell(m.task_key, fresh),
+                Text(m.author or "—", style=author_color(m.author)),
+                cell,
+            )
+        self._rows[table_id] = list(mentions)
         self._restore_cursor(table, cur)
 
     def _fill_prs(self, table_id: str, prs: list[PR]) -> None:
@@ -1850,26 +2143,101 @@ class JwuDashboard(App):
         self._restore_cursor(table, cur)
 
     def _fill_jobs(self, table_id: str, jobs: list) -> None:
+        """Вкладка «Работы»: строки, разделённые по дням горизонтальной чертой с датой.
+
+        Разделители вставляются только когда список действительно идёт по времени
+        (порядок по умолчанию либо сортировка по «Обновлено») — при сортировке по
+        статусу или заголовку черта «с этого места другой день» была бы неправдой.
+        """
         table = self.query_one(f"#{table_id}", DataTable)
         cur = table.cursor_row
         table.clear()
-        for j in jobs:
-            prs = ", ".join(str(p.pr_id) for p in j.prs) or "—"
+        cells = [
+            [str(j.id), _fmt_dt(j.updated_at), j.status, j.anchor,
+             ", ".join(str(p.pr_id) for p in j.prs) or "—", j.title or "—"]
+            for j in jobs
+        ]
+        widths = [
+            max([len(JOB_COLUMNS[i])] + [len(row[i]) for row in cells])
+            for i in range(len(JOB_COLUMNS))
+        ]
+        by_day = self._sort.get(table_id, (1, True))[0] == 1
+        if by_day and jobs:  # заголовок дня длиннее «30.07.2026 15:10» — иначе черта разойдётся
+            widths[1] = max([widths[1]] + [len(_day_label(j.updated_at)) + 3 for j in jobs])
+        rows: list = []   # объект строки; None у разделителя — по нему нечего открывать
+        day = None
+        for job, row in zip(jobs, cells):
+            if by_day and _day_key(job.updated_at) != day:
+                if day is not None:  # пустая строка отбивает закончившийся день от следующего
+                    table.add_row(*(Text("") for _ in widths))
+                    rows.append(None)
+                day = _day_key(job.updated_at)
+                table.add_row(*self._day_divider(job.updated_at, widths))
+                rows.append(None)
             table.add_row(
-                Text(str(j.id), style="cyan"),
-                Text(_fmt_dt(j.updated_at), style="dim"),
-                Text(j.status, style=status_color(j.status)),
-                Text(j.anchor),
-                Text(prs),
-                Text(j.title or "—"),
+                Text(row[0], style="cyan"),
+                Text(row[1], style="dim"),
+                Text(row[2], style=status_color(job.status)),
+                Text(row[3]),
+                Text(row[4]),
+                Text(row[5]),
             )
-        self._rows[table_id] = list(jobs)
+            rows.append(job)
+        self._rows[table_id] = rows
         self._restore_cursor(table, cur)
+        self._skip_divider(table, table_id, step=1)
+
+    def _skip_divider(self, table: DataTable, table_id: str, *, step: int) -> None:
+        """Сдвинуть курсор с разделителя дня на ближайшую настоящую строку.
+
+        Разделитель — не работа: на нём нечего открывать и нечего закрывать, поэтому
+        курсор через него проезжает, а не застревает.
+        """
+        rows = self._rows.get(table_id) or []
+        idx = table.cursor_row
+        if idx is None or idx >= len(rows) or rows[idx] is not None:
+            return
+        for direction in (step, -step):
+            probe = idx + direction
+            while 0 <= probe < len(rows):
+                if rows[probe] is not None:
+                    table.move_cursor(row=probe)
+                    return
+                probe += direction
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Курсор встал на разделитель дня → проехать дальше в ту же сторону."""
+        table_id = event.data_table.id or ""
+        prev = self._last_row.get(table_id)
+        idx = event.cursor_row
+        self._last_row[table_id] = idx
+        step = 1 if prev is None or (idx is not None and idx >= prev) else -1
+        self._skip_divider(event.data_table, table_id, step=step)
+
+    @staticmethod
+    def _day_divider(when: str, widths: list[int]) -> list[Text]:
+        """Строка-разделитель дня: черта во всю таблицу с заголовком «сегодня — 30.07.2026».
+
+        Заголовок живёт в колонке «Обновлено» — там же, где время самих работ, так что
+        глазу не нужно перепрыгивать. Сначала словами (в них и ищут «а что сегодня»),
+        потом дата.
+        """
+        head = Text("─ ", style="dim")
+        head.append(_day_name(when).capitalize(), style=f"bold {_day_color(when)}")
+        head.append(" — ", style="dim")
+        head.append(_fmt_day(when), style="bold cyan")
+        head.append(" ", style="dim")
+        head.append("─" * max(0, widths[1] - head.cell_len), style="dim")
+
+        cells = [Text("─" * w, style="dim") for w in widths]
+        cells[1] = head
+        return cells
 
     def _render_workspace_head(self) -> None:
         """Шапки двух вкладок: управление контурами и структура активного."""
         self._update_head("#ws-head", self._workspaces_head_lines())
         self._update_head("#structure-head", self._structure_head_lines())
+        self._update_head("#rules-head", self._rules_head_lines())
 
     def _update_head(self, selector: str, lines: list[str]) -> None:
         try:
@@ -1883,11 +2251,9 @@ class JwuDashboard(App):
         active = (f"[dim]активный:[/dim] [b]{escape(ws.name or ws.slug)}[/b] "
                   f"[dim]({escape(ws.slug)})[/dim]" if ws else
                   "[yellow]активный воркспейс не выбран[/yellow]")
-        return [
-            f"Воркспейсов: {len(self.data.workspaces)}   ·   {active}",
-            "[b]enter[/b][dim] — переключиться · [/dim][b]N[/b][dim] — создать · [/dim]"
-            "[b]D[/b][dim] — удалить · [/dim][b]W[/b][dim] — быстрый выбор из любой вкладки[/dim]",
-        ]
+        # Клавиши тут не перечисляем: для этого есть легенда по «?», и она знает
+        # про текущую вкладку. Шапка — только состояние.
+        return [f"Воркспейсов: {len(self.data.workspaces)}   ·   {active}"]
 
     def _structure_head_lines(self) -> list[str]:
         ws = self.data.workspace
@@ -1900,9 +2266,6 @@ class JwuDashboard(App):
             f"[dim]Jira:[/dim] {yes if ws.jira_enabled else no}   "
             f"[dim]Bitbucket:[/dim] {yes if ws.bitbucket_enabled else no}   "
             f"[dim]работ:[/dim] {len(self.data.jobs)} (активных {active_jobs})",
-            "[b]→[/b][dim]/[/dim][b]←[/b][dim] — раскрыть/свернуть (или мышью) · [/dim]"
-            "[b]a[/b][dim] — добавить папку · [/dim][b]D[/b][dim] — отвязать · [/dim]"
-            "[b]o[/b][dim] — открыть в файловом менеджере[/dim]",
         ]
         if not self.data.paths:
             lines.append(
@@ -1989,36 +2352,63 @@ class JwuDashboard(App):
         self._rows[table_id] = list(features)
         self._restore_cursor(table, cur)
 
-    def _fill_analyses(self, table_id: str, analyses: list[Analysis]) -> None:
+    def _fill_rules(self, table_id: str, rules: list) -> None:
+        """Вкладка «Правила»: тип · область · суть · когда правили.
+
+        В строке только суть (``title``); подробности — многострочная инструкция —
+        живут в карточке по enter, иначе таблица превратилась бы в простыню.
+        """
         table = self.query_one(f"#{table_id}", DataTable)
         cur = table.cursor_row
         table.clear()
-        for a in analyses:
+        for r in rules:
+            label, color = WORKSPACE_RULE_BADGES.get(r.kind, (r.kind, "white"))
+            title = Text(r.title or "—")
+            if r.text:
+                title.append("  …", style="dim")   # есть подробности, смотри карточку
             table.add_row(
-                Text(str(a.id), style="cyan"),
-                Text(_fmt_dt(a.created_at), style="dim"),
-                Text(a.title),
+                Text(label, style=color),
+                Text(r.tag, style="cyan") if r.tag else Text("общее", style="dim"),
+                title,
+                Text(_fmt_dt(r.updated_at), style="dim"),
             )
-        self._rows[table_id] = list(analyses)
+        self._rows[table_id] = list(rules)
         self._restore_cursor(table, cur)
+
+    def _rules_head_lines(self) -> list[str]:
+        rules = self.data.rules
+        general = sum(1 for r in rules if not r.tag)
+        bans = sum(1 for r in rules if r.kind == "constraint")
+        if not rules:
+            # пустое состояние объясняет, зачем вкладка нужна; когда правила есть —
+            # объяснение только занимает место
+            return [
+                "[yellow]Правил нет[/yellow][dim] — это то, что агент обязан знать о "
+                "проекте: что нельзя делать, как поднять стенд, где что лежит.[/dim]",
+                "[dim]Общие правила приезжают в контекст любой работы. Завести — [/dim]"
+                "[b]N[/b][dim].[/dim]",
+            ]
+        return [
+            f"Правил: {len(rules)}   ·   [dim]общих:[/dim] {general}   ·   "
+            f"[dim]запретов:[/dim] {bans}"
+        ]
 
     # --- взаимодействие ------------------------------------------------- #
 
     def action_tab_next(self) -> None:
-        tabs = self.query_one("#tabs", TabbedContent)
+        tabs = self._tabs
         order = self._visible_tabs() or _TAB_ORDER
         idx = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(idx + 1) % len(order)]
 
     def action_tab_prev(self) -> None:
-        tabs = self.query_one("#tabs", TabbedContent)
+        tabs = self._tabs
         order = self._visible_tabs() or _TAB_ORDER
         idx = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(idx - 1) % len(order)]
 
     def _active(self) -> tuple[str, str, str]:
-        active = self.query_one("#tabs", TabbedContent).active
-        return TABS.get(active, ("t-mine", "issue", "mine"))
+        return TABS.get(self._tabs.active, ("t-mine", "issue", "mine"))
 
     def _obj_at(self, table_id: str, idx: int | None):
         rows = self._rows.get(table_id, [])
@@ -2052,33 +2442,108 @@ class JwuDashboard(App):
                 jobs=jobs, job_get_fn=self._job_get_fn,
                 issue_get_fn=self._issue_get_fn, refresh_interval=detail_iv,
             ))
+        elif isinstance(obj, Mention):
+            # карточку задачи грузим только здесь: за самим упоминанием мы не следим
+            self._mark_mentions_seen([obj.id])
+            if obj.task_key and self._issue_get_fn is not None:
+                self._open_issue_loading(obj.task_key)
         elif isinstance(obj, PR):
             self.push_screen(PRDetailScreen(
                 obj, detail_fn=self._pr_detail_fn, refresh_interval=detail_iv))
-        elif isinstance(obj, Analysis):
-            self.push_screen(AnalysisScreen(
-                obj.id, get_fn=self._analysis_get_fn, refresh_interval=local_iv))
         elif isinstance(obj, Job):
             self.push_screen(JobDetailScreen(
                 obj.id, get_fn=self._job_get_fn, jira_base=self.jira_base,
                 refresh_interval=local_iv))
         elif isinstance(obj, Workspace):
             self._switch_workspace(obj.id)
+        elif isinstance(obj, WorkspaceRule):
+            self.push_screen(RuleDetailScreen(
+                obj.id, get_fn=self._rule_get_fn, edit_fn=self._apply_rule_edit,
+                tags_fn=self._known_tags, refresh_interval=local_iv))
         elif isinstance(obj, LocalFeature):
             self.push_screen(FeatureDetailScreen(
                 obj.id, get_fn=self._feature_get_fn, jobs_fn=self._feature_jobs_fn,
                 status_fn=self._feature_status_fn, edit_fn=self._feature_edit_fn,
                 refresh_interval=local_iv))
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Поиск по ключу задачи: Enter в поле #search сразу открывает карточку (с загрузкой)."""
-        if event.input.id != "search":
+    # --- панель изменений, поиск и легенда ------------------------------- #
+
+    def _show_changes(self, visible: bool) -> None:
+        """Показать/спрятать боковую панель вместе с её ручкой-разделителем."""
+        for selector in ("#changes-col", "#splitter"):
+            try:
+                self.query_one(selector).display = visible
+            except Exception:  # noqa: BLE001 — урезанная тестовая сборка
+                pass
+
+    def action_toggle_changes(self) -> None:
+        """b — свернуть/развернуть панель «Изменения»."""
+        try:
+            column = self.query_one("#changes-col")
+        except Exception:  # noqa: BLE001
             return
-        key = normalize_issue_key(event.value)
-        event.input.value = ""
-        if not key or self._issue_get_fn is None:
+        self._show_changes(not column.display)
+
+    def action_search_issue(self) -> None:
+        """/ — модалка поиска: ввёл ключ, сразу открылась карточка (данные подтянутся)."""
+        if self._issue_get_fn is None:
+            self.notify("Поиск задач недоступен: в этом воркспейсе нет Jira",
+                        severity="warning")
             return
-        self._open_issue_loading(key)
+
+        def do(value: Optional[str]) -> None:
+            key = normalize_issue_key(value or "")
+            if key:
+                self._open_issue_loading(key)
+
+        self.push_screen(
+            TextPromptScreen("Открыть задачу по ключу", placeholder="PROJ-123"), do)
+
+    def action_show_legend(self) -> None:
+        """? — легенда клавиш: сначала клавиши текущего окна, ниже общие."""
+        page, common, where = self._legend_sections()
+        self.push_screen(LegendScreen(page, common, title=where))
+
+    def _legend_sections(self) -> tuple[list, list, str]:
+        """Клавиши текущего окна и общие. Собирается ДО показа модалки — потом
+        активным экраном станет она сама, и контекст будет уже не тот."""
+        scoped = {a for actions in self._TAB_SCOPED_ACTIONS.values() for a in actions}
+        screen = self.screen
+        on_top = screen is not self.screen_stack[0]
+
+        def rows(bindings) -> list[tuple[str, str]]:
+            out: list[tuple[str, str]] = []
+            for binding in bindings:
+                key, action, description = _binding_parts(binding)
+                if not description:
+                    continue
+                try:
+                    if self.check_action(action, ()) is False:
+                        continue      # действие недоступно здесь — и в легенде ему не место
+                except Exception:  # noqa: BLE001
+                    pass
+                label = _key_label(key)
+                if (label, description) not in out:
+                    out.append((label, description))
+            return out
+
+        name = type(screen).__name__
+        if on_top:
+            # поверх дашборда открыт детальный экран — «страница» это его клавиши,
+            # и они ПЕРЕКРЫВАЮТ общие: одну и ту же клавишу в обеих секциях не показываем
+            page = rows(getattr(type(screen), "BINDINGS", []))
+            taken = {key for key, _ in page}
+            common = [row for row in rows(b for b in self.BINDINGS
+                                          if _binding_parts(b)[1] not in scoped)
+                      if row[0] not in taken]
+            return page, common, _SCREEN_TITLE.get(name, name)
+
+        page, common = [], []
+        for binding in self.BINDINGS:
+            (page if _binding_parts(binding)[1] in scoped else common).append(binding)
+        section = self._active()[2]
+        return (_TAB_HINTS.get(section, []) + rows(page), rows(common),
+                _TAB_TITLE.get(self._tabs.active, ""))
 
     def _open_issue_loading(self, key: str) -> None:
         """Сразу показать карточку задачи по ключу; данные подтянет сам экран (loading)."""
@@ -2115,9 +2580,7 @@ class JwuDashboard(App):
                 ))
             return
         # иначе — задача по ключу: берём из текущих данных или дотягиваем из сети
-        issue = next(
-            (i for i in (*self.data.mine, *self.data.mentions) if i.key == key), None
-        )
+        issue = next((i for i in self.data.mine if i.key == key), None)
         if issue is not None:
             self._open_detail(issue)
         elif self._issue_get_fn is not None:
@@ -2187,13 +2650,15 @@ class JwuDashboard(App):
             if kind == "pr":
                 return PR_MINE_COLUMNS if table_id == "t-prs-mine" else PR_REVIEW_COLUMNS
             return {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS,
-                    "analysis": ANALYSIS_COLUMNS, "job": JOB_COLUMNS}.get(kind, [])
+                    "job": JOB_COLUMNS, "rule": RULE_COLUMNS}.get(kind, [])
         return []
 
     def action_open(self) -> None:
         obj = self._selected_obj()
         if isinstance(obj, Issue) and self.jira_base:
             webbrowser.open(f"{self.jira_base}/browse/{obj.key}")
+        elif isinstance(obj, Mention) and self.jira_base and obj.task_key:
+            webbrowser.open(f"{self.jira_base}/browse/{obj.task_key}")
         elif isinstance(obj, PR) and obj.url:
             webbrowser.open(obj.url)
         elif isinstance(obj, WorkspacePath) and Path(obj.path).exists():
@@ -2207,6 +2672,8 @@ class JwuDashboard(App):
         obj = self._selected_obj()
         if isinstance(obj, Issue):
             notify_copied(self, obj.key)
+        elif isinstance(obj, Mention):
+            notify_copied(self, obj.task_key)
         elif isinstance(obj, LocalFeature):
             notify_copied(self, obj.key)
         elif isinstance(obj, Job) and obj.anchor:
@@ -2225,7 +2692,8 @@ class JwuDashboard(App):
             open_copy_modal(self, copy_items_for_pr(obj))
 
     def action_ack_changes(self) -> None:
-        """C / «очистить всё» — убрать ВСЕ накопленные изменения."""
+        """C / «очистить всё» — убрать ВСЕ накопленные изменения (и упоминания тоже)."""
+        self._mark_mentions_seen(None)
         if self._ack_changes_fn is None:
             return
         try:
@@ -2234,8 +2702,21 @@ class JwuDashboard(App):
             return
         self._render()
 
+    def _mark_mentions_seen(self, mention_ids: Optional[list[int]]) -> None:
+        """Пометить упоминания прочитанными: перечисленные либо все (None)."""
+        if self._mentions_seen_fn is None or not self.data.mentions:
+            return
+        try:
+            self.data = self._mentions_seen_fn(mention_ids)
+        except Exception:  # noqa: BLE001
+            return
+        self._render()
+
     def action_clear_section(self) -> None:
         """c / «✕ очистить» — убрать изменения только активной вкладки."""
+        if self._active()[2] == "mentions":
+            self._mark_mentions_seen(None)  # у упоминаний «очистить» = «прочитано»
+            return
         if self._clear_changes_fn is None:
             return
         section = self._active()[2]
@@ -2257,6 +2738,7 @@ class JwuDashboard(App):
         "workspaces": ("new_workspace", "delete_workspace"),
         "structure": ("add_path", "remove_path"),
         "features": ("new_feature",),
+        "rules": ("new_rule", "edit_rule", "delete_rule"),
     }
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
@@ -2270,7 +2752,7 @@ class JwuDashboard(App):
         if action == "copy_issue_key":
             try:
                 obj = self._selected_obj()
-                return True if isinstance(obj, (Issue, Job)) else None
+                return True if isinstance(obj, (Issue, Job, Mention)) else None
             except Exception:  # noqa: BLE001
                 return None
         if action == "copy_menu":
@@ -2436,6 +2918,55 @@ class JwuDashboard(App):
         self.push_screen(
             TextPromptScreen("Новая фича", placeholder="что нужно сделать"), do)
 
+    # --- правила воркспейса ---------------------------------------------- #
+
+    def _known_tags(self) -> list[str]:
+        """Теги папок контура — подсказка при выборе области действия правила."""
+        try:
+            return sorted(self._tags_fn() or []) if self._tags_fn else []
+        except Exception:  # noqa: BLE001 — подсказка не стоит падения экрана
+            return []
+
+    def _apply_rule_edit(self, rule_id: int, values: dict) -> None:
+        if self._rule_edit_fn is None:
+            return
+        self._rule_edit_fn(rule_id, values)
+        self._run_memory_refresh()
+
+    def action_new_rule(self) -> None:
+        if self._rule_create_fn is None:
+            return
+
+        def do(values: Optional[dict]) -> None:
+            if not values:
+                return
+            self._rule_create_fn(values)  # type: ignore[misc]
+            self._run_memory_refresh()
+
+        self.push_screen(RuleEditScreen(known_tags=self._known_tags()), do)
+
+    def action_edit_rule(self) -> None:
+        rule = self._selected_obj()
+        if not isinstance(rule, WorkspaceRule) or self._rule_edit_fn is None:
+            return
+
+        def do(values: Optional[dict]) -> None:
+            if values:
+                self._apply_rule_edit(rule.id, values)
+
+        self.push_screen(RuleEditScreen(rule, known_tags=self._known_tags()), do)
+
+    def action_delete_rule(self) -> None:
+        rule = self._selected_obj()
+        if not isinstance(rule, WorkspaceRule) or self._rule_delete_fn is None:
+            return
+
+        def do() -> None:
+            self._rule_delete_fn(rule.id)  # type: ignore[misc]
+            self._run_memory_refresh()
+
+        self.push_screen(ConfirmScreen(f"Удалить правило «{rule.title}»?", do))
+
     def action_close_job(self) -> None:
         job = self._selected_obj()
         if not isinstance(job, Job) or self._job_status_fn is None:
@@ -2575,15 +3106,3 @@ class JwuDashboard(App):
             # На паузе (_auto_paused) планировщик сам ничего не ставит.
             self._schedule_next_slow_sync()
 
-
-_TAB_TITLE = {
-    "tab-workspaces": "Workspace",
-    "tab-structure": "Структура",
-    "tab-mine": "Мои задачи",
-    "tab-mentions": "Упоминания",
-    "tab-features": "Фичи",
-    "tab-prs-mine": "PR: мои",
-    "tab-prs-review": "PR: на ревью",
-    "tab-analysis": "Анализ",
-    "tab-jobs": "Работы",
-}

@@ -31,7 +31,6 @@ from .config import (
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
 from .jira import JiraClient
 from .models import (
-    Analysis,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
     BuildReport,
@@ -40,12 +39,14 @@ from .models import (
     Issue,
     Job,
     LocalFeature,
+    Mention,
     Note,
     PR,
     PRComment,
     TestCaseFailure,
     Workspace,
     WorkspacePath,
+    WorkspaceRule,
 )
 from .store import Store
 
@@ -135,14 +136,13 @@ class DayContext:
     """Расширенный контекст дня для анализа Claude Code (после фулл-синка)."""
 
     user: str = ""
-    me_display: str = ""  # отображаемое имя (для матчинга «на мне» / «ждёт ответа»)
+    me_display: str = ""  # отображаемое имя (по нему отличают «на мне» от «не на мне»)
     synced_at: str | None = None
     deltas: list[Delta] = field(default_factory=list)
     mine: list[Issue] = field(default_factory=list)
     prs_mine: list[PR] = field(default_factory=list)
     prs_review: list[PR] = field(default_factory=list)
-    # (issue, тексты комментов с упоминанием меня)
-    mentions: list[tuple[Issue, list[str]]] = field(default_factory=list)
+    mentions: list[Mention] = field(default_factory=list)
     # pr_id -> комменты (только для flagged PR: конфликт / NEEDS_WORK)
     pr_comments: dict[int, list[PRComment]] = field(default_factory=dict)
 
@@ -158,10 +158,9 @@ class DashboardData:
     last_sync: dict[str, str | None] = field(default_factory=dict)
     deltas: list[Delta] = field(default_factory=list)
     mine: list[Issue] = field(default_factory=list)
-    mentions: list[Issue] = field(default_factory=list)
+    mentions: list[Mention] = field(default_factory=list)
     prs_mine: list[PR] = field(default_factory=list)
     prs_review: list[PR] = field(default_factory=list)
-    analyses: list[Analysis] = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
     # Контекст воркспейса: сам воркспейс, его папки и локальные фичи. Флаги интеграций
     # продублированы отдельно, чтобы TUI мог решать про видимость вкладок без workspace.
@@ -171,6 +170,7 @@ class DashboardData:
     workspaces: list[Workspace] = field(default_factory=list)
     paths: list[WorkspacePath] = field(default_factory=list)
     features: list[LocalFeature] = field(default_factory=list)
+    rules: list[WorkspaceRule] = field(default_factory=list)
     jira_enabled: bool = True
     bitbucket_enabled: bool = True
     # key задачи → её последний известный статус и текущий assignee;
@@ -187,15 +187,15 @@ class DashboardData:
             "workspaces": [w.model_dump() for w in self.workspaces],
             "paths": [p.model_dump() for p in self.paths],
             "features": [f.model_dump() for f in self.features],
+            "rules": [r.model_dump() for r in self.rules],
             "jira_enabled": self.jira_enabled,
             "bitbucket_enabled": self.bitbucket_enabled,
             "last_sync": self.last_sync,
             "deltas": [d.model_dump() for d in self.deltas],
             "mine": [i.model_dump() for i in self.mine],
-            "mentions": [i.model_dump() for i in self.mentions],
+            "mentions": [m.model_dump() for m in self.mentions],
             "prs_mine": [p.model_dump() for p in self.prs_mine],
             "prs_review": [p.model_dump() for p in self.prs_review],
-            "analyses": [a.model_dump() for a in self.analyses],
             "jobs": [j.model_dump() for j in self.jobs],
             "task_status": self.task_status,
             "task_assignee": self.task_assignee,
@@ -254,15 +254,15 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
         },
         deltas=store.pending_changes(),  # накопленные изменения (до явного закрытия)
         mine=store.latest_issues("mine"),
-        mentions=store.latest_issues("mentions"),
+        mentions=store.list_mentions(),
         prs_mine=store.latest_prs("mine"),
         prs_review=store.latest_prs("review"),
-        analyses=store.list_analyses(),
         jobs=store.list_jobs(),  # все работы (включая закрытые/завершённые)
         workspace=ws,
         workspaces=all_workspaces,
         paths=ws.paths if ws else [],
         features=store.list_features(),
+        rules=store.list_rules(),
         jira_enabled=ws.jira_enabled if ws else True,
         bitbucket_enabled=ws.bitbucket_enabled if ws else True,
         task_status=task_status,
@@ -531,6 +531,39 @@ class Service:
                 kept.append(issue)
         return kept
 
+    def collect_mentions(self) -> list[Mention]:
+        """Найти НОВЫЕ упоминания меня и записать их в память. Возвращает только новые.
+
+        Упоминание — событие, а не задача: запись создаётся один раз и дальше живёт сама
+        по себе, поэтому здесь нет ни снапшотов, ни дельт. Кандидатов даёт JQL вью
+        ``mentions``; карточку с комментариями тянем только у тех задач, что изменились
+        с прошлого разбора — иначе каждый синк перечитывал бы весь двухнедельный хвост.
+        """
+        jql = self.cfg.jira.views.get("mentions")
+        user = self._resolve_username()
+        if self.jira is None or not jql or not user:
+            return []
+        marker = f"[~{user}]"
+        scanned = self.store.mention_scan_state()
+        found: list[Mention] = []
+        seen_versions: list[tuple[str, str]] = []
+        for issue in self.jira.search(jql):
+            if issue.updated and scanned.get(issue.key) == issue.updated:
+                continue  # задача не менялась — новым упоминаниям взяться неоткуда
+            try:
+                full = self.jira.issue(issue.key, with_dev=False)
+            except Exception:  # noqa: BLE001 — нет доступа/сеть: разберём в следующий раз
+                continue
+            for c in full.comments:
+                if marker in (c.body or ""):
+                    found.append(Mention(
+                        task_key=full.key, comment_id=c.id, author=c.author,
+                        text=c.body or "", created=c.created, summary=full.summary,
+                    ))
+            seen_versions.append((full.key, full.updated or issue.updated))
+        self.store.set_mention_scans(seen_versions)
+        return self.store.add_mentions(found)
+
     def issue(self, key: str) -> Issue:
         return self._client_for_key(key).issue(key, with_dev=True)
 
@@ -767,13 +800,18 @@ class Service:
         """
         views: list[str] = []
         if self.jira is not None:
+            # «mentions» остаётся в списке вью только ради отметки времени синка в
+            # шапке вкладки: снапшотов у упоминаний нет (см. counts ниже).
             views += ["mine", "mentions"]
         if self.bitbucket is not None:
             views += ["prs:mine", "prs:review"]
         run_id = self.store.start_sync_run(views)
         counts: dict[str, int] = {}
         if self.jira is not None:
-            counts |= self._sync_tasks(run_id, ["mine", "mentions"])
+            counts |= self._sync_tasks(run_id, ["mine"])
+            # Упоминания живут отдельной сущностью, вне снапшотов и дельт (см.
+            # collect_mentions): их «изменение» — это появление нового упоминания.
+            counts["mentions"] = len(self.collect_mentions())
         if self.bitbucket is not None:
             counts |= self._sync_prs(run_id, ["mine", "review"])
         # counts фиксируем ДО compute_changes: детекция исчезновения (gone/pr_gone)
@@ -786,7 +824,14 @@ class Service:
 
     def sync_section(self, section: str) -> SyncResult:
         """Синк одной секции/вкладки: mine | mentions | prs_mine | prs_review."""
-        if section in ("mine", "mentions"):
+        if section == "mentions":
+            if self.jira is None:
+                raise ValueError("В этом воркспейсе Jira не подключена")
+            run_id = self.store.start_sync_run(["mentions"])
+            counts = {"mentions": len(self.collect_mentions())}
+            self.store.finish_sync_run(run_id, counts)
+            return SyncResult(run_id=run_id, counts=counts, deltas=[])
+        if section == "mine":
             if self.jira is None:
                 raise ValueError("В этом воркспейсе Jira не подключена")
             run_id = self.store.start_sync_run([section])
@@ -906,12 +951,6 @@ class Service:
         login, display, _ = self._identity()
         d = dashboard_from_memory(self.store, login or self.cfg.jira.username)
         user = login or self.cfg.jira.username
-        marker = f"[~{user}]" if user else None
-
-        mentions: list[tuple[Issue, list[str]]] = []
-        for issue in d.mentions:
-            texts = [c.body for c in issue.comments if marker and marker in (c.body or "")]
-            mentions.append((issue, texts))
 
         # подтянуть комменты только для проблемных PR (конфликт / есть NEEDS_WORK)
         pr_comments: dict[int, list[PRComment]] = {}
@@ -939,7 +978,7 @@ class Service:
             mine=d.mine,
             prs_mine=d.prs_mine,
             prs_review=d.prs_review,
-            mentions=mentions,
+            mentions=d.mentions,
             pr_comments=pr_comments,
         )
 

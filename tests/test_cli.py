@@ -648,3 +648,209 @@ def test_init_suggests_inner_repos_for_container_folder(monkeypatch, tmp_path):
         str((container / "backend").resolve()): ["backend"],
         str((container / "frontend").resolve()): ["frontend"],
     }
+
+
+def test_dashboard_opens_last_workspace_and_pins_it(monkeypatch, tmp_path):
+    """`jwu dashboard` открывается на последнем выбранном контуре, а не на контуре папки.
+
+    И закрепляет его в `_WORKSPACE_ARG`: иначе TUI показывал бы один воркспейс,
+    а колбэки (синк, работы, фичи) молча ходили бы в другой — тот, что дала папка.
+    """
+    from jwu.core import workspaces
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    home = workspaces.create(store, "home")
+    workspaces.create(store, "work2")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder)
+    workspaces.set_active(store, store.get_workspace_by_slug("work2"))
+    store.close()
+
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+    monkeypatch.setattr(cli, "_store", lambda: Store(db))
+    monkeypatch.setattr(cli, "_WORKSPACE_ARG", None)
+    monkeypatch.chdir(folder)
+
+    started: dict = {}
+
+    class _FakeApp:
+        def __init__(self, data, **kwargs):
+            started["data"] = data
+
+        def run(self):
+            started["ran"] = True
+
+    import jwu.cli.dashboard as dash
+    monkeypatch.setattr(dash, "JwuDashboard", _FakeApp)
+
+    res = runner.invoke(cli.app, ["dashboard"])
+    assert res.exit_code == 0, res.output
+    assert started["ran"] is True
+    assert started["data"].workspace.slug == "work2"
+    assert cli._WORKSPACE_ARG == "work2"
+
+
+def test_dashboard_json_still_resolves_by_folder(monkeypatch, tmp_path):
+    """`--json` — это выдача для агентов: они работают в папке проекта, её и слушаем."""
+    from jwu.core import workspaces
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    home = workspaces.create(store, "home")
+    workspaces.create(store, "work2")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder)
+    workspaces.set_active(store, store.get_workspace_by_slug("work2"))
+    store.close()
+
+    # реальный _store() — он и делает резолв воркспейса, ради которого тест и написан
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+    monkeypatch.setattr(cli, "_WORKSPACE_ARG", None)
+    monkeypatch.chdir(folder)
+
+    res = runner.invoke(cli.app, ["dashboard", "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["workspace"]["slug"] == "home"
+
+
+def test_db_prune_is_dry_by_default(monkeypatch, tmp_path):
+    """`jwu db prune` без --apply ничего не удаляет — операция необратима."""
+    from datetime import datetime, timedelta, timezone
+
+    from jwu.core.models import Issue
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    old = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    for _ in range(5):
+        run = store.start_sync_run(["mine"])
+        store.save_issue_snapshot(run, Issue(key="PROJ-1", summary="s"), ["mine"])
+        store.finish_sync_run(run, {"tasks:mine": 1})
+        store.conn.execute("UPDATE sync_runs SET started_at = ? WHERE id = ?", (old, run))
+        store.conn.execute(
+            "UPDATE issue_snapshots SET fetched_at = ? WHERE sync_run_id = ?", (old, run))
+    store.conn.commit()
+    store.close()
+
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+
+    res = runner.invoke(cli.app, ["db", "prune", "--json"])
+    assert res.exit_code == 0, res.output
+    dry = json.loads(res.stdout)
+    assert dry["dry_run"] is True and dry["workspaces"]["work"]["issue_snapshots"] > 0
+    with Store(db) as check:
+        assert check.conn.execute(
+            "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == 5
+
+    res = runner.invoke(cli.app, ["db", "prune", "--apply", "--json"])
+    assert res.exit_code == 0, res.output
+    applied = json.loads(res.stdout)
+    assert applied["dry_run"] is False
+    assert applied["workspaces"]["work"]["issue_snapshots"] == \
+        dry["workspaces"]["work"]["issue_snapshots"]
+    with Store(db) as check:
+        assert check.conn.execute(
+            "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == 1
+
+
+def test_db_stats_reports_size_and_counts(monkeypatch, tmp_path):
+    from jwu.core.models import Issue
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    run = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run, Issue(key="PROJ-1", summary="s"), ["mine"])
+    store.close()
+
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+    res = runner.invoke(cli.app, ["db", "stats", "--json"])
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.stdout)
+    assert payload["size"] > 0
+    assert payload["workspaces"]["work"]["issue_snapshots"] == 1
+
+
+def test_rule_add_reads_multiline_from_stdin(monkeypatch, tmp_path):
+    """Инструкцию по стенду в аргумент не засунуть — она приходит через --file -."""
+    _patch_store(monkeypatch, tmp_path)
+
+    res = runner.invoke(
+        cli.app,
+        ["rule", "add", "Как поднять стенд", "--kind", "howto",
+         "--tag", "legacy-бэкенд", "--file", "-", "--json"],
+        input="1. docker compose up\n2. ./manage.py migrate\n",
+    )
+    assert res.exit_code == 0, res.output
+    rule = json.loads(res.stdout)
+    assert rule["kind"] == "howto" and rule["tag"] == "legacy-бэкенд"
+    assert rule["text"].splitlines() == ["1. docker compose up", "2. ./manage.py migrate"]
+
+    res = runner.invoke(cli.app, ["rule", "show", str(rule["id"])])
+    assert "docker compose up" in res.output
+
+
+def test_rules_list_filters_and_alias(monkeypatch, tmp_path):
+    _patch_store(monkeypatch, tmp_path)
+    runner.invoke(cli.app, ["rule", "add", "Не пушить в develop", "--kind", "constraint"])
+    runner.invoke(cli.app, ["rule", "add", "pnpm, не npm", "--kind", "gotcha",
+                            "--tag", "фронт"])
+
+    every = json.loads(runner.invoke(cli.app, ["rules", "--json"]).stdout)
+    assert len(every) == 2
+
+    # общие действуют везде, поэтому выдача по тегу включает и их
+    scoped = json.loads(runner.invoke(cli.app, ["rules", "--tag", "фронт", "--json"]).stdout)
+    assert {r["title"] for r in scoped} == {"Не пушить в develop", "pnpm, не npm"}
+
+    bans = json.loads(runner.invoke(cli.app, ["rule", "list", "--kind", "constraint",
+                                              "--json"]).stdout)
+    assert [r["title"] for r in bans] == ["Не пушить в develop"]
+
+    bad = runner.invoke(cli.app, ["rules", "--kind", "nope"])
+    assert bad.exit_code != 0
+
+
+def test_rule_edit_and_rm(monkeypatch, tmp_path):
+    _patch_store(monkeypatch, tmp_path)
+    created = json.loads(runner.invoke(
+        cli.app, ["rule", "add", "Ревью до коммита", "--json"]).stdout)
+
+    assert runner.invoke(cli.app, ["rule", "edit", str(created["id"]),
+                                   "--kind", "constraint"]).exit_code == 0
+    shown = json.loads(runner.invoke(
+        cli.app, ["rule", "show", str(created["id"]), "--json"]).stdout)
+    assert shown["kind"] == "constraint" and shown["title"] == "Ревью до коммита"
+
+    assert runner.invoke(cli.app, ["rule", "rm", str(created["id"]), "-y"]).exit_code == 0
+    assert runner.invoke(cli.app, ["rule", "show", str(created["id"])]).exit_code == 1
+
+
+def test_workspace_current_json_carries_rules(monkeypatch, tmp_path):
+    """Bash-фолбэк должен давать тот же контекст, что MCP: скиллы ссылаются на оба."""
+    from jwu.core import workspaces
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    ws = workspaces.create(store, "home")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, ws, folder, tags=["фронт"])
+    store.use_workspace(ws.id)
+    store.add_rule("Не пушить в develop", text="никогда", kind="constraint")
+    store.add_rule("Сборка через pnpm", text="длинная инструкция",
+                   kind="convention", tag="фронт")
+    store.close()
+
+    monkeypatch.setattr(cli, "_open_store", lambda: Store(db))
+    monkeypatch.setattr(cli, "_WORKSPACE_ARG", None)
+    monkeypatch.chdir(folder)
+
+    payload = json.loads(runner.invoke(
+        cli.app, ["workspace", "current", "--json"]).stdout)
+    md = payload["rules_md"]
+    assert "⛔ ЗАПРЕТ — Не пушить в develop" in md and "никогда" in md
+    assert "[#фронт]" in md and "длинная инструкция" not in md
+    assert [p["tags"] for p in payload["paths"]] == [["фронт"]]
