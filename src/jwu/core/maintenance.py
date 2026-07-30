@@ -1,10 +1,12 @@
-"""Обслуживание БД для синка через файловое облако (iCloud).
+"""Обслуживание БД: защита от облака, ежедневный бэкап и чистка снапшотов.
 
-Две задачи:
+Три задачи:
 - ``ensure_db_available`` — не дать открыть БД, которую iCloud выгрузил в плейсхолдер
   (иначе sqlite создал бы поверх пустую базу, и облако затёрло бы реальную).
 - ``run_daily_maintenance`` — раз в день проверять целостность и делать ЛОКАЛЬНЫЙ бэкап
   (не в облаке — чтобы пережить порчу синхронизации).
+- ``run_daily_prune`` — раз в день сносить старые снапшоты, если база разрослась.
+  Идёт СТРОГО после бэкапа: чистка необратима, и откатываться должно быть куда.
 """
 
 from __future__ import annotations
@@ -13,8 +15,12 @@ import shutil
 import sqlite3
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import ConfigError, data_dir
+
+if TYPE_CHECKING:  # только для аннотаций: core.store импортирует config, не наоборот
+    from .store import Store
 
 
 def _restrict(path: Path, mode: int) -> None:
@@ -127,3 +133,63 @@ def run_daily_maintenance(
     for old in sorted(bdir.glob(f"{db_file.name}.bak-*"))[:-keep]:
         old.unlink()
     return [f"бэкап БД: {marker.name}"]
+
+
+# Порог, ниже которого чистку не запускаем вовсе: на маленькой базе снапшоты никому
+# не мешают, а необратимая операция без нужды — плохой размен.
+AUTO_PRUNE_MIN_BYTES = 256 * 1024 * 1024
+AUTO_PRUNE_DAYS = 30
+# VACUUM пересобирает файл целиком (для гигабайта — десятки секунд и двойной объём
+# на диске), поэтому только когда освободилось действительно много.
+VACUUM_MIN_FREE_RATIO = 0.25
+_PRUNE_META_KEY = "last_prune"
+
+
+def _human_bytes(n: int) -> str:
+    size = float(max(0, n))
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} Б"
+
+
+def run_daily_prune(
+    store: "Store",
+    db_file: Path,
+    *,
+    backups_dir: Path | None = None,
+    min_bytes: int = AUTO_PRUNE_MIN_BYTES,
+    days: int = AUTO_PRUNE_DAYS,
+) -> list[str]:
+    """Раз в день снести старые снапшоты, если база переросла порог. Сообщения — наружу.
+
+    Порядок здесь важнее самой чистки:
+
+    1. база меньше порога — не трогаем ничего (обычный случай, выходим молча);
+    2. сегодня уже чистили — выходим;
+    3. **сегодняшнего бэкапа нет — не чистим**. Удаление снапшотов необратимо, а бэкап
+       делает ``run_daily_maintenance``; его же он пропускает на битой БД — значит
+       отсутствие копии это ещё и сигнал «с базой что-то не так, не усугубляй».
+
+    VACUUM зовём только если после чистки освободилась заметная доля файла.
+    """
+    if store.db_size() < min_bytes:
+        return []
+    today = date.today().isoformat()
+    if store.get_meta(_PRUNE_META_KEY) == today:
+        return []
+    bdir = backups_dir or (data_dir() / "backups")
+    if not (bdir / f"{db_file.name}.bak-{today}").exists():
+        return ["чистку снапшотов пропустил: сегодняшнего бэкапа БД нет"]
+
+    reports = store.prune_all_workspaces(days=days, dry_run=False)
+    store.set_meta(_PRUNE_META_KEY, today)
+    removed = sum(r.total for r in reports.values())
+    if not removed:
+        return []
+    msgs = [f"чистка снапшотов старше {days} дн.: удалено {removed} записей"]
+    if store.free_ratio() >= VACUUM_MIN_FREE_RATIO:
+        freed = store.vacuum()
+        msgs.append(f"VACUUM: файл БД похудел на {_human_bytes(freed)}")
+    return msgs

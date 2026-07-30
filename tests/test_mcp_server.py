@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -151,7 +152,8 @@ def test_workspace_create_and_paths_via_mcp(fresh_server, tmp_path, monkeypatch)
         "home-jwu", name="Личное", paths=[str(folder)]))
     assert ws["slug"] == "home-jwu"
     assert ws["jira_enabled"] is False          # интеграции объявляются явно
-    assert ws["paths"] == [str(folder.resolve())]
+    # папки едут с тегами и меткой — по ним агент понимает, что где лежит
+    assert [p["path"] for p in ws["paths"]] == [str(folder.resolve())]
 
     # по привязанной папке воркспейс определяется сам
     monkeypatch.chdir(folder)
@@ -160,10 +162,13 @@ def test_workspace_create_and_paths_via_mcp(fresh_server, tmp_path, monkeypatch)
     other = tmp_path / "second"
     other.mkdir()
     payload = _run(srv.jwu_workspace_add_path(str(other), label="второй репозиторий"))
-    assert set(payload["paths"]) == {str(folder.resolve()), str(other.resolve())}
+    assert {p["path"] for p in payload["paths"]} == {
+        str(folder.resolve()), str(other.resolve())}
+    assert {p["path"]: p["label"] for p in payload["paths"]}[
+        str(other.resolve())] == "второй репозиторий"
 
     payload = _run(srv.jwu_workspace_remove_path(str(other)))
-    assert payload["paths"] == [str(folder.resolve())]
+    assert [p["path"] for p in payload["paths"]] == [str(folder.resolve())]
 
 
 def test_workspace_create_rejects_duplicates_and_bad_slug(fresh_server):
@@ -235,3 +240,192 @@ def test_tag_replace_and_remove_via_mcp(fresh_server, tmp_path):
 def test_tagging_unbound_folder_is_refused(fresh_server, tmp_path):
     with pytest.raises(ValueError, match="не привязана"):
         _run(srv.jwu_workspace_tag(str(tmp_path / "nope"), add=["x"], workspace="work"))
+
+
+# --- правила воркспейса --------------------------------------------------- #
+
+
+def _ws_with_rules(db, tmp_path, monkeypatch):
+    store = Store(db)
+    home = workspaces.create(store, "home", name="Личное")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder, tags=["legacy-бэкенд"])
+    store.use_workspace(home.id)
+    store.add_rule("Не пушить в develop", text="совсем никогда", kind="constraint")
+    store.add_rule("Как поднять стенд", text="1. docker compose up\n2. migrate",
+                   kind="howto", tag="legacy-бэкенд")
+    store.close()
+    monkeypatch.chdir(folder)
+    return folder
+
+
+def test_workspace_current_carries_general_rules_and_tag_index(
+    fresh_server, tmp_path, monkeypatch
+):
+    """Правила приезжают вместе с контуром — их не надо запрашивать отдельно.
+
+    Общие целиком, привязанные к тегу — только списком: jwu_workspace_current зовут
+    все скиллы подряд, и тащить туда каждую инструкцию по стендам слишком дорого.
+    """
+    _ws_with_rules(fresh_server, tmp_path, monkeypatch)
+
+    md = _run(srv.jwu_workspace_current())["rules_md"]
+    assert "⛔ ЗАПРЕТ — Не пушить в develop" in md
+    assert "совсем никогда" in md                  # общее правило — с текстом
+    assert "[#legacy-бэкенд]" in md                # правило тега — только заголовком
+    assert "docker compose up" not in md
+
+
+def test_jwu_rules_returns_tag_rules_with_general(fresh_server, tmp_path, monkeypatch):
+    _ws_with_rules(fresh_server, tmp_path, monkeypatch)
+
+    scoped = _run(srv.jwu_rules(tag="legacy-бэкенд"))
+    assert "Не пушить в develop" in scoped["rules_md"]
+    assert "docker compose up" in scoped["rules_md"]            # полный текст
+    assert "legacy-бэкенд" in scoped["known_tags"]
+
+    only_bans = _run(srv.jwu_rules(kind="constraint"))
+    assert "Не пушить в develop" in only_bans["rules_md"]
+    assert "Как поднять стенд" not in only_bans["rules_md"]
+    with pytest.raises(ValueError, match="Недопустимый тип"):
+        _run(srv.jwu_rules(kind="nope"))
+
+
+def test_job_start_carries_project_context(fresh_server, tmp_path, monkeypatch):
+    """Старт работы приносит весь контекст проекта — где код и как тут принято.
+
+    Даже если скилл пропустил шаг с jwu_workspace_current, папки с тегами и правила
+    окажутся в контексте ДО первой правки.
+    """
+    folder = _ws_with_rules(fresh_server, tmp_path, monkeypatch)
+
+    payload = _run(srv.jwu_job_start(title="правки"))
+    assert "Не пушить в develop" in payload["rules_md"]
+    assert "[#legacy-бэкенд]" in payload["rules_md"]
+    # структура: где лежит код и под каким тегом
+    assert payload["paths"] == [
+        {"path": str(folder.resolve()), "label": "", "tags": ["legacy-бэкенд"]}
+    ]
+    assert payload["known_tags"] == {"legacy-бэкенд": 1}
+
+
+def test_workspace_context_is_identical_everywhere(fresh_server, tmp_path, monkeypatch):
+    """MCP, его же job_start и bash-фолбэк дают агенту ОДИН и тот же контекст.
+
+    Расхождение тут — это когда через один путь агент видит теги, а через другой нет;
+    именно так и было, пока папки в jwu_workspace_current шли голыми строками.
+    """
+    from typer.testing import CliRunner
+
+    from jwu.cli import main as cli
+
+    folder = _ws_with_rules(fresh_server, tmp_path, monkeypatch)
+    keys = ("paths", "known_tags", "rules_md")
+
+    current = _run(srv.jwu_workspace_current())
+    job = _run(srv.jwu_job_start(title="правки"))
+    monkeypatch.setattr(cli, "_WORKSPACE_ARG", None)
+    monkeypatch.chdir(folder)
+    from jwu.core.store import Store as _Store
+    monkeypatch.setattr(cli, "_open_store", lambda: _Store(fresh_server))
+    bash = json.loads(CliRunner().invoke(
+        cli.app, ["workspace", "current", "--json"]).stdout)
+
+    assert {k: current[k] for k in keys} == {k: job[k] for k in keys}
+    assert {k: current[k] for k in keys} == {k: bash[k] for k in keys}
+
+
+def test_rule_add_edit_rm_roundtrip(fresh_server, tmp_path, monkeypatch):
+    _ws_with_rules(fresh_server, tmp_path, monkeypatch)
+
+    added = _run(srv.jwu_rule_add("Ревью до коммита", text="всегда", kind="constraint"))
+    assert added["kind"] == "constraint" and added["tag"] == ""
+
+    edited = _run(srv.jwu_rule_edit(added["id"], tag="фронт"))
+    assert edited["tag"] == "фронт" and edited["title"] == "Ревью до коммита"
+
+    removed = _run(srv.jwu_rule_rm(added["id"]))
+    assert removed["removed"]["id"] == added["id"]
+    with pytest.raises(ValueError, match="не найдено"):
+        _run(srv.jwu_rule_rm(added["id"]))
+    with pytest.raises(ValueError, match="Недопустимый тип"):
+        _run(srv.jwu_rule_add("x", kind="nope"))
+
+
+# --- полнота поверхности MCP ---------------------------------------------- #
+
+
+def test_mcp_covers_the_read_surface_agents_need(fresh_server):
+    """У читающих CLI-команд, которыми пользуются скиллы, есть MCP-аналог.
+
+    Скиллы объявлены MCP-first; команда без инструмента заставляет агента идти в bash,
+    и именно там расходятся контексты (см. историю с папками без тегов).
+    """
+    import re
+    import pathlib
+
+    tools = set(re.findall(r"async def (jwu_\w+)",
+                           pathlib.Path("src/jwu/mcp_server.py").read_text()))
+    for expected in ("jwu_tasks", "jwu_changes", "jwu_rules",
+                     "jwu_feature_edit", "jwu_feature_rm"):
+        assert expected in tools, expected
+
+
+def test_jwu_changes_reads_pending_deltas(fresh_server, tmp_path, monkeypatch):
+    from jwu.core.models import Delta
+
+    store = Store(fresh_server)
+    home = workspaces.create(store, "home")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder)
+    store.use_workspace(home.id)
+    run = store.start_sync_run(["mine"])
+    store.add_pending_changes(run, [Delta(key="A-1", kind="new_comment",
+                                          summary="s", detail="+2 комм.")])
+    store.close()
+    monkeypatch.chdir(folder)
+
+    changes = _run(srv.jwu_changes())
+    assert [(c["key"], c["kind"], c["detail"]) for c in changes] == [
+        ("A-1", "new_comment", "+2 комм.")
+    ]
+
+
+def test_feature_edit_and_rm_via_mcp(fresh_server, tmp_path, monkeypatch):
+    store = Store(fresh_server)
+    home = workspaces.create(store, "home")
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    workspaces.add_path(store, home, folder)
+    store.use_workspace(home.id)
+    feature = store.create_feature("Тёмная тема")
+    store.create_job("", "по фиче", feature_id=feature.id)
+    store.close()
+    monkeypatch.chdir(folder)
+
+    edited = _run(srv.jwu_feature_edit(feature.key, title="Тёмная тема (v2)"))
+    assert edited["title"] == "Тёмная тема (v2)"
+    assert edited["status"] == "open"           # статус меняется отдельным инструментом
+
+    removed = _run(srv.jwu_feature_rm(feature.key))
+    assert removed["removed"]["key"] == feature.key
+    assert removed["jobs_unanchored"] == 1      # работа осталась, но потеряла якорь
+    with pytest.raises(ValueError, match="не найдена"):
+        _run(srv.jwu_feature_rm(feature.key))
+
+
+def test_workspaces_list_does_not_dump_every_contour_rules(fresh_server, tmp_path):
+    """Список воркспейсов — про то, какие они есть, а не про правила каждого проекта."""
+    store = Store(fresh_server)
+    home = workspaces.create(store, "home")
+    store.use_workspace(home.id)
+    store.add_rule("Не пушить в develop", text="длинный текст", kind="constraint")
+    store.close()
+
+    items = _run(srv.jwu_workspaces())
+    home_row = next(w for w in items if w["slug"] == "home")
+    assert home_row["rules"] == 1               # счётчик — да
+    assert "rules_md" not in home_row           # тексты — нет
+    assert "paths" not in home_row

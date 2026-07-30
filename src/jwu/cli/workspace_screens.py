@@ -1,4 +1,4 @@
-"""Экраны TUI, связанные с воркспейсами: выбор/создание, ввод строки, карточка фичи.
+"""Экраны TUI, связанные с воркспейсами: выбор/создание, ввод строки, карточки фичи и правила.
 
 Живут отдельно от ``dashboard.py`` (он и так большой) и НИЧЕГО оттуда не импортируют —
 зависимость строго односторонняя. Как и весь TUI, экраны не знают про сеть и БД: всё,
@@ -19,11 +19,16 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Footer, Header, Input, Static, Tree
+from textual.widgets import (
+    DataTable, Footer, Header, Input, Select, Static, TextArea, Tree,
+)
 
 from ..core import gitinfo
 from ..core.dates import fmt_dt as _fmt_dt
-from ..core.models import LOCAL_FEATURE_BADGES, LocalFeature, Workspace, WorkspacePath
+from ..core.models import (
+    LOCAL_FEATURE_BADGES, WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS,
+    LocalFeature, Workspace, WorkspacePath, WorkspaceRule,
+)
 
 WORKSPACE_COLUMNS = ["Workspace", "Название", "Jira", "Bitbucket", "Папок", "Работ"]
 
@@ -413,3 +418,193 @@ class FeatureDetailScreen(Screen):
 
         self.app.push_screen(
             TextPromptScreen("Название фичи", value=feature.title), do)
+
+
+class RuleEditScreen(ModalScreen[Optional[dict]]):
+    """Создание/правка правила воркспейса: тип, тег, суть и подробности.
+
+    ``TextPromptScreen`` рядом однострочный — инструкцию «как поднять стенд» в него не
+    ввести, поэтому подробности живут в ``TextArea``. Enter там переводит строку, так
+    что сохранение повешено на Ctrl+S. Результат, как и у соседа, отдаётся через
+    ``dismiss(value)``: колбэк на месте не успевал бы дорисовать нижний экран.
+    """
+
+    CSS = """
+    RuleEditScreen { align: center middle; }
+    #rule-box { width: 92; height: auto; max-height: 90%; border: round $accent;
+                padding: 1 2; background: $surface; }
+    #rule-title { height: auto; margin-bottom: 1; }
+    #rule-text { height: 12; margin-top: 1; }
+    #rule-hint { height: auto; margin-top: 1; color: $text-muted; }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Отмена"),
+        Binding("ctrl+s", "save", "Сохранить", priority=True),
+    ]
+
+    def __init__(self, rule: Optional[WorkspaceRule] = None,
+                 *, known_tags: Optional[list[str]] = None) -> None:
+        super().__init__()
+        self._rule = rule
+        self._known_tags = known_tags or []
+
+    def compose(self) -> ComposeResult:
+        rule = self._rule
+        with Vertical(id="rule-box"):
+            head = "Правка правила" if rule else "Новое правило воркспейса"
+            yield Static(Text.from_markup(f"[b]{head}[/b]"), id="rule-title")
+            yield Select(
+                [(WORKSPACE_RULE_BADGES[k][0], k) for k in WORKSPACE_RULE_KINDS],
+                value=rule.kind if rule else "info",
+                allow_blank=False, id="rule-kind",
+            )
+            tags = f" (известные: {', '.join(self._known_tags)})" if self._known_tags else ""
+            yield Input(value=rule.tag if rule else "", id="rule-tag",
+                        placeholder=f"тег папки — пусто, если правило общее{tags}")
+            yield Input(value=rule.title if rule else "", id="rule-name",
+                        placeholder="суть одной строкой")
+            yield TextArea(rule.text if rule else "", id="rule-text")
+            yield Static(
+                Text.from_markup("[dim]Ctrl+S — сохранить · Escape — отмена[/dim]"),
+                id="rule-hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#rule-name", Input).focus()
+
+    def action_save(self) -> None:
+        title = self.query_one("#rule-name", Input).value.strip()
+        if not title:
+            self.notify("Нужна суть правила — одной строкой", severity="warning")
+            return
+        self.dismiss({
+            "kind": self.query_one("#rule-kind", Select).value,
+            "tag": self.query_one("#rule-tag", Input).value.strip(),
+            "title": title,
+            "text": self.query_one("#rule-text", TextArea).text.strip(),
+        })
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RuleDetailScreen(Screen):
+    """Карточка правила: тип, область действия и подробности целиком."""
+
+    CSS = "VerticalScroll { padding: 1 2; }"
+    BINDINGS = [
+        Binding("escape,backspace,q", "app.pop_screen", "← Назад"),
+        Binding("e", "edit", "Править"),
+    ]
+
+    def __init__(
+        self,
+        rule_id: int,
+        *,
+        get_fn: Optional[Callable[[int], Optional[WorkspaceRule]]],
+        edit_fn: Optional[Callable[[int, dict], None]] = None,
+        tags_fn: Optional[Callable[[], list[str]]] = None,
+        refresh_interval: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.rule_id = rule_id
+        self._get_fn = get_fn
+        self._edit_fn = edit_fn
+        self._tags_fn = tags_fn
+        self._refresh_interval = refresh_interval
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield VerticalScroll(Static(id="rule-body"))
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._reload()
+        if self._refresh_interval:
+            self.set_interval(self._refresh_interval, self._reload)
+
+    def _reload(self) -> None:
+        rule = self._get_fn(self.rule_id) if self._get_fn else None
+        body = self.query_one("#rule-body", Static)
+        if rule is None:
+            body.update("[dim]правило не найдено[/dim]")
+            return
+        self.sub_title = rule.title
+        label, color = WORKSPACE_RULE_BADGES.get(rule.kind, (rule.kind, "white"))
+        scope = f"[cyan]{escape(rule.tag)}[/cyan]" if rule.tag else "[dim]весь воркспейс[/dim]"
+        parts = [
+            Text.from_markup(f"[b {color}]{escape(label)}[/b {color}]  {escape(rule.title)}"),
+            Rule(style="cyan"),
+            Text.from_markup(f"[dim]область:[/dim] {scope}   "
+                             f"[dim]обновлено:[/dim] {escape(_fmt_dt(rule.updated_at))}"),
+        ]
+        if rule.text:
+            parts += [Text(""), Text(rule.text)]
+        body.update(Group(*parts))
+
+    def action_edit(self) -> None:
+        rule = self._get_fn(self.rule_id) if self._get_fn else None
+        if rule is None or self._edit_fn is None:
+            return
+
+        def do(values: Optional[dict]) -> None:
+            if not values:
+                return
+            self._edit_fn(self.rule_id, values)  # type: ignore[misc]
+            self._reload()
+
+        known = self._tags_fn() if self._tags_fn else []
+        self.app.push_screen(RuleEditScreen(rule, known_tags=known), do)
+
+
+class LegendScreen(ModalScreen):
+    """Легенда клавиш текущего окна: сначала свои, ниже общие.
+
+    Набор клавиш зависит от того, где ты стоишь: на «Работах» `D` удаляет работу, на
+    «Правилах» — правило, а в карточке задачи половины этих клавиш нет вовсе. Поэтому
+    легенда собирается вызывающим под текущий экран, а не хардкодится здесь.
+    """
+
+    CSS = """
+    LegendScreen { align: center middle; }
+    #legend-box { width: 76; height: auto; max-height: 85%; border: round $accent;
+                  padding: 1 2; background: $surface; }
+    #legend-body { height: auto; }
+    #legend-hint { height: auto; margin-top: 1; color: $text-muted; }
+    """
+    BINDINGS = [Binding("escape,question_mark,q", "close", "Закрыть")]
+
+    def __init__(self, page: list[tuple[str, str]], common: list[tuple[str, str]],
+                 *, title: str = "") -> None:
+        super().__init__()
+        self._page = page
+        self._common = common
+        self._where = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="legend-box"):
+            yield Static(Text.from_markup("[b]Клавиши[/b]"), id="legend-title")
+            yield VerticalScroll(Static(self._body(), id="legend-body"))
+            yield Static(
+                Text.from_markup("[dim]Escape или ? — закрыть[/dim]"), id="legend-hint")
+
+    def _body(self):
+        parts = []
+        here = f"На этой странице — {self._where}" if self._where else "На этой странице"
+        for header, rows, empty in (
+            (here, self._page, "своих клавиш нет"),
+            ("Общие", self._common, "нет"),
+        ):
+            parts.append(Rule(header, align="left", style="cyan"))
+            if not rows:
+                parts.append(Text.from_markup(f"[dim]{empty}[/dim]"))
+                continue
+            width = max(len(key) for key, _ in rows)
+            for key, description in rows:
+                parts.append(Text.from_markup(
+                    f"  [b cyan]{escape(key.ljust(width))}[/b cyan]  {escape(description)}"
+                ))
+        return Group(*parts)
+
+    def action_close(self) -> None:
+        self.dismiss()

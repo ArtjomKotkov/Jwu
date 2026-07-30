@@ -162,20 +162,21 @@ def test_fetch_failure_does_not_wipe_tab_or_emit_gone(store):
     assert [i.key for i in store.latest_issues("mine")] == ["PROJ-1"]  # не затёрли
 
 
-def test_issue_still_in_other_view_is_not_gone(store):
-    """Задача, ушедшая из mine, но оставшаяся в mentions, не считается исчезнувшей."""
-    run1 = store.start_sync_run(["mine", "mentions"])
+def test_gone_detection_ignores_mentions_view(store):
+    """Исчезновение считается только по «моим задачам».
+
+    Упоминания больше не задачи в выборке, а отдельные записи (таблица mentions),
+    поэтому старый снапшот со вью «mentions» не должен удерживать задачу «живой».
+    """
+    run1 = store.start_sync_run(["mine"])
     store.save_issue_snapshot(run1, _issue("PROJ-1"), ["mine", "mentions"])
-    store.finish_sync_run(run1, {"tasks:mine": 1, "tasks:mentions": 1})
+    store.finish_sync_run(run1, {"tasks:mine": 1})
     store.compute_changes(run1)
 
-    run2 = store.start_sync_run(["mine", "mentions"])
-    store.save_issue_snapshot(run2, _issue("PROJ-1"), ["mentions"])
-    store.finish_sync_run(run2, {"tasks:mine": 0, "tasks:mentions": 1})
+    run2 = store.start_sync_run(["mine"])
+    store.finish_sync_run(run2, {"tasks:mine": 0})
     deltas = store.compute_changes(run2)
-    assert not any(d.kind == "gone" for d in deltas)  # ещё видна в mentions
-    assert store.latest_issues("mine") == []
-    assert [i.key for i in store.latest_issues("mentions")] == ["PROJ-1"]
+    assert [(d.key, d.kind, d.section) for d in deltas] == [("PROJ-1", "gone", "mine")]
 
 
 def test_gone_delta_survives_pending_roundtrip(store):
@@ -185,16 +186,12 @@ def test_gone_delta_survives_pending_roundtrip(store):
     assert restored[0].kind == "gone" and restored[0].section == "mine"
 
 
-def test_analyses_roundtrip(store):
-    a1 = store.save_analysis("план 1", "День 1")
-    a2 = store.save_analysis("план 2", "День 2")
-    assert a2.id > a1.id
-    lst = store.list_analyses()
-    assert [a.id for a in lst] == [a2.id, a1.id]  # новые сверху
-    assert lst[0].content == ""  # список без content
-    assert store.get_analysis(a1.id).content == "план 1"
-    assert store.get_analysis().id == a2.id  # последний
-    assert store.get_analysis(999) is None
+def test_analyses_are_gone(store):
+    """«Анализы» убраны из продукта: ни таблицы, ни методов стора не осталось."""
+    assert not hasattr(store, "save_analysis")
+    tables = {r["name"] for r in store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "analyses" not in tables
 
 
 def test_delete_job_removes_records_and_links(store):
@@ -266,3 +263,265 @@ def test_jobs_for_pr_distinguishes_project_repo(store):
     assert {j.id for j in store.jobs_for_pr(100)} == {j1.id, j2.id}                 # без фильтра — оба
     assert [j.id for j in store.jobs_for_pr(100, project="P1", repo="r1")] == [j1.id]
     assert [j.id for j in store.jobs_for_pr(100, project="P2", repo="r2")] == [j2.id]
+
+
+def test_mentions_dedup_and_seen(store):
+    from jwu.core.models import Mention
+
+    def m(comment_id, text="[~alice] глянь"):
+        return Mention(task_key="A-1", comment_id=comment_id, author="Боб", text=text,
+                       created=f"2026-05-2{comment_id}T10:00", summary="Задача")
+
+    assert [x.comment_id for x in store.add_mentions([m("1"), m("2")])] == ["1", "2"]
+    # тот же комментарий второй раз — не новая запись
+    assert store.add_mentions([m("1"), m("3")]) and \
+        [x.comment_id for x in store.add_mentions([m("1")])] == []
+    assert {x.comment_id for x in store.list_mentions()} == {"1", "2", "3"}
+    assert [x.created for x in store.list_mentions()] == sorted(
+        (x.created for x in store.list_mentions()), reverse=True)  # свежие сверху
+
+    ids = [x.id for x in store.list_mentions()]
+    assert len(store.unseen_mentions()) == 3
+    store.mark_mentions_seen([ids[0]])
+    assert len(store.unseen_mentions()) == 2
+    store.mark_mentions_seen(None)
+    assert store.unseen_mentions() == []
+
+
+def test_mention_scan_state_roundtrip(store):
+    assert store.mention_scan_state() == {}
+    store.set_mention_scan("A-1", "2026-05-20T10:00")
+    store.set_mention_scan("A-1", "2026-05-21T10:00")  # перезапись, не дубль
+    assert store.mention_scan_state() == {"A-1": "2026-05-21T10:00"}
+
+
+# --- чистка старых снапшотов ---------------------------------------------- #
+
+
+def _age_run(store, run_id, days):
+    """Состарить прогон и его снапшоты на N дней (чистка смотрит на даты)."""
+    from datetime import datetime, timedelta, timezone
+
+    old = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    store.conn.execute("UPDATE sync_runs SET started_at = ? WHERE id = ?", (old, run_id))
+    for table in ("issue_snapshots", "pr_snapshots"):
+        store.conn.execute(
+            f"UPDATE {table} SET fetched_at = ? WHERE sync_run_id = ?", (old, run_id))
+    store.conn.commit()
+
+
+def _history(store, count=5, *, days_old=60):
+    """Несколько состаренных прогонов с одной задачей и одним PR в каждом."""
+    runs = []
+    for n in range(count):
+        run = store.start_sync_run(["mine", "prs:mine"])
+        store.save_issue_snapshot(run, _issue(comments=list(range(n + 1))), ["mine"])
+        store.save_pr_snapshot(run, PR(id=7, project="P", repository="r"), ["mine"])
+        store.finish_sync_run(run, {"tasks:mine": 1, "prs:mine": 1})
+        store.compute_changes(run)
+        _age_run(store, run, days_old)
+        runs.append(run)
+    return runs
+
+
+def test_prune_keeps_latest_snapshot_of_every_entity(store):
+    runs = _history(store, count=5)
+    report = store.prune_snapshots(days=30, dry_run=False)
+
+    assert report.issue_snapshots > 0 and report.pr_snapshots > 0
+    # по одной живой записи на сущность — ими считаются дельты следующего синка
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == 1
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM pr_snapshots").fetchone()[0] == 1
+    # выжил именно последний снапшот, а не какой попало
+    kept = store.conn.execute("SELECT sync_run_id FROM issue_snapshots").fetchone()[0]
+    assert kept == runs[-1]
+    # и данные вкладок после чистки на месте
+    assert [i.key for i in store.latest_issues("mine")] == ["PROJ-1"]
+    assert [p.id for p in store.latest_prs("mine")] == [7]
+
+
+def test_prune_does_not_resurrect_new_or_gone_deltas(store):
+    """Главное свойство чистки: следующий синк после неё должен быть таким же тихим."""
+    _history(store, count=5)
+    store.prune_snapshots(days=30, dry_run=False)
+
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_issue_snapshot(run, _issue(comments=[0, 1, 2, 3, 4]), ["mine"])
+    store.save_pr_snapshot(run, PR(id=7, project="P", repository="r"), ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 1, "prs:mine": 1})
+    assert store.compute_changes(run) == []
+
+
+def test_prune_keeps_last_reliable_run_for_gone_detection(store):
+    """Прогон, по которому считается «ушла из выборки», удалять нельзя."""
+    _history(store, count=4)
+    store.prune_snapshots(days=30, dry_run=False)
+
+    # задача перестала приходить → ждём ровно одну gone, а не тишину и не дубли
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.finish_sync_run(run, {"tasks:mine": 0, "prs:mine": 0})
+    deltas = store.compute_changes(run)
+    assert [(d.key, d.kind) for d in deltas] == [("PROJ-1", "gone"), ("P/r#7", "pr_gone")]
+
+
+def test_prune_keeps_last_reliable_dev_snapshot(store):
+    """Свежайший снапшот с достоверной dev-панелью — база для new_pr, его не трогаем."""
+    run1 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run1, _issue(prs=[42], dev_ok=True), ["mine"])
+    store.finish_sync_run(run1, {"tasks:mine": 1})
+    store.compute_changes(run1)
+    _age_run(store, run1, 60)
+
+    # свежий снапшот есть, но dev-панель в нём сбойная (pr_ids пустые)
+    run2 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run2, _issue(prs=[], dev_ok=False), ["mine"])
+    store.finish_sync_run(run2, {"tasks:mine": 1})
+    store.compute_changes(run2)
+    _age_run(store, run2, 60)
+
+    store.prune_snapshots(days=30, dry_run=False)
+
+    # dev-status снова ответил тем же PR — «новым» он выглядеть не должен
+    run3 = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run3, _issue(prs=[42], dev_ok=True), ["mine"])
+    store.finish_sync_run(run3, {"tasks:mine": 1})
+    assert not any(d.kind == "new_pr" for d in store.compute_changes(run3))
+
+
+def test_prune_spares_fresh_snapshots(store):
+    """Свежие снапшоты не трогаем вовсе — чистка идёт строго по возрасту."""
+    _history(store, count=3, days_old=3)
+    before = store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0]
+    report = store.prune_snapshots(days=30, dry_run=False)
+    assert report.total == 0
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == before
+
+
+def test_prune_dry_run_counts_but_changes_nothing(store):
+    _history(store, count=5)
+    before = store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0]
+
+    dry = store.prune_snapshots(days=30, dry_run=True)
+    assert dry.dry_run is True and dry.issue_snapshots > 0
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == before
+
+    # сухой прогон обещает ровно то, что потом и делает
+    real = store.prune_snapshots(days=30, dry_run=False)
+    assert (real.issue_snapshots, real.pr_snapshots, real.sync_runs) == \
+        (dry.issue_snapshots, dry.pr_snapshots, dry.sync_runs)
+
+
+def test_prune_all_workspaces_restores_scope(store):
+    from jwu.core import workspaces
+
+    home = workspaces.create(store, "home")
+    store.use_workspace(home.id)
+    _history(store, count=3)
+    store.use_workspace(store.get_workspace_by_slug("work").id)
+    _history(store, count=3)
+
+    reports = store.prune_all_workspaces(days=30, dry_run=False)
+    assert set(reports) == {"work", "home"}
+    assert all(r.total > 0 for r in reports.values())
+    # скоуп соединения после обхода вернулся туда, где был
+    assert store.workspace_id == store.get_workspace_by_slug("work").id
+
+
+def test_vacuum_reclaims_space(store):
+    _history(store, count=30)
+    store.prune_snapshots(days=30, dry_run=False)
+    assert store.free_ratio() > 0
+    store.vacuum()
+    assert store.free_ratio() == 0
+    # соединение осталось рабочим (VACUUM трогает isolation_level)
+    assert store.list_workspaces()
+
+
+# --- правила воркспейса --------------------------------------------------- #
+
+
+def test_rules_crud_and_scoping(store):
+    ban = store.add_rule("Не пушить в develop", kind="constraint")
+    how = store.add_rule("Как поднять стенд", text="1. docker compose up",
+                         kind="howto", tag="legacy-бэкенд")
+    store.add_rule("Сборка только pnpm", kind="convention", tag="фронт")
+
+    assert [r.id for r in store.list_rules()] == sorted(r.id for r in store.list_rules())
+    assert {r.title for r in store.list_rules(kind="constraint")} == {"Не пушить в develop"}
+
+    # tag="" — только общие; tag="x" — общие И правила этого тега (общие действуют везде)
+    assert [r.id for r in store.list_rules(tag="")] == [ban.id]
+    assert {r.id for r in store.list_rules(tag="legacy-бэкенд")} == {ban.id, how.id}
+
+    store.update_rule(how.id, title="Как поднять стенд локально", kind="info")
+    fresh = store.get_rule(how.id)
+    assert fresh.title == "Как поднять стенд локально" and fresh.kind == "info"
+    assert fresh.text == "1. docker compose up"        # не затёрли тем, что не передали
+    assert fresh.updated_at >= how.updated_at
+
+    store.delete_rule(how.id)
+    assert store.get_rule(how.id) is None
+    assert len(store.list_rules()) == 2
+
+
+def test_rule_kind_is_validated(store):
+    with pytest.raises(ValueError, match="Неизвестный тип"):
+        store.add_rule("x", kind="nope")
+    rule = store.add_rule("x")
+    assert rule.kind == "info"                          # дефолт — справка
+    with pytest.raises(ValueError, match="Неизвестный тип"):
+        store.update_rule(rule.id, kind="nope")
+    with pytest.raises(ValueError, match="Неизвестное поле"):
+        store.update_rule(rule.id, nonsense="x")
+
+
+def test_rules_markdown_reads_as_a_briefing(store):
+    """Правила отдаются текстом: их читают и исполняют, а не парсят."""
+    store.add_rule("Не пушить в develop", text="совсем никогда", kind="constraint")
+    store.add_rule("Как поднять стенд", text="шаг один\nшаг два",
+                   kind="howto", tag="legacy-бэкенд")
+
+    md = store.rules_markdown()
+    assert "#1 ⛔ ЗАПРЕТ — Не пушить в develop" in md
+    assert "совсем никогда" in md                 # общее правило — целиком
+    assert "[#legacy-бэкенд]" in md               # правило тега — только заголовком
+    assert "шаг один" not in md
+    # многострочный текст остаётся многострочным, а не \n-эскейпом
+    assert "\\n" not in md
+
+    # с тегом приезжает и его полный текст
+    scoped = store.rules_markdown(tag="legacy-бэкенд")
+    assert "Только для #legacy-бэкенд" in scoped
+    assert "шаг один" in scoped and "шаг два" in scoped
+    assert "совсем никогда" in scoped             # общие никуда не делись
+
+    assert store.rules_markdown(tag="нет-такого").count("Только для") == 0
+
+
+def test_rules_markdown_is_empty_without_rules(store):
+    assert store.rules_markdown() == ""
+
+
+def test_rules_are_isolated_and_removed_with_workspace(store):
+    from jwu.core import workspaces
+
+    home = workspaces.create(store, "home")
+    store.use_workspace(home.id)
+    store.add_rule("домашнее правило")
+    work = store.get_workspace_by_slug("work")
+    store.use_workspace(work.id)
+    store.add_rule("рабочее правило")
+
+    assert [r.title for r in store.list_rules()] == ["рабочее правило"]
+    store.use_workspace(home.id)
+    assert [r.title for r in store.list_rules()] == ["домашнее правило"]
+
+    store.delete_workspace(home.id)
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM workspace_rules WHERE workspace_id = ?",
+        (home.id,),
+    ).fetchone()[0] == 0

@@ -40,6 +40,35 @@ def fmt_dt(value: TimeLike, *, fallback: str = "—") -> str:
     return ts.strftime(DT_FMT) if ts is not None else fallback
 
 
+def day_key(value: TimeLike) -> str:
+    """Календарный день в локальной TZ (`ГГГГ-ММ-ДД`) — им группируют записи по дням."""
+    ts = _to_dt(value)
+    return ts.date().isoformat() if ts is not None else ""
+
+
+_WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
+def fmt_day(value: TimeLike, *, fallback: str = "без даты") -> str:
+    """День человеку: `ДД.ММ.ГГГГ`; пусто/невалидно → ``fallback``."""
+    ts = _to_dt(value)
+    return ts.strftime("%d.%m.%Y") if ts is not None else fallback
+
+
+def day_name(value: TimeLike, *, fallback: str = "") -> str:
+    """Как назвать день словами: «сегодня» / «вчера» / название дня недели."""
+    ts = _to_dt(value)
+    if ts is None:
+        return fallback
+    today = datetime.now(ts.tzinfo or timezone.utc).date()
+    delta = (today - ts.date()).days
+    if delta == 0:
+        return "сегодня"
+    if delta == 1:
+        return "вчера"
+    return _WEEKDAYS[ts.weekday()]
+
+
 def fmt_ago(value: TimeLike, *, fallback: str = "не синкано — нажми R") -> str:
     """Время → «N мин/ч/дн назад» (или «только что»). Пусто/невалидно → ``fallback``."""
     ts = _to_dt(value)
