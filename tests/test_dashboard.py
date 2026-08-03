@@ -1297,6 +1297,8 @@ def test_normalize_issue_key():
     assert normalize_issue_key("PROJ-1") == "PROJ-1"
     assert normalize_issue_key("") == ""
     assert normalize_issue_key("   ") == ""
+    # ключ GitHub регистрозависим (имя репозитория) — его в верхний регистр не поднимаем
+    assert normalize_issue_key(" dndeck#42 ") == "dndeck#42"
 
 
 def test_linked_issue_click_opens_card_and_back():
@@ -1609,7 +1611,7 @@ def test_Y_copies_issue_key_from_list_via_modal(monkeypatch):
             assert isinstance(app.screen, CopyModalScreen)
             await pilot.press("i")
             assert copied == ["A-1"]
-            assert notes and notes[0][0][0] == "Скопировано: ключ Jira"
+            assert notes and notes[0][0][0] == "Скопировано: ключ задачи"
             await pilot.press("q")
 
     asyncio.run(run())
@@ -2947,7 +2949,7 @@ def test_search_says_so_when_jira_is_off():
     """Воркспейс без Jira: искать нечего — говорим прямо, а не открываем пустую модалку."""
     from jwu.cli.workspace_screens import TextPromptScreen
 
-    data = DashboardData(user="alice", jira_enabled=False, bitbucket_enabled=False)
+    data = DashboardData(user="alice", provider="local")
     app = JwuDashboard(data)                     # issue_get_fn не передан
 
     async def run() -> None:
@@ -2957,7 +2959,7 @@ def test_search_says_so_when_jira_is_off():
             await pilot.press("/")
             await pilot.pause()
             assert not isinstance(app.screen, TextPromptScreen)
-            assert notes and "Jira" in notes[0][0]
+            assert notes and "нет провайдера задач" in notes[0][0]
             await pilot.press("q")
 
     asyncio.run(run())
@@ -3062,3 +3064,108 @@ def test_empty_rules_tab_explains_itself():
             await pilot.press("q")
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# GitHub-контур в дашборде
+# --------------------------------------------------------------------------- #
+
+
+def _github_data(store, ws) -> DashboardData:
+    store.use_workspace(ws.id)
+    data = dashboard_from_memory(store)
+    data.workspace = ws
+    return data
+
+
+def test_github_workspace_shows_task_and_pr_tabs_but_not_features(tmp_path):
+    """У GitHub-контура задачи и PR приходят от одного провайдера — вкладки те же, что у Jira."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "dndeck", provider="github")
+    data = _github_data(store, ws)
+    store.close()
+
+    app = JwuDashboard(data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            visible = app._visible_tabs()
+            assert "tab-mine" in visible and "tab-prs-review" in visible
+            assert "tab-features" not in visible   # задачи ведутся в Issues
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_footer_shows_provider_host_and_login(tmp_path):
+    """Куда и под кем залогинены — видно всегда: контуров несколько, спутать нельзя."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "dndeck", provider="github")
+    data = _github_data(store, ws)
+    data.user, data.display_name = "akotkov", "Артём"
+    data.env_label = "dndeck @ github.com"
+    store.close()
+
+    app = JwuDashboard(data)
+    block = app._user_block()
+    assert "GitHub" in block                      # провайдер
+    assert "dndeck @ github.com" in block         # хост и репозиторий
+    assert "Артём (akotkov)" in block             # под кем
+    assert "dndeck" in block                      # какой контур
+
+
+def test_local_workspace_footer_has_no_phantom_login(tmp_path):
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    ws = workspaces.create(store, "home")
+    data = _github_data(store, ws)
+    store.close()
+
+    block = JwuDashboard(data)._user_block()
+    assert "👤" not in block and "локальный" in block
+
+
+def test_switching_workspace_drops_previous_identity(tmp_path):
+    """После перехода в другой контур в футере не должен висеть логин из прошлого."""
+    from jwu.core import workspaces
+
+    store = Store(tmp_path / "state.db")
+    home = workspaces.create(store, "home")
+    work = store.get_workspace_by_slug("work")
+    store.use_workspace(work.id)
+    work_data = dashboard_from_memory(store)
+    work_data.user, work_data.display_name = "alice", "Alice"
+    home_data = _github_data(store, home)
+    store.close()
+
+    app = JwuDashboard(work_data, workspace_switch_fn=lambda wid: home_data)
+
+    async def run() -> None:
+        async with app.run_test() as pilot:
+            assert "alice" in app._user_block()
+            app._workspace_switched(home_data)
+            await pilot.pause()
+            assert "alice" not in app._user_block()
+            await pilot.press("q")
+
+    asyncio.run(run())
+
+
+def test_pr_task_key_reads_github_issue_number():
+    from jwu.cli.dashboard import pr_task_key
+
+    pr = PR(id=7, title="Fix save", source_branch="42-fix-save",
+            project="akotkov", repository="dndeck")
+    assert pr_task_key(pr, "akotkov") == "dndeck#42"
+    # ключ Jira по-прежнему в приоритете — контуры Jira ничего не замечают
+    jira_pr = PR(id=7, title="PROJ-9: fix", source_branch="PROJ-9-fix",
+                 project="PROJ", repository="repo")
+    assert pr_task_key(jira_pr) == "PROJ-9"
+    # связи нет — колонка «Задача» останется пустой, а не покажет мусор
+    assert pr_task_key(PR(id=7, title="Fix", source_branch="fix",
+                          project="akotkov", repository="dndeck"), "akotkov") == ""

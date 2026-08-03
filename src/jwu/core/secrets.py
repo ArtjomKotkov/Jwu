@@ -31,7 +31,7 @@ if TYPE_CHECKING:  # pragma: no cover — только для типов, что
 SECRET_SLOTS: tuple[str, ...] = (
     "jira.token", "jira.password", "jira.gate_password",
     "sdesk.token", "sdesk.password", "sdesk.gate_password",
-    "bitbucket.token", "jenkins.token",
+    "bitbucket.token", "github.token", "jenkins.token",
 )
 
 # Слоты, которые можно перебить переменной окружения (как и раньше).
@@ -39,6 +39,9 @@ SLOT_ENV: dict[str, str] = {
     "jira.token": "JIRA_TOKEN",
     "sdesk.token": "SDESK_TOKEN",
     "bitbucket.token": "BITBUCKET_TOKEN",
+    # GITHUB_TOKEN — общепринятое имя (его же ставит gh CLI и Actions), поэтому
+    # он и подхватывается автоматически: чаще всего токен уже есть в окружении.
+    "github.token": "GITHUB_TOKEN",
     "jenkins.token": "JENKINS_TOKEN",
 }
 

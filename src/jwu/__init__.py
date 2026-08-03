@@ -1,7 +1,7 @@
-"""jwu: CLI для Jira Server + Bitbucket Server с памятью."""
+"""jwu: CLI для Jira Server + Bitbucket Server и для GitHub, с локальной памятью."""
 
 # ИСТОЧНИК ПРАВДЫ о версии ИСПОЛНЯЕМОГО кода. Метаданные пакета (importlib.metadata)
 # для этого не годятся: при editable/develop-установке они остаются от того момента,
 # когда пакет ставили, и расходятся с реальным кодом. Держится в синхроне с
 # pyproject.toml — это проверяет тест (см. tests/test_version.py).
-__version__ = "1.6.0"
+__version__ = "1.7.0"

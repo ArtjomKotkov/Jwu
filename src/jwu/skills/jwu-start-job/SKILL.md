@@ -48,9 +48,12 @@ description: Use when the user wants to start/track work on a specific Jira task
 > так-то») — предложи сохранить: `jwu_rule_add(title, text, kind, tag)`
 > (bash: `jwu rule add "…" --kind constraint`).
 >
-> Если `jira_enabled=false` — Jira-команды и инструменты **не вызывай**: якорь работы там
-> либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
-> (`jwu job start --title "…"`). Если папка не привязана ни к одному воркспейсу — скажи
+> **Провайдер контура** (`provider` в ответе `jwu_workspace_current()`) говорит, откуда
+> берутся задачи и PR: `jira` (Jira + Bitbucket + Jenkins), `github` (Issues + PR + Actions)
+> или `local`. Инструменты одни и те же — меняется только формат ключа задачи: `PROJ-123`
+> у Jira, `dndeck#42` у GitHub. Если `provider=local` — инструменты задач **не вызывай**:
+> якорь работы там либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
+> (`jwu job start --title "…"`). У GitHub нет таймтрекера — `jwu_worklog` там откажет. Если папка не привязана ни к одному воркспейсу — скажи
 > об этом пользователю и предложи подключить проект.
 > Если папка не привязана ни к одному воркспейсу (`source` не `cwd`) — **не логируй работу**:
 > записи уедут в чужой контур. Сначала подключи проект — скилл **jwu-workspace-setup**
@@ -69,12 +72,13 @@ description: Use when the user wants to start/track work on a specific Jira task
    без текста. Запреты (⛔) и соглашения из правил действуют на весь цикл: план, который
    их нарушает, показывать нельзя.
    Дальше две ветки:
-   - **есть Jira** (`jira_enabled=true`) — всё как ниже, якорь работы это ключ задачи;
-   - **нет Jira** — вместо `jwu task <KEY>` смотри карточку локальной фичи
+   - **есть внешний трекер** (`provider` = `jira` или `github`) — всё как ниже, якорь
+     работы это ключ задачи: `PROJ-123` у Jira, `dndeck#42` у GitHub;
+   - **`provider=local`** — вместо `jwu task <KEY>` смотри карточку локальной фичи
      (`jwu feature show <KEY>` / `jwu_features()`), работу заводи как
      `jwu job start --feature <KEY> --title "<суть цикла>"`, а если фичи нет —
      `jwu job start --title "<суть>"` (работа без якоря). **Ключ задачи не выдумывай.**
-     Фаза 1 без Bitbucket сводится к прогону локальных тестов — конфликт и CI смотреть негде.
+     Фаза 1 там сводится к прогону локальных тестов — конфликт и CI смотреть негде.
 
 1. **Карточка задачи целиком:** `jwu task <KEY>` (поля: `status`, `description`, `comments`, `links`,
    `pull_requests`, `branches`, `commits`, `notes`, плюс секция «Работы»; `--json` если нужна структура).

@@ -164,9 +164,11 @@ from jwu.core.models import Issue as _Issue
 class _FakeSvc:
     def __init__(self, store):
         self._store = store
-        # CLI проверяет наличие клиентов, чтобы отказать в воркспейсе без интеграции
-        self.jira = object()
-        self.bitbucket = object()
+        # CLI проверяет наличие клиентов, чтобы отказать в контуре без провайдера
+        self.tasks_client = object()
+        self.pr_client = object()
+        self.jira = self.tasks_client
+        self.bitbucket = self.pr_client
         self.workspace = None
     def __enter__(self): return self
     def __exit__(self, *exc): pass
@@ -350,9 +352,9 @@ def test_configure_keeps_db_path_in_global_config(monkeypatch, tmp_path):
 
 
 def test_configure_enables_integrations_by_hosts(monkeypatch, tmp_path):
-    """Заданный хост включает интеграцию воркспейса — иначе команды отказывали бы."""
+    """Настроенные креды поднимают провайдера ЛОКАЛЬНОГО контура — иначе он бы молчал."""
     db, _, _ = _configure_env(monkeypatch, tmp_path)
-    runner.invoke(cli.app, ["workspace", "create", "home", "--no-jira", "--no-bitbucket"])
+    runner.invoke(cli.app, ["workspace", "create", "home"])
 
     res = runner.invoke(cli.app, [
         "-W", "home", "configure", "--non-interactive",
@@ -362,8 +364,30 @@ def test_configure_enables_integrations_by_hosts(monkeypatch, tmp_path):
 
     store = Store(db)
     ws = store.get_workspace_by_slug("home")
-    assert ws.jira_enabled is True
+    assert ws.provider == "jira"
     assert ws.bitbucket_enabled is False  # хост Bitbucket не задавали
+    store.close()
+
+
+def test_configure_enables_github_provider(monkeypatch, tmp_path):
+    """То же для GitHub: owner + токен делают локальный контур github-контуром."""
+    db, _, _ = _configure_env(monkeypatch, tmp_path)
+    runner.invoke(cli.app, ["workspace", "create", "dndeck"])
+
+    res = runner.invoke(cli.app, [
+        "-W", "dndeck", "configure", "--non-interactive",
+        "--github-owner", "akotkov", "--github-repos", "dndeck",
+        "--github-token", "GHTOK",
+    ])
+    assert res.exit_code == 0, res.output
+
+    store = Store(db)
+    ws = store.get_workspace_by_slug("dndeck")
+    assert ws.provider == "github" and ws.github_enabled is True
+    assert ws.prs_enabled is True          # PR у GitHub приходят из того же места
+    settings = store.workspace_settings(ws.id)
+    assert settings["github.owner"] == "akotkov"
+    assert store.workspace_secrets(ws.id)["github.token"] == "GHTOK"
     store.close()
 
 
@@ -443,10 +467,11 @@ def test_workspace_create_list_and_current(monkeypatch, tmp_path):
     folder.mkdir()
 
     res = runner.invoke(cli.app, ["workspace", "create", "home", "--name", "Личное",
-                                  "--path", str(folder), "--no-jira", "--json"])
+                                  "--path", str(folder), "--json"])
     assert res.exit_code == 0, res.output
     payload = json.loads(res.stdout)
-    assert payload["slug"] == "home" and payload["jira_enabled"] is False
+    assert payload["slug"] == "home" and payload["provider"] == "local"
+    assert payload["jira_enabled"] is False
 
     res = runner.invoke(cli.app, ["workspace", "list", "--json"])
     slugs = [w["slug"] for w in json.loads(res.stdout)["workspaces"]]
@@ -512,17 +537,16 @@ def test_jira_commands_refuse_in_workspace_without_jira(monkeypatch, tmp_path):
             cli._resolve_workspace(Store(db)), _cfg_stub(), db_path=str(db)
         ),
     )
-    assert runner.invoke(cli.app, ["workspace", "create", "home", "--no-jira",
-                                   "--no-bitbucket"]).exit_code == 0
+    assert runner.invoke(cli.app, ["workspace", "create", "home"]).exit_code == 0
 
     res = runner.invoke(cli.app, ["-W", "home", "tasks"])
     assert res.exit_code == 1
-    assert "Jira не подключена" in res.output
+    assert "нет провайдера задач" in res.output
     assert "jwu feature list" in res.output
 
     res = runner.invoke(cli.app, ["-W", "home", "prs"])
     assert res.exit_code == 1
-    assert "Bitbucket не подключён" in res.output
+    assert "не подключён хостинг репозиториев" in res.output
 
     res = runner.invoke(cli.app, ["-W", "home", "sync"])
     assert res.exit_code == 1
@@ -854,3 +878,32 @@ def test_workspace_current_json_carries_rules(monkeypatch, tmp_path):
     assert "⛔ ЗАПРЕТ — Не пушить в develop" in md and "никогда" in md
     assert "[#фронт]" in md and "длинная инструкция" not in md
     assert [p["tags"] for p in payload["paths"]] == [["фронт"]]
+
+
+def test_configure_keeps_settings_it_was_not_asked_to_change(monkeypatch, tmp_path):
+    """Запуск с одним флагом не должен обнулять остальной конфиг контура.
+
+    Раньше configure брал за основу глобальный config.toml, а потом писал его поверх
+    настроек воркспейса: `--github-token` в одиночку стирал owner и репозитории,
+    и поиск задач молча уходил искать по всему GitHub.
+    """
+    db, _, _ = _configure_env(monkeypatch, tmp_path)
+    runner.invoke(cli.app, ["workspace", "create", "dndeck"])
+    assert runner.invoke(cli.app, [
+        "-W", "dndeck", "configure", "--non-interactive",
+        "--github-owner", "DnDeck", "--github-repos", "dndeck",
+        "--github-token", "T1",
+    ]).exit_code == 0
+
+    # второй запуск — только новый токен, про owner/репозитории речи нет
+    assert runner.invoke(cli.app, [
+        "-W", "dndeck", "configure", "--non-interactive", "--github-token", "T2",
+    ]).exit_code == 0
+
+    store = Store(db)
+    ws = store.get_workspace_by_slug("dndeck")
+    settings = store.workspace_settings(ws.id)
+    assert settings["github.owner"] == "DnDeck"
+    assert settings["github.repos"] == "dndeck"
+    assert store.workspace_secrets(ws.id)["github.token"] == "T2"
+    store.close()

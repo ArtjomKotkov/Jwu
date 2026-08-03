@@ -1,11 +1,14 @@
-"""Pydantic-модели и парсинг сырых ответов Jira / Bitbucket.
+"""Pydantic-модели и парсинг сырых ответов Jira / Bitbucket / GitHub.
 
-Сырые JSON Jira/Bitbucket сильно вложены; модели держат уже «плоское» представление,
-а классметоды `from_jira_*` / `from_bitbucket_*` инкапсулируют разбор.
+Сырые JSON сильно вложены; модели держат уже «плоское» представление, а классметоды
+`from_jira_*` / `from_bitbucket_*` / `from_github_*` инкапсулируют разбор. Одни и те же
+модели наполняются любым провайдером — поэтому TUI, память и дельты про провайдера
+ничего не знают.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, computed_field
@@ -45,6 +48,18 @@ class Comment(BaseModel):
             body=raw.get("body", "") or "",
             created=raw.get("created", "") or "",
             updated=raw.get("updated", "") or "",
+        )
+
+    @classmethod
+    def from_github(cls, raw: dict) -> "Comment":
+        login = _get(raw, "user", "login", default="") or ""
+        return cls(
+            id=str(raw.get("id", "")),
+            author=login,
+            author_key=login,  # у GitHub логин и есть отображаемое имя
+            body=raw.get("body", "") or "",
+            created=gh_time(raw.get("created_at", "") or ""),
+            updated=gh_time(raw.get("updated_at", "") or ""),
         )
 
 
@@ -165,6 +180,9 @@ class Issue(BaseModel):
     comments: list[Comment] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
     links: list[IssueLink] = Field(default_factory=list)
+    # Метки GitHub (у Jira роль меток играет status) — по ним в Issues и понимают,
+    # что происходит с задачей, поэтому в карточке и в таблице они нужны.
+    labels: list[str] = Field(default_factory=list)
     branches: list[DevBranch] = Field(default_factory=list)
     commits: list[DevCommit] = Field(default_factory=list)
     pull_requests: list[DevPullRequest] = Field(default_factory=list)
@@ -201,6 +219,42 @@ class Issue(BaseModel):
             comments=comments,
             attachments=attachments,
             links=links,
+        )
+
+    @classmethod
+    def from_github(cls, raw: dict, *, default_owner: str = "") -> "Issue":
+        """Issue GitHub → та же модель задачи, что и у Jira.
+
+        ``status`` собирается из ``state``/``state_reason``: у GitHub нет рабочего процесса
+        Jira, и «Открыта / Закрыта / Не будет сделана» — всё, что он про задачу знает;
+        остальное живёт в метках.
+        """
+        owner, repo = _github_repo_from_url(raw.get("repository_url", ""))
+        state = (raw.get("state", "") or "").lower()
+        reason = (raw.get("state_reason", "") or "").lower()
+        if state == "closed":
+            status = "Не будет сделана" if reason == "not_planned" else "Закрыта"
+        else:
+            status = "Открыта"
+        assignees = raw.get("assignees") or []
+        assignee = _get(raw, "assignee", "login", default="") or (
+            (assignees[0] or {}).get("login", "") if assignees else ""
+        )
+        return cls(
+            key=github_key(repo, raw.get("number", 0), owner=owner, default_owner=default_owner),
+            summary=raw.get("title", "") or "",
+            status=status,
+            assignee=assignee or "",
+            reporter=_get(raw, "user", "login", default="") or "",
+            created=gh_time(raw.get("created_at", "") or ""),
+            updated=gh_time(raw.get("updated_at", "") or ""),
+            resolution=reason if state == "closed" else "",
+            description=raw.get("body", "") or "",
+            labels=[
+                (lb.get("name", "") if isinstance(lb, dict) else str(lb))
+                for lb in raw.get("labels", []) or []
+            ],
+            dev_ok=False,  # ветки/PR приезжают отдельным запросом (см. GitHubClient.issue)
         )
 
     def apply_dev_status(self, detail: dict) -> None:
@@ -266,6 +320,25 @@ class Reviewer(BaseModel):
             status=raw.get("status", ""),
         )
 
+    @classmethod
+    def from_github(cls, login: str, state: str = "") -> "Reviewer":
+        """Ревьювер GitHub. ``state`` — из отзыва (APPROVED / CHANGES_REQUESTED / …).
+
+        Пустой state = ревью запрошено, но не сделано, — это UNAPPROVED в терминах jwu:
+        так «ждёт моего ревью» и «просили доработать» остаются разными состояниями.
+        """
+        state = (state or "").upper()
+        status = {
+            "APPROVED": "APPROVED",
+            "CHANGES_REQUESTED": "NEEDS_WORK",
+        }.get(state, "UNAPPROVED")
+        return cls(
+            name=login,
+            display_name=login,
+            approved=status == "APPROVED",
+            status=status,
+        )
+
 
 class BuildStatus(BaseModel):
     """Статус CI-сборки по коммиту (build-status API Bitbucket — то, что видно на странице PR).
@@ -292,6 +365,39 @@ class BuildStatus(BaseModel):
             date_added=int(raw.get("dateAdded", 0) or 0),
         )
 
+    @classmethod
+    def from_github_check(cls, raw: dict) -> "BuildStatus":
+        """check-run GitHub (в т.ч. джоба GitHub Actions) → статус сборки.
+
+        Незавершённый ран — INPROGRESS независимо от conclusion (его ещё нет);
+        завершённый переводится по conclusion, где neutral/skipped считаются зелёными:
+        они не про поломку, а про «шаг не выполнялся».
+        """
+        completed = (raw.get("status", "") or "").lower() == "completed"
+        conclusion = (raw.get("conclusion", "") or "").lower()
+        state = _GH_CONCLUSION_STATE.get(conclusion, "FAILED") if completed else "INPROGRESS"
+        summary = _get(raw, "output", "title", default="") or ""
+        return cls(
+            state=state,
+            key=str(raw.get("id", "") or ""),
+            name=raw.get("name", "") or "",
+            url=raw.get("html_url", "") or raw.get("details_url", "") or "",
+            description=summary or (conclusion if completed else "выполняется"),
+            date_added=gh_ms(raw.get("started_at", "") or raw.get("completed_at", "") or ""),
+        )
+
+    @classmethod
+    def from_github_status(cls, raw: dict) -> "BuildStatus":
+        """Классический commit status GitHub (внешние CI вроде Travis/Codecov)."""
+        return cls(
+            state=_GH_STATUS_STATE.get((raw.get("state", "") or "").lower(), "FAILED"),
+            key=raw.get("context", "") or "",
+            name=raw.get("context", "") or "",
+            url=raw.get("target_url", "") or "",
+            description=raw.get("description", "") or "",
+            date_added=gh_ms(raw.get("updated_at", "") or raw.get("created_at", "") or ""),
+        )
+
 
 class TestCaseFailure(BaseModel):
     """Один упавший тест-кейс из Jenkins testReport."""
@@ -304,20 +410,23 @@ class TestCaseFailure(BaseModel):
 
 
 class BuildReport(BaseModel):
-    """Детальный разбор одной сборки: статус из Bitbucket + (если есть токен) данные Jenkins.
+    """Детальный разбор одной сборки: статус из хостинга + данные CI, если до них есть доступ.
 
-    Деградирует мягко: без доступа в Jenkins остаётся state/url/description из Bitbucket,
-    а ``jenkins_available=False`` и ``note`` объясняют, почему нет детализации.
+    Формат общий для обоих провайдеров: у Jira-контура это Bitbucket + Jenkins, у
+    GitHub-контура — check-run + GitHub Actions. Деградирует мягко: без доступа к CI
+    остаются state/url/description, а ``details_available=False`` и ``note`` объясняют,
+    почему нет детализации.
     """
 
-    state: str = ""        # из build-status Bitbucket
+    ci: str = "jenkins"    # jenkins | github-actions — чей разбор перед нами
+    state: str = ""        # состояние сборки по данным хостинга (build-status / check-run)
     name: str = ""
     url: str = ""
     description: str = ""
-    job_path: str = ""
+    job_path: str = ""     # путь джобы Jenkins либо owner/repo для Actions
     number: int = 0
-    jenkins_available: bool = False
-    result: str = ""       # из Jenkins (FAILURE/SUCCESS/None если идёт)
+    details_available: bool = False
+    result: str = ""       # из CI (FAILURE/SUCCESS/пусто, если ещё идёт)
     building: bool = False
     sha: str = ""
     branch: str = ""
@@ -325,6 +434,12 @@ class BuildReport(BaseModel):
     failures: list[TestCaseFailure] = Field(default_factory=list)
     console_tail: str = ""
     note: str = ""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def jenkins_available(self) -> bool:
+        """Совместимость: так это поле звалось, пока CI был только один (Jenkins)."""
+        return self.details_available and self.ci == "jenkins"
 
 
 class PRComment(BaseModel):
@@ -389,6 +504,61 @@ class PR(BaseModel):
             comment_count=int(_get(raw, "properties", "commentCount", default=0) or 0),
         )
 
+    @classmethod
+    def from_github(cls, raw: dict) -> "PR":
+        """PR GitHub → та же модель, что и у Bitbucket.
+
+        ``project`` — owner (организация или пользователь), ``repository`` — имя репозитория:
+        пара (project, repo) адресует PR одинаково у обоих провайдеров, поэтому память,
+        привязка PR к работам и экраны дашборда остаются общими.
+
+        Ревьюверы здесь — только ЗАПРОШЕННЫЕ (в payload PR отзывов нет); фактические
+        статусы досыпает клиент из ``/pulls/{n}/reviews``.
+        """
+        base_repo = _get(raw, "base", "repo", default={}) or {}
+        head_repo = _get(raw, "head", "repo", default={}) or {}
+        repo = base_repo or head_repo
+        if (raw.get("state", "") or "").lower() == "open":
+            state = "OPEN"
+        else:
+            state = "MERGED" if raw.get("merged_at") or raw.get("merged") else "DECLINED"
+        pull = cls(
+            id=int(raw.get("number", 0) or 0),
+            title=raw.get("title", "") or "",
+            description=raw.get("body", "") or "",
+            state=state,
+            author=_get(raw, "user", "login", default="") or "",
+            source_branch=_get(raw, "head", "ref", default="") or "",
+            target_branch=_get(raw, "base", "ref", default="") or "",
+            project=_get(repo, "owner", "login", default="") or "",
+            repository=repo.get("name", "") or "",
+            url=raw.get("html_url", "") or "",
+            created=gh_ms(raw.get("created_at", "") or ""),
+            updated=gh_ms(raw.get("updated_at", "") or ""),
+            reviewers=[
+                Reviewer.from_github(u.get("login", "") or "")
+                for u in raw.get("requested_reviewers", []) or []
+            ],
+            comment_count=int(raw.get("comments", 0) or 0)
+            + int(raw.get("review_comments", 0) or 0),
+            latest_commit=_get(raw, "head", "sha", default="") or "",
+        )
+        pull.apply_github_merge(raw)
+        return pull
+
+    def apply_github_merge(self, raw: dict) -> None:
+        """Конфликт/мержабельность из полей PR GitHub (отдельного эндпоинта у него нет).
+
+        ``mergeable`` приходит null, пока GitHub считает мерж в фоне — тогда честнее
+        оставить «неизвестно», чем показать зелёное или красное наугад.
+        """
+        mergeable = raw.get("mergeable")
+        state = (raw.get("mergeable_state", "") or "").lower()
+        if mergeable is None and not state:
+            return
+        self.conflicted = state == "dirty" or mergeable is False
+        self.can_merge = bool(mergeable) and state in ("clean", "has_hooks", "unstable", "")
+
     def apply_merge_status(self, merge: dict) -> None:
         """Заполнить статус конфликта из ответа /pull-requests/{id}/merge."""
         self.can_merge = bool(merge.get("canMerge", False))
@@ -398,6 +568,94 @@ class PR(BaseModel):
             vetoes = merge.get("vetoes", []) or []
             conflicted = any("conflict" in (v.get("summaryMessage", "").lower()) for v in vetoes)
         self.conflicted = bool(conflicted)
+
+
+# --------------------------------------------------------------------------- #
+# GitHub
+# --------------------------------------------------------------------------- #
+
+# Ключ задачи GitHub: `repo#42` (внутри своего owner'а) либо `owner/repo#42`.
+# Формат выбран так, чтобы ключ читался в таблицах, в имени ветки и в коммите —
+# ровно как ключ Jira, только с решёткой, к которой GitHub и так приучил.
+GITHUB_KEY_RE = re.compile(r"(?:([A-Za-z0-9][\w.-]*)/)?([A-Za-z0-9][\w.-]*)#(\d+)")
+
+# Ссылка на issue/PR в теле или ветке: `#42` без указания репозитория.
+GITHUB_SHORT_REF_RE = re.compile(r"(?<![\w/#])#(\d+)\b")
+
+# ISO-время GitHub — «2026-01-02T03:04:05Z». Python 3.10 не понимает суффикс Z,
+# поэтому приводим к «+00:00» ещё на разборе, а не в каждом месте показа.
+def gh_time(value: str) -> str:
+    value = (value or "").strip()
+    return value[:-1] + "+00:00" if value.endswith("Z") else value
+
+
+def gh_ms(value: str) -> int:
+    """ISO-время GitHub → epoch ms (в PR-модели даты хранятся числом, как в Bitbucket)."""
+    from datetime import datetime
+
+    iso = gh_time(value)
+    if not iso:
+        return 0
+    try:
+        return int(datetime.fromisoformat(iso).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def github_key(repo: str, number: int | str, *, owner: str = "", default_owner: str = "") -> str:
+    """Ключ задачи/PR: `repo#42`; с чужим owner'ом — `owner/repo#42`."""
+    if owner and default_owner and owner.lower() != default_owner.lower():
+        return f"{owner}/{repo}#{number}"
+    return f"{repo}#{number}"
+
+
+def parse_github_key(
+    key: str, *, default_owner: str = "", default_repo: str = ""
+) -> tuple[str, str, int] | None:
+    """`owner/repo#42` | `repo#42` | `#42` | `42` → (owner, repo, number).
+
+    Недостающие части добираются из дефолтов воркспейса. None — если это вообще не
+    похоже на ключ GitHub (например, ключ Jira ``PROJ-123``).
+    """
+    key = (key or "").strip()
+    if not key:
+        return None
+    match = GITHUB_KEY_RE.fullmatch(key)
+    if match:
+        owner, repo, number = match.group(1), match.group(2), int(match.group(3))
+        return (owner or default_owner, repo, number)
+    bare = key[1:] if key.startswith("#") else key
+    if bare.isdigit() and default_repo:
+        return (default_owner, default_repo, int(bare))
+    return None
+
+
+# Заключение check-run / состояние commit-status -> состояние сборки в модели jwu.
+_GH_CONCLUSION_STATE = {
+    "success": "SUCCESSFUL",
+    "neutral": "SUCCESSFUL",
+    "skipped": "SUCCESSFUL",
+    "failure": "FAILED",
+    "timed_out": "FAILED",
+    "action_required": "FAILED",
+    "cancelled": "FAILED",
+    "stale": "FAILED",
+    "startup_failure": "FAILED",
+}
+_GH_STATUS_STATE = {
+    "success": "SUCCESSFUL",
+    "failure": "FAILED",
+    "error": "FAILED",
+    "pending": "INPROGRESS",
+}
+
+
+def _github_repo_from_url(url: str) -> tuple[str, str]:
+    """(owner, repo) из ``repository_url`` вида https://api.github.com/repos/o/r."""
+    parts = [p for p in (url or "").split("/") if p]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return "", ""
 
 
 # --------------------------------------------------------------------------- #
@@ -420,19 +678,36 @@ class WorkspacePath(BaseModel):
     added_at: str = ""
 
 
-class Workspace(BaseModel):
-    """Контур работы: набор папок + свой конфиг интеграций + свои локальные данные.
+# Провайдер воркспейса — ЕДИНСТВЕННЫЙ источник задач и PR для контура. Их не смешивают:
+# проект живёт либо в Jira (+Bitbucket), либо в GitHub, либо вообще без внешнего трекера.
+# Выбирается при создании воркспейса и меняется командой `jwu workspace provider`.
+WORKSPACE_PROVIDERS = ["local", "jira", "github"]
 
-    ``jira_enabled``/``bitbucket_enabled`` объявляются ЯВНО при создании, а не выводятся
-    из наличия токена: воркспейс без Jira должен вести себя предсказуемо (скрытые вкладки,
-    внятные отказы Jira-команд) ещё до того, как креды вообще настроены.
+# провайдер -> (подпись, что он даёт)
+PROVIDER_LABELS: dict[str, tuple[str, str]] = {
+    "local": ("локальный", "фичи и работы в памяти jwu, без внешних систем"),
+    "jira": ("Jira", "задачи из Jira/SDESK, PR из Bitbucket, сборки из Jenkins"),
+    "github": ("GitHub", "задачи из Issues, PR и сборки из Actions"),
+}
+
+
+class Workspace(BaseModel):
+    """Контур работы: набор папок + провайдер задач/PR + свои локальные данные.
+
+    ``provider`` объявляется ЯВНО при создании, а не выводится из наличия токена:
+    воркспейс без внешнего трекера должен вести себя предсказуемо (скрытые вкладки,
+    внятные отказы Jira/GitHub-команд) ещё до того, как креды вообще настроены.
+
+    ``jira_enabled``/``github_enabled`` — производные от провайдера (их читают TUI, MCP
+    и скиллы). Отдельным флагом остаётся только ``bitbucket_enabled``: у Jira-контура
+    Bitbucket может и не быть, а вот у GitHub PR и задачи приходят из одного места.
     """
 
     id: int = 0
     slug: str = ""
     name: str = ""
-    jira_enabled: bool = False
-    bitbucket_enabled: bool = False
+    provider: str = "local"        # local | jira | github
+    bitbucket_enabled: bool = False  # имеет смысл только при provider="jira"
     archived: bool = False
     created_at: str = ""
     updated_at: str = ""
@@ -440,6 +715,27 @@ class Workspace(BaseModel):
     # Счётчик работ для списков/экрана выбора: заполняется вызывающим по требованию
     # (Store сам его не считает — это лишний запрос на каждое чтение воркспейса).
     jobs_count: int = 0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def jira_enabled(self) -> bool:
+        return self.provider == "jira"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def github_enabled(self) -> bool:
+        return self.provider == "github"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def prs_enabled(self) -> bool:
+        """Есть ли у контура место, откуда брать PR (вкладки «Мои PR» / «На ревью»)."""
+        return self.github_enabled or (self.jira_enabled and self.bitbucket_enabled)
+
+    @property
+    def provider_label(self) -> str:
+        """Как называть провайдера человеку: «Jira», «GitHub», «локальный»."""
+        return PROVIDER_LABELS.get(self.provider, (self.provider, ""))[0]
 
     @property
     def label(self) -> str:

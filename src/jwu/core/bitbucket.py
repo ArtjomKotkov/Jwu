@@ -174,13 +174,18 @@ class BitbucketClient:
             f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
         )
 
-    def build_statuses(self, commit_sha: str) -> list[BuildStatus]:
+    def build_statuses(
+        self, commit_sha: str, *, project: str = "", repo: str = ""
+    ) -> list[BuildStatus]:
         """Статусы CI-сборок по коммиту (build-status API — то, что рисуется на странице PR).
 
         Эндпоинт живёт под ``/rest/build-status/1.0`` (вне базового ``/rest/api/1.0``),
         поэтому дёргаем абсолютным URL. Bitbucket иногда задваивает запись по одной сборке
         (чистый ключ + ключ с экранированными слэшами) — дедуплицируем по URL, предпочитая
         запись без ``\\`` в ключе.
+
+        ``project``/``repo`` здесь не нужны (поиск идёт по всему инстансу) и приняты
+        только ради общего контракта с GitHub, где сборки ищутся внутри репозитория.
         """
         url = f"{self.base_url}/rest/build-status/1.0/commits/{commit_sha}"
         try:

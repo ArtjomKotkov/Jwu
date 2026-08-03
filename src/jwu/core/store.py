@@ -20,12 +20,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import (
-    WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS, Delta, Issue, Job, JobPRLink,
-    JobRecord, LocalFeature, Mention, Note, PR, Workspace, WorkspacePath, WorkspaceRule,
+    WORKSPACE_PROVIDERS, WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS, Delta, Issue, Job,
+    JobPRLink, JobRecord, LocalFeature, Mention, Note, PR, Workspace, WorkspacePath,
+    WorkspaceRule,
 )
 
 # Префикс ключей локальных фич должен читаться как ключ Jira: HOMEJWU-1, FEAT-3.
 _FEATURE_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]{1,7}$")
+
+# Чем PR опознаётся в памяти: (project/owner, repo, номер). Одного номера мало —
+# в Bitbucket он сквозной по инстансу, а в GitHub нумерация СВОЯ в каждом репозитории,
+# и PR #1 двух репозиториев одного контура иначе слиплись бы в один.
+PRRef = tuple[str, str, int]
 
 # Воркспейс, в который уезжают данные, накопленные до появления воркспейсов.
 DEFAULT_WORKSPACE_SLUG = "work"
@@ -42,6 +48,10 @@ CREATE TABLE IF NOT EXISTS workspaces (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     slug              TEXT NOT NULL UNIQUE,
     name              TEXT NOT NULL DEFAULT '',
+    -- откуда контур берёт задачи и PR: local | jira | github (см. WORKSPACE_PROVIDERS)
+    provider          TEXT NOT NULL DEFAULT 'local',
+    -- jira_enabled остаётся производной от provider и пишется синхронно: по ней читает
+    -- предыдущая версия jwu, если пользователь откатится
     jira_enabled      INTEGER NOT NULL DEFAULT 0,
     bitbucket_enabled INTEGER NOT NULL DEFAULT 0,
     archived          INTEGER NOT NULL DEFAULT 0,
@@ -211,7 +221,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # executescript(SCHEMA), и CREATE INDEX по ней упал бы. Создаются в шаге миграции, после ALTER.
 WORKSPACE_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_issue_snap_ws ON issue_snapshots(workspace_id, key, sync_run_id);
-CREATE INDEX IF NOT EXISTS idx_pr_snap_ws    ON pr_snapshots(workspace_id, pr_id, sync_run_id);
+CREATE INDEX IF NOT EXISTS idx_pr_snap_ws    ON pr_snapshots(workspace_id, project, repo, pr_id, sync_run_id);
 CREATE INDEX IF NOT EXISTS idx_sync_runs_ws  ON sync_runs(workspace_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_ws       ON jobs(workspace_id, task_key);
 CREATE INDEX IF NOT EXISTS idx_notes_ws      ON notes(workspace_id, key);
@@ -265,7 +275,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -280,18 +290,27 @@ def _add_column(conn: sqlite3.Connection, table: str, column: str, decl: str) ->
 
 def _insert_workspace(
     conn: sqlite3.Connection, slug: str, *, name: str = "",
-    jira: bool = False, bitbucket: bool = False,
+    provider: str = "local", bitbucket: bool = False,
 ) -> int:
     """Создать воркспейс (или вернуть id существующего с таким slug)."""
     row = conn.execute("SELECT id FROM workspaces WHERE slug = ?", (slug,)).fetchone()
     if row:
         return int(row["id"])
     ts = _now()
-    cur = conn.execute(
-        "INSERT INTO workspaces (slug, name, jira_enabled, bitbucket_enabled, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
-        (slug, name or slug, int(jira), int(bitbucket), ts, ts),
-    )
+    # Функцию зовут и из миграции v2, когда колонки provider в таблице ещё нет:
+    # старую БД доводят до текущей схемы по шагам, и каждый шаг видит свою форму.
+    if "provider" in _columns(conn, "workspaces"):
+        cur = conn.execute(
+            "INSERT INTO workspaces (slug, name, provider, jira_enabled, bitbucket_enabled,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (slug, name or slug, provider, int(provider == "jira"), int(bitbucket), ts, ts),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO workspaces (slug, name, jira_enabled, bitbucket_enabled,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (slug, name or slug, int(provider == "jira"), int(bitbucket), ts, ts),
+        )
     return int(cur.lastrowid)
 
 
@@ -306,7 +325,8 @@ def _m002_workspaces(conn: sqlite3.Connection) -> None:
     conn.executescript(WORKSPACE_INDEXES)
 
     wid = _insert_workspace(
-        conn, DEFAULT_WORKSPACE_SLUG, name=DEFAULT_WORKSPACE_NAME, jira=True, bitbucket=True
+        conn, DEFAULT_WORKSPACE_SLUG, name=DEFAULT_WORKSPACE_NAME,
+        provider="jira", bitbucket=True,
     )
     for table in WORKSPACE_SCOPED_TABLES:
         conn.execute(f"UPDATE {table} SET workspace_id = ? WHERE workspace_id = 0", (wid,))
@@ -371,12 +391,37 @@ def _m006_drop_analyses(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS analyses")
 
 
+def _m007_provider(conn: sqlite3.Connection) -> None:
+    """v6 → v7: у контура ОДИН провайдер задач и PR + PR опознаются вместе с репозиторием.
+
+    Раньше интеграции были независимыми флажками (Jira да, Bitbucket нет), и это работало,
+    пока источник был один. С появлением GitHub смешение перестало иметь смысл: задачи и
+    PR приезжают из одного места, и «Jira + GitHub Issues разом» — это не режим, а каша.
+    Существующие контуры с любой из интеграций становятся jira-контурами, остальные —
+    локальными; ``bitbucket_enabled`` остаётся подфлагом Jira-контура.
+
+    Заодно пересобираем индекс снапшотов PR: ключ PR теперь (project, repo, номер) —
+    в GitHub нумерация своя в каждом репозитории (см. ``PRRef``).
+    """
+    _add_column(conn, "workspaces", "provider", "TEXT NOT NULL DEFAULT 'local'")
+    conn.execute(
+        "UPDATE workspaces SET provider = CASE"
+        " WHEN jira_enabled = 1 OR bitbucket_enabled = 1 THEN 'jira' ELSE 'local' END"
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_pr_snap_ws")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pr_snap_ws"
+        " ON pr_snapshots(workspace_id, project, repo, pr_id, sync_run_id)"
+    )
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
     (4, _m004_secrets),
     (5, _m005_path_tags),
     (6, _m006_drop_analyses),
+    (7, _m007_provider),
 ]
 
 
@@ -497,16 +542,23 @@ class Store:
             return int(row["id"])
         wid = _insert_workspace(
             self.conn, DEFAULT_WORKSPACE_SLUG, name=DEFAULT_WORKSPACE_NAME,
-            jira=True, bitbucket=True,
+            provider="jira", bitbucket=True,
         )
         self.conn.commit()
         return wid
 
     @staticmethod
     def _workspace_from_row(row) -> Workspace:
+        keys = row.keys()
+        # provider появился в схеме v7; на БД, открытой более старой версией jwu,
+        # его может не быть — тогда выводим из исторических флажков.
+        if "provider" in keys and row["provider"]:
+            provider = row["provider"]
+        else:
+            provider = "jira" if (row["jira_enabled"] or row["bitbucket_enabled"]) else "local"
         return Workspace(
             id=row["id"], slug=row["slug"], name=row["name"],
-            jira_enabled=bool(row["jira_enabled"]),
+            provider=provider,
             bitbucket_enabled=bool(row["bitbucket_enabled"]),
             archived=bool(row["archived"]),
             created_at=row["created_at"], updated_at=row["updated_at"],
@@ -517,11 +569,11 @@ class Store:
         return ws
 
     def create_workspace(
-        self, slug: str, *, name: str = "", jira_enabled: bool = False,
+        self, slug: str, *, name: str = "", provider: str = "local",
         bitbucket_enabled: bool = False,
     ) -> Workspace:
         wid = _insert_workspace(
-            self.conn, slug, name=name, jira=jira_enabled, bitbucket=bitbucket_enabled
+            self.conn, slug, name=name, provider=provider, bitbucket=bitbucket_enabled
         )
         self.conn.commit()
         ws = self.get_workspace(wid)
@@ -548,8 +600,27 @@ class Store:
         ]
 
     def update_workspace(self, workspace_id: int, **fields) -> None:
-        """Точечно обновить поля воркспейса (name/slug/jira_enabled/bitbucket_enabled/archived)."""
-        allowed = {"slug", "name", "jira_enabled", "bitbucket_enabled", "archived"}
+        """Точечно обновить поля воркспейса (name/slug/provider/bitbucket_enabled/archived).
+
+        Смена ``provider`` тянет за собой ``jira_enabled``: колонка осталась в схеме как
+        совместимость со старыми версиями jwu и обязана оставаться согласованной.
+        """
+        allowed = {"slug", "name", "provider", "bitbucket_enabled", "archived"}
+        fields = dict(fields)
+        provider = fields.get("provider")
+        if provider is not None:
+            if provider not in WORKSPACE_PROVIDERS:
+                raise ValueError(
+                    f"Неизвестный провайдер: {provider!r}. Доступны: "
+                    + ", ".join(WORKSPACE_PROVIDERS)
+                )
+            self.conn.execute(
+                "UPDATE workspaces SET jira_enabled = ? WHERE id = ?",
+                (int(provider == "jira"), workspace_id),
+            )
+            if provider != "jira":
+                # Bitbucket — часть Jira-контура; в github/local контуре флажок только врёт
+                fields.setdefault("bitbucket_enabled", False)
         sets, params = [], []
         for key, value in fields.items():
             if key not in allowed:
@@ -865,12 +936,13 @@ class Store:
             if view in json.loads(r["views"])
         }
 
-    def _pr_members_in_run(self, run_id: int, view: str) -> set[int]:
-        """id PR, попавшие во вкладку ``view`` в конкретном прогоне."""
+    def _pr_members_in_run(self, run_id: int, view: str) -> set[PRRef]:
+        """PR, попавшие во вкладку ``view`` в конкретном прогоне (см. ``PRRef``)."""
         return {
-            r["pr_id"]
+            (r["project"], r["repo"], r["pr_id"])
             for r in self.conn.execute(
-                "SELECT pr_id, views FROM pr_snapshots WHERE sync_run_id = ? AND workspace_id = ?",
+                "SELECT pr_id, project, repo, views FROM pr_snapshots"
+                " WHERE sync_run_id = ? AND workspace_id = ?",
                 (run_id, self.workspace_id),
             )
             if view in json.loads(r["views"])
@@ -901,16 +973,17 @@ class Store:
 
     def _latest_pr_rows(self) -> list:
         pairs = self.conn.execute(
-            "SELECT pr_id, MAX(sync_run_id) AS run FROM pr_snapshots"
-            " WHERE workspace_id = ? GROUP BY pr_id",
+            "SELECT pr_id, project, repo, MAX(sync_run_id) AS run FROM pr_snapshots"
+            " WHERE workspace_id = ? GROUP BY project, repo, pr_id",
             (self.workspace_id,),
         ).fetchall()
         rows = []
         for pair in pairs:
             row = self.conn.execute(
-                "SELECT pr_id, fields, views FROM pr_snapshots"
-                " WHERE workspace_id = ? AND pr_id = ? AND sync_run_id = ? LIMIT 1",
-                (self.workspace_id, pair["pr_id"], pair["run"]),
+                "SELECT pr_id, project, repo, fields, views FROM pr_snapshots"
+                " WHERE workspace_id = ? AND pr_id = ? AND project = ? AND repo = ?"
+                " AND sync_run_id = ? LIMIT 1",
+                (self.workspace_id, pair["pr_id"], pair["project"], pair["repo"], pair["run"]),
             ).fetchone()
             if row is not None:
                 rows.append(row)
@@ -948,7 +1021,7 @@ class Store:
         вкладки — смерженные/отклонённые PR, переставшие приходить из Bitbucket,
         пропадают из списка (а не висят по устаревшему снапшоту).
         """
-        live: set[int] | None = None
+        live: set[PRRef] | None = None
         if view in ("mine", "review"):
             run_id = self._membership_run(f"prs:{view}", f"prs:{view}")
             if run_id is not None:
@@ -957,7 +1030,7 @@ class Store:
         prs: list[PR] = []
         for row in rows:
             if live is not None:
-                if row["pr_id"] not in live:
+                if (row["project"], row["repo"], row["pr_id"]) not in live:
                     continue
             elif view is not None and view not in json.loads(row["views"]):
                 continue
@@ -998,11 +1071,12 @@ class Store:
             return None
         return json.loads(row["signature"]).get("pr_ids", [])
 
-    def _prev_pr_signature(self, pr_id: int, before_run: int) -> dict | None:
+    def _prev_pr_signature(self, ref: PRRef, before_run: int) -> dict | None:
+        project, repo, pr_id = ref
         row = self.conn.execute(
-            "SELECT signature FROM pr_snapshots WHERE pr_id = ? AND sync_run_id < ?"
-            " AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
-            (pr_id, before_run, self.workspace_id),
+            "SELECT signature FROM pr_snapshots WHERE pr_id = ? AND project = ? AND repo = ?"
+            " AND sync_run_id < ? AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
+            (pr_id, project, repo, before_run, self.workspace_id),
         ).fetchone()
         if not row:
             return None
@@ -1069,7 +1143,9 @@ class Store:
         ).fetchall()
         for row in pr_rows:
             cur = json.loads(row["signature"])
-            prev = self._prev_pr_signature(row["pr_id"], run_id)
+            prev = self._prev_pr_signature(
+                (row["project"], row["repo"], row["pr_id"]), run_id
+            )
             if prev is None:
                 continue  # первый раз видим PR — не шумим
             pr_key = f"{row['project']}/{row['repo']}#{row['pr_id']}"
@@ -1109,14 +1185,15 @@ class Store:
         ).fetchone()
         return json.loads(row["fields"]).get("summary", "") if row else ""
 
-    def _last_pr_ref(self, pr_id: int) -> tuple[str, str]:
+    def _last_pr_ref(self, ref: PRRef) -> tuple[str, str]:
+        project, repo, pr_id = ref
         row = self.conn.execute(
-            "SELECT project, repo, fields FROM pr_snapshots WHERE pr_id = ? AND workspace_id = ?"
-            " ORDER BY sync_run_id DESC LIMIT 1",
-            (pr_id, self.workspace_id),
+            "SELECT project, repo, fields FROM pr_snapshots WHERE pr_id = ? AND project = ?"
+            " AND repo = ? AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
+            (pr_id, project, repo, self.workspace_id),
         ).fetchone()
         if not row:
-            return "", f"#{pr_id}"
+            return "", f"{project}/{repo}#{pr_id}" if repo else f"#{pr_id}"
         title = json.loads(row["fields"]).get("title", "")
         return title, f"{row['project']}/{row['repo']}#{pr_id}"
 
@@ -1158,7 +1235,7 @@ class Store:
                     detail="ушла из выборки (закрыта / сменила статус / переназначена)",
                 ))
 
-        live_prs: set[int] = set()
+        live_prs: set[PRRef] = set()
         for v in ("mine", "review"):
             r = self._membership_run(f"prs:{v}", f"prs:{v}")
             if r is not None:
@@ -1171,8 +1248,8 @@ class Store:
             if prev_run is None:
                 continue
             gone = self._pr_members_in_run(prev_run, v) - self._pr_members_in_run(run_id, v)
-            for pid in sorted(gone - live_prs):
-                title, pr_key = self._last_pr_ref(pid)
+            for ref in sorted(gone - live_prs):
+                title, pr_key = self._last_pr_ref(ref)
                 out.append(Delta(
                     key=pr_key, kind="pr_gone", summary=title, section=section,
                     detail="пропал из списка (вероятно смержен / отклонён)",
@@ -1247,7 +1324,7 @@ class Store:
             f"DELETE FROM pr_snapshots WHERE workspace_id = ? AND fetched_at < ?"
             f" AND sync_run_id NOT IN ({holes})"
             "  AND id NOT IN (SELECT MAX(id) FROM pr_snapshots"
-            "                 WHERE workspace_id = ? GROUP BY pr_id)",
+            "                 WHERE workspace_id = ? GROUP BY project, repo, pr_id)",
             [wid, cutoff, *runs, wid],
         )
         report.pr_snapshots = prs.rowcount
@@ -1296,7 +1373,8 @@ class Store:
             "pr_snapshots": count(
                 "SELECT COUNT(*) FROM pr_snapshots WHERE workspace_id = ?"),
             "pr_ids": count(
-                "SELECT COUNT(DISTINCT pr_id) FROM pr_snapshots WHERE workspace_id = ?"),
+                "SELECT COUNT(*) FROM (SELECT 1 FROM pr_snapshots WHERE workspace_id = ?"
+                " GROUP BY project, repo, pr_id)"),
             "sync_runs": count("SELECT COUNT(*) FROM sync_runs WHERE workspace_id = ?"),
         }
 
@@ -1904,6 +1982,19 @@ class Store:
             (job_id, self.workspace_id),
         ).fetchone()
         return self._job_from_row(row, with_records=True) if row else None
+
+    def jobs_count(self, workspace_id: int | None = None) -> int:
+        """Сколько работ в контуре — одним COUNT, без материализации самих работ.
+
+        Нужен ровно для счётчика в списке воркспейсов: раньше там звали ``list_jobs()``
+        по каждому контуру, а он тянет работы вместе с их записями — на каждое обновление
+        дашборда (раз в несколько секунд) это лишняя выборка всего журнала всех контуров.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE workspace_id = ?",
+            (workspace_id if workspace_id is not None else self.workspace_id,),
+        ).fetchone()
+        return int(row[0])
 
     def list_jobs(self, *, task_key: str | None = None, pr_id: int | None = None,
                   status: str | None = None, project: str | None = None,

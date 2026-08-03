@@ -16,7 +16,7 @@
 # В БД лежат СЕКРЕТЫ воркспейсов в открытом виде (файл закрывается правами 600).
 # Не клади её в облачную папку (iCloud/Dropbox/Google Drive) — jwu предупредит.
 # Если облако всё же нужно, держи токены в переменных окружения: JIRA_TOKEN,
-# SDESK_TOKEN, BITBUCKET_TOKEN, JENKINS_TOKEN — они перекрывают значения из БД.
+# SDESK_TOKEN, BITBUCKET_TOKEN, GITHUB_TOKEN, JENKINS_TOKEN — они перекрывают БД.
 
 # --- ниже: те же поля, но как они выглядят в настройках воркспейса ------------
 # Правятся через `jwu configure`; оставлено как справка о структуре.
@@ -48,6 +48,16 @@
 # base_url = "https://git.example.com"
 # project = "PROJ"
 # repo = "repo"
+
+# GitHub — АЛЬТЕРНАТИВНЫЙ провайдер контура (см. `jwu workspace provider github`).
+# Он закрывает всё сразу: задачи (Issues), PR и сборки (Actions), поэтому секции
+# jira/bitbucket/jenkins в таком контуре не используются вовсе.
+# [github]
+# api_url = "https://api.github.com"     # GHE: https://ghe.example.com/api/v3
+# web_url = "https://github.com"         # GHE: https://ghe.example.com
+# owner = "akotkov"                      # организация или пользователь
+# repos = "dndeck,dndeck-ui"             # пусто => все репозитории owner'а
+# username = ""                          # мой логин; пусто => берётся из /user
 
 # Jenkins опционален: статусы сборок jwu берёт из Bitbucket и без него, токен нужен
 # только для детализации причины падения (`jwu build`).

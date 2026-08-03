@@ -34,6 +34,7 @@ from textual.widgets import (
 from ..core import gitinfo
 from ..core.jira import JiraError
 from .copy_modal import (
+    task_url,
     copy_items_for_issue,
     copy_items_for_job,
     copy_items_for_pr,
@@ -41,9 +42,11 @@ from .copy_modal import (
     open_copy_modal,
 )
 from ..core.models import (
+    GITHUB_SHORT_REF_RE,
     JOB_RECORD_BADGES,
     LOCAL_FEATURE_BADGES,
     WORKSPACE_RULE_BADGES,
+    github_key,
     Issue,
     Job,
     LocalFeature,
@@ -167,9 +170,13 @@ TAB_ROWS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _TAB_ORDER = GLOBAL_TABS + PROJECT_TABS
 _ROW_OF_PANE = {pane: row for row, panes in TAB_ROWS for pane in panes}
 
-# Вкладки, которые видны только при подключённой интеграции воркспейса.
-JIRA_TABS = ("tab-mine", "tab-mentions")
-BITBUCKET_TABS = ("tab-prs-mine", "tab-prs-review")
+# Вкладки, которые видны только при соответствующем провайдере воркспейса.
+# TASK_TABS — задачи внешнего трекера (Jira или GitHub Issues), PR_TABS — pull request'ы.
+TASK_TABS = ("tab-mine", "tab-mentions")
+PR_TABS = ("tab-prs-mine", "tab-prs-review")
+# Прежние имена: тот же смысл, просто до появления GitHub провайдер был один.
+JIRA_TABS = TASK_TABS
+BITBUCKET_TABS = PR_TABS
 
 
 # Textual зовёт клавиши по именам («question_mark»), человек — символами.
@@ -379,7 +386,7 @@ MENTION_COLUMNS = ["Когда", "Задача", "От кого", "Упомин�
 PR_MINE_COLUMNS = ["PR", "Конфликт", "Задача", "Назначен", "Статус", "Title", "Ревью"]
 PR_REVIEW_COLUMNS = ["PR", "Конфликт", "Title", "Ревью"]
 JOB_COLUMNS = ["ID", "Обновлено", "Статус", "Якорь", "PR", "Title"]
-WORKSPACE_COLUMNS = ["", "Workspace", "Название", "Jira", "Bitbucket", "Папок", "Работ"]
+WORKSPACE_COLUMNS = ["", "Workspace", "Название", "Провайдер", "PR", "Папок", "Работ"]
 PATH_COLUMNS = ["Папка", "Git", "Метка", "Состояние", "Добавлена"]
 FEATURE_COLUMNS = ["Ключ", "Обновлена", "Статус", "Приоритет", "Название"]
 RULE_COLUMNS = ["Тип", "Тег", "Правило", "Обновлено"]
@@ -762,18 +769,40 @@ def parse_pr_url(url: str) -> Optional[tuple[str, str, int]]:
     return (m.group(1), m.group(2), int(m.group(3))) if m else None
 
 
-def pr_task_key(pr: PR) -> str:
-    """Извлечь ключ задачи из PR: сначала из source_branch, иначе из title. Пусто — не нашли."""
+_GH_BRANCH_ISSUE_RE = re.compile(r"^(?:\w+/)?(\d+)[-_]")
+
+
+def pr_task_key(pr: PR, owner: str = "") -> str:
+    """Ключ задачи, к которой относится PR: из имени ветки, иначе из заголовка.
+
+    Ключ Jira (``PROJ-123``) ищем в обоих; если его нет — пробуем номер issue GitHub:
+    ветка ``42-fix-crash`` либо ``#42`` в заголовке. Пусто — связь не нашлась.
+    Логика та же, что в сервисном слое (Service._task_key_from_pr), — иначе колонка
+    «Задача» показывала бы не тот ключ, под которым лежит снапшот.
+    """
     for src in (pr.source_branch, pr.title):
         m = _TASK_KEY_RE.search(src or "")
         if m:
             return m.group(1)
-    return ""
+    if not pr.repository:
+        return ""
+    m = _GH_BRANCH_ISSUE_RE.match(pr.source_branch or "")
+    if m is None:
+        m = GITHUB_SHORT_REF_RE.search(pr.title or "")
+    if m is None:
+        return ""
+    return github_key(pr.repository, m.group(1), owner=pr.project, default_owner=owner)
+
+
+# Ключ Jira: буквы-цифры, дефис, номер. Только такой ввод имеет смысл поднимать в верхний
+# регистр — имя репозитория в ключе GitHub (dndeck#42) регистрозависимо.
+_JIRA_KEY_INPUT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 
 
 def normalize_issue_key(value: str) -> str:
-    """Нормализовать ввод поиска в ключ задачи: обрезать пробелы, в верхний регистр."""
-    return (value or "").strip().upper()
+    """Нормализовать ввод поиска в ключ задачи: обрезать пробелы; Jira-ключ — в верхний регистр."""
+    value = (value or "").strip()
+    return value.upper() if _JIRA_KEY_INPUT_RE.match(value) else value
 
 
 def _msafe(s: str) -> str:
@@ -905,6 +934,7 @@ class IssueDetailScreen(Screen):
         *,
         jira_base: str,
         user: str,
+        owner: str = "",
         pr_detail_fn: Optional[Callable[[str, str, int], PRDetail]] = None,
         jobs: Optional[list] = None,
         job_get_fn: Optional[Callable[[int], Optional[Job]]] = None,
@@ -916,6 +946,8 @@ class IssueDetailScreen(Screen):
         self.issue = issue
         self.jira_base = jira_base.rstrip("/")
         self.user = user
+        # owner GitHub — без него ключ вида repo#42 не разворачивается в ссылку
+        self.owner = owner
         self._pr_detail_fn = pr_detail_fn
         self.jobs = jobs or []
         self._job_get_fn = job_get_fn
@@ -1138,15 +1170,16 @@ class IssueDetailScreen(Screen):
     # --- действия ------------------------------------------------------- #
 
     def action_open(self) -> None:
-        if self.jira_base:
-            webbrowser.open(f"{self.jira_base}/browse/{self.issue.key}")
+        url = task_url(self.jira_base, self.issue.key, self.owner)
+        if url:
+            webbrowser.open(url)
 
     def action_copy_issue_key(self) -> None:
         notify_copied(self, self.issue.key)
 
     def action_copy_menu(self) -> None:
         open_copy_modal(self, copy_items_for_issue(
-            self.issue, self.jira_base, user=self.user))
+            self.issue, self.jira_base, user=self.user, owner=self.owner))
 
     def action_open_pr(self, project: str, repo: str, pr_id: int) -> None:
         """Клик по PR / клавиша p → экран PR (с возвратом по Esc)."""
@@ -1305,12 +1338,14 @@ class JobDetailScreen(Screen):
         *,
         get_fn: Optional[Callable[[int], Optional[Job]]],
         jira_base: str = "",
+        owner: str = "",
         refresh_interval: float = 0.0,
     ) -> None:
         super().__init__()
         self.job_id = job_id
         self._get_fn = get_fn
         self.jira_base = jira_base.rstrip("/")
+        self.owner = owner
         self._refresh_interval = refresh_interval
         self._title = ""
         self._job: Optional[Job] = None
@@ -1363,7 +1398,7 @@ class JobDetailScreen(Screen):
         if self._job is None:
             self.notify("Работа не загружена", severity="warning")
             return
-        open_copy_modal(self, copy_items_for_job(self._job, self.jira_base))
+        open_copy_modal(self, copy_items_for_job(self._job, self.jira_base, self.owner))
 
     def _reload(self) -> None:
         job = self._get_fn(self.job_id) if self._get_fn else None
@@ -1738,12 +1773,12 @@ class JwuDashboard(App):
         нужны именно там, где Jira нет (иначе они дублировали бы задачи).
         """
         hidden: set[str] = set()
-        if not self.data.jira_enabled:
-            hidden |= set(JIRA_TABS)
+        if not self.data.tasks_enabled:
+            hidden |= set(TASK_TABS)
         else:
             hidden.add("tab-features")
-        if not self.data.bitbucket_enabled:
-            hidden |= set(BITBUCKET_TABS)
+        if not self.data.prs_enabled:
+            hidden |= set(PR_TABS)
         return tuple(pane for pane in _TAB_ORDER if pane not in hidden)
 
     def _initial_tab(self) -> str:
@@ -1881,17 +1916,33 @@ class JwuDashboard(App):
         return f"[dim]🔄 последний синк: {ago}{self._next_network_hint()}[/dim]"
 
     def _user_block(self) -> str:
-        """Кто смотрит дашборд: имя/логин, почта и окружение (1–2 строки)."""
-        if self._display_name and self._user:
-            who = f"{self._display_name} ({self._user})"
-        else:
-            who = self._display_name or self._user or "—"
-        head = f"👤 {escape(who)}"
-        if self._email:
-            head += f"   ·   ✉ {escape(self._email)}"
-        lines = [f"[dim]{head}[/dim]"]
-        if self.env_label:
-            lines.append(f"[dim]🌐 {escape(self.env_label)}[/dim]")
+        """Куда и под кем мы залогинены — обязано меняться вместе с воркспейсом.
+
+        Контуров несколько (рабочая Jira, личный GitHub, локальный), переключают их
+        на ходу, и спутать, в чей трекер сейчас пишешь, — самая дорогая ошибка здесь.
+        Поэтому в футере всегда: провайдер и хост, а рядом — логин.
+        """
+        provider = self.data.provider
+        env = self.data.env_label or self.env_label
+        ws = self.data.workspace
+        who_line = ""
+        if provider != "local":
+            if self._display_name and self._user:
+                who = f"{self._display_name} ({self._user})"
+            else:
+                who = self._display_name or self._user or "не определён"
+            who_line = f"👤 {escape(who)}"
+            if self._email:
+                who_line += f"   ·   ✉ {escape(self._email)}"
+        label = ws.provider_label if ws is not None else provider
+        env_line = f"🌐 [b]{escape(label)}[/b]"
+        if env:
+            env_line += f"   ·   {escape(env)}"
+        if ws is not None:
+            env_line += f"   ·   контур [b]{escape(ws.slug)}[/b]"
+        lines = [f"[dim]{env_line}[/dim]"]
+        if who_line:
+            lines.insert(0, f"[dim]{who_line}[/dim]")
         return "\n".join(lines)
 
     def _update_status(self) -> None:
@@ -1998,9 +2049,9 @@ class JwuDashboard(App):
                 keyfns = [
                     lambda p: p.id,
                     conflict_key,
-                    lambda p: pr_task_key(p),
-                    lambda p: task_assignee.get(pr_task_key(p), ""),
-                    lambda p: task_status.get(pr_task_key(p), ""),
+                    lambda p: pr_task_key(p, self.data.owner),
+                    lambda p: task_assignee.get(pr_task_key(p, self.data.owner), ""),
+                    lambda p: task_status.get(pr_task_key(p, self.data.owner), ""),
                     title_key,
                     reviewers_approved,
                 ]
@@ -2106,7 +2157,7 @@ class JwuDashboard(App):
             title_cell = Text(pr.title, style="yellow" if changed else "")
             review_cell = reviewers_cell(pr.reviewers, current_user=self._user)
             if with_task_cols:
-                key = pr_task_key(pr)
+                key = pr_task_key(pr, self.data.owner)
                 if key:
                     task_cell = Text.from_markup(
                         f"[@click=app.open_issue('{escape(key)}')][cyan u]{escape(key)}[/cyan u][/]"
@@ -2263,8 +2314,8 @@ class JwuDashboard(App):
         active_jobs = len([j for j in self.data.jobs if j.status == "active"])
         lines = [
             f"[b]{escape(ws.name or ws.slug)}[/b] [dim]({escape(ws.slug)})[/dim]   "
-            f"[dim]Jira:[/dim] {yes if ws.jira_enabled else no}   "
-            f"[dim]Bitbucket:[/dim] {yes if ws.bitbucket_enabled else no}   "
+            f"[dim]провайдер:[/dim] [cyan]{escape(ws.provider_label)}[/cyan]   "
+            f"[dim]PR:[/dim] {yes if ws.prs_enabled else no}   "
             f"[dim]работ:[/dim] {len(self.data.jobs)} (активных {active_jobs})",
         ]
         if not self.data.paths:
@@ -2314,10 +2365,10 @@ class JwuDashboard(App):
                 Text("→" if is_active else " ", style="bold green"),
                 Text(ws.slug, style="bold cyan" if is_active else "cyan"),
                 Text(ws.name or "—"),
-                Text("да" if ws.jira_enabled else "нет",
-                     style="green" if ws.jira_enabled else "dim"),
-                Text("да" if ws.bitbucket_enabled else "нет",
-                     style="green" if ws.bitbucket_enabled else "dim"),
+                Text(ws.provider_label,
+                     style="cyan" if ws.provider != "local" else "dim"),
+                Text("да" if ws.prs_enabled else "нет",
+                     style="green" if ws.prs_enabled else "dim"),
                 Text(str(len(ws.paths))),
                 Text(str(ws.jobs_count)),
             )
@@ -2437,7 +2488,8 @@ class JwuDashboard(App):
         if isinstance(obj, Issue):
             jobs = [j for j in self.data.jobs if j.task_key == obj.key]
             self.push_screen(IssueDetailScreen(
-                obj, jira_base=self.jira_base, user=self.data.user,
+                obj, jira_base=self._task_base(), user=self.data.user,
+                owner=self.data.owner,
                 pr_detail_fn=self._pr_detail_fn,
                 jobs=jobs, job_get_fn=self._job_get_fn,
                 issue_get_fn=self._issue_get_fn, refresh_interval=detail_iv,
@@ -2452,7 +2504,8 @@ class JwuDashboard(App):
                 obj, detail_fn=self._pr_detail_fn, refresh_interval=detail_iv))
         elif isinstance(obj, Job):
             self.push_screen(JobDetailScreen(
-                obj.id, get_fn=self._job_get_fn, jira_base=self.jira_base,
+                obj.id, get_fn=self._job_get_fn, jira_base=self._task_base(),
+                owner=self.data.owner,
                 refresh_interval=local_iv))
         elif isinstance(obj, Workspace):
             self._switch_workspace(obj.id)
@@ -2487,7 +2540,7 @@ class JwuDashboard(App):
     def action_search_issue(self) -> None:
         """/ — модалка поиска: ввёл ключ, сразу открылась карточка (данные подтянутся)."""
         if self._issue_get_fn is None:
-            self.notify("Поиск задач недоступен: в этом воркспейсе нет Jira",
+            self.notify("Поиск задач недоступен: в этом воркспейсе нет провайдера задач",
                         severity="warning")
             return
 
@@ -2497,7 +2550,10 @@ class JwuDashboard(App):
                 self._open_issue_loading(key)
 
         self.push_screen(
-            TextPromptScreen("Открыть задачу по ключу", placeholder="PROJ-123"), do)
+            TextPromptScreen(
+                "Открыть задачу по ключу",
+                placeholder="dndeck#42" if self.data.provider == "github" else "PROJ-123",
+            ), do)
 
     def action_show_legend(self) -> None:
         """? — легенда клавиш: сначала клавиши текущего окна, ниже общие."""
@@ -2550,7 +2606,8 @@ class JwuDashboard(App):
         detail_iv = self.detail_interval if self.auto_update else 0.0
         jobs = [j for j in self.data.jobs if j.task_key == key]
         self.push_screen(IssueDetailScreen(
-            Issue(key=key), jira_base=self.jira_base, user=self.data.user,
+            Issue(key=key), jira_base=self._task_base(), user=self.data.user,
+            owner=self.data.owner,
             pr_detail_fn=self._pr_detail_fn, jobs=jobs, job_get_fn=self._job_get_fn,
             issue_get_fn=self._issue_get_fn, refresh_interval=detail_iv, loading=True,
         ))
@@ -2653,12 +2710,19 @@ class JwuDashboard(App):
                     "job": JOB_COLUMNS, "rule": RULE_COLUMNS}.get(kind, [])
         return []
 
+    def _task_base(self) -> str:
+        """Хост трекера текущего контура (после смены воркспейса он другой)."""
+        return self.data.web_base or self.jira_base
+
+    def _task_url(self, key: str) -> str:
+        return task_url(self._task_base(), key, self.data.owner)
+
     def action_open(self) -> None:
         obj = self._selected_obj()
-        if isinstance(obj, Issue) and self.jira_base:
-            webbrowser.open(f"{self.jira_base}/browse/{obj.key}")
-        elif isinstance(obj, Mention) and self.jira_base and obj.task_key:
-            webbrowser.open(f"{self.jira_base}/browse/{obj.task_key}")
+        if isinstance(obj, Issue) and self._task_url(obj.key):
+            webbrowser.open(self._task_url(obj.key))
+        elif isinstance(obj, Mention) and obj.task_key and self._task_url(obj.task_key):
+            webbrowser.open(self._task_url(obj.task_key))
         elif isinstance(obj, PR) and obj.url:
             webbrowser.open(obj.url)
         elif isinstance(obj, WorkspacePath) and Path(obj.path).exists():
@@ -2685,9 +2749,10 @@ class JwuDashboard(App):
         obj = self._selected_obj()
         if isinstance(obj, Issue):
             open_copy_modal(self, copy_items_for_issue(
-                obj, self.jira_base, user=self.data.user))
+                obj, self._task_base(), user=self.data.user, owner=self.data.owner))
         elif isinstance(obj, Job):
-            open_copy_modal(self, copy_items_for_job(obj, self.jira_base))
+            open_copy_modal(self, copy_items_for_job(
+                obj, self._task_base(), self.data.owner))
         elif isinstance(obj, PR):
             open_copy_modal(self, copy_items_for_pr(obj))
 
@@ -2806,7 +2871,7 @@ class JwuDashboard(App):
     def _workspace_switched(self, data: DashboardData) -> None:
         self._loading_workspace = False
         self._start_with_picker = False
-        self._apply_data(data)
+        self._apply_data(data, new_workspace=True)
         self._apply_tab_visibility()
         self._focus_active_table()
         self._run_reindex()  # у нового контура свои папки — переиндексировать
@@ -3059,15 +3124,23 @@ class JwuDashboard(App):
             return
         self.call_from_thread(self._apply_data, data)
 
-    def _apply_data(self, data: DashboardData) -> None:
+    def _apply_data(self, data: DashboardData, *, new_workspace: bool = False) -> None:
         self.data = data
-        if data.user:  # не затираем известные данные пустыми (рефреш из памяти)
-            self._user = data.user
+        if new_workspace:
+            # У нового контура своя личность (или её нет вовсе). Оставить прежнюю —
+            # значит показывать в футере, что мы залогинены не туда, где на самом деле.
+            self._user = data.user or ""
+            self._display_name = data.display_name or ""
+            self._email = data.email or ""
             self.sub_title = self._user
-        if data.display_name:
-            self._display_name = data.display_name
-        if data.email:
-            self._email = data.email
+        else:
+            if data.user:  # не затираем известные данные пустыми (рефреш из памяти)
+                self._user = data.user
+                self.sub_title = self._user
+            if data.display_name:
+                self._display_name = data.display_name
+            if data.email:
+                self._email = data.email
         self._render()
 
     def _after_refresh(self, data: Optional[DashboardData], error: Optional[str]) -> None:
