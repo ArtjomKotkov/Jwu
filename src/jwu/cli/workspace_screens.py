@@ -30,7 +30,7 @@ from ..core.models import (
     LocalFeature, Workspace, WorkspacePath, WorkspaceRule,
 )
 
-WORKSPACE_COLUMNS = ["Workspace", "Название", "Jira", "Bitbucket", "Папок", "Работ"]
+WORKSPACE_COLUMNS = ["Workspace", "Название", "Провайдер", "PR", "Папок", "Работ"]
 
 
 class TextPromptScreen(ModalScreen[Optional[str]]):
@@ -138,10 +138,10 @@ class WorkspacePickerScreen(ModalScreen):
             table.add_row(
                 Text(ws.slug, style="cyan"),
                 Text(ws.name or "—"),
-                Text("да" if ws.jira_enabled else "нет",
-                     style="green" if ws.jira_enabled else "dim"),
-                Text("да" if ws.bitbucket_enabled else "нет",
-                     style="green" if ws.bitbucket_enabled else "dim"),
+                Text(ws.provider_label,
+                     style="cyan" if ws.provider != "local" else "dim"),
+                Text("да" if ws.prs_enabled else "нет",
+                     style="green" if ws.prs_enabled else "dim"),
                 Text(str(len(ws.paths))),
                 Text(str(ws.jobs_count)),
             )

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from . import secrets as secrets_mod
 from .config import Config, _apply_raw, load_config
-from .models import Workspace
+from .models import WORKSPACE_PROVIDERS, Workspace
 from .store import DEFAULT_WORKSPACE_SLUG as DEFAULT_SLUG, Store
 
 ACTIVE_META_KEY = "active_workspace"
@@ -242,6 +242,11 @@ _SETTING_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("bitbucket.base_url", "bitbucket", "base_url"),
     ("bitbucket.project", "bitbucket", "project"),
     ("bitbucket.repo", "bitbucket", "repo"),
+    ("github.api_url", "github", "api_url"),
+    ("github.web_url", "github", "web_url"),
+    ("github.owner", "github", "owner"),
+    ("github.repos", "github", "repos"),
+    ("github.username", "github", "username"),
     ("jenkins.base_url", "jenkins", "base_url"),
     ("jenkins.username", "jenkins", "username"),
 )
@@ -257,7 +262,7 @@ def _settings_to_raw(settings: dict[str, str]) -> dict:
     raw: dict = {}
     for key, value in settings.items():
         parts = key.split(".")
-        if len(parts) < 2 or parts[0] not in ("jira", "sdesk", "bitbucket", "jenkins"):
+        if len(parts) < 2 or parts[0] not in ("jira", "sdesk", "bitbucket", "github", "jenkins"):
             continue  # служебные ключи воркспейса (features.seq и пр.) — не конфиг
         node = raw
         for part in parts[:-1]:
@@ -281,6 +286,8 @@ def save_workspace_config(store: Store, workspace: Workspace, cfg: Config) -> No
               for key, section, attr in _SETTING_FIELDS}
     for name, jql in (cfg.jira.views or {}).items():
         values[f"jira.views.{name}"] = jql
+    for name, query in (cfg.github.views or {}).items():
+        values[f"github.views.{name}"] = query
     store.set_workspace_settings(workspace.id, values)
 
 
@@ -385,16 +392,46 @@ def suggest(store: Store, path: str | Path | None = None) -> Suggestion:
     )
 
 
+def normalize_provider(provider: str) -> str:
+    """Проверить провайдера контура (local | jira | github)."""
+    provider = (provider or "local").strip().lower()
+    if provider not in WORKSPACE_PROVIDERS:
+        raise WorkspaceError(
+            f"Неизвестный провайдер: «{provider}». Доступны: "
+            + ", ".join(WORKSPACE_PROVIDERS)
+        )
+    return provider
+
+
+def set_provider(store: Store, workspace: Workspace, provider: str, *,
+                 bitbucket: bool | None = None) -> Workspace:
+    """Сменить провайдера контура (задачи и PR у него один источник).
+
+    Локальные данные (работы, фичи, заметки, правила) остаются на месте: провайдер —
+    это про то, откуда приезжают задачи и PR, а не про накопленную историю. Снапшоты
+    прежнего провайдера тоже не трогаем — они перестанут обновляться и уйдут при чистке.
+    """
+    provider = normalize_provider(provider)
+    fields: dict = {"provider": provider}
+    if bitbucket is not None and provider == "jira":
+        fields["bitbucket_enabled"] = bitbucket
+    store.update_workspace(workspace.id, **fields)
+    return store.get_workspace(workspace.id) or workspace
+
+
 def create(
-    store: Store, slug: str, *, name: str = "", jira: bool = False, bitbucket: bool = False,
-    paths: list[str] | None = None, tags: list[str] | None = None,
+    store: Store, slug: str, *, name: str = "", provider: str = "local",
+    bitbucket: bool = False, paths: list[str] | None = None,
+    tags: list[str] | None = None,
 ) -> Workspace:
     """Создать воркспейс и сразу привязать к нему папки (с общими тегами, если заданы)."""
     slug = normalize_slug(slug)
+    provider = normalize_provider(provider)
     if store.get_workspace_by_slug(slug) is not None:
         raise WorkspaceError(f"Воркспейс «{slug}» уже есть.")
     ws = store.create_workspace(
-        slug, name=name or slug, jira_enabled=jira, bitbucket_enabled=bitbucket
+        slug, name=name or slug, provider=provider,
+        bitbucket_enabled=bitbucket and provider == "jira",
     )
     for path in paths or []:
         add_path(store, ws, path, tags=list(tags or []))

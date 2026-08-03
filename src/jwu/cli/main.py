@@ -15,6 +15,7 @@ from rich.console import Console, Group
 from rich.table import Table
 
 from ..core.bitbucket import BitbucketError
+from ..core.github import GitHubError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
 from ..core.dates import fmt_ago, fmt_dt
@@ -29,6 +30,7 @@ from ..skills_install import (
     install_skills,
 )
 from ..core.jira import JiraError
+from ..core import models
 from ..core.models import (
     JOB_RECORD_BADGES, JOB_RECORD_KINDS, LOCAL_FEATURE_BADGES, LOCAL_FEATURE_STATUSES,
     WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS,
@@ -142,35 +144,35 @@ def _service() -> Service:
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
-    except (JiraError, BitbucketError) as exc:
+    except (JiraError, BitbucketError, GitHubError) as exc:
         err.print(f"[red]Ошибка авторизации:[/red] {exc}")
         raise typer.Exit(code=1)
 
 
 def _builds_service() -> Service:
-    """Сервис для команд сборок: только Bitbucket + Jenkins, без зависимости от Jira."""
+    """Сервис для команд сборок: хостинг + CI, без зависимости от трекера задач."""
     try:
         _prepare_db()
         with Store(str(db_path())) as probe:
             ws = _resolve_workspace(probe)
-        _require_bitbucket(ws)
+        _require_prs(ws)
         return Service.builds_for_workspace(ws)
     except ConfigError as exc:
         err.print(f"[red]Ошибка конфига:[/red] {exc}")
         raise typer.Exit(code=1)
-    except (JiraError, BitbucketError) as exc:
+    except (JiraError, BitbucketError, GitHubError) as exc:
         err.print(f"[red]Ошибка авторизации:[/red] {exc}")
         raise typer.Exit(code=1)
 
 
-def _require_jira(svc: Service) -> None:
-    """Отказать внятно, если команда требует Jira, а в воркспейсе её нет."""
-    if svc.jira is not None:
+def _require_tasks(svc: Service) -> None:
+    """Отказать внятно, если команда требует трекер задач, а контур локальный."""
+    if svc.tasks_client is not None:
         return
     slug = svc.workspace.slug if svc.workspace else "?"
     err.print(
-        f"[red]В воркспейсе «{slug}» Jira не подключена.[/red]\n"
-        f"Подключить: [cyan]jwu configure -W {slug} --jira-host …[/cyan]\n"
+        f"[red]В воркспейсе «{slug}» нет провайдера задач[/red] (контур локальный).\n"
+        f"Подключить: [cyan]jwu workspace provider -W {slug} jira|github[/cyan]\n"
         f"Локальные фичи: [cyan]jwu feature list[/cyan]   ·   "
         f"работа без задачи: [cyan]jwu job start --title \"…\"[/cyan]"
     )
@@ -178,31 +180,39 @@ def _require_jira(svc: Service) -> None:
     raise typer.Exit(code=1)
 
 
-def _require_bitbucket(ws: Workspace) -> None:
-    """Отказать внятно, если команда требует Bitbucket, а в воркспейсе его нет."""
-    if ws.bitbucket_enabled:
+# Историческое имя: команды «требуют Jira» ровно в том смысле, что им нужен трекер задач.
+_require_jira = _require_tasks
+
+
+def _require_prs(ws: Workspace) -> None:
+    """Отказать внятно, если команда требует PR, а брать их в воркспейсе неоткуда."""
+    if ws.prs_enabled:
         return
+    if ws.provider == "jira":
+        hint = f"jwu configure -W {ws.slug} --bitbucket-token …"
+    else:
+        hint = f"jwu workspace provider -W {ws.slug} github"
     err.print(
-        f"[red]В воркспейсе «{ws.slug}» Bitbucket не подключён.[/red]\n"
-        f"Подключить: [cyan]jwu configure -W {ws.slug} --bitbucket-token …[/cyan]"
+        f"[red]В воркспейсе «{ws.slug}» не подключён хостинг репозиториев[/red] "
+        f"(провайдер: {ws.provider_label}).\nПодключить: [cyan]{hint}[/cyan]"
     )
     raise typer.Exit(code=1)
 
 
 def _service_with_jira() -> Service:
-    """Сервис для команд, которым Jira обязательна."""
+    """Сервис для команд, которым обязателен трекер задач."""
     svc = _service()
-    _require_jira(svc)
+    _require_tasks(svc)
     return svc
 
 
-def _service_with_bitbucket() -> Service:
-    """Сервис для команд, которым обязателен Bitbucket."""
+def _service_with_prs() -> Service:
+    """Сервис для команд, которым обязателен хостинг репозиториев (PR)."""
     svc = _service()
-    if svc.bitbucket is None:
+    if svc.pr_client is None:
         ws = svc.workspace
         svc.close()
-        _require_bitbucket(ws or Workspace(slug="?"))
+        _require_prs(ws or Workspace(slug="?"))
     return svc
 
 
@@ -279,15 +289,20 @@ def _render_builds(builds: list) -> None:
 
 @auth_app.command("check")
 def auth_check(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
-    """Проверить токены Jira и Bitbucket."""
+    """Проверить доступы контура (какие именно — зависит от его провайдера)."""
     with _service() as svc:
         result = svc.auth_check()
     if json_out:
         _emit_json(result)
-        raise typer.Exit(code=0 if result["jira"]["ok"] and result["bitbucket"]["ok"] else 1)
+        # Jenkins опционален и на вердикт не влияет: сборки видны и без него.
+        required = [r for name, r in result.items() if name != "jenkins"]
+        raise typer.Exit(code=0 if all(r["ok"] for r in required) else 1)
+    if not result:
+        console.print("[dim]Локальный контур: внешних доступов нет — проверять нечего.[/dim]")
+        raise typer.Exit(code=0)
     ok = True
     # Jenkins опционален — печатаем, если настроен, но на код выхода не влияет.
-    for name in ("jira", "sdesk", "bitbucket", "jenkins"):
+    for name in ("jira", "sdesk", "bitbucket", "github", "jenkins"):
         r = result.get(name)
         if r is None:
             continue
@@ -320,38 +335,66 @@ app.add_typer(configure_app, name="configure")
 
 
 def _enable_configured_integrations(store: Store, ws: Workspace, cfg) -> None:
-    """Включить интеграции воркспейса, которые пользователь реально настроил.
+    """Включить то, что пользователь реально настроил, — в рамках провайдера контура.
 
     Признак «настроил» — непустой секрет плюс хост, отличный от заглушки в дефолтах
     Config (jira.example.com/git.example.com): иначе `jwu configure` без единого флага
-    включал бы обе интеграции всем подряд.
+    включал бы интеграции всем подряд. Провайдера здесь НЕ переключаем: это осознанный
+    выбор (`jwu workspace provider`), а не побочный эффект того, что ввели токен.
     """
     from ..core.config import BitbucketConfig, JiraConfig
 
     stored = store.workspace_secrets(ws.id)
+    if ws.provider != "jira":
+        return
     updates: dict[str, bool] = {}
-    jira_ready = (cfg.jira.base_url and cfg.jira.base_url != JiraConfig().base_url
-                  and (stored.get("jira.token") or stored.get("jira.password")))
-    if jira_ready and not ws.jira_enabled:
-        updates["jira_enabled"] = True
     bb_ready = (cfg.bitbucket.base_url and cfg.bitbucket.base_url != BitbucketConfig().base_url
                 and stored.get("bitbucket.token"))
     if bb_ready and not ws.bitbucket_enabled:
         updates["bitbucket_enabled"] = True
+    jira_ready = (cfg.jira.base_url and cfg.jira.base_url != JiraConfig().base_url
+                  and (stored.get("jira.token") or stored.get("jira.password")))
     if updates:
         store.update_workspace(ws.id, **updates)
-        names = ", ".join("Jira" if k == "jira_enabled" else "Bitbucket" for k in updates)
-        console.print(f"[green]Подключено к воркспейсу «{ws.label}»:[/green] {names}")
+        console.print(f"[green]Подключено к воркспейсу «{ws.label}»:[/green] Bitbucket")
+    elif jira_ready and not stored.get("bitbucket.token"):
+        console.print("[dim]Bitbucket не настроен — вкладки PR останутся пустыми.[/dim]")
+
+
+def _enable_provider_if_configured(store: Store, ws: Workspace, cfg) -> Workspace:
+    """Поднять провайдера у ЛОКАЛЬНОГО контура, если для него завезли креды.
+
+    Локальный контур — это «ещё не выбрали»; если человек в нём настроил GitHub или Jira,
+    молчать и оставлять контур локальным было бы издевательством. У контура с уже
+    выбранным провайдером ничего не меняем.
+    """
+    from ..core.config import JiraConfig
+
+    if ws.provider != "local":
+        return ws
+    stored = store.workspace_secrets(ws.id)
+    if cfg.github.owner and stored.get("github.token"):
+        provider = "github"
+    elif (cfg.jira.base_url and cfg.jira.base_url != JiraConfig().base_url
+          and (stored.get("jira.token") or stored.get("jira.password"))):
+        provider = "jira"
+    else:
+        return ws
+    updated = workspaces.set_provider(store, ws, provider)
+    console.print(f"[green]Провайдер воркспейса «{ws.label}»:[/green] {updated.provider_label}")
+    return updated
 
 
 def _auth_check_report() -> None:
-    """Проверить связь по текущему конфигу и напечатать ✓/✗ по Jira и Bitbucket."""
+    """Проверить связь по текущему конфигу и напечатать ✓/✗ по системам провайдера."""
     try:
         with _open_store() as store:
             ws = _resolve_workspace(store)
+        if ws.provider == "local":
+            return  # локальному контуру проверять нечего
         with Service.for_workspace(ws) as svc:
             res = svc.auth_check()
-        for name in ("jira", "sdesk", "bitbucket", "jenkins"):
+        for name in ("jira", "sdesk", "bitbucket", "github", "jenkins"):
             r = res.get(name)
             if r is None:
                 continue
@@ -392,6 +435,18 @@ def configure_main(
     bitbucket_project: Optional[str] = typer.Option(None, "--bitbucket-project"),
     bitbucket_repo: Optional[str] = typer.Option(None, "--bitbucket-repo"),
     bitbucket_token_opt: Optional[str] = typer.Option(None, "--bitbucket-token"),
+    github_owner: Optional[str] = typer.Option(None, "--github-owner",
+        help="Организация или пользователь GitHub, чьи репозитории ведём."),
+    github_repos: Optional[str] = typer.Option(None, "--github-repos",
+        help="Репозитории через запятую (пусто — все репозитории owner'а)."),
+    github_user: Optional[str] = typer.Option(None, "--github-user",
+        help="Мой логин на GitHub (пусто — узнаем сами)."),
+    github_token_opt: Optional[str] = typer.Option(None, "--github-token",
+        help="PAT GitHub (classic со scope repo — покрывает Issues, PR и Actions)."),
+    github_api: Optional[str] = typer.Option(None, "--github-api",
+        help="API-хост для GitHub Enterprise (напр. https://ghe.example.com/api/v3)."),
+    github_web: Optional[str] = typer.Option(None, "--github-web",
+        help="Веб-хост GitHub Enterprise (напр. https://ghe.example.com)."),
     jenkins_host: Optional[str] = typer.Option(None, "--jenkins-host"),
     jenkins_user: Optional[str] = typer.Option(None, "--jenkins-user"),
     jenkins_token_opt: Optional[str] = typer.Option(None, "--jenkins-token",
@@ -401,7 +456,24 @@ def configure_main(
     """Визард настройки (когда вызвано без подкоманды export/import)."""
     if ctx.invoked_subcommand is not None:
         return  # вызвана подкоманда (export/import) — визард не запускаем
-    cfg = load_config()
+
+    # За основу берём УЖЕ СОХРАНЁННЫЙ конфиг воркспейса, а не глобальный config.toml:
+    # ниже он целиком перезаписывается, поэтому запуск с одним флагом (скажем, только
+    # --github-token) иначе обнулял бы все остальные поля контура. Заодно интерактивный
+    # визард показывает в дефолтах то, что реально настроено здесь.
+    # Что спрашивать, диктует провайдер контура: у GitHub-контура вопросов про Jira,
+    # Bitbucket и Jenkins просто не существует.
+    with _open_store() as probe:
+        ws0 = _resolve_workspace(probe)
+        provider = ws0.provider
+        cfg = workspaces.config_for_workspace(probe, ws0)
+    if not non_interactive and provider == "local":
+        provider = _prompt_default(
+            "Провайдер задач и PR (local / jira / github)", provider
+        ).strip().lower()
+        if provider not in ("local", "jira", "github"):
+            err.print(f"[red]Неизвестный провайдер: {provider}[/red]")
+            raise typer.Exit(code=1)
 
     if non_interactive:
         if jira_host is not None: cfg.jira.base_url = jira_host.rstrip("/")
@@ -420,6 +492,11 @@ def configure_main(
         if sdesk_gate_user is not None: cfg.sdesk.proxy_basic_user = sdesk_gate_user
         elif gate_user is not None and not cfg.sdesk.proxy_basic_user:
             cfg.sdesk.proxy_basic_user = gate_user
+        if github_owner is not None: cfg.github.owner = github_owner
+        if github_repos is not None: cfg.github.repos = github_repos
+        if github_user is not None: cfg.github.username = github_user
+        if github_api is not None: cfg.github.api_url = github_api.rstrip("/")
+        if github_web is not None: cfg.github.web_url = github_web.rstrip("/")
         if db_path_opt is not None: cfg.storage.db_path = db_path_opt
         new_secrets = {
             "jira.token": jira_token_opt,
@@ -429,8 +506,32 @@ def configure_main(
             "sdesk.password": sdesk_password,
             "sdesk.gate_password": sdesk_gate_password,
             "bitbucket.token": bitbucket_token_opt,
+            "github.token": github_token_opt,
             "jenkins.token": jenkins_token_opt,
         }
+    elif provider == "github":
+        cfg.github.owner = github_owner or _prompt_default(
+            "GitHub owner (организация или пользователь)", cfg.github.owner)
+        cfg.github.repos = github_repos if github_repos is not None else _prompt_default(
+            "Репозитории через запятую (Enter — все)", cfg.github.repos)
+        cfg.github.username = github_user if github_user is not None else _prompt_default(
+            "Мой логин на GitHub (Enter — узнаем сами)", cfg.github.username)
+        gtok = github_token_opt if github_token_opt is not None else _prompt_default(
+            "GitHub PAT-токен", "", secret=True)
+        # GitHub Enterprise: спрашиваем, только если человек сам поменял хост
+        cfg.github.api_url = (github_api or _prompt_default(
+            "API-хост GitHub", cfg.github.api_url)).rstrip("/")
+        cfg.github.web_url = (github_web or _prompt_default(
+            "Веб-хост GitHub", cfg.github.web_url)).rstrip("/")
+        cur_db = cfg.storage.db_path or str(db_path(cfg))
+        cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
+        new_secrets = {"github.token": gtok}
+    elif provider == "local":
+        cur_db = cfg.storage.db_path or str(db_path(cfg))
+        cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
+        new_secrets = {}
+        console.print("[dim]Локальный контур: внешних доступов не требуется. "
+                      "Задачи ведутся фичами (jwu feature add).[/dim]")
     else:
         cfg.jira.base_url = (jira_host or _prompt_default("Jira host", cfg.jira.base_url)).rstrip("/")
         cfg.jira.username = jira_user or _prompt_default("Jira username", cfg.jira.username)
@@ -503,12 +604,16 @@ def configure_main(
 
     with _open_store() as store:
         ws = _resolve_workspace(store)
+        # cfg приехал из ПРЕДЫДУЩЕГО соединения (см. начало функции) — источник секретов
+        # в нём смотрит в уже закрытый Store; перевешиваем на живое.
+        cfg.secrets = secrets.DbSecrets(store, ws.id)
         workspaces.save_workspace_config(store, ws, cfg)
         saved = 0
         for slot, value in new_secrets.items():
             if value:  # пусто/None => не трогаем, старое значение остаётся
                 store.set_workspace_secret(ws.id, slot, value)
                 saved += 1
+        ws = _enable_provider_if_configured(store, ws, cfg)
         _enable_configured_integrations(store, ws, cfg)
         for warn in warn_if_cloud_path(db_path()):
             err.print(f"[yellow]⚠ {warn}[/yellow]")
@@ -613,8 +718,11 @@ def _ws_json(store: Store, ws: Workspace) -> dict:
         "id": ws.id,
         "slug": ws.slug,
         "name": ws.name,
+        "provider": ws.provider,
         "jira_enabled": ws.jira_enabled,
+        "github_enabled": ws.github_enabled,
         "bitbucket_enabled": ws.bitbucket_enabled,
+        "prs_enabled": ws.prs_enabled,
         "archived": ws.archived,
         "jobs": len(jobs),
         "jobs_active": len([j for j in jobs if j.status == "active"]),
@@ -628,6 +736,15 @@ def _ws_json(store: Store, ws: Workspace) -> dict:
 
 def _yes_no(flag: bool) -> str:
     return "[green]да[/green]" if flag else "[dim]нет[/dim]"
+
+
+def _provider_cell(ws: Workspace) -> str:
+    """Провайдер контура в таблицах: у Jira отдельно отмечаем, есть ли Bitbucket."""
+    if ws.provider == "local":
+        return "[dim]локальный[/dim]"
+    if ws.provider == "jira":
+        return "[cyan]Jira[/cyan]" + ("" if ws.bitbucket_enabled else " [dim](без Bitbucket)[/dim]")
+    return f"[cyan]{ws.provider_label}[/cyan]"
 
 
 @workspace_app.command("list")
@@ -646,14 +763,14 @@ def workspace_list(
         console.print("[dim]Воркспейсов нет. Создать: jwu workspace create <slug>[/dim]")
         return
     table = Table(box=None, pad_edge=False)
-    for col in ("", "Slug", "Название", "Jira", "Bitbucket", "Папок", "Работ"):
+    for col in ("", "Slug", "Название", "Провайдер", "PR", "Папок", "Работ"):
         table.add_column(col)
     for ws in items:
         store.use_workspace(ws.id)
         table.add_row(
             "→" if ws.slug == active else " ",
             ws.slug, ws.name,
-            _yes_no(ws.jira_enabled), _yes_no(ws.bitbucket_enabled),
+            _provider_cell(ws), _yes_no(ws.prs_enabled),
             str(len(ws.paths)), str(len(store.list_jobs())),
         )
     console.print(table)
@@ -666,19 +783,21 @@ def workspace_create(
     paths: list[str] = typer.Option([], "--path", help="Папка воркспейса (можно несколько)."),
     tag: list[str] = typer.Option(
         [], "--tag", "-t", help="Теги для указанных папок: legacy-бэкенд, новая-версия…"),
-    jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключена ли Jira."),
+    provider: str = typer.Option(
+        "local", "--provider", "-p",
+        help="Откуда задачи и PR: local (свои фичи) | jira (+Bitbucket) | github."),
     bitbucket: bool = typer.Option(
-        False, "--bitbucket/--no-bitbucket", help="Подключён ли Bitbucket."
+        False, "--bitbucket/--no-bitbucket", help="Для jira-контура: подключён ли Bitbucket."
     ),
     use: bool = typer.Option(True, "--use/--no-use", help="Сделать активным."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Создать воркспейс. Интеграции объявляются явно — по умолчанию их нет."""
+    """Создать воркспейс. Провайдер объявляется явно — по умолчанию контур локальный."""
     store = _open_store()
     try:
         ws = workspaces.create(
-            store, slug, name=name, jira=jira, bitbucket=bitbucket, paths=list(paths),
-            tags=list(tag),
+            store, slug, name=name, provider=provider, bitbucket=bitbucket,
+            paths=list(paths), tags=list(tag),
         )
     except workspaces.WorkspaceError as exc:
         err.print(f"[red]{exc}[/red]")
@@ -688,11 +807,51 @@ def workspace_create(
     if json_out:
         _emit_json(_ws_json(store, ws))
         return
-    console.print(f"[green]Воркспейс «{ws.label}» создан.[/green]")
+    console.print(f"[green]Воркспейс «{ws.label}» создан.[/green] "
+                  f"Провайдер: {ws.provider_label}")
     for p in ws.paths:
         console.print(f"  📁 {p.path}")
-    if jira or bitbucket:
+    if ws.provider != "local":
         console.print(f"Настроить доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
+
+
+@workspace_app.command("provider")
+def workspace_provider(
+    provider: Optional[str] = typer.Argument(
+        None, help="local | jira | github. Без аргумента — показать текущий."),
+    bitbucket: Optional[bool] = typer.Option(
+        None, "--bitbucket/--no-bitbucket", help="Для jira-контура: подключён ли Bitbucket."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Показать или сменить провайдера контура (задачи и PR у него один источник).
+
+    Локальные данные — работы, фичи, заметки, правила — остаются на месте: провайдер
+    отвечает только за то, откуда приезжают задачи и PR.
+    """
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    if provider is None:
+        if json_out:
+            _emit_json(_ws_json(store, ws))
+            return
+        console.print(f"[b]{ws.label}[/b]   провайдер: {_provider_cell(ws)}")
+        for name, (label, what) in models.PROVIDER_LABELS.items():
+            mark = "→" if name == ws.provider else " "
+            console.print(f" {mark} [cyan]{name}[/cyan] — {label}: [dim]{what}[/dim]")
+        console.print("\nСменить: [cyan]jwu workspace provider <local|jira|github>[/cyan]")
+        return
+    try:
+        updated = workspaces.set_provider(store, ws, provider, bitbucket=bitbucket)
+    except workspaces.WorkspaceError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(_ws_json(store, updated))
+        return
+    console.print(f"[green]Провайдер воркспейса «{updated.label}»:[/green] "
+                  f"{updated.provider_label}")
+    if updated.provider != "local":
+        console.print(f"Доступы: [cyan]jwu configure -W {updated.slug}[/cyan]")
 
 
 @app.command("init")
@@ -700,9 +859,11 @@ def init_workspace(
     path: str = typer.Argument(".", help="Папка проекта (по умолчанию — текущая)."),
     slug: Optional[str] = typer.Option(None, "--slug", help="Имя воркспейса (иначе — по папке)."),
     name: str = typer.Option("", "--name", help="Человекочитаемое название."),
-    jira: bool = typer.Option(False, "--jira/--no-jira", help="Подключить Jira."),
+    provider: str = typer.Option(
+        "local", "--provider", "-p",
+        help="Откуда задачи и PR: local | jira (+Bitbucket) | github."),
     bitbucket: bool = typer.Option(
-        False, "--bitbucket/--no-bitbucket", help="Подключить Bitbucket."),
+        False, "--bitbucket/--no-bitbucket", help="Для jira-контура: подключить Bitbucket."),
     attach: Optional[str] = typer.Option(
         None, "--attach", help="Привязать папку к СУЩЕСТВУЮЩЕМУ воркспейсу вместо создания."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать, применить предложение."),
@@ -711,8 +872,9 @@ def init_workspace(
     """Подключить проект к jwu: завести воркспейс для папки, привязать репозитории, дать теги.
 
     Сначала показывает, ЧТО собирается сделать (найденные репозитории и предлагаемые теги),
-    и только потом спрашивает подтверждение. Интеграции по умолчанию не подключаются —
-    для личного проекта они не нужны, а для рабочего есть `jwu configure`.
+    и только потом спрашивает подтверждение. Провайдер по умолчанию локальный — для
+    личного проекта внешние системы не нужны, а для рабочего есть `--provider` и
+    `jwu configure`.
     """
     store = _open_store()
     sg = workspaces.suggest(store, path)
@@ -761,7 +923,7 @@ def init_workspace(
             "ok": False, "reason": "confirm_required", "path": sg.path,
             "suggested": {"slug": target_slug, "name": name or sg.name,
                           "paths": sg.suggested_paths, "tags": sg.suggested_tags,
-                          "jira": jira, "bitbucket": bitbucket},
+                          "provider": provider, "bitbucket": bitbucket},
             "repos": [{"root": r.root, "name": r.name, "branch": r.branch} for r in sg.repos],
             # альтернатива созданию: привязать папку к уже существующему контуру
             "existing_workspaces": [{"slug": w.slug, "name": w.name,
@@ -773,7 +935,8 @@ def init_workspace(
     if not json_out:
         console.print(f"[b]Подключаю проект[/b] {sg.path}")
         console.print(f"  воркспейс: [cyan]{target_slug}[/cyan]"
-                      f"   Jira: {_yes_no(jira)}   Bitbucket: {_yes_no(bitbucket)}")
+                      f"   провайдер: [cyan]{provider}[/cyan]"
+                      + (f"   Bitbucket: {_yes_no(bitbucket)}" if provider == "jira" else ""))
         if sg.repos:
             console.print(f"  найдено репозиториев: {len(sg.repos)}")
         for folder in sg.suggested_paths:
@@ -792,7 +955,7 @@ def init_workspace(
 
     try:
         ws = workspaces.create(store, target_slug, name=name or sg.name,
-                               jira=jira, bitbucket=bitbucket)
+                               provider=provider, bitbucket=bitbucket)
         for folder in sg.suggested_paths:
             workspaces.add_path(store, ws, folder, tags=sg.suggested_tags.get(folder, []))
     except workspaces.WorkspaceError as exc:
@@ -807,7 +970,7 @@ def init_workspace(
     console.print(f"\n[green]Готово:[/green] воркспейс «{ws.label}», папок {len(ws.paths)}")
     console.print("Дальше: [cyan]jwu dashboard[/cyan]   ·   "
                   "фичи: [cyan]jwu feature add \"…\"[/cyan]")
-    if jira or bitbucket:
+    if ws.provider != "local":
         console.print(f"Доступы: [cyan]jwu configure -W {ws.slug}[/cyan]")
 
 
@@ -848,7 +1011,7 @@ def workspace_current(
         return
     ws = res.workspace
     console.print(f"[b]{ws.label}[/b]   [dim]({res.source_human})[/dim]")
-    console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
+    console.print(f"Провайдер: {_provider_cell(ws)}   ·   PR: {_yes_no(ws.prs_enabled)}")
 
 
 @workspace_app.command("migrate")
@@ -891,7 +1054,7 @@ def workspace_show(
         _emit_json(payload)
         return
     console.print(f"[b]{ws.label}[/b]")
-    console.print(f"Jira: {_yes_no(ws.jira_enabled)}   ·   Bitbucket: {_yes_no(ws.bitbucket_enabled)}")
+    console.print(f"Провайдер: {_provider_cell(ws)}   ·   PR: {_yes_no(ws.prs_enabled)}")
     jobs_all = store.list_jobs()
     active_jobs = [j for j in jobs_all if j.status == "active"]
     console.print(f"Работ: {len(jobs_all)} (активных {len(active_jobs)})")
@@ -905,13 +1068,17 @@ def workspace_show(
     else:
         console.print("\n[dim]Папок нет. Привязать текущую: jwu workspace add-path .[/dim]")
 
+    # Показываем настройки ТОЛЬКО текущего провайдера: хост Jira в github-контуре
+    # ничего не значит (он мог достаться от глобального конфига) и лишь путает.
+    own = {"jira": ("jira.", "sdesk.", "bitbucket.", "jenkins."),
+           "github": ("github.",)}.get(ws.provider, ())
     settings = {k: v for k, v in store.workspace_settings(ws.id).items()
-                if not k.startswith("features.") and v}
+                if not k.startswith("features.") and v and k.startswith(own)}
     if settings:
-        console.print("\n[b]Настройки[/b]")
+        console.print(f"\n[b]Настройки[/b] [dim](провайдер: {ws.provider})[/dim]")
         for key in sorted(settings):
-            if key.startswith("jira.views."):
-                continue  # JQL длинный и шумный — виден в --json
+            if ".views." in key:
+                continue  # JQL/поисковый запрос длинный и шумный — виден в --json
             console.print(f"  [dim]{key}[/dim] = {settings[key]}")
     stored = store.workspace_secrets(ws.id)
     if stored:
@@ -1101,7 +1268,7 @@ def tasks(
     with _service_with_jira() as svc:
         try:
             issues = svc.tasks(view, jql=jql)
-        except (ValueError, JiraError) as exc:
+        except (ValueError, JiraError, GitHubError) as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1)
     if json_out:
@@ -1288,7 +1455,7 @@ def prs(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """PR из Bitbucket по роли (мои / на ревью) со статусом merge-конфликта."""
-    with _service_with_bitbucket() as svc:
+    with _service_with_prs() as svc:
         if mine_reviews or on is not None:
             day = datetime.now().date().isoformat() if (on or "").lower() == "today" else on
             prs_list = svc.my_reviews(on=day)
@@ -1308,7 +1475,7 @@ def pr(
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Детали одного PR + статус merge-конфликта + комментарии ревью."""
-    with _service_with_bitbucket() as svc:
+    with _service_with_prs() as svc:
         detail = svc.pr_detail(project, repo, pr_id)
         pull = detail.pr
         jobs_list = svc.jobs_for_pr(pr_id, project or "", repo or "")
@@ -1435,13 +1602,13 @@ def sync(
 ) -> None:
     """Синк по команде: тянет вью + PR, пишет снапшот в память, считает дельты.
 
-    Секции отключённых интеграций пропускаются: воркспейсу без Jira синкать
+    Секции, которых у провайдера нет, пропускаются: локальному контуру синкать
     задачи неоткуда, и это не ошибка.
     """
     with _service() as svc:
-        if svc.jira is None and svc.bitbucket is None:
+        if svc.tasks_client is None and svc.pr_client is None:
             slug = svc.workspace.slug if svc.workspace else "?"
-            err.print(f"[yellow]В воркспейсе «{slug}» нет подключённых интеграций — синкать нечего.[/yellow]")
+            err.print(f"[yellow]В воркспейсе «{slug}» нет внешнего провайдера — синкать нечего.[/yellow]")
             raise typer.Exit(code=1)
         result = svc.sync()
     if json_out:
@@ -1548,7 +1715,7 @@ def dashboard(
     def _initial_sync() -> DashboardData:
         try:
             return _full_sync_dashboard()
-        except (JiraError, BitbucketError) as exc:
+        except (JiraError, BitbucketError, GitHubError) as exc:
             err.print(f"[red]Ошибка авторизации:[/red] {exc}")
             raise typer.Exit(code=1)
 
@@ -1628,7 +1795,7 @@ def dashboard(
 
 def _pr_detail(project: str, repo: str, pr_id: int):
     """Лениво подтянуть детали PR для экрана PR."""
-    with _service_with_bitbucket() as svc:
+    with _service_with_prs() as svc:
         return svc.pr_detail(project, repo, pr_id)
 
 
@@ -2061,7 +2228,7 @@ def worklog(
     try:
         with _service_with_jira() as svc:
             result = svc.add_worklog(key, time, comment=comment, started=started)
-    except JiraError as exc:
+    except (JiraError, GitHubError) as exc:
         if json_out:
             _emit_json({"ok": False, "key": key, "error": str(exc)})
         else:

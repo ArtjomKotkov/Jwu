@@ -71,7 +71,8 @@ def test_legacy_db_migrates_into_work_workspace(tmp_path):
     try:
         ws = store.get_workspace_by_slug(DEFAULT_WORKSPACE_SLUG)
         assert ws is not None and ws.name == "Работа"
-        # существующие данные заведомо рабочие — обе интеграции включены
+        # существующие данные заведомо рабочие — это jira-контур с Bitbucket
+        assert ws.provider == "jira"
         assert (ws.jira_enabled, ws.bitbucket_enabled) == (True, True)
         assert store.workspace_id == ws.id
         # данные видны и никуда не делись
@@ -455,3 +456,100 @@ def test_dashboard_falls_back_to_cwd_without_saved_choice(tmp_path):
     res = workspaces.resolve(store, cwd=folder, prefer_active=True)
     assert res.source == "cwd" and res.workspace.slug == "home"
     store.close()
+
+
+# --------------------------------------------------------------------------- #
+# Провайдер контура
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_is_derived_for_db_from_older_jwu(tmp_path):
+    """БД, созданная версией без провайдеров: включённые интеграции = jira-контур."""
+    db = tmp_path / "state.db"
+    _make_legacy_db(db)
+    store = Store(db)
+    try:
+        ws = store.get_workspace_by_slug(DEFAULT_WORKSPACE_SLUG)
+        assert ws.provider == "jira" and ws.prs_enabled is True
+        # колонка провайдера действительно заполнена, а не выведена на лету
+        row = store.conn.execute(
+            "SELECT provider FROM workspaces WHERE id = ?", (ws.id,)
+        ).fetchone()
+        assert row["provider"] == "jira"
+    finally:
+        store.close()
+
+
+def test_created_workspace_is_local_until_provider_is_chosen(tmp_path):
+    store = Store(tmp_path / "state.db")
+    try:
+        ws = workspaces.create(store, "dndeck")
+        assert ws.provider == "local"
+        assert (ws.jira_enabled, ws.github_enabled, ws.prs_enabled) == (False, False, False)
+    finally:
+        store.close()
+
+
+def test_switching_provider_keeps_local_data_and_clears_bitbucket(tmp_path):
+    """Смена провайдера — это про источник задач, а не про накопленную историю."""
+    store = Store(tmp_path / "state.db")
+    try:
+        ws = workspaces.create(store, "dndeck", provider="jira", bitbucket=True)
+        store.use_workspace(ws.id)
+        store.create_job("PROJ-1", "работа")
+        feature = store.create_feature("тёмная тема")
+
+        ws = workspaces.set_provider(store, ws, "github")
+        assert ws.provider == "github" and ws.github_enabled is True
+        # Bitbucket — часть Jira-контура: в github-контуре флажок обязан погаснуть
+        assert ws.bitbucket_enabled is False
+        assert ws.prs_enabled is True     # PR у GitHub приходят от того же провайдера
+        assert [j.title for j in store.list_jobs()] == ["работа"]
+        assert [f.key for f in store.list_features()] == [feature.key]
+    finally:
+        store.close()
+
+
+def test_unknown_provider_is_rejected(tmp_path):
+    store = Store(tmp_path / "state.db")
+    try:
+        with pytest.raises(workspaces.WorkspaceError, match="Неизвестный провайдер"):
+            workspaces.create(store, "x", provider="gitlab")
+    finally:
+        store.close()
+
+
+def test_job_counters_do_not_read_other_workspaces_journals(tmp_path):
+    """Счётчик работ соседнего контура — это COUNT, а не вычитывание его журнала.
+
+    Снимок дашборда собирается на каждом обновлении; тянуть ради одной цифры все работы
+    всех проектов (да ещё с записями лога) — цена, которую платили бы несколько раз в минуту.
+    Заодно проверяем, что скоуп store после подсчёта остался на текущем контуре.
+    """
+    from jwu.core.service import dashboard_from_memory
+
+    store = Store(tmp_path / "state.db")
+    try:
+        other = workspaces.create(store, "other")
+        store.use_workspace(other.id)
+        job = store.create_job("PROJ-1", "чужая работа")
+        store.add_job_record(job.id, "note", "запись")
+        current = store.get_workspace_by_slug(DEFAULT_WORKSPACE_SLUG)
+        store.use_workspace(current.id)
+
+        calls: list[int] = []
+        original = Store.list_jobs
+        store_cls_list_jobs = lambda self, **kw: (calls.append(self.workspace_id),
+                                                  original(self, **kw))[1]
+        Store.list_jobs = store_cls_list_jobs
+        try:
+            data = dashboard_from_memory(store)
+        finally:
+            Store.list_jobs = original
+
+        assert {w.slug: w.jobs_count for w in data.workspaces} == {"work": 0, "other": 1}
+        # журнал читали только у текущего контура (для вкладки «Работы»)
+        assert set(calls) == {current.id}
+        assert store.workspace_id == current.id
+    finally:
+        store.close()

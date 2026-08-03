@@ -126,11 +126,13 @@ def _stamp(payload: dict, workspace: Workspace) -> dict:
 
 
 def _require_jira(svc: Service) -> Service:
-    if svc.jira is None:
+    """Проверить, что у контура есть трекер задач (Jira или GitHub Issues)."""
+    if svc.tasks_client is None:
         slug = svc.workspace.slug if svc.workspace else "?"
         raise ValueError(
-            f"В воркспейсе «{slug}» Jira не подключена. Используй jwu_features / jwu_jobs, "
-            f"либо подключи Jira: jwu configure -W {slug} --jira-host …"
+            f"В воркспейсе «{slug}» нет провайдера задач (контур локальный). "
+            f"Используй jwu_features / jwu_jobs, либо выбери провайдера: "
+            f"jwu_workspace_provider(provider=\"jira\"|\"github\")"
         )
     return svc
 
@@ -164,8 +166,13 @@ def _workspace_payload(store: Store, ws: Workspace, *, with_context: bool = True
         "id": ws.id,
         "slug": ws.slug,
         "name": ws.name,
+        # provider — откуда контур берёт задачи и PR: local | jira | github.
+        # Флаги ниже производные, оставлены для совместимости со старыми скиллами.
+        "provider": ws.provider,
         "jira_enabled": ws.jira_enabled,
+        "github_enabled": ws.github_enabled,
         "bitbucket_enabled": ws.bitbucket_enabled,
+        "prs_enabled": ws.prs_enabled,
         "jobs": len(jobs),
         "jobs_active": len([j for j in jobs if j.status == "active"]),
         "features": len(store.list_features()),
@@ -196,9 +203,10 @@ async def jwu_workspaces() -> list[dict]:
 async def jwu_workspace_current() -> dict:
     """Какой воркспейс сейчас активен и ПОЧЕМУ (source: explicit|env|cwd|active|only).
 
-    Вызывай первым, когда неясен контекст: по `jira_enabled` видно, можно ли вообще
-    звать Jira-инструменты (jwu_task/jwu_attachments/jwu_worklog). Если Jira нет —
-    работай с локальными фичами (jwu_features) и работами (jwu_jobs).
+    Вызывай первым, когда неясен контекст: по `provider` видно, откуда берутся задачи и
+    PR. `jira`/`github` — работают jwu_task/jwu_prs/jwu_build (у GitHub ключ задачи
+    выглядит как `repo#42`, таймтрекера нет). `local` — внешних задач нет, работай с
+    фичами (jwu_features) и работами (jwu_jobs).
     """
     store = _registry()
     ws_mod.migrate_legacy_config(store)
@@ -291,7 +299,9 @@ async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
 @mcp.tool()
 async def jwu_prs(view: str = "review", with_conflicts: bool = True,
                   workspace: Optional[str] = None) -> list[dict]:
-    """Список PR из Bitbucket по роли: view = "review" (ждут моего ревью) или "mine" (мои).
+    """Список PR по роли: view = "review" (ждут моего ревью) или "mine" (мои).
+
+    Источник — хостинг контура: Bitbucket у jira-контура, GitHub у github-контура.
 
     with_conflicts=True добавляет статус merge-конфликта по каждому PR (чуть медленнее).
 
@@ -312,8 +322,9 @@ async def jwu_pr(
     """Детали одного PR: статус конфликта, ревьюеры, все комментарии ревью (с file:line
     и вложенностью), коммиты, статусы сборок и связанные работы.
 
-    project/repo — ключ проекта и slug репозитория Bitbucket; если не заданы, берутся
-    дефолтные из конфига. Если у PR NEEDS_WORK, а комментарии пусты — укажи project/repo.
+    project/repo — проект и репозиторий (у Bitbucket ключ проекта и slug, у GitHub owner
+    и имя репозитория); если не заданы, берутся дефолтные из конфига. Если у PR
+    NEEDS_WORK, а комментарии пусты — укажи project/repo.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
@@ -335,16 +346,18 @@ async def jwu_builds(
     repo: Optional[str] = None,
     workspace: Optional[str] = None,
 ) -> list[dict]:
-    """Статусы CI-сборок по head-коммиту PR (быстро, из build-status API Bitbucket).
+    """Статусы CI-сборок по head-коммиту PR (быстро: build-status Bitbucket либо
+    check-runs GitHub).
 
-    Не зависит от Jira. project/repo — по умолчанию из конфига воркспейса.
+    Не зависит от трекера задач. project/repo — по умолчанию из конфига воркспейса.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
     """
     svc = _builds_svc(workspace)
-    proj = project or svc.cfg.bitbucket.project
-    rp = repo or svc.cfg.bitbucket.repo
+    default_project, default_repo = svc.default_pr_ref()
+    proj = project or default_project
+    rp = repo or default_repo
     return [b.model_dump() for b in svc.build_statuses_for_pr(proj, rp, pr_id)]
 
 
@@ -466,29 +479,52 @@ async def jwu_workspace_suggest(path: Optional[str] = None) -> dict:
 async def jwu_workspace_create(
     slug: str,
     name: str = "",
-    jira: bool = False,
+    provider: str = "local",
     bitbucket: bool = False,
     paths: Optional[list[str]] = None,
     tags: Optional[list[str]] = None,
     use: bool = False,
 ) -> dict:
-    """Создать воркспейс — контур со своими папками, интеграциями и данными.
+    """Создать воркспейс — контур со своими папками, провайдером и данными.
 
     slug — короткое имя латиницей (home-jwu, work). paths — папки, которые сразу
-    привязать: по ним jwu потом определяет воркспейс автоматически. Интеграции
-    объявляются ЯВНО (jira/bitbucket): по умолчанию их нет и креды не нужны вовсе —
-    подключить потом можно командой `jwu configure -W <slug>`.
+    привязать: по ним jwu потом определяет воркспейс автоматически.
+    provider — ОДИН источник задач и PR: `local` (свои фичи, ничего снаружи),
+    `jira` (Jira + Bitbucket + Jenkins) или `github` (Issues + PR + Actions).
+    По умолчанию контур локальный, креды не нужны вовсе; доступы настраиваются потом
+    командой `jwu configure -W <slug>`. bitbucket=True имеет смысл только у jira.
     use=True делает воркспейс активным по умолчанию для команд вне привязанных папок.
     """
     store = _registry()
     try:
-        ws = ws_mod.create(store, slug, name=name, jira=jira, bitbucket=bitbucket,
+        ws = ws_mod.create(store, slug, name=name, provider=provider, bitbucket=bitbucket,
                            paths=list(paths or []), tags=list(tags or []))
     except ws_mod.WorkspaceError as exc:
         raise ValueError(str(exc))
     if use:
         ws_mod.set_active(store, ws)
     return _workspace_payload(store, ws)
+
+
+@mcp.tool()
+async def jwu_workspace_provider(
+    provider: str,
+    bitbucket: Optional[bool] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Сменить провайдера контура: `local` | `jira` | `github`.
+
+    Провайдер — единственный источник задач и PR; смешивать их нельзя. Локальные данные
+    (работы, фичи, заметки, правила) при смене остаются на месте. После смены нужны
+    доступы: `jwu configure -W <slug>`.
+    """
+    store = _registry()
+    ws = _resolve(workspace)
+    try:
+        updated = ws_mod.set_provider(store, ws, provider, bitbucket=bitbucket)
+    except ws_mod.WorkspaceError as exc:
+        raise ValueError(str(exc))
+    return _workspace_payload(store, updated)
 
 
 @mcp.tool()

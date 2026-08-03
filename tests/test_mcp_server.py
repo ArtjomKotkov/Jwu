@@ -125,7 +125,7 @@ def test_jira_tools_refuse_without_jira(fresh_server, monkeypatch):
     workspaces.create(store, "home")
     store.close()
     # сервис без интеграций строится без единого обращения к кредам
-    with pytest.raises(ValueError, match="Jira не подключена"):
+    with pytest.raises(ValueError, match="нет провайдера задач"):
         _run(srv.jwu_task("PROJ-1", workspace="home"))
 
 

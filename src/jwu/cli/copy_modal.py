@@ -12,7 +12,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
 from ..core.clipboard import copy_to_clipboard
-from ..core.models import Issue, Job, PR
+from ..core.models import Issue, Job, PR, parse_github_key
 
 
 def notify_copied(screen, text: str, *, label: str = "") -> None:
@@ -23,9 +23,20 @@ def notify_copied(screen, text: str, *, label: str = "") -> None:
         screen.notify(f"Не скопировать: {exc}", severity="error")
 
 
-def _issue_url(jira_base: str, key: str) -> str:
-    base = (jira_base or "").rstrip("/")
-    return f"{base}/browse/{key}" if base and key else ""
+def task_url(base: str, key: str, owner: str = "") -> str:
+    """Ссылка на задачу по её ключу — форма ключа и говорит, чей это трекер.
+
+    ``PROJ-123`` → ``{base}/browse/PROJ-123`` (Jira), ``repo#42`` → ``{base}/owner/repo/issues/42``
+    (GitHub). Owner берётся из ключа, а если его там нет — из настроек контура.
+    """
+    base = (base or "").rstrip("/")
+    if not base or not key:
+        return ""
+    ref = parse_github_key(key, default_owner=owner)
+    if ref is not None:
+        gh_owner, repo, number = ref
+        return f"{base}/{gh_owner}/{repo}/issues/{number}" if gh_owner else ""
+    return f"{base}/browse/{key}"
 
 
 def _md_link(label: str, url: str) -> str:
@@ -37,11 +48,12 @@ def _wiki_link(label: str, url: str) -> str:
 
 
 def mention_comment_text(issue: Issue, user: str) -> str:
-    """Текст последнего коммента задачи, где упомянут user ([~login])."""
+    """Текст последнего коммента задачи, где упомянут user ([~login] или @login)."""
     if not user:
         return ""
-    marker = f"[~{user}]"
-    hits = [c for c in issue.comments if marker in (c.body or "")]
+    markers = (f"[~{user}]", f"@{user}")
+    hits = [c for c in issue.comments
+            if any(m in (c.body or "") for m in markers)]
     if not hits:
         return ""
     return " ".join((hits[-1].body or "").split())
@@ -63,31 +75,32 @@ def copy_items_for_issue(
     jira_base: str,
     *,
     user: str = "",
+    owner: str = "",
 ) -> list[CopyItem]:
-    url = _issue_url(jira_base, issue.key)
+    url = task_url(jira_base, issue.key, owner)
     key_summary = (
         f"{issue.key}: {issue.summary}"
         if issue.key and issue.summary else ""
     )
     mention = mention_comment_text(issue, user)
     return _copy_items_nonempty([
-        CopyItem("i", "ключ Jira", issue.key),
+        CopyItem("i", "ключ задачи", issue.key),
         CopyItem("u", "URL", url),
         CopyItem("m", "ссылка Markdown", _md_link(issue.key, url)),
-        CopyItem("w", "ссылка Jira wiki", _wiki_link(issue.key, url)),
+        CopyItem("w", "ссылка wiki", _wiki_link(issue.key, url)),
         CopyItem("t", "заголовок", issue.summary or ""),
         CopyItem("s", "KEY: summary", key_summary),
         CopyItem("e", "текст упоминания", mention),
     ])
 
 
-def copy_items_for_job(job: Job, jira_base: str) -> list[CopyItem]:
-    url = _issue_url(jira_base, job.task_key)
+def copy_items_for_job(job: Job, jira_base: str, owner: str = "") -> list[CopyItem]:
+    url = task_url(jira_base, job.task_key, owner)
     return _copy_items_nonempty([
         CopyItem("i", "ключ задачи", job.task_key),
         CopyItem("u", "URL задачи", url),
         CopyItem("m", "ссылка Markdown задачи", _md_link(job.task_key, url)),
-        CopyItem("w", "ссылка Jira wiki задачи", _wiki_link(job.task_key, url)),
+        CopyItem("w", "ссылка wiki задачи", _wiki_link(job.task_key, url)),
         CopyItem("t", "заголовок работы", job.title or ""),
         CopyItem("n", "номер работы", str(job.id) if job.id else ""),
     ])

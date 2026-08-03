@@ -1,17 +1,18 @@
 ---
 name: build-failure
-description: Use when the user wants to understand why a CI build failed for a PR/branch (Jenkins) — phrases like «почему упал билд», «разбери сборку», «красный билд», «что упало в jenkins», «build failure», «упали тесты ветки в CI». Collects facts ONLY via jwu (`jwu builds`/`jwu build`, which reach Bitbucket+Jenkins and do NOT need Jira) and dispatches the `jenkins-build-analyst` subagent to produce a structured root-cause verdict (наш баг vs регресс из целевой ветки vs инфра) and a fix.
+description: Use when the user wants to understand why a CI build failed for a PR/branch (Jenkins or GitHub Actions) — phrases like «почему упал билд», «разбери сборку», «красный билд», «что упало в jenkins», «что упало в actions», «build failure», «упали тесты ветки в CI». Collects facts ONLY via jwu (`jwu builds`/`jwu build`, which reach Bitbucket+Jenkins or GitHub Actions and do NOT need Jira) and dispatches the `jenkins-build-analyst` subagent to produce a structured root-cause verdict (наш баг vs регресс из целевой ветки vs инфра) and a fix.
 ---
 
 # build-failure: разбор падения CI-сборки
 
 ## Когда применять
-Пользователь спрашивает, почему красный билд / что упало в Jenkins по PR или ветке
+Пользователь спрашивает, почему красный билд / что упало в CI по PR или ветке
 («почему упал билд», «разбери сборку 159», «упали тесты ветки в CI», «build failure»).
 
 ## Что делает
-Единый источник данных — **jwu** (у него есть доступ в Bitbucket+Jenkins; команды сборок
-не зависят от Jira). Анализ делегируется субагенту **jenkins-build-analyst**.
+Единый источник данных — **jwu**: у него есть доступ к CI контура (Bitbucket + Jenkins
+либо GitHub Actions), и команды сборок не зависят от трекера задач. Анализ делегируется
+субагенту **jenkins-build-analyst** — он разбирает отчёт любого из двух CI.
 
 > **MCP-first.** Read-данные бери MCP-инструментами jwu — они предпочтительнее bash:
 > `jwu_builds(pr_id, project, repo)` вместо `jwu builds …`, `jwu_build(pr_id, project, repo, url)`
@@ -43,17 +44,24 @@ description: Use when the user wants to understand why a CI build failed for a P
 > так-то») — предложи сохранить: `jwu_rule_add(title, text, kind, tag)`
 > (bash: `jwu rule add "…" --kind constraint`).
 >
-> Если `jira_enabled=false` — Jira-команды и инструменты **не вызывай**: якорь работы там
-> либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
-> (`jwu job start --title "…"`). Если папка не привязана ни к одному воркспейсу — скажи
+> **Провайдер контура** (`provider` в ответе `jwu_workspace_current()`) говорит, откуда
+> берутся задачи и PR: `jira` (Jira + Bitbucket + Jenkins), `github` (Issues + PR + Actions)
+> или `local`. Инструменты одни и те же — меняется только формат ключа задачи: `PROJ-123`
+> у Jira, `dndeck#42` у GitHub. Если `provider=local` — инструменты задач **не вызывай**:
+> якорь работы там либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
+> (`jwu job start --title "…"`). У GitHub нет таймтрекера — `jwu_worklog` там откажет. Если папка не привязана ни к одному воркспейсу — скажи
 > об этом пользователю и предложи подключить проект.
 > Если папка не привязана ни к одному воркспейсу (`source` не `cwd`) — **не логируй работу**:
 > записи уедут в чужой контур. Сначала подключи проект — скилл **jwu-workspace-setup**
 > (`jwu init`).
 
 
-> **Нужны Bitbucket и Jenkins.** Если `bitbucket_enabled=false`, разбирать нечего: скажи, что в
-> этом воркспейсе CI не подключён, и предложи прогнать тесты локально.
+> **Нужен хостинг с CI.** Если `prs_enabled=false`, разбирать нечего: скажи, что в этом
+> воркспейсе CI не подключён, и предложи прогнать тесты локально. Откуда берутся сборки,
+> зависит от провайдера: `jira` → Bitbucket + Jenkins, `github` → check-runs и GitHub
+> Actions. Команды и поля отчёта одинаковые (`jwu_builds` / `jwu_build`); у отчёта есть
+> поле `ci` (`jenkins` | `github-actions`), а вместо упавших тест-кейсов Actions отдают
+> упавшие шаги джобы плюс хвост лога.
 
 ## Шаги
 1. **Собери вводные** из запроса: номер PR (обязательно, если нет прямого URL сборки),

@@ -31,9 +31,12 @@ description: Use when the user asks for a daily work analysis / summary of their
 > так-то») — предложи сохранить: `jwu_rule_add(title, text, kind, tag)`
 > (bash: `jwu rule add "…" --kind constraint`).
 >
-> Если `jira_enabled=false` — Jira-команды и инструменты **не вызывай**: якорь работы там
-> либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
-> (`jwu job start --title "…"`). Если папка не привязана ни к одному воркспейсу — скажи
+> **Провайдер контура** (`provider` в ответе `jwu_workspace_current()`) говорит, откуда
+> берутся задачи и PR: `jira` (Jira + Bitbucket + Jenkins), `github` (Issues + PR + Actions)
+> или `local`. Инструменты одни и те же — меняется только формат ключа задачи: `PROJ-123`
+> у Jira, `dndeck#42` у GitHub. Если `provider=local` — инструменты задач **не вызывай**:
+> якорь работы там либо локальная фича (`jwu_features` / `jwu feature list`), либо ничего
+> (`jwu job start --title "…"`). У GitHub нет таймтрекера — `jwu_worklog` там откажет. Если папка не привязана ни к одному воркспейсу — скажи
 > об этом пользователю и предложи подключить проект.
 > Если папка не привязана ни к одному воркспейсу (`source` не `cwd`) — **не логируй работу**:
 > записи уедут в чужой контур. Сначала подключи проект — скилл **jwu-workspace-setup**

@@ -1,6 +1,16 @@
-"""Сервисный слой: связывает клиентов Jira/Bitbucket и SQLite-память.
+"""Сервисный слой: связывает клиентов провайдера и SQLite-память.
 
 CLI обращается только сюда. Здесь же — локальная доводка «упоминаний» и оркестрация sync.
+
+У контура ОДИН провайдер задач и PR (см. ``Workspace.provider``), поэтому сервис держит
+две ссылки — ``tasks_client`` и ``pr_client``, — а не по клиенту на каждую систему:
+
+- ``jira``   → JiraClient (+SDESK) и BitbucketClient (+Jenkins);
+- ``github`` → один GitHubClient в обеих ролях (Issues, PR, Actions);
+- ``local``  → оба None: работы и фичи живут в памяти jwu и сети не требуют.
+
+Свойства ``jira``/``bitbucket``/``github`` отвечают «а это клиент такого-то типа?» —
+через них внешний код (CLI, MCP) проверяет, что доступно в текущем контуре.
 """
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ from .bitbucket import BitbucketClient
 from .config import (
     Config,
     bitbucket_token,
+    github_token,
     jenkins_auth,
     jira_login,
     jira_proxy_basic,
@@ -28,14 +39,17 @@ from .config import (
     sdesk_proxy_basic,
     sdesk_token,
 )
+from .github import GitHubClient
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
 from .jira import JiraClient
 from .models import (
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
+    GITHUB_SHORT_REF_RE,
     BuildReport,
     BuildStatus,
     Delta,
+    github_key,
     Issue,
     Job,
     LocalFeature,
@@ -55,6 +69,8 @@ _UNSAFE_NAME_RE = re.compile(r"[^\w.\- ]+", re.UNICODE)
 _PR_TASK_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-[0-9]+)\b")
 # project/repo/id из URL PR Bitbucket (для статусов сборок по dev-панели задачи).
 _BITBUCKET_PR_URL_RE = re.compile(r"/projects/([^/]+)/repos/([^/]+)/pull-requests/(\d+)")
+# То же для GitHub: https://github.com/owner/repo/pull/42
+_GITHUB_PR_URL_RE = re.compile(r"github[^/]*/([^/]+)/([^/]+)/pull/(\d+)")
 # Алиасы «ключ из ветки PR → канонический ключ задачи в Jira» — лежат одним JSON
 # в meta под этим ключом. Нужны, когда Jira слила старую задачу в новый ключ
 # (PR ссылается на старый, а snapshot пишется под канонический).
@@ -171,12 +187,38 @@ class DashboardData:
     paths: list[WorkspacePath] = field(default_factory=list)
     features: list[LocalFeature] = field(default_factory=list)
     rules: list[WorkspaceRule] = field(default_factory=list)
-    jira_enabled: bool = True
+    # Провайдер контура: им TUI решает, какие вкладки показывать (см. tasks_enabled/prs_enabled).
+    provider: str = "jira"
     bitbucket_enabled: bool = True
+    # Куда и под кем мы залогинены — это должно быть видно в футере дашборда, чтобы
+    # после смены контура нельзя было спутать рабочую Jira с личным GitHub.
+    env_label: str = ""      # «PROJ @ jira.example.com» / «dndeck @ github.com»
+    web_base: str = ""       # хост для ссылок на задачи (Jira base_url либо github web_url)
+    owner: str = ""          # owner GitHub — нужен, чтобы собрать ссылку по ключу repo#42
     # key задачи → её последний известный статус и текущий assignee;
     # для колонок «Назначен» / «Статус» в PR-таблицах.
     task_status: dict[str, str] = field(default_factory=dict)
     task_assignee: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def tasks_enabled(self) -> bool:
+        """Есть ли откуда брать задачи (вкладки «Мои» и «Упоминания»)."""
+        return self.provider in ("jira", "github")
+
+    @property
+    def prs_enabled(self) -> bool:
+        """Есть ли откуда брать PR (вкладки «Мои PR» и «На ревью»)."""
+        return self.provider == "github" or (
+            self.provider == "jira" and self.bitbucket_enabled
+        )
+
+    @property
+    def jira_enabled(self) -> bool:
+        return self.provider == "jira"
+
+    @property
+    def github_enabled(self) -> bool:
+        return self.provider == "github"
 
     def to_json_dict(self) -> dict:
         return {
@@ -188,7 +230,12 @@ class DashboardData:
             "paths": [p.model_dump() for p in self.paths],
             "features": [f.model_dump() for f in self.features],
             "rules": [r.model_dump() for r in self.rules],
+            "provider": self.provider,
+            "env_label": self.env_label,
+            "web_base": self.web_base,
+            "owner": self.owner,
             "jira_enabled": self.jira_enabled,
+            "github_enabled": self.github_enabled,
             "bitbucket_enabled": self.bitbucket_enabled,
             "last_sync": self.last_sync,
             "deltas": [d.model_dump() for d in self.deltas],
@@ -217,6 +264,38 @@ def _read_identity(store: Store) -> dict:
         return {}
 
 
+def _environment(store: Store, ws: Workspace | None) -> dict:
+    """Куда смотрит контур: подпись окружения, хост для ссылок и owner (для GitHub).
+
+    Читается из настроек воркспейса, а не из глобального конфига: дашборд переключают
+    между контурами прямо на ходу, и «где мы сейчас» обязано меняться вместе с ними.
+    """
+    if ws is None or ws.provider == "local":
+        return {"env_label": "локальный контур" if ws is not None else "", }
+    from urllib.parse import urlparse
+
+    from .workspaces import config_for_workspace
+
+    try:
+        cfg = config_for_workspace(store, ws)
+    except Exception:  # noqa: BLE001 — подпись окружения не стоит падения дашборда
+        return {}
+    if ws.provider == "github":
+        host = urlparse(cfg.github.web_url).netloc or cfg.github.web_url
+        repos = cfg.github.repo_list
+        what = repos[0] if len(repos) == 1 else (cfg.github.owner or "")
+        return {
+            "env_label": f"{what} @ {host}".strip(" @"),
+            "web_base": cfg.github.web_url,
+            "owner": cfg.github.owner,
+        }
+    host = urlparse(cfg.jira.base_url).netloc or cfg.jira.base_url
+    return {
+        "env_label": f"{cfg.jira.project} @ {host}".strip(" @"),
+        "web_base": cfg.jira.base_url,
+    }
+
+
 def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
     """Собрать дашборд из памяти (свежайшие снапшоты по сущностям). Сеть/токены не нужны.
 
@@ -226,13 +305,12 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
     ident = _read_identity(store)
     ws = store.get_workspace(store.workspace_id)
     # Список всех контуров со счётчиком работ — для вкладки управления воркспейсами.
-    # Скоуп store при этом восстанавливаем: дальше он читает данные текущего воркспейса.
+    # Считаем COUNT'ом по чужим контурам: снимок собирается на каждом обновлении дашборда,
+    # и вычитывать ради одной цифры весь журнал работ соседнего проекта незачем. Скоуп
+    # store при этом не трогаем — дальше он читает данные текущего воркспейса.
     all_workspaces = store.list_workspaces()
     for item in all_workspaces:
-        store.use_workspace(item.id)
-        item.jobs_count = len(store.list_jobs())
-    if ws is not None:
-        store.use_workspace(ws.id)
+        item.jobs_count = store.jobs_count(item.id)
     # Все известные задачи по ключу → статус (для колонки «Статус задачи» в PR-таблицах).
     # Берём из всех вью разом, чтобы статус был и для PR с чужой задачей (review).
     all_issues = store.latest_issues(None)
@@ -263,8 +341,9 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
         paths=ws.paths if ws else [],
         features=store.list_features(),
         rules=store.list_rules(),
-        jira_enabled=ws.jira_enabled if ws else True,
+        provider=ws.provider if ws else "jira",
         bitbucket_enabled=ws.bitbucket_enabled if ws else True,
+        **_environment(store, ws),
         task_status=task_status,
         task_assignee=task_assignee,
     )
@@ -274,8 +353,8 @@ class Service:
     def __init__(
         self,
         cfg: Config,
-        jira: JiraClient | None,
-        bitbucket: BitbucketClient | None,
+        tasks: "JiraClient | GitHubClient | None",
+        prs: "BitbucketClient | GitHubClient | None",
         store: Store,
         jenkins: JenkinsClient | None = None,
         sdesk: JiraClient | None = None,
@@ -284,9 +363,10 @@ class Service:
     ) -> None:
         self.cfg = cfg
         # Воркспейс, в контексте которого работает сервис (None — старый глобальный режим).
-        # Его флаги jira_enabled/bitbucket_enabled определяют, какие клиенты вообще созданы.
+        # Его provider определяет, какие клиенты вообще созданы.
         self.workspace = workspace
-        self.jira = jira
+        # Клиент задач и клиент PR. У GitHub-контура это ОДИН объект в обеих ролях.
+        self.tasks_client = tasks
         # Второй Jira-инстанс (SDESK): строится ЛЕНИВО (self._sdesk_factory) при первом
         # обращении к его ключу — чтобы недоступный/неверно настроенный SDESK не рушил
         # работу с основной Jira. Задачи с его префиксом ключа обслуживаются им, всё
@@ -294,11 +374,37 @@ class Service:
         # готовый клиент через sdesk=...
         self.sdesk = sdesk
         self._sdesk_factory = sdesk_factory
-        self.bitbucket = bitbucket
+        self.pr_client = prs
         self.jenkins = jenkins
         self.store = store
         self._me: dict | None = None      # кэш /myself на время жизни сервиса
         self._cred_fp: str | None = None  # кэш отпечатка кредов
+
+    # --- какой провайдер перед нами --------------------------------------- #
+
+    @property
+    def provider(self) -> str:
+        """local | jira | github — по типу клиентов (или по воркспейсу, если их нет)."""
+        if isinstance(self.tasks_client, GitHubClient) or isinstance(self.pr_client, GitHubClient):
+            return "github"
+        if self.tasks_client is not None or self.pr_client is not None:
+            return "jira"
+        return self.workspace.provider if self.workspace else "local"
+
+    @property
+    def jira(self) -> JiraClient | None:
+        """Клиент Jira — или None, если задачи берутся не из Jira."""
+        return self.tasks_client if isinstance(self.tasks_client, JiraClient) else None
+
+    @property
+    def bitbucket(self) -> BitbucketClient | None:
+        """Клиент Bitbucket — или None, если PR приходят не оттуда."""
+        return self.pr_client if isinstance(self.pr_client, BitbucketClient) else None
+
+    @property
+    def github(self) -> GitHubClient | None:
+        """Клиент GitHub — или None, если контур не на GitHub."""
+        return self.pr_client if isinstance(self.pr_client, GitHubClient) else None
 
     @classmethod
     def from_config(cls, cfg: Config | None = None, *, db_path: str | None = None,
@@ -344,14 +450,26 @@ class Service:
         store = Store(db_path or str(default_db_path()), workspace_id)
         return cls(cfg, None, bitbucket, store, jenkins)
 
+    @staticmethod
+    def _github_client(cfg: Config) -> GitHubClient:
+        """Клиент GitHub по конфигу воркспейса — он же и задачи, и PR, и сборки."""
+        return GitHubClient(
+            cfg.github.api_url,
+            github_token(cfg),
+            owner=cfg.github.owner,
+            repos=cfg.github.repo_list,
+            web_url=cfg.github.web_url,
+            views=cfg.github.views,
+        )
+
     @classmethod
     def for_workspace(
         cls, workspace: Workspace, cfg: Config | None = None, *, db_path: str | None = None
     ) -> "Service":
-        """Сервис в контексте воркспейса: клиенты только для подключённых интеграций.
+        """Сервис в контексте воркспейса: клиенты ровно под его провайдера.
 
-        Воркспейс без Jira и Bitbucket вообще не требует кредов — ни один токен не
-        запрашивается, и работа с локальными фичами/работами возможна «из коробки».
+        Локальный контур вообще не требует кредов — ни один токен не запрашивается,
+        и работа с фичами/работами возможна «из коробки».
 
         Store открывается ПЕРВЫМ: конфиг воркспейса (и его секреты) читаются из этой же
         БД, поэтому источник секретов должен держать живое соединение сервиса, а не чужое.
@@ -361,6 +479,12 @@ class Service:
 
         store = Store(db_path or str(default_db_path()), workspace.id)
         cfg = cfg or config_for_workspace(store, workspace)
+
+        if workspace.provider == "github":
+            gh = cls._github_client(cfg)
+            # Один клиент в обеих ролях: у GitHub задачи, PR и сборки живут на одном хосте.
+            return cls(cfg, gh, gh, store, workspace=workspace)
+
         jira = None
         sdesk_factory = None
         if workspace.jira_enabled:
@@ -387,25 +511,32 @@ class Service:
     def builds_for_workspace(
         cls, workspace: Workspace, cfg: Config | None = None, *, db_path: str | None = None
     ) -> "Service":
-        """Bitbucket + Jenkins в контексте воркспейса, без логина в Jira (см. for_builds)."""
+        """Хостинг + CI в контексте воркспейса, без логина в трекер (см. for_builds).
+
+        Разбор красной сборки не должен зависеть от доступности Jira — поэтому у
+        Jira-контура здесь поднимаются только Bitbucket и Jenkins. У GitHub-контура
+        клиент всё равно один, но роль задач намеренно остаётся пустой.
+        """
         from .config import db_path as default_db_path
         from .workspaces import config_for_workspace
 
         store = Store(db_path or str(default_db_path()), workspace.id)
         cfg = cfg or config_for_workspace(store, workspace)
+        if workspace.provider == "github":
+            return cls(cfg, None, cls._github_client(cfg), store, workspace=workspace)
         bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
         jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
         return cls(cfg, None, bitbucket, store, jenkins, workspace=workspace)
 
     def close(self) -> None:
-        if self.jira is not None:
-            self.jira.close()
-        if self.sdesk is not None:
-            self.sdesk.close()
-        if self.bitbucket is not None:
-            self.bitbucket.close()
-        if self.jenkins is not None:
-            self.jenkins.close()
+        clients = [self.tasks_client, self.pr_client, self.sdesk, self.jenkins]
+        seen: list[int] = []
+        for client in clients:
+            # tasks_client и pr_client у GitHub-контура — один и тот же объект
+            if client is None or id(client) in seen:
+                continue
+            seen.append(id(client))
+            client.close()
         self.store.close()
 
     def __enter__(self) -> "Service":
@@ -431,7 +562,7 @@ class Service:
             return False
         return key.split("-", 1)[0].upper() == self.cfg.sdesk.project.upper()
 
-    def _client_for_key(self, key: str) -> JiraClient:
+    def _client_for_key(self, key: str) -> "JiraClient | GitHubClient | None":
         """Выбрать инстанс по префиксу ключа: SDESK-* → SDESK-инстанс, иначе основная Jira.
 
         Резолвинг по одной задаче (карточка/worklog/вложения) ходит в тот инстанс,
@@ -443,23 +574,43 @@ class Service:
             client = self._sdesk_client()
             if client is not None:
                 return client
-        return self.jira
+        return self.tasks_client
+
+    def _require_tasks(self) -> "JiraClient | GitHubClient":
+        """Клиент задач или внятный отказ: у локального контура его нет вовсе."""
+        if self.tasks_client is None:
+            raise ValueError(
+                "В этом воркспейсе нет провайдера задач (локальный контур). "
+                "Задачи ведутся фичами: jwu feature add"
+            )
+        return self.tasks_client
 
     def _myself(self) -> dict:
-        """/myself с кэшем на время жизни сервиса (один запрос на синк)."""
-        if self.jira is None:
-            return {}  # воркспейс без Jira — личности «из Jira» просто нет
+        """Личность из провайдера задач, с кэшем на время жизни сервиса."""
+        if self.tasks_client is None:
+            return {}  # локальный контур — личности «извне» просто нет
         if self._me is None:
             try:
-                self._me = self.jira.myself()
+                self._me = self.tasks_client.myself()
             except Exception:  # noqa: BLE001 — данные о пользователе не критичны
                 self._me = {}
         return self._me
 
+    def _configured_username(self) -> str:
+        """Логин, заданный в настройках провайдера (пусто — узнаем у самого провайдера)."""
+        return self.cfg.github.username if self.provider == "github" else self.cfg.jira.username
+
     def _resolve_username(self) -> str:
-        if self.cfg.jira.username:
-            return self.cfg.jira.username
-        return self._myself().get("name", "") or ""
+        return self._configured_username() or (self._myself().get("name", "") or "")
+
+    def _views(self) -> dict[str, str]:
+        """Именованные выборки задач текущего провайдера (JQL либо поиск GitHub)."""
+        return self.cfg.github.views if self.provider == "github" else self.cfg.jira.views
+
+    def _mention_marker(self, login: str) -> str:
+        """Как выглядит упоминание меня в тексте: ``[~login]`` в Jira, ``@login`` в GitHub."""
+        marker = getattr(self.tasks_client, "mention_marker", None)
+        return marker(login) if callable(marker) else f"[~{login}]"
 
     def _cred_fingerprint(self) -> str:
         """Хэш кредов (base_url + логин + токен/сессия). Меняется при смене кредов.
@@ -469,8 +620,13 @@ class Service:
         """
         if self._cred_fp is not None:
             return self._cred_fp
-        mats = [self.cfg.jira.base_url, self.cfg.jira.username]
-        for fn in (jira_token, jira_login, jira_proxy_basic):
+        if self.provider == "github":
+            mats = [self.cfg.github.api_url, self.cfg.github.owner, self.cfg.github.username]
+            fns = (github_token,)
+        else:
+            mats = [self.cfg.jira.base_url, self.cfg.jira.username]
+            fns = (jira_token, jira_login, jira_proxy_basic)
+        for fn in fns:
             try:
                 mats.append(repr(fn(self.cfg)))
             except Exception:  # noqa: BLE001 — нет кредов/keychain недоступен
@@ -490,9 +646,9 @@ class Service:
             return cached["user"], cached.get("display_name", ""), cached.get("email", "")
         me = self._myself()
         if not me:  # сеть недоступна — отдаём, что было в кэше
-            return (cached.get("user", self.cfg.jira.username),
+            return (cached.get("user", self._configured_username()),
                     cached.get("display_name", ""), cached.get("email", ""))
-        login = self.cfg.jira.username or me.get("name", "") or ""
+        login = self._configured_username() or me.get("name", "") or ""
         display = me.get("displayName", "") or ""
         email = me.get("emailAddress", "") or ""
         if login:
@@ -503,28 +659,34 @@ class Service:
         return login, display, email
 
     def tasks(self, view: str = "mine", *, jql: str | None = None) -> list[Issue]:
-        """Список задач по именованному вью или произвольному JQL."""
+        """Список задач по именованному вью или произвольному запросу провайдера."""
+        client = self._require_tasks()
+        views = self._views()
         if jql is None:
-            jql = self.cfg.jira.views.get(view)
+            jql = views.get(view)
             if jql is None:
-                raise ValueError(f"Неизвестный вью: {view!r}. Доступны: {', '.join(self.cfg.jira.views)}")
-        issues = self.jira.search(jql)
-        if view == "mentions" and jql is self.cfg.jira.views.get("mentions"):
+                raise ValueError(f"Неизвестный вью: {view!r}. Доступны: {', '.join(views)}")
+        issues = client.search(jql)
+        if view == "mentions" and jql is views.get("mentions"):
             issues = self._filter_mentions(issues)
         return issues
 
     def _filter_mentions(self, issues: list[Issue]) -> list[Issue]:
-        """Локально оставить задачи, где меня реально упомянули в комментах ([~username])."""
+        """Локально оставить задачи, где меня реально упомянули в комментариях.
+
+        Поиск обоих провайдеров отдаёт задачи, где я «фигурирую», — а упоминание живёт
+        в тексте комментария, поэтому последнее слово всегда за локальной проверкой.
+        """
         username = self._resolve_username()
-        if not username:
+        if not username or self.tasks_client is None:
             return issues  # имени нет — не можем уточнить, отдаём как есть
-        marker = f"[~{username}]"
+        marker = self._mention_marker(username)
         kept: list[Issue] = []
         for issue in issues:
             # комментов может не быть в списочном ответе — дотягиваем карточку
             if not issue.comments:
                 try:
-                    issue = self.jira.issue(issue.key, with_dev=False)
+                    issue = self.tasks_client.issue(issue.key, with_dev=False)
                 except Exception:  # noqa: BLE001
                     continue
             if any(marker in (c.body or "") for c in issue.comments):
@@ -539,19 +701,19 @@ class Service:
         ``mentions``; карточку с комментариями тянем только у тех задач, что изменились
         с прошлого разбора — иначе каждый синк перечитывал бы весь двухнедельный хвост.
         """
-        jql = self.cfg.jira.views.get("mentions")
+        jql = self._views().get("mentions")
         user = self._resolve_username()
-        if self.jira is None or not jql or not user:
+        if self.tasks_client is None or not jql or not user:
             return []
-        marker = f"[~{user}]"
+        marker = self._mention_marker(user)
         scanned = self.store.mention_scan_state()
         found: list[Mention] = []
         seen_versions: list[tuple[str, str]] = []
-        for issue in self.jira.search(jql):
+        for issue in self.tasks_client.search(jql):
             if issue.updated and scanned.get(issue.key) == issue.updated:
                 continue  # задача не менялась — новым упоминаниям взяться неоткуда
             try:
-                full = self.jira.issue(issue.key, with_dev=False)
+                full = self.tasks_client.issue(issue.key, with_dev=False)
             except Exception:  # noqa: BLE001 — нет доступа/сеть: разберём в следующий раз
                 continue
             for c in full.comments:
@@ -565,6 +727,7 @@ class Service:
         return self.store.add_mentions(found)
 
     def issue(self, key: str) -> Issue:
+        self._require_tasks()
         return self._client_for_key(key).issue(key, with_dev=True)
 
     def add_worklog(
@@ -575,7 +738,11 @@ class Service:
         comment: str | None = None,
         started: str | None = None,
     ) -> dict:
-        """Залогировать время по задаче в таймтрекер Jira (worklog)."""
+        """Залогировать время по задаче в таймтрекер Jira (worklog).
+
+        У GitHub таймтрекера нет — клиент честно откажет (см. GitHubClient.add_worklog).
+        """
+        self._require_tasks()
         return self._client_for_key(key).add_worklog(
             key, time_spent, comment=comment, started=started
         )
@@ -644,19 +811,40 @@ class Service:
             results.append((att, path))
         return results
 
-    # --- Bitbucket ------------------------------------------------------ #
+    # --- PR (Bitbucket либо GitHub) -------------------------------------- #
+
+    def _require_prs(self) -> "BitbucketClient | GitHubClient":
+        """Клиент PR или внятный отказ."""
+        if self.pr_client is None:
+            raise ValueError("В этом воркспейсе не подключён хостинг репозиториев (PR негде брать)")
+        return self.pr_client
+
+    def default_pr_ref(self) -> tuple[str, str]:
+        """Проект/репозиторий по умолчанию для команд, где их не указали явно."""
+        if self.provider == "github":
+            repos = self.cfg.github.repo_list
+            return self.cfg.github.owner, (repos[0] if repos else "")
+        return self.cfg.bitbucket.project, self.cfg.bitbucket.repo
+
+    def _fill_merge_status(self, pr: PR) -> None:
+        """Догрузить статус merge-конфликта у PR (у провайдеров это разные запросы)."""
+        client = self.pr_client
+        if client is None or not (pr.project and pr.repository):
+            return
+        try:
+            filler = getattr(client, "fill_merge_status", None)
+            if callable(filler):
+                filler(pr)
+            else:
+                pr.apply_merge_status(client.merge_status(pr.project, pr.repository, pr.id))
+        except Exception:  # noqa: BLE001 — конфликт не критичен, PR полезен и без него
+            pass
 
     def prs(self, view: str = "review", *, with_conflicts: bool = True) -> list[PR]:
-        prs = self.bitbucket.dashboard_prs(view)
+        prs = self._require_prs().dashboard_prs(view)
         if with_conflicts:
             for pr in prs:
-                if pr.project and pr.repository:
-                    try:
-                        pr.apply_merge_status(
-                            self.bitbucket.merge_status(pr.project, pr.repository, pr.id)
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
+                self._fill_merge_status(pr)
         return prs
 
     def my_reviews(self, *, on: str | None = None) -> list[PR]:
@@ -666,15 +854,16 @@ class Service:
         epoch ms). Если задан `on` (YYYY-MM-DD, локальная дата) — оставляет только ревью,
         поставленные в этот день; PR без даты моего ревья при фильтре отбрасываются.
         """
+        client = self._require_prs()
         login = self._resolve_username()
         out: list[PR] = []
-        for pr in self.bitbucket.dashboard_prs("review"):
+        for pr in client.dashboard_prs("review"):
             mine = next((r for r in pr.reviewers if r.name == login), None)
             if mine is None or mine.status not in ("APPROVED", "NEEDS_WORK"):
                 continue
             if not (pr.project and pr.repository):
                 continue
-            ts = self.bitbucket.my_review_at(pr.project, pr.repository, pr.id, login)
+            ts = client.my_review_at(pr.project, pr.repository, pr.id, login)
             pr.my_review_status = mine.status
             pr.my_review_at = ts
             if on is not None:
@@ -686,9 +875,10 @@ class Service:
         return out
 
     def pr(self, pr_id: int, *, project: str | None = None, repo: str | None = None) -> PR:
-        return self.bitbucket.pr(
-            project or self.cfg.bitbucket.project,
-            repo or self.cfg.bitbucket.repo,
+        default_project, default_repo = self.default_pr_ref()
+        return self._require_prs().pr(
+            project or default_project,
+            repo or default_repo,
             pr_id,
         )
 
@@ -707,48 +897,68 @@ class Service:
             for issue in issues:
                 seen.setdefault(issue.key, issue)
                 key_views.setdefault(issue.key, set()).add(view)
-        # детальный снапшот: комменты + dev-панель
+        # детальный снапшот: комменты + связанные ветки/PR
         for key in seen:
             try:
-                full = self.jira.issue(key, with_dev=True)
+                full = self.tasks_client.issue(key, with_dev=True)
             except Exception:  # noqa: BLE001
                 full = seen[key]
             self.store.save_issue_snapshot(run_id, full, sorted(key_views.get(key, [])))
         return counts
 
     def _sync_prs(self, run_id: int, views: list[str]) -> dict[str, int]:
-        pr_seen: dict[int, PR] = {}
-        pr_views: dict[int, set[str]] = {}
+        pr_seen: dict[tuple[str, str, int], PR] = {}
+        pr_views: dict[tuple[str, str, int], set[str]] = {}
         counts: dict[str, int] = {}
         for view in views:
             try:
-                prs = self.bitbucket.dashboard_prs(view)
+                prs = self.pr_client.dashboard_prs(view)
             except Exception:  # noqa: BLE001
                 continue
             counts[f"prs:{view}"] = len(prs)
             for pr in prs:
-                pr_seen.setdefault(pr.id, pr)
-                pr_views.setdefault(pr.id, set()).add(view)
-        for pr in pr_seen.values():
+                # PR опознаётся вместе с репозиторием: в GitHub нумерация в каждом своя
+                ref = (pr.project, pr.repository, pr.id)
+                pr_seen.setdefault(ref, pr)
+                pr_views.setdefault(ref, set()).add(view)
+        for ref, pr in pr_seen.items():
             if pr.project and pr.repository:
-                try:
-                    pr.apply_merge_status(
-                        self.bitbucket.merge_status(pr.project, pr.repository, pr.id)
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    pr.latest_commit = self.bitbucket.latest_commit(
-                        pr.project, pr.repository, pr.id
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(pr.id, [])))
+                self._fill_merge_status(pr)
+                if not pr.latest_commit:
+                    try:
+                        pr.latest_commit = self.pr_client.latest_commit(
+                            pr.project, pr.repository, pr.id
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(ref, [])))
         # Подтянуть статус/assignee задач, на которые ссылаются PR — нужно для
         # колонок «Назначен»/«Статус» в дашборде. PR на чужой релизной задаче
         # никогда не попадёт в mine/mentions, но ключ в branch/title есть.
         self._snapshot_pr_tasks(run_id, list(pr_seen.values()))
         return counts
+
+    def _task_key_from_pr(self, pr: PR) -> str:
+        """Ключ задачи, к которой относится PR: из имени ветки, иначе из заголовка.
+
+        В Jira-контуре это ``PROJ-123`` (ветка ``PROJ-123-fix``), в GitHub — номер issue:
+        ветка ``42-fix-crash`` (так их называет сам GitHub) либо ``#42`` в заголовке PR.
+        """
+        if self.provider != "github":
+            for src in (pr.source_branch, pr.title):
+                match = _PR_TASK_KEY_RE.search(src or "")
+                if match:
+                    return match.group(1)
+            return ""
+        branch_match = re.match(r"^(?:\w+/)?(\d+)[-_]", pr.source_branch or "")
+        number = branch_match.group(1) if branch_match else ""
+        if not number:
+            title_match = GITHUB_SHORT_REF_RE.search(pr.title or "")
+            number = title_match.group(1) if title_match else ""
+        if not number or not pr.repository:
+            return ""
+        return github_key(pr.repository, number, owner=pr.project,
+                          default_owner=self.cfg.github.owner)
 
     def _snapshot_pr_tasks(self, run_id: int, prs: list[PR]) -> None:
         """Снапшотим задачи, упомянутые в branch/title PR, если их ещё нет в этом run.
@@ -759,11 +969,9 @@ class Service:
         """
         keys: set[str] = set()
         for pr in prs:
-            for src in (pr.source_branch, pr.title):
-                m = _PR_TASK_KEY_RE.search(src or "")
-                if m:
-                    keys.add(m.group(1))
-                    break
+            key = self._task_key_from_pr(pr)
+            if key:
+                keys.add(key)
         aliases = _load_pr_task_aliases(self.store)
         # Уже снапшотнутые в этом прогоне задачи (из mine/mentions) трогать нельзя:
         # их снапшот богаче (with_dev=True, есть pr_ids/branches), а pr_link-дубль
@@ -799,20 +1007,20 @@ class Service:
         тоже нет, иначе детекция исчезновения решила бы, что вкладка «опустела».
         """
         views: list[str] = []
-        if self.jira is not None:
+        if self.tasks_client is not None:
             # «mentions» остаётся в списке вью только ради отметки времени синка в
             # шапке вкладки: снапшотов у упоминаний нет (см. counts ниже).
             views += ["mine", "mentions"]
-        if self.bitbucket is not None:
+        if self.pr_client is not None:
             views += ["prs:mine", "prs:review"]
         run_id = self.store.start_sync_run(views)
         counts: dict[str, int] = {}
-        if self.jira is not None:
+        if self.tasks_client is not None:
             counts |= self._sync_tasks(run_id, ["mine"])
             # Упоминания живут отдельной сущностью, вне снапшотов и дельт (см.
             # collect_mentions): их «изменение» — это появление нового упоминания.
             counts["mentions"] = len(self.collect_mentions())
-        if self.bitbucket is not None:
+        if self.pr_client is not None:
             counts |= self._sync_prs(run_id, ["mine", "review"])
         # counts фиксируем ДО compute_changes: детекция исчезновения (gone/pr_gone)
         # опирается на надёжность прогона по counts, а ради «вкладка реально пуста»
@@ -825,20 +1033,20 @@ class Service:
     def sync_section(self, section: str) -> SyncResult:
         """Синк одной секции/вкладки: mine | mentions | prs_mine | prs_review."""
         if section == "mentions":
-            if self.jira is None:
-                raise ValueError("В этом воркспейсе Jira не подключена")
+            if self.tasks_client is None:
+                raise ValueError("В этом воркспейсе нет провайдера задач")
             run_id = self.store.start_sync_run(["mentions"])
             counts = {"mentions": len(self.collect_mentions())}
             self.store.finish_sync_run(run_id, counts)
             return SyncResult(run_id=run_id, counts=counts, deltas=[])
         if section == "mine":
-            if self.jira is None:
-                raise ValueError("В этом воркспейсе Jira не подключена")
+            if self.tasks_client is None:
+                raise ValueError("В этом воркспейсе нет провайдера задач")
             run_id = self.store.start_sync_run([section])
             counts = self._sync_tasks(run_id, [section])
         elif section in ("prs_mine", "prs_review"):
-            if self.bitbucket is None:
-                raise ValueError("В этом воркспейсе Bitbucket не подключён")
+            if self.pr_client is None:
+                raise ValueError("В этом воркспейсе не подключён хостинг репозиториев")
             view = "mine" if section == "prs_mine" else "review"
             run_id = self.store.start_sync_run([f"prs:{view}"])
             counts = self._sync_prs(run_id, [view])
@@ -851,15 +1059,17 @@ class Service:
 
     def pr_detail(self, project: str | None, repo: str | None, pr_id: int) -> "PRDetail":
         """Лениво: PR + статус конфликта + комменты (с дифф-контекстом) + коммиты."""
-        project = project or self.cfg.bitbucket.project
-        repo = repo or self.cfg.bitbucket.repo
-        pr = self.bitbucket.pr(project, repo, pr_id)
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        project = project or default_project
+        repo = repo or default_repo
+        pr = client.pr(project, repo, pr_id)
         try:
-            comments = self.bitbucket.pr_comments(project, repo, pr_id)
+            comments = client.pr_comments(project, repo, pr_id)
         except Exception:  # noqa: BLE001
             comments = []
         try:
-            commits = self.bitbucket.pr_commits(project, repo, pr_id)
+            commits = client.pr_commits(project, repo, pr_id)
         except Exception:  # noqa: BLE001
             commits = []
         try:
@@ -870,17 +1080,23 @@ class Service:
 
     def build_statuses_for_pr(self, project: str, repo: str, pr_id: int) -> list[BuildStatus]:
         """Статусы CI-сборок по head-коммиту PR (то, что видно на странице PR)."""
-        sha = self.bitbucket.latest_commit(project, repo, pr_id)
+        client = self._require_prs()
+        sha = client.latest_commit(project, repo, pr_id)
         if not sha:
             return []
-        return self.bitbucket.build_statuses(sha)
+        # GitHub ищет сборки только внутри репозитория, Bitbucket — по всему инстансу;
+        # project/repo передаём всегда, лишними они не будут.
+        return client.build_statuses(sha, project=project, repo=repo)
 
     def build_statuses_for_pr_url(self, url: str) -> list[BuildStatus]:
-        """Статусы сборок по URL PR из dev-панели задачи (парсит project/repo/id из URL)."""
-        match = _BITBUCKET_PR_URL_RE.search(url or "")
-        if not match:
-            return []
-        return self.build_statuses_for_pr(match.group(1), match.group(2), int(match.group(3)))
+        """Статусы сборок по URL PR из карточки задачи (парсит project/repo/id из URL)."""
+        for pattern in (_BITBUCKET_PR_URL_RE, _GITHUB_PR_URL_RE):
+            match = pattern.search(url or "")
+            if match:
+                return self.build_statuses_for_pr(
+                    match.group(1), match.group(2), int(match.group(3))
+                )
+        return []
 
     def build_report(
         self,
@@ -890,14 +1106,16 @@ class Service:
         *,
         build_url: str | None = None,
     ) -> BuildReport | None:
-        """Детальный разбор сборки PR: статус из Bitbucket + причина падения из Jenkins.
+        """Детальный разбор сборки PR: статус из хостинга + причина падения из CI.
 
         По умолчанию берётся упавшая сборка (иначе — первая по head-коммиту), либо
-        конкретная по ``build_url``. Без Jenkins-токена/доступа отчёт деградирует до
-        статуса из Bitbucket с пояснением в ``note``. None — если по коммиту сборок нет.
+        конкретная по ``build_url``. Без доступа к CI (нет токена Jenkins, протухли логи
+        Actions) отчёт деградирует до статуса с пояснением в ``note``. None — если по
+        коммиту сборок нет вовсе.
         """
-        project = project or self.cfg.bitbucket.project
-        repo = repo or self.cfg.bitbucket.repo
+        default_project, default_repo = self.default_pr_ref()
+        project = project or default_project
+        repo = repo or default_repo
         statuses = self.build_statuses_for_pr(project, repo, pr_id)
         if build_url:
             chosen = next((b for b in statuses if b.url == build_url), None) or BuildStatus(url=build_url)
@@ -907,6 +1125,10 @@ class Service:
             chosen = chosen or (statuses[0] if statuses else None)
         if chosen is None:
             return None
+
+        # У GitHub-контура за детализацию отвечает сам клиент (Actions живут там же).
+        if self.github is not None:
+            return self.github.build_report(project, repo, chosen)
 
         report = BuildReport(
             state=chosen.state, name=chosen.name, url=chosen.url, description=chosen.description,
@@ -925,7 +1147,7 @@ class Service:
         job_path, number = parsed
         try:
             info = self.jenkins.build_info(job_path, number)
-            report.jenkins_available = True
+            report.details_available = True
             report.result = info["result"] or ""
             report.building = info["building"]
             report.sha = info["sha"]
@@ -949,8 +1171,8 @@ class Service:
         """Фулл-синк + расширенный контекст для дневного анализа Claude Code."""
         self.sync()
         login, display, _ = self._identity()
-        d = dashboard_from_memory(self.store, login or self.cfg.jira.username)
-        user = login or self.cfg.jira.username
+        user = login or self._configured_username()
+        d = dashboard_from_memory(self.store, user)
 
         # подтянуть комменты только для проблемных PR (конфликт / есть NEEDS_WORK)
         pr_comments: dict[int, list[PRComment]] = {}
@@ -963,9 +1185,9 @@ class Service:
             if pr.id in seen or len(pr_comments) >= max_pr_comments:
                 continue
             seen.add(pr.id)
-            if pr.project and pr.repository:
+            if pr.project and pr.repository and self.pr_client is not None:
                 try:
-                    pr_comments[pr.id] = self.bitbucket.pr_comments(
+                    pr_comments[pr.id] = self.pr_client.pr_comments(
                         pr.project, pr.repository, pr.id
                     )
                 except Exception:  # noqa: BLE001
@@ -1014,7 +1236,23 @@ class Service:
     # --- auth ----------------------------------------------------------- #
 
     def auth_check(self) -> dict:
+        """Проверка доступов по системам текущего провайдера.
+
+        Ключи в ответе — имена систем (jira/sdesk/bitbucket/github/jenkins); отсутствие
+        ключа значит «в этом контуре такой системы нет», а не «не проверяли».
+        """
         result: dict = {}
+        if self.github is not None:
+            try:
+                me = self.github.myself()
+                result["github"] = {
+                    "ok": True, "user": me.get("name"), "name": me.get("displayName"),
+                }
+            except Exception as exc:  # noqa: BLE001
+                result["github"] = {"ok": False, "error": str(exc)}
+            return result
+        if self.jira is None:
+            return result  # локальный контур — проверять нечего
         try:
             me = self.jira.myself()
             result["jira"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
@@ -1028,11 +1266,12 @@ class Service:
                 result["sdesk"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
             except Exception as exc:  # noqa: BLE001
                 result["sdesk"] = {"ok": False, "error": str(exc)}
-        try:
-            self.bitbucket.ping()
-            result["bitbucket"] = {"ok": True}
-        except Exception as exc:  # noqa: BLE001
-            result["bitbucket"] = {"ok": False, "error": str(exc)}
+        if self.bitbucket is not None:
+            try:
+                self.bitbucket.ping()
+                result["bitbucket"] = {"ok": True}
+            except Exception as exc:  # noqa: BLE001
+                result["bitbucket"] = {"ok": False, "error": str(exc)}
         # Jenkins опционален: проверяем, только если настроен токен.
         if self.jenkins is not None and self.jenkins.auth is not None:
             try:

@@ -86,6 +86,43 @@ class BitbucketConfig:
     token_env: str = "BITBUCKET_TOKEN"
 
 
+DEFAULT_GITHUB_VIEWS: dict[str, str] = {
+    # Синтаксис поиска GitHub. ``@me`` он раскрывает сам — логин знать не обязательно.
+    "mine": "is:issue is:open assignee:@me",
+    # Кандидаты в упоминания; какие именно комментарии меня упомянули, разбирается
+    # локально (как и в Jira), потому что поиск отдаёт задачи, а не комментарии.
+    "mentions": "is:issue mentions:@me",
+}
+
+
+@dataclass
+class GitHubConfig:
+    """GitHub как ЕДИНСТВЕННЫЙ провайдер контура: задачи (Issues), PR и сборки (Actions).
+
+    ``owner`` — организация или пользователь, чьи репозитории считаются «своими»
+    (в ключах задач и PR он опускается: ``dndeck#42``). ``repos`` сужает выборку до
+    перечисленных репозиториев — иначе в списки попадёт всё, что найдёт поиск по ``@me``.
+
+    Хост отдельно для API и для веба: у github.com они разные (api.github.com), а у
+    GitHub Enterprise — общий (``https://ghe.example.com/api/v3`` и ``https://ghe.example.com``).
+    """
+
+    api_url: str = "https://api.github.com"
+    web_url: str = "https://github.com"
+    owner: str = ""
+    repos: str = ""       # через запятую; пусто => все репозитории owner'а
+    username: str = ""    # логин; пусто => берётся из /user при первом обращении
+    views: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_GITHUB_VIEWS))
+    token_account: str = "github"
+    token_service: str = "github-pat"
+    token_env: str = "GITHUB_TOKEN"
+
+    @property
+    def repo_list(self) -> list[str]:
+        """Репозитории из ``repos`` списком (пустые элементы отбрасываются)."""
+        return [r.strip() for r in (self.repos or "").split(",") if r.strip()]
+
+
 @dataclass
 class JenkinsConfig:
     """CI Jenkins: глубокие детали сборок (тест-репорт, консоль) поверх статусов из Bitbucket.
@@ -112,6 +149,7 @@ class Config:
     jira: JiraConfig = field(default_factory=JiraConfig)
     sdesk: SdeskConfig = field(default_factory=SdeskConfig)
     bitbucket: BitbucketConfig = field(default_factory=BitbucketConfig)
+    github: GitHubConfig = field(default_factory=GitHubConfig)
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     # Откуда берутся секреты. По умолчанию — системный keyring (как исторически);
@@ -132,6 +170,8 @@ def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
         }
     elif section == "bitbucket":
         pairs = {"token": (cfg.bitbucket.token_service, cfg.bitbucket.token_account)}
+    elif section == "github":
+        pairs = {"token": (cfg.github.token_service, cfg.github.token_account)}
     elif section == "jenkins":
         pairs = {"token": (cfg.jenkins.token_service, cfg.jenkins.username)}
     else:
@@ -227,6 +267,19 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     cfg.bitbucket.token_service = b.get("token_service", cfg.bitbucket.token_service)
     cfg.bitbucket.token_env = b.get("token_env", cfg.bitbucket.token_env)
 
+    g = raw.get("github", {}) or {}
+    cfg.github.api_url = g.get("api_url", cfg.github.api_url).rstrip("/")
+    cfg.github.web_url = g.get("web_url", cfg.github.web_url).rstrip("/")
+    cfg.github.owner = g.get("owner", cfg.github.owner)
+    cfg.github.repos = g.get("repos", cfg.github.repos)
+    cfg.github.username = g.get("username", cfg.github.username)
+    cfg.github.token_account = g.get("token_account", cfg.github.token_account)
+    cfg.github.token_service = g.get("token_service", cfg.github.token_service)
+    cfg.github.token_env = g.get("token_env", cfg.github.token_env)
+    gviews = g.get("views") or {}
+    if gviews:
+        cfg.github.views = {**DEFAULT_GITHUB_VIEWS, **gviews}
+
     k = raw.get("jenkins", {}) or {}
     cfg.jenkins.base_url = k.get("base_url", cfg.jenkins.base_url).rstrip("/")
     cfg.jenkins.username = k.get("username", cfg.jenkins.username)
@@ -270,6 +323,15 @@ def save_config(cfg: Config, path: Path | None = None) -> Path:
     bb["project"] = cfg.bitbucket.project
     bb["repo"] = cfg.bitbucket.repo
 
+    # GitHub пишем, только если контур им пользуется — иначе не засоряем конфиг.
+    if github_enabled(cfg):
+        gh = raw.setdefault("github", {})
+        gh["api_url"] = cfg.github.api_url
+        gh["web_url"] = cfg.github.web_url
+        gh["owner"] = cfg.github.owner
+        gh["repos"] = cfg.github.repos
+        gh["username"] = cfg.github.username
+
     if cfg.jenkins.username or cfg.jenkins.base_url != JenkinsConfig().base_url:
         jk = raw.setdefault("jenkins", {})
         jk["base_url"] = cfg.jenkins.base_url
@@ -298,6 +360,15 @@ def _require_slot(cfg: Config, slot: str) -> str:
 def sdesk_enabled(cfg: Config) -> bool:
     """Подключён ли второй Jira-инстанс (SDESK): заданы и хост, и project-префикс."""
     return bool(cfg.sdesk.base_url and cfg.sdesk.project)
+
+
+def github_enabled(cfg: Config) -> bool:
+    """Настроен ли GitHub: указан owner (репозитории можно и не сужать)."""
+    return bool(cfg.github.owner)
+
+
+def github_token(cfg: Config) -> str:
+    return _require_slot(cfg, "github.token")
 
 
 # --- секреты Jira-подобного инстанса (Jira / SDESK) ------------------------- #
@@ -398,6 +469,14 @@ def export_bundle(cfg: Config, path: Path) -> int:
         }
         if cfg.sdesk.proxy_basic_user:
             raw["sdesk"]["proxy_basic_user"] = cfg.sdesk.proxy_basic_user
+    if github_enabled(cfg):
+        raw["github"] = {
+            "api_url": cfg.github.api_url,
+            "web_url": cfg.github.web_url,
+            "owner": cfg.github.owner,
+            "repos": cfg.github.repos,
+            "username": cfg.github.username,
+        }
     if cfg.jenkins.username:
         raw["jenkins"] = {"base_url": cfg.jenkins.base_url, "username": cfg.jenkins.username}
 
