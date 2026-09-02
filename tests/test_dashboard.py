@@ -317,7 +317,7 @@ def test_changes_panel_survives_bracket_in_truncated_summary():
     long_with_bracket = "Нужен фикс расхождения данных в статистике v2 [acme]"
     data.deltas = [
         Delta(key="A-1", kind="new_comment", summary=long_with_bracket),
-        Delta(key="A-2", kind="status_change", summary="Проблема [1win]", detail="A → B"),
+        Delta(key="A-2", kind="status_change", summary="Проблема [acme]", detail="A → B"),
     ]
     app = JwuDashboard(data, jira_base="https://jira.test")
 

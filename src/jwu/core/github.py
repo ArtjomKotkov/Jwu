@@ -362,6 +362,51 @@ class GitHubClient:
         merged = (raw.get("pull_request") or {}).get("merged_at") or raw.get("merged_at")
         return "MERGED" if merged else "DECLINED"
 
+    def add_comment(self, key: str, body: str) -> dict:
+        """Комментарий к Issue/PR (в GitHub это один и тот же эндпоинт)."""
+        owner, repo, number = self._require_ref(key)
+        return self._post(f"/repos/{owner}/{repo}/issues/{number}/comments", {"body": body})
+
+    _NO_CREATE = (
+        "Создание задач в jwu сделано для Jira (REST v2 + createmeta) и в контуре GitHub "
+        "не поддержано. Заводи Issue в вебе или через gh issue create."
+    )
+
+    def create_meta(self, project: str) -> dict:
+        """В GitHub нет схемы полей проекта — проверять createmeta нечего."""
+        raise GitHubError(self._NO_CREATE)
+
+    def create_issue(self, fields: dict) -> dict:
+        """Создание задач в контуре GitHub не поддержано — отказываемся явно."""
+        raise GitHubError(self._NO_CREATE)
+
+    def transitions(self, key: str) -> list[dict]:
+        """У Issue GitHub нет схемы переходов — только open/closed."""
+        return []
+
+    def do_transition(self, key: str, transition_id: str) -> dict:
+        raise GitHubError(
+            "В GitHub нет переходов по процессу: у Issue только open/closed. "
+            "Меняй состояние в вебе или через gh issue close/reopen."
+        )
+
+    def add_attachment(self, key: str, path) -> list[dict]:
+        raise GitHubError(
+            "GitHub REST API не умеет прикладывать файлы к Issue: вложения там — "
+            "ссылки в тексте, загруженные через веб-интерфейс."
+        )
+
+    def link_types(self) -> list[dict]:
+        """Типизированных связей между Issue в GitHub нет."""
+        return []
+
+    def link_issues(self, inward: str, outward: str, link_type: str) -> dict:
+        """Связей вида Jira issueLink в GitHub нет — только упоминания в тексте."""
+        raise GitHubError(
+            "В GitHub нет типизированных связей между задачами: сошлись на задачу "
+            "упоминанием в тексте (#42) или закрывающим ключевым словом."
+        )
+
     def add_worklog(self, key: str, time_spent: str, **_: object) -> dict:
         """В GitHub таймтрекера нет — честно отказываемся, а не пишем в никуда."""
         raise GitHubError(

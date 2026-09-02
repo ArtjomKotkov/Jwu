@@ -51,3 +51,33 @@ def test_replaces_existing_agent(tmp_path):
     results = dict(install_agents(tmp_path))
     assert results["reviewer-jwu-sample"] == "обновлён"
     assert "СТАРОЕ" not in target.read_text(encoding="utf-8")
+
+
+def test_install_removes_retired_skills(tmp_path):
+    """Переименованный скилл нельзя оставлять у пользователя: он сработает по своим
+    триггерам со старыми инструкциями."""
+    from jwu.skills_install import RETIRED_SKILLS, install_skills
+
+    stale = tmp_path / "jwu-create-issue"
+    stale.mkdir()
+    (stale / "SKILL.md").write_text("старое", encoding="utf-8")
+    assert "jwu-create-issue" in RETIRED_SKILLS
+
+    results = install_skills(tmp_path)
+
+    assert not stale.exists()
+    assert ("jwu-create-issue", "удалён (устарел)") in results
+    assert (tmp_path / "jwu-task-create" / "SKILL.md").is_file()
+
+
+def test_install_does_not_touch_foreign_skills(tmp_path):
+    """Чужие скиллы пользователя не трогаем — удаляем только перечисленные явно."""
+    from jwu.skills_install import install_skills
+
+    mine = tmp_path / "jwu-my-own"
+    mine.mkdir()
+    (mine / "SKILL.md").write_text("моё", encoding="utf-8")
+
+    install_skills(tmp_path)
+
+    assert (mine / "SKILL.md").read_text(encoding="utf-8") == "моё"

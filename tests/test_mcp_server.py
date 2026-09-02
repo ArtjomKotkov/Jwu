@@ -127,6 +127,27 @@ def test_jira_tools_refuse_without_jira(fresh_server, monkeypatch):
     # сервис без интеграций строится без единого обращения к кредам
     with pytest.raises(ValueError, match="нет провайдера задач"):
         _run(srv.jwu_task("PROJ-1", workspace="home"))
+    with pytest.raises(ValueError, match="нет провайдера задач"):
+        _run(srv.jwu_issue_create("PROJ", "тема", workspace="home"))
+    with pytest.raises(ValueError, match="нет провайдера задач"):
+        _run(srv.jwu_issue_link("PROJ-1", "PROJ-2", workspace="home"))
+
+
+def test_issue_create_is_dry_run_by_default(fresh_server, monkeypatch):
+    """Без явного dry_run=False инструмент НИЧЕГО не создаёт — только показывает payload."""
+    calls = []
+
+    class _Svc:
+        tasks_client = object()
+
+        def create_issue(self, project, summary, **kw):
+            calls.append(kw)
+            return {"ok": False, "dry_run": kw["dry_run"], "fields": {}, "check": {},
+                    "issue": {}}
+
+    monkeypatch.setattr(srv, "_full_svc", lambda ws=None: _Svc())
+    _run(srv.jwu_issue_create("PROJ", "тема", workspace="work"))
+    assert calls[0]["dry_run"] is True
 
 
 def test_job_start_validates_anchors(fresh_server):
@@ -429,3 +450,62 @@ def test_workspaces_list_does_not_dump_every_contour_rules(fresh_server, tmp_pat
     assert home_row["rules"] == 1               # счётчик — да
     assert "rules_md" not in home_row           # тексты — нет
     assert "paths" not in home_row
+
+
+def test_write_tools_preview_before_writing(fresh_server, monkeypatch):
+    """Пишущие инструменты по умолчанию только показывают, что уедет наружу."""
+    sent = []
+
+    class _Svc:
+        tasks_client = object()
+
+        def key_is_client_facing(self, key):
+            return key.startswith("SDESK")
+
+        def add_comment(self, key, text, *, client_facing=False):
+            sent.append((key, text, client_facing))
+            return {"id": "1"}
+
+        def add_attachment(self, key, paths):
+            sent.append((key, tuple(paths)))
+            return []
+
+    monkeypatch.setattr(srv, "_full_svc", lambda ws=None: _Svc())
+
+    preview = _run(srv.jwu_comment("SDESK-1", "черновик", workspace="work"))
+    assert preview["dry_run"] is True and preview["client_facing"] is True
+    assert "клиент" in preview["hint"]
+    assert sent == []
+
+    files = _run(srv.jwu_issue_attach("PROJ-1", ["/нет/такого.har"], workspace="work"))
+    assert files["dry_run"] is True and files["files"][0]["exists"] is False
+    assert sent == []
+
+    _run(srv.jwu_comment("PROJ-1", "готово", dry_run=False, workspace="work"))
+    assert sent == [("PROJ-1", "готово", False)]
+
+
+def test_auth_refresh_drops_cached_services(fresh_server, monkeypatch):
+    """После смены кредов сервер обязан пересоздать соединения, а не жить со старыми."""
+    closed: list[str] = []
+
+    class _Svc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.tasks_client = object()
+
+        def close(self):
+            closed.append(self.tag)
+
+        def auth_check(self):
+            return {"jira": {"ok": True, "user": "akotkov"}}
+
+    ws = srv._resolve("work")
+    srv._full[ws.id] = _Svc("старый")
+    monkeypatch.setattr(srv.Service, "for_workspace",
+                        classmethod(lambda cls, workspace, **kw: _Svc("новый")))
+
+    result = _run(srv.jwu_auth_refresh(workspace="work"))
+    assert closed == ["старый"]
+    assert srv._full[ws.id].tag == "новый"
+    assert result["ok"] is True and result["auth"]["jira"]["user"] == "akotkov"

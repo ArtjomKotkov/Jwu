@@ -190,3 +190,50 @@ def bitbucket_commits_raw(ids=("abc123def", "fff999aaa")):
             for i in ids
         ],
     }
+
+
+def jira_createmeta_raw(
+    project="PROJ",
+    types=None,
+    required_extra=None,
+    priorities=("Major", "Blocker"),
+):
+    """Ответ /issue/createmeta?expand=projects.issuetypes.fields для одного проекта.
+
+    ``required_extra`` — дополнительные обязательные поля вида {id: имя}: у разных
+    проектов они разные, и именно на них спотыкается создание задачи вслепую.
+    """
+    types = types if types is not None else ["Task", "Bug"]
+    required_extra = required_extra or {}
+    fields = {
+        "project": {"name": "Project", "required": True},
+        "issuetype": {"name": "Issue Type", "required": True},
+        "summary": {"name": "Summary", "required": True},
+        "description": {"name": "Description", "required": False},
+        "priority": {
+            "name": "Priority",
+            "required": False,
+            # id обязателен: именно им jwu ссылается на значение в payload
+            "allowedValues": [{"id": str(3 + i), "name": p} for i, p in enumerate(priorities)],
+        },
+        "components": {
+            "name": "Components",
+            "required": False,
+            "allowedValues": [{"id": "55", "name": "core"}],
+        },
+    }
+    for field_id, title in required_extra.items():
+        fields[field_id] = {"name": title, "required": True}
+    return {
+        "projects": [
+            {
+                "key": project,
+                "name": project,
+                "issuetypes": [
+                    {"id": str(10000 + i), "name": t,
+                     "subtask": t.lower() == "sub-task", "fields": fields}
+                    for i, t in enumerate(types)
+                ],
+            }
+        ]
+    }

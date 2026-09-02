@@ -907,3 +907,295 @@ def test_configure_keeps_settings_it_was_not_asked_to_change(monkeypatch, tmp_pa
     assert settings["github.repos"] == "dndeck"
     assert store.workspace_secrets(ws.id)["github.token"] == "T2"
     store.close()
+
+
+class _CreateSvc:
+    """Сервис-заглушка для `jwu issue create`: помнит, дошло ли дело до записи."""
+
+    def __init__(self, problems=None, error=None):
+        self.tasks_client = object()
+        self.pr_client = None
+        self.jira = self.tasks_client
+        self.workspace = None
+        self.problems = problems or []
+        self.similar = []
+        self.error = error
+        self.created: list[dict] = []
+        self.links: list[tuple] = []
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): pass
+    def close(self): pass
+
+    def create_issue(self, project, summary, *, dry_run=False, from_job=None,
+                     check_duplicates=True, **kw):
+        from jwu.core.jira import build_create_fields
+        if from_job is not None:
+            kw["description"] = f"черновик из работы #{from_job}"
+        fields = build_create_fields(project, summary, **kw)
+        check = {"ok": not self.problems, "problems": list(self.problems),
+                 "project": project, "issue_types": ["Task"], "required": ["Summary"]}
+        if dry_run or self.problems:
+            return {"ok": False, "dry_run": dry_run, "fields": fields, "check": check,
+                    "similar": list(self.similar) if check_duplicates else [], "issue": {}}
+        if self.error is not None:
+            raise self.error
+        self.created.append(fields)
+        return {"ok": True, "dry_run": False, "fields": fields, "check": check,
+                "similar": [], "issue": {"key": "PROJ-777", "id": "1",
+                          "url": "https://jira.test/browse/PROJ-777"}}
+
+    def link_types(self, key=""): return ["Relates", "Blocks"]
+
+    def link_issues(self, inward, outward, link_type):
+        self.links.append((inward, outward, link_type))
+        return {"type": link_type, "inward": inward, "outward": outward}
+
+
+def _patch_create_svc(monkeypatch, svc):
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+    return svc
+
+
+def test_issue_create_json_requires_confirmation(monkeypatch):
+    """--json без --yes показывает payload и НЕ создаёт: подтверждение — отдельный шаг."""
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "Падает экспорт",
+                                  "--json"])
+    assert res.exit_code == 0
+    payload = json.loads(res.stdout)
+    assert payload["reason"] == "confirm_required"
+    assert payload["fields"]["summary"] == "Падает экспорт"
+    assert svc.created == []
+
+
+def test_issue_create_with_yes_creates_and_returns_key(monkeypatch, tmp_path):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    body = tmp_path / "task.md"
+    body.write_text("Шаги:\n# открыть\n# нажать", encoding="utf-8")
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "Падает экспорт",
+                                  "-F", str(body), "--type", "Bug", "--label", "duty",
+                                  "--yes", "--json"])
+    assert res.exit_code == 0
+    payload = json.loads(res.stdout)
+    assert payload == {"ok": True, "key": "PROJ-777",
+                       "url": "https://jira.test/browse/PROJ-777",
+                       "fields": payload["fields"]}
+    assert svc.created[0]["description"].startswith("Шаги:")   # описание взято из файла
+    assert svc.created[0]["labels"] == ["duty"]
+
+
+def test_issue_create_reads_description_from_stdin(monkeypatch):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "-F", "-", "--yes", "--json"], input="из stdin\nвторая строка")
+    assert res.exit_code == 0
+    assert svc.created[0]["description"] == "из stdin\nвторая строка"
+
+
+def test_issue_create_dry_run_never_creates(monkeypatch):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "--dry-run", "--yes", "--json"])
+    assert res.exit_code == 0
+    payload = json.loads(res.stdout)
+    assert payload["dry_run"] is True and svc.created == []
+
+
+def test_issue_create_refuses_when_required_field_missing(monkeypatch):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc(
+        problems=["Не заполнено обязательное поле «Отдел» (customfield_10500)"]))
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "--yes", "--json"])
+    assert res.exit_code == 1
+    payload = json.loads(res.stdout)
+    assert payload["reason"] == "invalid_fields"
+    assert "Отдел" in payload["check"]["problems"][0]
+    assert svc.created == []
+
+
+def test_issue_create_reports_jira_error(monkeypatch):
+    from jwu.core.jira import JiraError
+
+    _patch_create_svc(monkeypatch, _CreateSvc(
+        error=JiraError("400: summary: Summary слишком длинный", 400)))
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "--yes", "--json"])
+    assert res.exit_code == 1
+    assert "Summary слишком длинный" in json.loads(res.stdout)["error"]
+
+
+def test_issue_create_rejects_two_description_sources(monkeypatch):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "-d", "строкой", "-F", "-", "--yes"])
+    assert res.exit_code == 1
+    assert svc.created == []
+
+
+def test_issue_link_requires_confirmation(monkeypatch):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    res = runner.invoke(cli.app, ["issue", "link", "PROJ-2", "PROJ-1", "--json"])
+    assert json.loads(res.stdout)["reason"] == "confirm_required"
+    assert svc.links == []
+
+    res = runner.invoke(cli.app, ["issue", "link", "PROJ-2", "PROJ-1", "-t", "Blocks",
+                                  "--yes", "--json"])
+    assert res.exit_code == 0
+    assert svc.links == [("PROJ-2", "PROJ-1", "Blocks")]
+
+
+class _CommentSvc:
+    """Заглушка для `jwu comment`: помнит, что и куда отправлено."""
+
+    def __init__(self, sdesk_keys=("SDESK",)):
+        self.tasks_client = object()
+        self.pr_client = None
+        self.workspace = None
+        self.sdesk_keys = sdesk_keys
+        self.sent: list[tuple] = []
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): pass
+    def close(self): pass
+
+    def key_is_client_facing(self, key):
+        return key.split("-", 1)[0] in self.sdesk_keys
+
+    def add_comment(self, key, text, *, client_facing=False):
+        if self.key_is_client_facing(key) and not client_facing:
+            raise ValueError("КЛИЕНТ")
+        self.sent.append((key, text, client_facing))
+        return {"id": "11"}
+
+
+def test_comment_json_requires_confirmation(monkeypatch):
+    svc = _CommentSvc()
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+    res = runner.invoke(cli.app, ["comment", "PROJ-1", "-m", "перенёс фикс", "--json"])
+    assert res.exit_code == 0
+    payload = json.loads(res.stdout)
+    assert payload["reason"] == "confirm_required" and payload["client_facing"] is False
+    assert svc.sent == []
+
+    res = runner.invoke(cli.app, ["comment", "PROJ-1", "-m", "перенёс фикс", "--yes", "--json"])
+    assert res.exit_code == 0
+    assert svc.sent == [("PROJ-1", "перенёс фикс", False)]
+
+
+def test_comment_to_sdesk_requires_to_client_flag(monkeypatch, tmp_path):
+    """Клиентский инстанс: без --to-client команда обязана отказать, ничего не отправив."""
+    svc = _CommentSvc()
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+    body = tmp_path / "answer.md"
+    body.write_text("Ответ клиенту", encoding="utf-8")
+
+    res = runner.invoke(cli.app, ["comment", "SDESK-9", "-F", str(body), "--yes", "--json"])
+    assert res.exit_code == 1
+    assert json.loads(res.stdout)["reason"] == "client_facing_confirmation_required"
+    assert svc.sent == []
+
+    res = runner.invoke(cli.app, ["comment", "SDESK-9", "-F", str(body),
+                                  "--to-client", "--yes", "--json"])
+    assert res.exit_code == 0
+    assert svc.sent == [("SDESK-9", "Ответ клиенту", True)]
+
+
+def test_comment_dry_run_sends_nothing(monkeypatch):
+    svc = _CommentSvc()
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+    res = runner.invoke(cli.app, ["comment", "PROJ-1", "-m", "текст", "--dry-run",
+                                  "--yes", "--json"])
+    assert res.exit_code == 0
+    assert json.loads(res.stdout)["dry_run"] is True
+    assert svc.sent == []
+
+
+def test_comment_refuses_empty_text(monkeypatch):
+    svc = _CommentSvc()
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+    res = runner.invoke(cli.app, ["comment", "PROJ-1", "-m", "   ", "--yes"])
+    assert res.exit_code == 1
+    assert svc.sent == []
+
+
+def test_issue_create_from_job_builds_description(monkeypatch):
+    """--from-job собирает описание из лога работы; со своим текстом не сочетается."""
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "--from-job", "7", "--yes", "--json"])
+    assert res.exit_code == 0
+    assert svc.created[0]["description"] == "черновик из работы #7"
+
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "тема",
+                                  "--from-job", "7", "-d", "свой текст", "--yes", "--json"])
+    assert res.exit_code == 1
+    assert len(svc.created) == 1
+
+
+class _TransitionSvc:
+    def __init__(self):
+        self.tasks_client = object()
+        self.pr_client = None
+        self.workspace = None
+        self.done: list[tuple] = []
+        self.attached: list[tuple] = []
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): pass
+    def close(self): pass
+
+    def transitions(self, key):
+        return [{"id": "31", "name": "In Progress", "to": "In Progress"}]
+
+    def transition(self, key, target):
+        if target.lower() != "in progress":
+            raise ValueError("Перехода нет. Доступные: In Progress")
+        self.done.append((key, target))
+        return {"key": key, "transition": "In Progress", "status": "In Progress"}
+
+    def add_attachment(self, key, paths):
+        self.attached.append((key, tuple(paths)))
+        return [{"id": "9", "filename": "a.log", "size": 3, "path": paths[0]}]
+
+
+def test_issue_transition_requires_confirmation_and_lists_available(monkeypatch):
+    svc = _TransitionSvc()
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+
+    res = runner.invoke(cli.app, ["issue", "transition", "PROJ-1", "In Progress", "--json"])
+    assert json.loads(res.stdout)["reason"] == "confirm_required"
+    assert svc.done == []
+
+    res = runner.invoke(cli.app, ["issue", "transition", "PROJ-1", "In Progress",
+                                  "--yes", "--json"])
+    assert res.exit_code == 0 and svc.done == [("PROJ-1", "In Progress")]
+
+    res = runner.invoke(cli.app, ["issue", "transition", "PROJ-1", "Closed", "--yes", "--json"])
+    assert res.exit_code == 1
+    assert "Доступные: In Progress" in json.loads(res.stdout)["error"]
+
+
+def test_issue_attach_requires_confirmation(monkeypatch, tmp_path):
+    svc = _TransitionSvc()
+    monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
+    src = tmp_path / "a.log"
+    src.write_text("abc", encoding="utf-8")
+
+    res = runner.invoke(cli.app, ["issue", "attach", "PROJ-1", str(src), "--json"])
+    assert json.loads(res.stdout)["reason"] == "confirm_required"
+    assert svc.attached == []
+
+    res = runner.invoke(cli.app, ["issue", "attach", "PROJ-1", str(src), "--yes", "--json"])
+    assert res.exit_code == 0
+    assert svc.attached == [("PROJ-1", (str(src),))]
+
+
+def test_issue_create_preview_shows_similar(monkeypatch):
+    svc = _patch_create_svc(monkeypatch, _CreateSvc())
+    svc.similar = [{"key": "PROJ-9", "summary": "то же самое", "status": "Closed",
+                    "resolution": "Done", "created": "2025-09-01"}]
+    res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "то же самое",
+                                  "--dry-run", "--json"])
+    assert res.exit_code == 0
+    assert json.loads(res.stdout)["similar"][0]["key"] == "PROJ-9"

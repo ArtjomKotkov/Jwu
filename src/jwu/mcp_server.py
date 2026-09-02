@@ -6,15 +6,24 @@
 поэтому вход в Jira/SDESK (в т.ч. сессионный за гейтом) выполняется один раз.
 
 Read: workspaces, workspace_current, workspace_paths, workspace_suggest, rules, tasks, task, changes,
-prs, pr, builds, build, attachments, jobs, features. Write: workspace_create, workspace_add_path, workspace_remove_path,
-workspace_tag, workspace_use, rule_add, rule_edit, rule_rm, note, worklog, job_start, job_add,
+prs, pr, builds, build, attachments, jobs, features, worklogs, task_branches, issue_create_meta,
+issue_similar, issue_transitions, auth_refresh. Write: workspace_create, workspace_add_path, workspace_remove_path,
+workspace_tag, workspace_use, rule_add, rule_edit, rule_rm, note, worklog, comment, issue_create,
+issue_link, issue_transition, issue_attach, job_start, job_add,
 job_link, job_status, feature_add, feature_status, feature_edit, feature_rm. Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
-только у `jwu_worklog` (таймтрекер Jira/SDESK) — вызывать по явному подтверждению.
+у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в SDESK его читает КЛИЕНТ),
+`jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition` и `jwu_issue_attach` —
+вызывать только по явному подтверждению пользователя. У пишущих инструментов с
+`dry_run` порядок обязателен: сначала превью, показать его пользователю, потом запись.
 
 Всё работает в контексте ВОРКСПЕЙСА. По умолчанию он определяется по рабочей папке
 процесса сервера (в Claude Code это корень проекта); любой инструмент принимает
 `workspace=` для явного выбора. Сервисы кэшируются ПО воркспейсам, поэтому логин в
 Jira/SDESK всё так же выполняется один раз на воркспейс.
+
+Соединения живут вместе с процессом: протухшую СЕССИЮ Jira клиент переустанавливает
+сам (см. JiraClient._send), а сменившиеся креды подхватываются только через
+`jwu_auth_refresh` — после 401 зови его и повторяй вызов.
 
 Транспорт — stdio (запуск как подпроцесс Claude Code). Инструменты объявлены async,
 чтобы все обращения к клиентам и SQLite-хранилищу шли из одного потока event-loop
@@ -917,6 +926,280 @@ async def jwu_worklog(
     svc = _require_jira(_full_svc(workspace))
     result = svc.add_worklog(key, time, comment=comment, started=started)
     return {"ok": True, "key": key, "timeSpent": time, "worklog": result}
+
+
+@mcp.tool()
+async def jwu_auth_refresh(workspace: Optional[str] = None) -> dict:
+    """Переподключиться к Jira/SDESK/Bitbucket свежими кредами и проверить доступ.
+
+    Сервер живёт всю сессию Claude Code и держит соединения открытыми, поэтому креды,
+    прочитанные при первом обращении, живут вместе с ним. Протухшую СЕССИЮ Jira клиент
+    переустанавливает сам; а вот если пользователь поменял пароль или PAT (`jwu configure`),
+    сервер об этом не узнает — соединения нужно пересоздать этим инструментом.
+
+    Зови его, когда любой инструмент вернул 401 («токен невалиден», «сессия не
+    восстановилась»), и повтори исходный вызов. Ответ — тот же отчёт, что у
+    `jwu auth check`: по системам, у каждой `ok` либо `error`. Ничего не пишет
+    и никаких секретов не показывает.
+    """
+    ws = _resolve(workspace)
+    for cache in (_full, _builds):
+        svc = cache.pop(ws.id, None)
+        if svc is not None:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001 — соединение и так считаем мёртвым
+                pass
+    try:
+        checked = _full_svc(workspace).auth_check()
+    except Exception as exc:  # noqa: BLE001 — логин может упасть прямо здесь
+        return _stamp({"ok": False, "error": str(exc)}, ws)
+    ok = all(item.get("ok") for item in checked.values()) if checked else True
+    return _stamp({"ok": ok, "auth": checked}, ws)
+
+
+@mcp.tool()
+async def jwu_worklogs(
+    on: str,
+    keys: Optional[list[str]] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Мои worklog'и за дату — что уже затрекано. Без записи.
+
+    Без `keys` отвечает на вопрос «что вообще затрекано за такой-то день»: задачи
+    находятся сами по JQL (worklogAuthor/worklogDate) в Jira и SDESK. Со списком ключей
+    смотрит только их. Обязательная проверка перед jwu_worklog, чтобы не задвоить время.
+
+    on — дата YYYY-MM-DD. Ответ: {KEY: [{time, seconds, comment, started}, …]}.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    targets = list(keys or []) or svc.my_worklog_keys_on(on)
+    return svc.my_worklogs_on(targets, on)
+
+
+@mcp.tool()
+async def jwu_comment(
+    key: str,
+    text: str,
+    client_facing: bool = False,
+    dry_run: bool = True,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: комментарий в задачу Jira/SDESK. Только по явному подтверждению.
+
+    Это НЕ локальная заметка (для неё есть jwu_note) — текст уходит в саму Jira и
+    удалить его через jwu нельзя. Порядок обязателен: сначала dry_run=True (по умолчанию)
+    — вернётся текст и признак `client_facing`; ПОКАЗАТЬ текст пользователю целиком,
+    дождаться явного «да» и только потом повторить с dry_run=False.
+
+    Комментарий во внутренней задаче читает команда. Комментарий в SDESK **читает
+    КЛИЕНТ** — для таких ключей нужен ещё и client_facing=True, и подтверждение
+    пользователя должно быть получено именно на отправку клиенту, а не «вообще».
+    """
+    svc = _require_jira(_full_svc(workspace))
+    to_client = svc.key_is_client_facing(key)
+    if dry_run:
+        return {"ok": False, "dry_run": True, "key": key, "text": text,
+                "client_facing": to_client,
+                "hint": ("Задача SDESK: текст увидит клиент — показать его пользователю "
+                         "дословно и получить согласие на отправку КЛИЕНТУ"
+                         if to_client else
+                         "Показать текст пользователю и получить подтверждение")}
+    result = svc.add_comment(key, text, client_facing=client_facing)
+    return {"ok": True, "key": key, "id": result.get("id", ""), "client_facing": to_client}
+
+
+@mcp.tool()
+async def jwu_task_branches(
+    key: str,
+    branch_patterns: Optional[list[str]] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """В какие релизные ветки доехал фикс задачи, а в какие нет. Без записи.
+
+    Отвечает на дежурный вопрос «баг известный, но есть ли фикс в версии клиента»:
+    коммиты и PR берутся из dev-панели задачи, ветки — из локальных клонов репозиториев
+    воркспейса (git branch --contains). Ничего не фетчит: если клон давно не обновлялся,
+    свежих веток в нём может не быть.
+
+    `repos[].reached` — ветки, куда доехали ВСЕ коммиты задачи; `partial` — куда доехала
+    часть (самый опасный случай); `missing` — где фикса нет. Ветки идут от свежих к
+    старым. `dev_ok=false` значит, что dev-панель ответила не полностью и пустой список
+    коммитов означает «не знаем», а не «коммитов нет».
+
+    branch_patterns — свои шаблоны релизных веток (по умолчанию release/*, hotfix/*,
+    master, main, develop).
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return svc.task_branch_reach(key, patterns=branch_patterns)
+
+
+@mcp.tool()
+async def jwu_issue_create_meta(project: str, workspace: Optional[str] = None) -> dict:
+    """Что можно создать в проекте: типы задач и обязательные поля (createmeta). Без записи.
+
+    Читающий инструмент: показывает, какие типы задач доступны в проекте и какие поля
+    он требует. Полезно вызвать ДО jwu_issue_create, если проект незнакомый — у разных
+    проектов обязательные поля разные. Пустой `issue_types` — проекта нет либо нет прав
+    на создание в нём.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    meta = svc.tasks_client.create_meta(project) if svc.tasks_client else {}
+    return {
+        "project": meta.get("key", "") or project,
+        "issue_types": [
+            {
+                "name": t.get("name", ""),
+                "subtask": bool(t.get("subtask")),
+                "required": [
+                    f.get("name", fid)
+                    for fid, f in (t.get("fields") or {}).items()
+                    if f.get("required") and fid not in ("project", "issuetype", "reporter")
+                ],
+            }
+            for t in (meta.get("issuetypes") or [])
+        ],
+    }
+
+
+@mcp.tool()
+async def jwu_issue_create(
+    project: str,
+    summary: str,
+    description: Optional[str] = None,
+    issuetype: str = "Task",
+    priority: Optional[str] = None,
+    assignee: Optional[str] = None,
+    labels: Optional[list[str]] = None,
+    components: Optional[list[str]] = None,
+    fix_versions: Optional[list[str]] = None,
+    parent: Optional[str] = None,
+    from_job: Optional[int] = None,
+    dry_run: bool = True,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: создать задачу в Jira/SDESK. Только по явному подтверждению.
+
+    Создаёт РЕАЛЬНУЮ задачу, которую увидит команда (а в SDESK — клиент). Порядок
+    обязателен: сначала dry_run=True (по умолчанию) — вернётся итоговый payload и
+    результат проверки по createmeta, ничего не отправляя; ПОКАЗАТЬ этот текст
+    пользователю целиком, дождаться явного «да» и только потом повторить вызов с
+    dry_run=False. Без подтверждения пользователя dry_run=False НЕ вызывать.
+
+    Поля Jira Server: description — обычный wiki-текст (не ADF), assignee и другие
+    пользователи задаются логином, issuetype/priority/components/fixVersions — именами.
+    parent — для подзадач. Инстанс выбирается по префиксу ключа проекта. from_job — id
+    работы jwu: описание собирается из её лога (фазы, баги, ревью, прогоны тестов) как
+    ЧЕРНОВИК, который пользователь правит перед отправкой; вместе с description не
+    используется.
+
+    Ответ: `ok` (создано ли), `fields` (что уходит/ушло в Jira), `check` (проверка
+    createmeta: `problems` — почему нельзя отправлять), `issue` (ключ и ссылка).
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return svc.create_issue(
+        project, summary,
+        description=description, issuetype=issuetype, priority=priority,
+        assignee=assignee, labels=labels, components=components,
+        fix_versions=fix_versions, parent=parent, from_job=from_job, dry_run=dry_run,
+    )
+
+
+@mcp.tool()
+async def jwu_issue_similar(
+    project: str,
+    summary: str,
+    months: int = 12,
+    workspace: Optional[str] = None,
+) -> list[dict]:
+    """Похожие по тексту задачи проекта — проверка на дубль. Без записи.
+
+    Разбираемый баг вполне может оказаться точной копией задачи годичной давности:
+    проверять стоит ДО того, как заводить новую (jwu_issue_create с dry_run=True делает
+    этот же поиск сам и кладёт результат в поле `similar`). Поиск нечёткий — это
+    подсказка человеку, решение за ним.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return svc.find_similar_issues(project, summary, months=months)
+
+
+@mcp.tool()
+async def jwu_issue_transitions(key: str, workspace: Optional[str] = None) -> list[dict]:
+    """Какие переходы по процессу доступны задаче прямо сейчас. Без записи.
+
+    Набор зависит от ТЕКУЩЕГО статуса и схемы проекта — спрашивать нужно перед каждым
+    переводом, а не помнить. Ответ: [{id, name, to}], где `to` — статус после перехода.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return svc.transitions(key)
+
+
+@mcp.tool()
+async def jwu_issue_transition(
+    key: str,
+    target: str,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: перевести задачу по процессу. Только по явному подтверждению.
+
+    Статус задачи видит вся команда, а обратный переход из нового статуса может быть
+    недоступен. Сначала jwu_issue_transitions — показать пользователю доступные переходы,
+    дождаться выбора и «да», и только потом звать этот инструмент.
+
+    target — имя перехода (или его id). Неизвестное имя вернёт ошибку со списком
+    доступных, ничего не изменив.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return {"ok": True, **svc.transition(key, target)}
+
+
+@mcp.tool()
+async def jwu_issue_attach(
+    key: str,
+    paths: list[str],
+    dry_run: bool = True,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: приложить файлы к задаче. Только по явному подтверждению.
+
+    Вложение видно всем, у кого есть доступ к задаче (в SDESK — клиенту), и удалить его
+    через jwu нельзя. Сначала dry_run=True (по умолчанию) — вернётся список файлов с
+    размерами; показать его пользователю, дождаться «да», потом dry_run=False.
+
+    ВАЖНО: har-файлы, логи и выгрузки часто содержат токены, куки и персональные данные.
+    Прежде чем прикладывать — скажи пользователю, что именно уедет в задачу.
+    """
+    svc = _require_jira(_full_svc(workspace))
+    if dry_run:
+        files = []
+        for name in paths:
+            path = Path(name).expanduser()
+            files.append({"path": str(path), "exists": path.is_file(),
+                          "size": path.stat().st_size if path.is_file() else 0})
+        return {"ok": False, "dry_run": True, "key": key, "files": files,
+                "client_facing": svc.key_is_client_facing(key),
+                "hint": "Показать список пользователю и получить подтверждение"}
+    return {"ok": True, "key": key, "attachments": svc.add_attachment(key, paths)}
+
+
+@mcp.tool()
+async def jwu_issue_link(
+    inward: str,
+    outward: str,
+    link_type: str = "Relates",
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: связать две задачи в Jira. Только по явному подтверждению.
+
+    Направление как в Jira: link_type применяется от `inward` к `outward`
+    («PROJ-2 blocks PROJ-1» — inward=PROJ-2, outward=PROJ-1, link_type=Blocks).
+    Неизвестный тип связи вернёт список доступных, а не создаст мусор. Обе задачи
+    должны жить в одном инстансе (Jira ↔ SDESK связать нельзя).
+    """
+    svc = _require_jira(_full_svc(workspace))
+    return {"ok": True, **svc.link_issues(inward, outward, link_type)}
 
 
 def main() -> None:
