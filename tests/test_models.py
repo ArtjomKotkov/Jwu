@@ -117,3 +117,36 @@ def test_job_defaults():
     assert job.records == [] and job.prs == []
     rec = JobRecord(job_id=1, text="t")
     assert rec.kind == "note" and rec.status is None
+
+
+def test_job_description_text_groups_records_by_section():
+    """Черновик описания из работы: разделы в фиксированном порядке, wiki-разметкой."""
+    from jwu.core.models import Job, JobPRLink, JobRecord, job_description_text
+
+    job = Job(
+        id=7, task_key="PROJ-1", title="Асинхронная отправка",
+        prs=[JobPRLink(pr_id=838, project="PROJ", repo="app")],
+        records=[
+            JobRecord(kind="phase", text="Фаза 1 — анализ", status="done"),
+            JobRecord(kind="bug", text="Падает на пустом ответе\nтолько в проде"),
+            JobRecord(kind="constraint", text="Не трогать миграции"),
+            JobRecord(kind="test-fail", text="3 теста упали"),
+            JobRecord(kind="note", text="созвон с QA"),
+        ],
+    )
+    text = job_description_text(job)
+    assert text.startswith("*Асинхронная отправка*")
+    assert "Работа jwu #7, якорь: PROJ-1" in text
+    assert "PR: app#838" in text
+    # разделы идут в порядке важности, а не в порядке записей
+    assert text.index("h3. Что сделано") < text.index("h3. Найденные проблемы")
+    assert text.index("h3. Найденные проблемы") < text.index("h3. Ограничения")
+    assert "* Фаза 1 — анализ [done]" in text
+    assert "** только в проде" in text          # многострочный текст записи не теряется
+    assert "🧪 ТЕСТЫ УПАЛИ: 3 теста упали" in text   # в смешанном разделе бейдж остаётся
+
+
+def test_job_description_text_of_empty_job_is_empty():
+    from jwu.core.models import Job, job_description_text
+
+    assert job_description_text(Job(id=1)) == ""

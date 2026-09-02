@@ -41,7 +41,7 @@ from .config import (
 )
 from .github import GitHubClient
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
-from .jira import JiraClient
+from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
@@ -51,6 +51,7 @@ from .models import (
     Delta,
     github_key,
     Issue,
+    job_description_text,
     Job,
     LocalFeature,
     Mention,
@@ -115,6 +116,27 @@ def _build_sdesk_client(cfg: Config) -> JiraClient:
             cfg.sdesk.base_url, login=slogin, proxy_basic=sdesk_proxy_basic(cfg)
         )
     return _jira_like_client(cfg.sdesk.base_url, token=sdesk_token(cfg))
+
+
+# Слова короче этого в поиск дублей не идут: предлоги и «для»/«при» только зашумляют.
+_MIN_SEARCH_WORD = 4
+_SEARCH_WORD_RE = re.compile(r"\w{%d,}" % _MIN_SEARCH_WORD, re.UNICODE)
+
+
+def _text_search_terms(summary: str, *, limit: int = 3) -> list[str]:
+    """Значимые слова summary для JQL ``text ~ …``, от самых длинных к коротким.
+
+    Спецсимволы Lucene (кавычки, дефисы, скобки) в запрос не попадают вовсе: они меняют
+    смысл запроса (ведущий дефис — это NOT) и ломают синтаксис. Берём только слова,
+    длинные вперёд: именно они различают задачи, а короткие («для», «при») зашумляют.
+
+    Список, а не строка, потому что слова надо соединять через AND: ``text ~ "a b"``
+    в Jira — поиск ФРАЗЫ, и на реальных заголовках он не находит ничего.
+    """
+    words = _SEARCH_WORD_RE.findall(summary or "")
+    uniq = list(dict.fromkeys(words))
+    uniq.sort(key=len, reverse=True)
+    return uniq[:limit]
 
 
 def _safe_filename(name: str) -> str:
@@ -746,6 +768,313 @@ class Service:
         return self._client_for_key(key).add_worklog(
             key, time_spent, comment=comment, started=started
         )
+
+    def _workspace_repo_roots(self) -> dict[str, str]:
+        """Каталоги git-репозиториев воркспейса → имя репозитория (из origin)."""
+        from . import gitinfo
+
+        roots: dict[str, str] = {}
+        for path in (self.workspace.paths if self.workspace else []):
+            for info in gitinfo.find_repos(path.path):
+                roots[info.root] = info.name
+        return roots
+
+    def task_branch_reach(
+        self, key: str, *, patterns: list[str] | None = None
+    ) -> dict:
+        """В какие релизные ветки доехал фикс задачи, а в какие — нет.
+
+        Дежурный вопрос почти всегда одной формы: «баг известный, есть ли фикс в версии
+        клиента». Ответ собирается из dev-панели задачи (коммиты и PR) и локальных клонов
+        репозиториев воркспейса: где коммит физически есть, там git и говорит, какие ветки
+        его содержат.
+
+        ``dev_ok=False`` в ответе значит, что dev-панель Jira ответила не полностью —
+        тогда пустой список коммитов означает «не знаем», а не «коммитов нет».
+        Репозитории, в которых ни одного коммита задачи не нашлось, в ответ не попадают.
+        """
+        from . import gitbranches
+
+        issue = self.issue(key)
+        # Dev-панель отдаёт один коммит несколько раз (он приходит и от repository,
+        # и от ветки) — иначе он посчитается дважды в «доехало N из M».
+        commits = list({c.id: c for c in issue.commits if c.id}.values())
+        shas = [c.id for c in commits]
+        roots = self._workspace_repo_roots()
+        repos = gitbranches.reach(
+            list(roots), shas, names=roots,
+            patterns=patterns or list(gitbranches.DEFAULT_BRANCH_PATTERNS),
+        )
+        return {
+            "key": issue.key,
+            "summary": issue.summary,
+            "status": issue.status,
+            "dev_ok": issue.dev_ok,
+            "commits": [{"sha": c.id, "message": (c.message or "").splitlines()[0][:120]}
+                        for c in commits],
+            "prs": self._pr_targets(issue.pull_requests),
+            "searched_repos": len(roots),
+            "repos": [
+                {
+                    "name": r.name, "root": r.root, "error": r.error,
+                    "commits": [{"sha": c.sha, "found": c.found, "branches": c.branches}
+                                for c in r.commits],
+                    "reached": r.reached, "partial": r.partial, "missing": r.missing,
+                }
+                for r in repos
+            ],
+        }
+
+    def _pr_targets(self, prs: list) -> list[dict]:
+        """Целевые ветки PR из dev-панели: куда фикс вливался (best-effort).
+
+        PR в dev-панели приходит без целевой ветки — её знает только хостинг, поэтому
+        подтягиваем детали по URL. Хостинг недоступен или PR из чужого проекта — оставляем
+        ветку пустой, но сам PR из ответа не выкидываем.
+        """
+        out: list[dict] = []
+        for pr in prs:
+            item = {"id": pr.id, "status": pr.status, "name": pr.name, "url": pr.url,
+                    "target_branch": "", "repository": ""}
+            for pattern in (_BITBUCKET_PR_URL_RE, _GITHUB_PR_URL_RE):
+                match = pattern.search(pr.url or "")
+                if not match:
+                    continue
+                try:
+                    detail = self.pr(int(match.group(3)),
+                                     project=match.group(1), repo=match.group(2))
+                except Exception:  # noqa: BLE001 — нет доступа/сети: ветка просто неизвестна
+                    break
+                item["target_branch"] = detail.target_branch
+                item["repository"] = detail.repository
+                break
+            out.append(item)
+        return out
+
+    def create_issue(
+        self,
+        project: str,
+        summary: str,
+        *,
+        description: str | None = None,
+        issuetype: str = "Task",
+        priority: str | None = None,
+        assignee: str | None = None,
+        labels: list[str] | None = None,
+        components: list[str] | None = None,
+        fix_versions: list[str] | None = None,
+        parent: str | None = None,
+        from_job: int | None = None,
+        check_duplicates: bool = True,
+        dry_run: bool = False,
+    ) -> dict:
+        """Создать задачу в трекере, предварительно сверив поля с createmeta проекта.
+
+        Инстанс выбирается по ключу проекта тем же правилом, что и по ключу задачи
+        (SDESK-* → SDESK-инстанс). Порядок такой: собрать payload → проверить по
+        createmeta → и только если проверка чистая, отправить POST. ``dry_run`` даёт
+        первые два шага без записи — ровно то, что показывается пользователю до «да».
+
+        Возвращает ``{"ok", "fields", "check", "similar", "issue"}``; при ``ok=False``
+        в ``check`` лежат внятные причины (какого поля не хватает, какие значения
+        допустимы), а ``issue`` пустой — наружу ничего не ушло. ``similar`` заполняется
+        только на превью: похожие по тексту задачи проекта, чтобы не завести дубль.
+        """
+        self._require_tasks()
+        client = self._client_for_key(project)
+        if from_job is not None and not description:
+            description = self.job_description_draft(from_job)
+        fields = build_create_fields(
+            project, summary,
+            description=description, issuetype=issuetype, priority=priority,
+            assignee=assignee, labels=labels, components=components,
+            fix_versions=fix_versions, parent=parent,
+        )
+        check = check_create_fields(client.create_meta(project), fields)
+        # Отправляем payload, приведённый по createmeta: тип задачи, приоритет,
+        # компоненты и версии уходят идентификаторами, а не именами (по имени этот
+        # инстанс их может не разрезолвить). Показываем пользователю тот же payload —
+        # dry-run обязан совпадать с тем, что реально уедет.
+        fields = check["fields"]
+        if dry_run or not check["ok"]:
+            # Похожие задачи ищем только на превью: это подсказка человеку до отправки,
+            # а на самом создании лишний запрос ни на что не влияет.
+            similar = self.find_similar_issues(project, summary) if check_duplicates else []
+            return {"ok": False, "dry_run": dry_run, "fields": fields, "check": check,
+                    "similar": similar, "issue": {}}
+        return {"ok": True, "dry_run": False, "fields": fields, "check": check,
+                "similar": [], "issue": client.create_issue(fields)}
+
+    def add_comment(self, key: str, text: str, *, client_facing: bool = False) -> dict:
+        """Написать комментарий в задачу. Для SDESK нужно отдельное согласие.
+
+        У двух случаев принципиально разная цена ошибки: комментарий во внутреннюю
+        задачу читает команда, а комментарий в SDESK читает КЛИЕНТ. Поэтому случайно
+        отправить черновик клиенту нельзя: для ключей SDESK требуется явный
+        ``client_facing=True`` (в CLI — флаг ``--to-client``).
+        """
+        self._require_tasks()
+        if not (text or "").strip():
+            raise ValueError("Пустой комментарий отправлять некуда")
+        if self._key_is_sdesk(key) and not client_facing:
+            raise ValueError(
+                f"{key} — задача SDESK, её комментарии читает КЛИЕНТ. Если текст готов "
+                f"для клиента, подтверди это явно: CLI — флаг --to-client, "
+                f"MCP — client_facing=True."
+            )
+        return self._client_for_key(key).add_comment(key, text)
+
+    def key_is_client_facing(self, key: str) -> bool:
+        """Уедет ли запись по этому ключу клиенту (SDESK), а не только команде."""
+        return self._key_is_sdesk(key)
+
+    def find_similar_issues(
+        self, project: str, summary: str, *, months: int = 12, limit: int = 5
+    ) -> list[dict]:
+        """Похожие по тексту задачи проекта — проверка на дубль ПЕРЕД созданием.
+
+        Не украшение: баг, который сегодня разбирают, вполне может оказаться точной
+        копией задачи годичной давности по другому аккаунту — и находится это обычно
+        случайно. Часть задач после такой проверки вообще не заводится.
+
+        Ищем по значимым словам summary (``text ~``), в пределах проекта и последних
+        ``months`` месяцев. Поиск нечёткий: это подсказка человеку, а не приговор.
+        """
+        terms = _text_search_terms(summary)
+        if not terms or self.provider == "github":
+            return []
+        weeks = max(1, int(months * 4.35))
+        client = self._client_for_key(project)
+        # Лесенка от строгого к мягкому: сперва все значимые слова через AND, потом
+        # отбрасываем самые короткие. На узком запросе ответ точный, а если он пуст —
+        # дубля с таким набором слов нет, и стоит поискать по главному слову.
+        for size in range(len(terms), 0, -1):
+            jql = (f'project = "{project}" AND text ~ "{" AND ".join(terms[:size])}" '
+                   f'AND created >= -{weeks}w ORDER BY created DESC')
+            try:
+                found = client.search(jql, max_results=limit)
+            except Exception:  # noqa: BLE001 — поиск дублей не должен мешать созданию
+                return []
+            if found:
+                return [
+                    {"key": i.key, "summary": i.summary, "status": i.status,
+                     "resolution": i.resolution, "created": i.created}
+                    for i in found[:limit]
+                ]
+        return []
+
+    def job_description_draft(self, job_id: int) -> str:
+        """Черновик описания задачи из лога работы (фазы, баги, ревью, прогоны тестов)."""
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Работа #{job_id} не найдена в этом воркспейсе")
+        return job_description_text(job)
+
+    def link_issues(self, inward: str, outward: str, link_type: str) -> dict:
+        """Связать две задачи. Тип связи сверяется со списком инстанса до отправки.
+
+        Инстанс берётся по ключу первой задачи: связывать задачи РАЗНЫХ инстансов
+        (Jira ↔ SDESK) нельзя — это разные Jira, и такая связь просто не существует.
+        """
+        self._require_tasks()
+        if self._key_is_sdesk(inward) != self._key_is_sdesk(outward):
+            raise ValueError(
+                f"{inward} и {outward} живут в разных инстансах Jira — связать их нельзя. "
+                f"Сошлись на задачу ссылкой в тексте."
+            )
+        client = self._client_for_key(inward)
+        known = [str(t.get("name", "")) for t in client.link_types() if t.get("name")]
+        if known and link_type.lower() not in {n.lower() for n in known}:
+            raise ValueError(
+                f"Тип связи «{link_type}» инстансу неизвестен. Доступные: {', '.join(known)}"
+            )
+        exact = next((n for n in known if n.lower() == link_type.lower()), link_type)
+        return client.link_issues(inward, outward, exact)
+
+    def transitions(self, key: str) -> list[dict]:
+        """Доступные сейчас переходы задачи: сначала показать, потом выполнять."""
+        self._require_tasks()
+        return self._client_for_key(key).transitions(key)
+
+    def transition(self, key: str, target: str) -> dict:
+        """Перевести задачу по имени перехода (или по его id).
+
+        Имя сверяется с тем, что инстанс отдаёт для ТЕКУЩЕГО статуса: набор переходов
+        зависит от статуса и схемы проекта, поэтому «нет такого перехода» — это почти
+        всегда «из этого статуса так нельзя», и список доступных нужен в самой ошибке.
+        """
+        self._require_tasks()
+        available = self.transitions(key)
+        match = next(
+            (t for t in available
+             if t["id"] == target or t["name"].lower() == target.lower()),
+            None,
+        )
+        if match is None:
+            names = ", ".join(t["name"] for t in available) or "—"
+            raise ValueError(
+                f"Перехода «{target}» у {key} сейчас нет. Доступные: {names}"
+            )
+        self._client_for_key(key).do_transition(key, match["id"])
+        return {"key": key, "transition": match["name"], "status": match["to"]}
+
+    def add_attachment(self, key: str, paths: list[str]) -> list[dict]:
+        """Приложить файлы к задаче (har, скриншот, выгрузка, собранные при разборе).
+
+        Файлы проверяются ДО отправки: половина загруженных вложений — худший исход,
+        чем внятный отказ. Возвращает по записи на файл: имя, размер, id в Jira.
+        """
+        self._require_tasks()
+        targets = [Path(p).expanduser() for p in paths]
+        missing = [str(p) for p in targets if not p.is_file()]
+        if missing:
+            raise ValueError(f"Не файлы или не найдены: {', '.join(missing)}")
+        if not targets:
+            raise ValueError("Не задан ни один файл")
+        client = self._client_for_key(key)
+        out: list[dict] = []
+        for path in targets:
+            for created in client.add_attachment(key, path):
+                out.append({
+                    "id": str(created.get("id", "")),
+                    "filename": created.get("filename", path.name),
+                    "size": int(created.get("size", 0) or 0),
+                    "path": str(path),
+                })
+        return out
+
+    def link_types(self, key: str = "") -> list[str]:
+        """Имена доступных типов связей (инстанс — по ключу задачи, если он задан)."""
+        self._require_tasks()
+        client = self._client_for_key(key) if key else self._require_tasks()
+        return [str(t.get("name", "")) for t in client.link_types() if t.get("name")]
+
+    def my_worklog_keys_on(self, date: str) -> list[str]:
+        """Задачи, в которые я что-то трекал за дату — по JQL, без списка ключей заранее.
+
+        Без этого «посмотреть, что вообще затрекано за день» можно было только зная
+        заранее, куда трекал, — а нужно ровно обратное, когда разносишь время задним
+        числом. Ищем в обоих инстансах (Jira и SDESK): время уходит и туда, и туда.
+        У GitHub таймтрекера нет вовсе — там список всегда пуст.
+        """
+        if self.provider == "github":
+            return []
+        jql = f'worklogAuthor = currentUser() AND worklogDate = "{date}" ORDER BY updated DESC'
+        keys: list[str] = []
+        clients = [self.tasks_client]
+        if sdesk_enabled(self.cfg):
+            try:
+                clients.append(self._sdesk_client())
+            except Exception:  # noqa: BLE001 — SDESK недоступен: отдаём хотя бы Jira
+                pass
+        for client in clients:
+            if client is None:
+                continue
+            try:
+                keys.extend(issue.key for issue in client.search(jql, fields="summary"))
+            except Exception:  # noqa: BLE001 — инстанс не ответил: не роняем весь день
+                continue
+        return list(dict.fromkeys(keys))
 
     def my_worklogs_on(self, keys: list[str], date: str) -> dict[str, list[dict]]:
         """Мои worklog-записи по задачам за дату — чтобы не задвоить трекинг.

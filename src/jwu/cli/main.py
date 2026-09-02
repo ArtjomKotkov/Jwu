@@ -60,6 +60,10 @@ db_app = typer.Typer(help="Файл БД: сколько занимает, чи�
 app.add_typer(db_app, name="db")
 feature_app = typer.Typer(help="Локальные фичи: мини-трекер воркспейса, когда Jira нет.")
 app.add_typer(feature_app, name="feature")
+issue_app = typer.Typer(
+    help="Задачи: создание и связи (ВНЕШНЯЯ запись в Jira)."
+)
+app.add_typer(issue_app, name="issue")
 rule_app = typer.Typer(
     help="Правила воркспейса: запреты, инструкции и общая инфа для агента."
 )
@@ -1277,12 +1281,76 @@ def tasks(
         _render_issues(issues)
 
 
+# Сколько веток показывать в строке отчёта: в живом репозитории релизных веток
+# десятки, а спрашивают про свежие — они и стоят первыми. Полный список даёт --json.
+_BRANCH_LIST_LIMIT = 8
+
+
+def _branch_list(names: list[str]) -> str:
+    head = ", ".join(names[:_BRANCH_LIST_LIMIT])
+    tail = len(names) - _BRANCH_LIST_LIMIT
+    return f"{head} [dim]… и ещё {tail}[/dim]" if tail > 0 else head
+
+
+def _render_branch_reach(data: dict) -> None:
+    """Отчёт «куда доехал фикс»: по репозиториям — ветки с фиксом и без него."""
+    console.print(f"[bold cyan]{data['key']}[/bold cyan]  [{data['status']}]  {data['summary']}")
+    if not data["dev_ok"]:
+        console.print("[yellow]⚠ dev-панель Jira ответила не полностью — "
+                      "список коммитов может быть неполным.[/yellow]")
+    if not data["commits"]:
+        console.print("[dim]В dev-панели задачи нет коммитов: смотреть нечего "
+                      "(фикс мог уехать без ссылки на задачу).[/dim]")
+    for pr in data["prs"]:
+        target = f" → [cyan]{pr['target_branch']}[/cyan]" if pr["target_branch"] else ""
+        console.print(f"  PR {pr['id']} [{pr['status']}]{target} [dim]{pr['name']}[/dim]")
+    if not data["repos"]:
+        console.print(f"[dim]Ни в одном из репозиториев воркспейса "
+                      f"({data['searched_repos']}) коммитов задачи не нашлось. "
+                      f"Проверь, что нужный репозиторий привязан: jwu workspace paths[/dim]")
+        return
+    for repo in data["repos"]:
+        console.print(f"\n[bold]{repo['name']}[/bold] [dim]{repo['root']}[/dim]")
+        if repo["error"]:
+            console.print(f"  [red]git недоступен:[/red] {repo['error']}")
+            continue
+        found = [c for c in repo["commits"] if c["found"]]
+        console.print(f"  коммитов задачи в клоне: {len(found)} из {len(repo['commits'])}")
+        if repo["reached"]:
+            console.print(f"  [green]✓ доехало:[/green] {_branch_list(repo['reached'])}")
+        if repo["partial"]:
+            console.print(f"  [yellow]~ частично (не все коммиты):[/yellow] "
+                          f"{_branch_list(repo['partial'])}")
+        if repo["missing"]:
+            console.print(f"  [red]✗ нет:[/red] {_branch_list(repo['missing'])}")
+        if not any((repo["reached"], repo["partial"], repo["missing"])):
+            console.print("  [dim]релизных веток по шаблону не нашлось "
+                          "(шаблон задаётся --branch-pattern)[/dim]")
+
+
 @app.command()
 def task(
     key: str = typer.Argument(..., help="Ключ задачи, напр. PROJ-5525."),
+    branches: bool = typer.Option(
+        False, "--branches",
+        help="Показать, в какие релизные ветки доехал фикс задачи (по локальным клонам)."
+    ),
+    branch_pattern: list[str] = typer.Option(
+        [], "--branch-pattern",
+        help="Шаблон релизных веток (можно несколько): release/*, v1.*. "
+             "По умолчанию release/*, hotfix/*, master, main, develop."
+    ),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Полная карточка задачи: описание, все комменты, статус, links, dev-панель."""
+    if branches:
+        with _service_with_jira() as svc:
+            data = svc.task_branch_reach(key, patterns=list(branch_pattern) or None)
+        if json_out:
+            _emit_json(data)
+        else:
+            _render_branch_reach(data)
+        return
     with _service_with_jira() as svc:
         issue = svc.issue(key)
         notes = svc.get_notes(key)
@@ -2242,19 +2310,28 @@ def worklog(
 
 @app.command()
 def worklogs(
-    keys: list[str] = typer.Argument(..., help="Ключи задач: PROJ-1 PROJ-2 …"),
+    keys: Optional[list[str]] = typer.Argument(
+        None, help="Ключи задач: PROJ-1 PROJ-2 … Без них — все мои задачи за дату."
+    ),
     on: str = typer.Option("today", "--on", help="Дата (YYYY-MM-DD или 'today')."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Мои уже залогированные worklog'и по задачам за день (проверка двойного трека)."""
+    """Мои уже залогированные worklog'и за день (проверка двойного трека).
+
+    Без ключей отвечает на вопрос «что вообще затрекано за такой-то день»: задачи
+    находятся сами (JQL по worklogAuthor/worklogDate в Jira и SDESK). Ключи, если они
+    известны, ограничивают выборку ими.
+    """
     day = datetime.now().date().isoformat() if on.lower() == "today" else on
     with _service_with_jira() as svc:
-        data = svc.my_worklogs_on(keys, day)
+        targets = list(keys or []) or svc.my_worklog_keys_on(day)
+        data = svc.my_worklogs_on(targets, day)
     if json_out:
         _emit_json(data)
         return
     if not data:
-        console.print(f"[dim]За {day} по этим задачам ничего не затрекано.[/dim]")
+        where = "по этим задачам" if keys else "нигде"
+        console.print(f"[dim]За {day} {where} ничего не затрекано.[/dim]")
         return
     table = Table(show_header=True, header_style="bold")
     table.add_column("Задача", style="cyan", no_wrap=True)
@@ -2266,6 +2343,467 @@ def worklogs(
     console.print(table)
     total = sum(e["seconds"] for entries in data.values() for e in entries)
     console.print(f"[dim]Итого за {day}: {total // 3600}h {(total % 3600) // 60}m[/dim]")
+
+
+@app.command()
+def comment(
+    key: str = typer.Argument(..., help="Ключ задачи, напр. PROJ-5525 или SDESK-1234."),
+    text: Optional[str] = typer.Option(None, "--text", "-m", help="Текст комментария."),
+    text_file: Optional[str] = typer.Option(
+        None, "--file", "-F", help="Файл с текстом; «-» — читать из stdin."
+    ),
+    to_client: bool = typer.Option(
+        False, "--to-client",
+        help="Согласие отправить комментарий КЛИЕНТУ (обязательно для задач SDESK)."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Показать текст целиком, ничего не отправляя."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Написать комментарий в задачу. ВНЕШНЯЯ запись — в отличие от `jwu note`.
+
+    `jwu note` пишет в локальную память jwu, эта команда — в саму Jira. Комментарий во
+    внутренней задаче читает команда, а комментарий в SDESK читает КЛИЕНТ, поэтому для
+    ключей SDESK обязателен флаг `--to-client`: случайно отправить клиенту черновик
+    так нельзя. Текст длиннее пары строк передавай файлом или через stdin (`-F -`).
+    """
+    body = _read_description(text, text_file)
+    if not (body or "").strip():
+        err.print("[red]Пустой комментарий:[/red] задай --text или --file.")
+        raise typer.Exit(code=1)
+    svc = _service_with_jira()
+    try:
+        client_facing = svc.key_is_client_facing(key)
+        if client_facing and not to_client:
+            message = (f"{key} — задача SDESK, её комментарии читает КЛИЕНТ. "
+                       f"Подтверди это флагом --to-client.")
+            if json_out:
+                _emit_json({"ok": False, "reason": "client_facing_confirmation_required",
+                            "key": key, "error": message})
+            else:
+                err.print(f"[red]{message}[/red]")
+            raise typer.Exit(code=1)
+
+        if dry_run:
+            if json_out:
+                _emit_json({"ok": True, "dry_run": True, "key": key, "text": body,
+                            "client_facing": client_facing})
+            else:
+                _render_comment_preview(key, body, client_facing)
+                console.print("[dim]--dry-run: в Jira ничего не отправлено.[/dim]")
+            raise typer.Exit(code=0)
+
+        if not yes:
+            if json_out:
+                _emit_json({"ok": False, "reason": "confirm_required", "key": key,
+                            "text": body, "client_facing": client_facing,
+                            "hint": "Показать текст пользователю целиком и повторить с --yes"})
+                raise typer.Exit(code=0)
+            _render_comment_preview(key, body, client_facing)
+            question = (f"Отправить этот текст КЛИЕНТУ в {key}?" if client_facing
+                        else f"Отправить комментарий в {key}?")
+            if not typer.confirm(question, default=False):
+                console.print("[dim]Отменено, в Jira ничего не отправлено.[/dim]")
+                raise typer.Exit(code=1)
+
+        result = svc.add_comment(key, body, client_facing=to_client)
+    except (JiraError, GitHubError, ValueError) as exc:
+        if json_out:
+            _emit_json({"ok": False, "key": key, "error": str(exc)})
+        else:
+            err.print(f"[red]✗[/red] {key}: комментарий не отправлен — {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        svc.close()
+    if json_out:
+        _emit_json({"ok": True, "key": key, "id": result.get("id", ""),
+                    "client_facing": client_facing})
+    else:
+        console.print(f"[green]✓[/green] {key}: комментарий добавлен")
+
+
+def _render_comment_preview(key: str, body: str, client_facing: bool) -> None:
+    """Показать текст комментария целиком — до отправки, а не после."""
+    if client_facing:
+        console.print(f"[red bold]⚠ {key} — SDESK: этот текст увидит КЛИЕНТ[/red bold]")
+    else:
+        console.print(f"[b]Комментарий в {key}[/b] [dim](читает команда)[/dim]")
+    console.print("[dim]--- текст ---[/dim]")
+    console.print(body)
+    console.print("[dim]--- конец текста ---[/dim]")
+
+
+# --------------------------------------------------------------------------- #
+# issue: создание задач и связей (внешняя запись)
+# --------------------------------------------------------------------------- #
+
+
+def _read_description(text: Optional[str], from_file: Optional[str]) -> Optional[str]:
+    """Описание задачи: строкой, из файла или из stdin (``--description-file -``).
+
+    Файл/stdin — основной способ: описания длинные, многострочные, с блоками кода;
+    одним аргументом командной строки они ломаются на кавычках и переносах.
+    """
+    if text is not None and from_file is not None:
+        err.print("[red]--description и --description-file вместе не работают[/red] — "
+                  "выбери что-то одно.")
+        raise typer.Exit(code=1)
+    if from_file is None:
+        return text
+    if from_file == "-":
+        return sys.stdin.read()
+    path = Path(from_file).expanduser()
+    if not path.is_file():
+        err.print(f"[red]Файл с описанием не найден:[/red] {path}")
+        raise typer.Exit(code=1)
+    return path.read_text(encoding="utf-8")
+
+
+def _render_similar(similar: list[dict]) -> None:
+    """Похожие задачи проекта — чтобы не завести дубль годичной давности."""
+    if not similar:
+        return
+    console.print(f"[yellow]Похожие задачи в проекте ({len(similar)}):[/yellow]")
+    for item in similar:
+        state = item["resolution"] or item["status"]
+        console.print(f"  [cyan]{item['key']}[/cyan] [{state}] {item['summary'][:90]}")
+    console.print("[dim]Проверь, не дубль ли — часть задач после этого не заводится.[/dim]")
+
+
+def _render_create_preview(fields: dict, check: dict, similar: list[dict] | None = None) -> None:
+    """Показать человеку, ЧТО именно уедет в Jira, и что об этом думает createmeta."""
+    console.print("[b]Будет создана задача[/b]")
+    type_name = check.get("issuetype") or (fields.get("issuetype") or {}).get("name", "?")
+    console.print(f"  проект: [cyan]{(fields.get('project') or {}).get('key', '?')}[/cyan]"
+                  f"   тип: [cyan]{type_name}[/cyan]")
+    console.print(f"  summary: {fields.get('summary', '')}")
+    # Payload печатаем как есть: значения в нём — идентификаторы из createmeta, и
+    # пользователь должен видеть ровно то, что уедет, а не причёсанный пересказ.
+    payload = {k: v for k, v in fields.items() if k != "description"}
+    console.print("[dim]--- payload ---[/dim]")
+    console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+    description = fields.get("description") or ""
+    if description:
+        console.print("[dim]--- описание ---[/dim]")
+        console.print(description)
+        console.print("[dim]--- конец описания ---[/dim]")
+    else:
+        console.print("  [dim]описание пустое[/dim]")
+    _render_similar(similar or [])
+    if check.get("problems"):
+        console.print("[red]Проверка по createmeta не прошла:[/red]")
+        for problem in check["problems"]:
+            console.print(f"  [red]•[/red] {problem}")
+    else:
+        console.print("[green]Проверка по createmeta пройдена[/green] "
+                      f"[dim](обязательные поля: {', '.join(check.get('required') or []) or '—'})[/dim]")
+
+
+@issue_app.command("create")
+def issue_create(
+    project: str = typer.Option(..., "--project", "-p", help="Ключ проекта, напр. PROJ."),
+    summary: str = typer.Option(..., "--summary", "-s", help="Заголовок задачи."),
+    description: Optional[str] = typer.Option(
+        None, "--description", "-d", help="Описание строкой (для длинных — --description-file)."
+    ),
+    description_file: Optional[str] = typer.Option(
+        None, "--description-file", "-F",
+        help="Файл с описанием; «-» — читать из stdin. Основной способ."
+    ),
+    type_: str = typer.Option("Task", "--type", "-t", help="Тип задачи по имени."),
+    priority: Optional[str] = typer.Option(None, "--priority", help="Приоритет по имени."),
+    assignee: Optional[str] = typer.Option(None, "--assignee", help="Исполнитель по логину."),
+    label: list[str] = typer.Option([], "--label", help="Метка (можно несколько раз)."),
+    component: list[str] = typer.Option([], "--component", help="Компонент (можно несколько)."),
+    fix_version: list[str] = typer.Option(
+        [], "--fix-version", help="Версия исправления (можно несколько)."
+    ),
+    parent: Optional[str] = typer.Option(
+        None, "--parent", help="Родительская задача (для подзадач), напр. PROJ-100."
+    ),
+    from_job: Optional[int] = typer.Option(
+        None, "--from-job",
+        help="Собрать описание из лога работы jwu (фазы, баги, ревью, прогоны тестов)."
+    ),
+    no_dupe_check: bool = typer.Option(
+        False, "--no-dupe-check", help="Не искать похожие задачи перед созданием."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Показать payload и проверку по createmeta, ничего не создавая."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Создать задачу в Jira. ВНЕШНЯЯ запись — без подтверждения не создаётся.
+
+    Поля сверяются с `createmeta` проекта ДО отправки: вместо сырой 400-й от Jira видно,
+    какого обязательного поля не хватает и какие значения допустимы. `--dry-run`
+    показывает итоговый payload и результат проверки, ничего не отправляя, и
+    подтверждения не требует. Инстанс (Jira/SDESK) выбирается по префиксу проекта.
+    """
+    text = _read_description(description, description_file)
+    if text is not None and from_job is not None:
+        err.print("[red]--from-job вместе с --description/--description-file не работает[/red] — "
+                  "черновик из работы либо свой текст.")
+        raise typer.Exit(code=1)
+    svc = _service_with_jira()
+    try:
+        preview = svc.create_issue(
+            project, summary,
+            description=text, issuetype=type_, priority=priority, assignee=assignee,
+            labels=list(label), components=list(component), fix_versions=list(fix_version),
+            parent=parent, from_job=from_job, check_duplicates=not no_dupe_check,
+            dry_run=True,
+        )
+        fields, check = preview["fields"], preview["check"]
+        similar = preview.get("similar") or []
+
+        if dry_run:
+            if json_out:
+                _emit_json({"ok": bool(check["ok"]), "dry_run": True,
+                            "fields": fields, "check": check, "similar": similar})
+            else:
+                _render_create_preview(fields, check, similar)
+                console.print("[dim]--dry-run: в Jira ничего не отправлено.[/dim]")
+            raise typer.Exit(code=0 if check["ok"] else 1)
+
+        if not check["ok"]:
+            if json_out:
+                _emit_json({"ok": False, "reason": "invalid_fields",
+                            "fields": fields, "check": check, "similar": similar})
+            else:
+                _render_create_preview(fields, check, similar)
+                console.print("[dim]Задача не создана: сначала поправь поля.[/dim]")
+            raise typer.Exit(code=1)
+
+        # Подтверждение. Для агента (--json) это отдельный шаг: он обязан показать
+        # payload пользователю и вернуться с --yes, а не создавать задачу молча.
+        if not yes:
+            if json_out:
+                _emit_json({"ok": False, "reason": "confirm_required",
+                            "fields": fields, "check": check, "similar": similar,
+                            "hint": "Показать payload пользователю и повторить с --yes"})
+                raise typer.Exit(code=0)
+            _render_create_preview(fields, check, similar)
+            if not typer.confirm("Создавать задачу в Jira?", default=False):
+                console.print("[dim]Отменено, в Jira ничего не отправлено.[/dim]")
+                raise typer.Exit(code=1)
+
+        result = svc.create_issue(
+            project, summary,
+            description=text, issuetype=type_, priority=priority, assignee=assignee,
+            labels=list(label), components=list(component), fix_versions=list(fix_version),
+            parent=parent, from_job=from_job,
+        )
+    except (JiraError, GitHubError, ValueError) as exc:
+        if json_out:
+            _emit_json({"ok": False, "project": project, "error": str(exc)})
+        else:
+            err.print(f"[red]✗[/red] задача не создана — {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        svc.close()
+
+    issue = result["issue"]
+    if json_out:
+        _emit_json({"ok": True, "key": issue["key"], "url": issue["url"],
+                    "fields": result["fields"]})
+    else:
+        console.print(f"[green]✓[/green] создана {issue['key']} — {issue['url']}")
+
+
+@issue_app.command("link")
+def issue_link(
+    inward: str = typer.Argument(..., help="Первая задача (к ней применяется inward-описание)."),
+    outward: str = typer.Argument(..., help="Вторая задача (outward-описание)."),
+    type_: str = typer.Option("Relates", "--type", "-t", help="Тип связи, напр. Relates, Blocks."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Связать две задачи. ВНЕШНЯЯ запись — без подтверждения связь не создаётся.
+
+    Направление как в Jira: `jwu issue link PROJ-2 PROJ-1 --type Blocks` читается
+    «PROJ-2 blocks PROJ-1». Тип связи сверяется со списком инстанса: неизвестное имя
+    даёт список доступных, а не 400-ю. Обе задачи должны жить в одном инстансе.
+    """
+    svc = _service_with_jira()
+    try:
+        if not yes:
+            if json_out:
+                _emit_json({"ok": False, "reason": "confirm_required", "inward": inward,
+                            "outward": outward, "type": type_,
+                            "link_types": svc.link_types(inward)})
+                raise typer.Exit(code=0)
+            if not typer.confirm(f"Связать {inward} ↔ {outward} как «{type_}»?", default=False):
+                console.print("[dim]Отменено.[/dim]")
+                raise typer.Exit(code=1)
+        result = svc.link_issues(inward, outward, type_)
+    except (JiraError, GitHubError, ValueError) as exc:
+        if json_out:
+            _emit_json({"ok": False, "error": str(exc)})
+        else:
+            err.print(f"[red]✗[/red] связь не создана — {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        svc.close()
+    if json_out:
+        _emit_json({"ok": True, **result})
+    else:
+        console.print(f"[green]✓[/green] {inward} ↔ {outward}: «{result['type']}»")
+
+
+@issue_app.command("transitions")
+def issue_transitions(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Какие переходы по процессу доступны задаче ПРЯМО СЕЙЧАС.
+
+    Набор зависит от текущего статуса и схемы проекта, поэтому смотреть его нужно
+    перед каждым переводом, а не помнить.
+    """
+    with _service_with_jira() as svc:
+        try:
+            items = svc.transitions(key)
+        except (JiraError, GitHubError) as exc:
+            err.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(items)
+        return
+    if not items:
+        console.print(f"[dim]У {key} сейчас нет доступных переходов.[/dim]")
+        return
+    for item in items:
+        console.print(f"  [cyan]{item['name']}[/cyan] → {item['to']} [dim]id={item['id']}[/dim]")
+
+
+@issue_app.command("transition")
+def issue_transition(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    target: str = typer.Argument(..., help="Имя перехода (или его id), напр. «In Progress»."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Перевести задачу по процессу. ВНЕШНЯЯ запись — без подтверждения не выполняется.
+
+    Неизвестное имя перехода даёт список доступных из текущего статуса, а не 400-ю.
+    """
+    svc = _service_with_jira()
+    try:
+        if not yes:
+            if json_out:
+                _emit_json({"ok": False, "reason": "confirm_required", "key": key,
+                            "target": target, "available": svc.transitions(key)})
+                raise typer.Exit(code=0)
+            if not typer.confirm(f"Перевести {key}: «{target}»?", default=False):
+                console.print("[dim]Отменено.[/dim]")
+                raise typer.Exit(code=1)
+        result = svc.transition(key, target)
+    except (JiraError, GitHubError, ValueError) as exc:
+        if json_out:
+            _emit_json({"ok": False, "key": key, "error": str(exc)})
+        else:
+            err.print(f"[red]✗[/red] {key}: не переведено — {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        svc.close()
+    if json_out:
+        _emit_json({"ok": True, **result})
+    else:
+        console.print(f"[green]✓[/green] {key}: «{result['transition']}» → {result['status']}")
+
+
+@issue_app.command("attach")
+def issue_attach(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    files: list[str] = typer.Argument(..., help="Файлы: har, скриншот, выгрузка…"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Приложить файлы к задаче. ВНЕШНЯЯ запись — без подтверждения не выполняется.
+
+    Обратная операция к `jwu attachments --download`: то, что собрано локально при
+    разборе (har, скриншот, лог), уезжает в карточку задачи.
+    """
+    svc = _service_with_jira()
+    try:
+        if not yes:
+            sizes = []
+            for name in files:
+                path = Path(name).expanduser()
+                sizes.append(f"{path.name} ({_human_size(path.stat().st_size)})"
+                             if path.is_file() else f"{name} [нет файла]")
+            if json_out:
+                _emit_json({"ok": False, "reason": "confirm_required", "key": key,
+                            "files": sizes})
+                raise typer.Exit(code=0)
+            console.print(f"[b]В {key} уедут файлы:[/b] {', '.join(sizes)}")
+            if not typer.confirm("Приложить?", default=False):
+                console.print("[dim]Отменено.[/dim]")
+                raise typer.Exit(code=1)
+        created = svc.add_attachment(key, list(files))
+    except (JiraError, GitHubError, ValueError) as exc:
+        if json_out:
+            _emit_json({"ok": False, "key": key, "error": str(exc)})
+        else:
+            err.print(f"[red]✗[/red] {key}: не приложено — {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        svc.close()
+    if json_out:
+        _emit_json({"ok": True, "key": key, "attachments": created})
+    else:
+        for item in created:
+            console.print(f"[green]✓[/green] {key}: {item['filename']} "
+                          f"[dim]{_human_size(item['size'])}[/dim]")
+
+
+@issue_app.command("similar")
+def issue_similar(
+    project: str = typer.Option(..., "--project", "-p", help="Ключ проекта."),
+    summary: str = typer.Option(..., "--summary", "-s", help="Заголовок будущей задачи."),
+    months: int = typer.Option(12, "--months", help="За сколько месяцев искать."),
+    limit: int = typer.Option(5, "--limit", help="Сколько показать."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Похожие по тексту задачи проекта — проверка на дубль до создания.
+
+    Тот же поиск, что `jwu issue create` делает сам на превью; отдельной командой
+    удобно проверить идею задачи, ещё не собрав её текст.
+    """
+    with _service_with_jira() as svc:
+        try:
+            found = svc.find_similar_issues(project, summary, months=months, limit=limit)
+        except (JiraError, GitHubError) as exc:
+            err.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(found)
+    elif found:
+        _render_similar(found)
+    else:
+        console.print(f"[dim]Похожих задач в {project} за {months} мес. не нашлось.[/dim]")
+
+
+@issue_app.command("link-types")
+def issue_link_types(
+    key: str = typer.Option("", "--key", help="Ключ задачи — выбрать инстанс (Jira/SDESK)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Какие типы связей знает инстанс (имена для `jwu issue link --type`)."""
+    with _service_with_jira() as svc:
+        try:
+            names = svc.link_types(key)
+        except (JiraError, GitHubError) as exc:
+            err.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(names)
+    else:
+        console.print(", ".join(names) or "[dim]типов связей нет[/dim]")
 
 
 # --------------------------------------------------------------------------- #

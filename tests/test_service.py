@@ -1,4 +1,7 @@
+import json
+
 import httpx
+import pytest
 import respx
 
 from jwu.core.bitbucket import BitbucketClient
@@ -13,6 +16,7 @@ from .fixtures import (
     bitbucket_merge_raw,
     bitbucket_pr_raw,
     dev_status_pr_raw,
+    jira_createmeta_raw,
     jira_issue_raw,
     jira_search_raw,
 )
@@ -484,3 +488,368 @@ def test_collect_mentions_rescans_changed_issue(tmp_path):
         assert len(svc.store.list_mentions()) == 2
     finally:
         svc.close()
+
+
+@respx.mock
+def test_create_issue_dry_run_does_not_post(tmp_path):
+    """dry_run отдаёт готовый payload и проверку, но наружу ничего не пишет."""
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw()))
+    post = respx.post(f"{JIRA}/rest/api/2/issue")
+    svc = _service(tmp_path)
+    try:
+        res = svc.create_issue("PROJ", "Падает экспорт", description="шаги",
+                               issuetype="Bug", dry_run=True)
+    finally:
+        svc.close()
+    assert res["ok"] is False and res["dry_run"] is True and res["issue"] == {}
+    assert res["check"]["ok"] is True
+    assert res["fields"]["summary"] == "Падает экспорт"
+    assert not post.called
+
+
+@respx.mock
+def test_create_issue_posts_and_returns_key(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw()))
+    respx.post(f"{JIRA}/rest/api/2/issue").mock(
+        return_value=httpx.Response(201, json={"id": "1", "key": "PROJ-777"}))
+    svc = _service(tmp_path)
+    try:
+        res = svc.create_issue("PROJ", "Падает экспорт", issuetype="Bug")
+    finally:
+        svc.close()
+    assert res["ok"] is True
+    assert res["issue"]["key"] == "PROJ-777"
+    assert res["issue"]["url"] == f"{JIRA}/browse/PROJ-777"
+
+
+@respx.mock
+def test_create_issue_stops_before_post_when_required_field_missing(tmp_path):
+    """Обязательное поле проекта не заполнено — POST не делаем вовсе."""
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(return_value=httpx.Response(
+        200, json=jira_createmeta_raw(required_extra={"customfield_10500": "Отдел"})))
+    post = respx.post(f"{JIRA}/rest/api/2/issue")
+    svc = _service(tmp_path)
+    try:
+        res = svc.create_issue("PROJ", "тема")
+    finally:
+        svc.close()
+    assert res["ok"] is False and not post.called
+    assert any("Отдел" in p for p in res["check"]["problems"])
+
+
+@respx.mock
+def test_create_issue_in_sdesk_project_goes_to_sdesk_instance(tmp_path):
+    """Инстанс выбирается по префиксу ключа проекта — как и для карточки задачи."""
+    respx.get(f"{SDESK}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw(project="SDESK")))
+    post = respx.post(f"{SDESK}/rest/api/2/issue").mock(
+        return_value=httpx.Response(201, json={"id": "2", "key": "SDESK-42"}))
+    jira_post = respx.post(f"{JIRA}/rest/api/2/issue")
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        res = svc.create_issue("SDESK", "обращение клиента")
+    finally:
+        svc.close()
+    assert res["issue"]["key"] == "SDESK-42"
+    assert post.called and not jira_post.called
+
+
+@respx.mock
+def test_create_issue_propagates_jira_error(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw()))
+    respx.post(f"{JIRA}/rest/api/2/issue").mock(return_value=httpx.Response(
+        400, json={"errors": {"summary": "Summary слишком длинный"}}))
+    from jwu.core.jira import JiraError
+
+    svc = _service(tmp_path)
+    try:
+        with pytest.raises(JiraError) as exc:
+            svc.create_issue("PROJ", "тема")
+    finally:
+        svc.close()
+    assert "summary: Summary слишком длинный" in str(exc.value)
+
+
+@respx.mock
+def test_link_issues_checks_type_and_instance(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/issueLinkType").mock(return_value=httpx.Response(
+        200, json={"issueLinkTypes": [{"name": "Relates"}, {"name": "Blocks"}]}))
+    route = respx.post(f"{JIRA}/rest/api/2/issueLink").mock(
+        return_value=httpx.Response(201, content=b""))
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        res = svc.link_issues("PROJ-2", "PROJ-1", "blocks")
+        assert res["type"] == "Blocks"  # регистр берём из инстанса
+        with pytest.raises(ValueError) as unknown:
+            svc.link_issues("PROJ-2", "PROJ-1", "Дублирует")
+        with pytest.raises(ValueError) as cross:
+            svc.link_issues("PROJ-2", "SDESK-1", "Relates")
+    finally:
+        svc.close()
+    assert route.call_count == 1
+    assert "Relates, Blocks" in str(unknown.value)
+    assert "разных инстансах" in str(cross.value)
+
+
+def test_task_branch_reach_dedupes_commits_and_adds_pr_targets(tmp_path, monkeypatch):
+    """Dev-панель отдаёт коммит дважды — считать его дважды нельзя («2 из 2» вместо «1»)."""
+    from jwu.core import gitbranches
+    from jwu.core.models import DevCommit, DevPullRequest, Issue, PR
+
+    svc = _service(tmp_path)
+    issue = Issue(key="PROJ-1", summary="S", status="Closed")
+    issue.commits = [DevCommit(id="abc123", message="fix\nдетали"),
+                     DevCommit(id="abc123", message="fix")]
+    issue.pull_requests = [DevPullRequest(
+        id="#42", name="fix", status="MERGED",
+        url="https://git.test/projects/PROJ/repos/app/pull-requests/42")]
+    monkeypatch.setattr(svc, "issue", lambda key: issue)
+    monkeypatch.setattr(svc, "_workspace_repo_roots", lambda: {"/repo": "app"})
+    monkeypatch.setattr(svc, "pr", lambda pr_id, project=None, repo=None: PR(
+        id=pr_id, target_branch="release-10.5", repository=repo))
+    seen: dict = {}
+
+    def _reach(roots, shas, **kw):
+        seen["shas"] = shas
+        return [gitbranches.RepoReach(name="app", root="/repo")]
+
+    monkeypatch.setattr(gitbranches, "reach", _reach)
+    try:
+        data = svc.task_branch_reach("PROJ-1")
+    finally:
+        svc.close()
+
+    assert seen["shas"] == ["abc123"]                    # дубль коммита схлопнут
+    assert data["commits"] == [{"sha": "abc123", "message": "fix"}]
+    assert data["prs"][0]["target_branch"] == "release-10.5"
+    assert data["repos"][0]["name"] == "app"
+
+
+def test_task_branch_reach_survives_unavailable_pr_host(tmp_path, monkeypatch):
+    """Хостинг недоступен — ветка PR просто неизвестна, отчёт всё равно строится."""
+    from jwu.core import gitbranches
+    from jwu.core.models import DevPullRequest, Issue
+
+    svc = _service(tmp_path)
+    issue = Issue(key="PROJ-1")
+    issue.pull_requests = [DevPullRequest(
+        id="#42", status="MERGED",
+        url="https://git.test/projects/PROJ/repos/app/pull-requests/42")]
+    monkeypatch.setattr(svc, "issue", lambda key: issue)
+    monkeypatch.setattr(svc, "_workspace_repo_roots", lambda: {})
+    monkeypatch.setattr(svc, "pr", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("нет сети")))
+    monkeypatch.setattr(gitbranches, "reach", lambda *a, **kw: [])
+    try:
+        data = svc.task_branch_reach("PROJ-1")
+    finally:
+        svc.close()
+    assert data["prs"][0]["target_branch"] == ""
+    assert data["repos"] == []
+
+
+@respx.mock
+def test_add_comment_refuses_sdesk_without_client_consent(tmp_path):
+    """Комментарий в SDESK читает клиент — без явного согласия он не уходит."""
+    route = respx.post(f"{SDESK}/rest/api/2/issue/SDESK-1/comment").mock(
+        return_value=httpx.Response(201, json={"id": "1"}))
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        with pytest.raises(ValueError) as exc:
+            svc.add_comment("SDESK-1", "черновик ответа")
+        assert not route.called
+        assert svc.add_comment("SDESK-1", "готовый ответ", client_facing=True)["id"] == "1"
+    finally:
+        svc.close()
+    assert "КЛИЕНТ" in str(exc.value)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_add_comment_to_internal_task_needs_no_client_flag(tmp_path):
+    route = respx.post(f"{JIRA}/rest/api/2/issue/PROJ-1/comment").mock(
+        return_value=httpx.Response(201, json={"id": "7"}))
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        assert svc.add_comment("PROJ-1", "команде: перенёс фикс")["id"] == "7"
+        with pytest.raises(ValueError, match="Пустой"):
+            svc.add_comment("PROJ-1", "   ")
+    finally:
+        svc.close()
+    assert json.loads(route.calls.last.request.content) == {"body": "команде: перенёс фикс"}
+
+
+@respx.mock
+def test_my_worklog_keys_on_searches_both_instances(tmp_path):
+    """«Что вообще затрекано за день» ищется JQL-ом и в Jira, и в SDESK."""
+    jira = respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(
+        200, json=jira_search_raw([jira_issue_raw(key="PROJ-1")])))
+    sdesk = respx.get(f"{SDESK}/rest/api/2/search").mock(return_value=httpx.Response(
+        200, json=jira_search_raw([jira_issue_raw(key="SDESK-9")])))
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        keys = svc.my_worklog_keys_on("2026-08-31")
+    finally:
+        svc.close()
+    assert keys == ["PROJ-1", "SDESK-9"]
+    assert "worklogDate" in jira.calls.last.request.url.params["jql"]
+    assert sdesk.called
+
+
+@respx.mock
+def test_my_worklog_keys_on_survives_dead_instance(tmp_path):
+    """SDESK лёг — день всё равно показываем по основной Jira."""
+    respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(
+        200, json=jira_search_raw([jira_issue_raw(key="PROJ-1")])))
+    respx.get(f"{SDESK}/rest/api/2/search").mock(return_value=httpx.Response(500, text="down"))
+    svc = _service_with_sdesk(tmp_path)
+    try:
+        assert svc.my_worklog_keys_on("2026-08-31") == ["PROJ-1"]
+    finally:
+        svc.close()
+
+
+@respx.mock
+def test_transition_resolves_name_and_lists_available(tmp_path):
+    """Перехода из текущего статуса нет — в ошибке список доступных, а не 400-я."""
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1/transitions").mock(
+        return_value=httpx.Response(200, json={"transitions": [
+            {"id": "31", "name": "In Progress", "to": {"name": "In Progress"}}]}))
+    route = respx.post(f"{JIRA}/rest/api/2/issue/PROJ-1/transitions").mock(
+        return_value=httpx.Response(204, content=b""))
+    svc = _service(tmp_path)
+    try:
+        result = svc.transition("PROJ-1", "in progress")   # регистр не важен
+        with pytest.raises(ValueError) as exc:
+            svc.transition("PROJ-1", "Closed")
+    finally:
+        svc.close()
+    assert result == {"key": "PROJ-1", "transition": "In Progress", "status": "In Progress"}
+    assert "In Progress" in str(exc.value)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_add_attachment_checks_files_before_sending(tmp_path):
+    """Половина загруженных файлов хуже внятного отказа — проверяем ДО отправки."""
+    route = respx.post(f"{JIRA}/rest/api/2/issue/PROJ-1/attachments").mock(
+        return_value=httpx.Response(200, json=[{"id": "9", "filename": "a.log", "size": 3}]))
+    good = tmp_path / "a.log"
+    good.write_text("abc", encoding="utf-8")
+    svc = _service(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="не найдены"):
+            svc.add_attachment("PROJ-1", [str(good), str(tmp_path / "нет.log")])
+        assert not route.called
+        created = svc.add_attachment("PROJ-1", [str(good)])
+    finally:
+        svc.close()
+    assert created[0]["filename"] == "a.log" and created[0]["path"] == str(good)
+
+
+@respx.mock
+def test_find_similar_issues_builds_and_query(tmp_path):
+    """`text ~ "a b"` в Jira — поиск ФРАЗЫ и не находит ничего: слова соединяем через AND."""
+    route = respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(
+        200, json=jira_search_raw([jira_issue_raw(key="PROJ-9", summary="Отчёт врёт")])))
+    svc = _service(tmp_path)
+    try:
+        found = svc.find_similar_issues("PROJ", "Отчёт «По часам» врёт PROJ-1", months=12)
+    finally:
+        svc.close()
+    jql = route.calls.last.request.url.params["jql"]
+    assert 'project = "PROJ"' in jql and "created >= -52w" in jql
+    phrase = jql.split('text ~ "')[1].split('"')[0]
+    assert " AND " in phrase and '"' not in phrase
+    assert "PROJ-1" not in jql            # дефисы Lucene (ведущий дефис = NOT) не уедут
+    assert found[0]["key"] == "PROJ-9"
+
+
+@respx.mock
+def test_find_similar_issues_relaxes_query_until_something_found(tmp_path):
+    """Строгий набор слов ничего не дал — ищем по более коротким, а не сдаёмся."""
+    route = respx.get(f"{JIRA}/rest/api/2/search")
+    route.side_effect = [
+        httpx.Response(200, json=jira_search_raw([])),                       # все слова
+        httpx.Response(200, json=jira_search_raw([jira_issue_raw(key="PROJ-9")])),
+    ]
+    svc = _service(tmp_path)
+    try:
+        found = svc.find_similar_issues("PROJ", "Поддержка OpenSearch release")
+    finally:
+        svc.close()
+    def _phrase(call):
+        return call.request.url.params["jql"].split('text ~ "')[1].split('"')[0]
+
+    first, second = (_phrase(c) for c in route.calls)
+    assert first == "OpenSearch AND Поддержка AND release"   # сперва все значимые слова
+    assert second == "OpenSearch AND Поддержка"              # потом без самого короткого
+    assert found[0]["key"] == "PROJ-9"
+
+
+@respx.mock
+def test_find_similar_issues_gives_up_quietly(tmp_path):
+    """Ничего не нашлось ни на одном уровне — пустой список, а не ошибка."""
+    respx.get(f"{JIRA}/rest/api/2/search").mock(
+        return_value=httpx.Response(200, json=jira_search_raw([])))
+    svc = _service(tmp_path)
+    try:
+        assert svc.find_similar_issues("PROJ", "Совершенно уникальный заголовок") == []
+    finally:
+        svc.close()
+
+
+@respx.mock
+def test_create_issue_preview_carries_similar_issues(tmp_path):
+    """Похожие задачи приходят вместе с превью — до создания, а не после."""
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw()))
+    respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(
+        200, json=jira_search_raw([jira_issue_raw(key="PROJ-9")])))
+    svc = _service(tmp_path)
+    try:
+        preview = svc.create_issue("PROJ", "Отчёт показывает некорректные данные",
+                                   dry_run=True)
+        quiet = svc.create_issue("PROJ", "Отчёт показывает некорректные данные",
+                                 dry_run=True, check_duplicates=False)
+    finally:
+        svc.close()
+    assert preview["similar"][0]["key"] == "PROJ-9"
+    assert quiet["similar"] == []
+
+
+@respx.mock
+def test_create_issue_sends_issuetype_by_id(tmp_path):
+    """Регресс: по имени этот инстанс тип не находит («issue type selected is invalid»)."""
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw()))
+    route = respx.post(f"{JIRA}/rest/api/2/issue").mock(
+        return_value=httpx.Response(201, json={"id": "1", "key": "PROJ-777"}))
+    svc = _service(tmp_path)
+    try:
+        preview = svc.create_issue("PROJ", "тема", issuetype="Task", priority="Major",
+                                   dry_run=True, check_duplicates=False)
+        result = svc.create_issue("PROJ", "тема", issuetype="Task", priority="Major")
+    finally:
+        svc.close()
+    sent = json.loads(route.calls.last.request.content)["fields"]
+    assert sent["issuetype"] == {"id": "10000"}
+    assert sent["priority"] == {"id": "3"}
+    # то, что показали в dry-run, и то, что отправили, — один и тот же payload
+    assert preview["fields"] == result["fields"] == sent
+
+
+@respx.mock
+def test_create_issue_with_unknown_type_never_posts(tmp_path):
+    respx.get(f"{JIRA}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw()))
+    post = respx.post(f"{JIRA}/rest/api/2/issue")
+    svc = _service(tmp_path)
+    try:
+        res = svc.create_issue("PROJ", "тема", issuetype="Эпик", check_duplicates=False)
+    finally:
+        svc.close()
+    assert res["ok"] is False and not post.called
+    assert "Task, Bug" in res["check"]["problems"][0]

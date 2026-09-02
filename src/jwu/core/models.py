@@ -851,6 +851,56 @@ class Job(BaseModel):
         return self.task_key or self.feature_key or f"#{self.id}"
 
 
+# Как записи работы раскладываются по разделам описания задачи. Порядок разделов —
+# порядок этого списка: сначала что сделано, потом чем это грозит, потом детали.
+_JOB_TEXT_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
+    ("Что сделано", ("phase",)),
+    ("Найденные проблемы", ("bug", "bug-resolved")),
+    ("Ограничения и предупреждения", ("constraint", "warning")),
+    ("Принятые решения", ("decision",)),
+    ("Тесты", ("test-pass", "test-fail")),
+    ("Ревью", ("review", "remark")),
+    ("Осталось сделать", ("todo",)),
+    ("Заметки", ("note",)),
+]
+
+
+def job_description_text(job: "Job") -> str:
+    """Черновик описания задачи из лога работы — wiki-разметкой Jira Server.
+
+    Данные для описания в работе уже собраны (фазы, найденные баги, ревью, прогоны
+    тестов) — не хватало только рендера. Это именно ЧЕРНОВИК: пользователь правит его
+    перед отправкой, поэтому здесь ничего не додумывается, только раскладывается по
+    разделам в человекочитаемом виде.
+    """
+    lines: list[str] = []
+    if job.title:
+        lines.append(f"*{job.title}*")
+    anchors = [a for a in (job.task_key, job.feature_key) if a]
+    if anchors:
+        lines.append(f"Работа jwu #{job.id}, якорь: {', '.join(anchors)}")
+    prs = ", ".join(f"{p.repo or p.project}#{p.pr_id}" for p in job.prs)
+    if prs:
+        lines.append(f"PR: {prs}")
+
+    for title, kinds in _JOB_TEXT_SECTIONS:
+        records = [r for r in job.records if r.kind in kinds]
+        if not records:
+            continue
+        lines.extend(["", f"h3. {title}"])
+        for record in records:
+            badge = JOB_RECORD_BADGES.get(record.kind, ("", ""))[0]
+            # Бейдж несёт смысл («⛔ ЗАПРЕТ», «🧪 ТЕСТЫ УПАЛИ»), но внутри своего раздела
+            # он избыточен — оставляем только там, где в разделе смешаны разные типы.
+            mark = f"{badge}: " if badge and len(kinds) > 1 else ""
+            status = f" [{record.status}]" if record.status else ""
+            text = (record.text or "").strip()
+            first, *rest = text.splitlines() or [""]
+            lines.append(f"* {mark}{first}{status}")
+            lines.extend(f"** {line}" for line in rest if line.strip())
+    return "\n".join(lines).strip()
+
+
 # --------------------------------------------------------------------------- #
 # Локальные фичи (мини-трекер воркспейса без Jira)
 # --------------------------------------------------------------------------- #

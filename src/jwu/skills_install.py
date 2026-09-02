@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import importlib.resources as resources
+import shutil
 from pathlib import Path
 
 # Ожидаемые скиллы (для проверок/тестов; фактически ставится всё, что лежит в пакете).
@@ -18,6 +19,11 @@ EXPECTED_SKILLS = {
     "jwu-track-job",
     "jwu-job-review",
     "jwu-commit-message",
+    "jwu-task-create",
+    "jwu-task-comment",
+    "jwu-task-status",
+    "jwu-task-attach",
+    "jwu-task-branches",
     "jwu-analyze-day",
     "jwu-post-analyze-day",
     "jwu-track-time",
@@ -25,6 +31,15 @@ EXPECTED_SKILLS = {
     "build-failure",
     "jwu-workspace-setup",
     "jwu-update",
+}
+
+# Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
+# иначе переименованный скилл остаётся у пользователя второй копией и продолжает
+# срабатывать по своим триггерам — с устаревшими инструкциями. Список именно
+# перечислением, а не «всё лишнее с префиксом jwu-»: свои скиллы пользователя
+# удалять нельзя.
+RETIRED_SKILLS = {
+    "jwu-create-issue",  # 1.8.0: разъехался на jwu-task-create/comment/status/attach/branches
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.
@@ -65,7 +80,21 @@ def install_skills(dest: Path) -> list[tuple[str, str]]:
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "SKILL.md").write_text(content, encoding="utf-8")
         results.append((name, action))
+    results.extend(_remove_retired(dest))
     return sorted(results)
+
+
+def _remove_retired(dest: Path) -> list[tuple[str, str]]:
+    """Снести скиллы, которые jwu больше не раздаёт (см. RETIRED_SKILLS)."""
+    removed: list[tuple[str, str]] = []
+    for name in RETIRED_SKILLS:
+        target = dest / name
+        if not (target / "SKILL.md").is_file():
+            continue
+        shutil.rmtree(target, ignore_errors=True)
+        if not target.exists():
+            removed.append((name, "удалён (устарел)"))
+    return removed
 
 
 def install_agents(dest: Path) -> list[tuple[str, str]]:
