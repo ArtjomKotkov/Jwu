@@ -32,6 +32,7 @@ EXPECTED_SKILLS = {
     "jwu-workspace-setup",
     "jwu-update",
     "jwu-prompt-refine",
+    "duty-support",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
@@ -47,6 +48,7 @@ RETIRED_SKILLS = {
 EXPECTED_AGENTS = {
     "reviewer-jwu-sample",
     "jenkins-build-analyst",
+    "duty-support-sample",
 }
 
 
