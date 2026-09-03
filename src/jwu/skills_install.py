@@ -31,6 +31,7 @@ EXPECTED_SKILLS = {
     "build-failure",
     "jwu-workspace-setup",
     "jwu-update",
+    "jwu-prompt-refine",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
