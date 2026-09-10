@@ -307,18 +307,21 @@ async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
 
 @mcp.tool()
 async def jwu_prs(view: str = "review", with_conflicts: bool = True,
-                  workspace: Optional[str] = None) -> list[dict]:
+                  with_builds: bool = True, workspace: Optional[str] = None) -> list[dict]:
     """Список PR по роли: view = "review" (ждут моего ревью) или "mine" (мои).
 
     Источник — хостинг контура: Bitbucket у jira-контура, GitHub у github-контура.
 
     with_conflicts=True добавляет статус merge-конфликта по каждому PR (чуть медленнее).
+    with_builds=True добавляет статусы CI-сборок по head-коммиту (`builds` и сводный
+    `build_state`: FAILED | INPROGRESS | SUCCESSFUL | ""), ещё два запроса на PR.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
     """
     svc = _full_svc(workspace)
-    return [p.model_dump() for p in svc.prs(view, with_conflicts=with_conflicts)]
+    return [p.model_dump() for p in svc.prs(view, with_conflicts=with_conflicts,
+                                           with_builds=with_builds)]
 
 
 @mcp.tool()

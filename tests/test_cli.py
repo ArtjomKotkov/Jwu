@@ -1199,3 +1199,14 @@ def test_issue_create_preview_shows_similar(monkeypatch):
                                   "--dry-run", "--json"])
     assert res.exit_code == 0
     assert json.loads(res.stdout)["similar"][0]["key"] == "PROJ-9"
+
+
+def test_pr_state_red_build_ranks_after_conflict():
+    from jwu.core.models import BuildStatus, PR, Reviewer
+
+    red = [BuildStatus(state="FAILED", key="ci", url="u")]
+    approved = [Reviewer(name="a", approved=True, status="APPROVED")]
+    assert cli._pr_state(PR(id=1, builds=red, reviewers=approved)) == "красный билд"
+    assert cli._pr_state(PR(id=1, conflicted=True, builds=red)) == "конфликт"
+    assert cli._pr_state(PR(id=1, reviewers=approved)) == "апрувы собраны"
+    assert "сборка: красная" in cli._pr_line(PR(id=1, builds=red))

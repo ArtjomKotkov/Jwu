@@ -1256,6 +1256,13 @@ class PRDetailScreen(Screen):
             parts.append(Text.from_markup(
                 f"конфликт: {'[red]⚠ да[/red]' if pr.conflicted else '[green]нет[/green]'}"
             ))
+        if pr.build_state:
+            build_markup = {
+                "FAILED": "[red]✗ красная[/red]",
+                "INPROGRESS": "[yellow]… идёт[/yellow]",
+                "SUCCESSFUL": "[green]✓ зелёная[/green]",
+            }.get(pr.build_state, pr.build_state)
+            parts.append(Text.from_markup(f"сборка: {build_markup}"))
         if pr.reviewers:
             rev = ["[b]Ревьюеры[/b]"]
             for r in pr.reviewers:
@@ -2040,7 +2047,7 @@ class JwuDashboard(App):
             ]
         elif kind == "pr":
             # Колонки разные для «PR: мои» (7) и «PR: на ревью» (4) — см. PR_MINE_COLUMNS / PR_REVIEW_COLUMNS.
-            conflict_key = lambda p: 1 if p.conflicted else 0  # noqa: E731
+            conflict_key = lambda p: (1 if p.conflicted else 0) + (1 if p.build_state == "FAILED" else 0)  # noqa: E731
             reviewers_approved = lambda p: sum(1 for r in p.reviewers if r.approved)  # noqa: E731
             title_key = lambda p: p.title.lower()  # noqa: E731
             if table_id == "t-prs-mine":
@@ -2153,7 +2160,12 @@ class JwuDashboard(App):
         task_assignee = self.data.task_assignee or {}
         for pr in prs:
             changed = pr.id in self._changed_pr_ids
-            conflict = Text("⚠", style="dark_orange") if pr.conflicted else Text("")
+            # В одной ячейке два блокера мержа: ⚠ конфликт и ✗ красная сборка.
+            conflict = Text()
+            if pr.conflicted:
+                conflict.append("⚠", style="dark_orange")
+            if pr.build_state == "FAILED":
+                conflict.append("✗", style="red")
             title_cell = Text(pr.title, style="yellow" if changed else "")
             review_cell = reviewers_cell(pr.reviewers, current_user=self._user)
             if with_task_cols:

@@ -150,3 +150,18 @@ def test_job_description_text_of_empty_job_is_empty():
     from jwu.core.models import Job, job_description_text
 
     assert job_description_text(Job(id=1)) == ""
+
+
+def test_pr_build_state_priority():
+    from jwu.core.models import BuildStatus, PR
+
+    def pr(*states):
+        return PR(id=1, builds=[BuildStatus(state=s, key=s, url=f"u{i}") for i, s in enumerate(states)])
+
+    assert pr().build_state == ""
+    assert pr("SUCCESSFUL", "SUCCESSFUL").build_state == "SUCCESSFUL"
+    assert pr("SUCCESSFUL", "INPROGRESS").build_state == "INPROGRESS"
+    assert pr("SUCCESSFUL", "INPROGRESS", "FAILED").build_state == "FAILED"
+    # computed-поле попадает в дамп и не мешает обратной загрузке из снапшота
+    dumped = pr("FAILED").model_dump_json()
+    assert PR.model_validate_json(dumped).build_state == "FAILED"

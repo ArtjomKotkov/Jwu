@@ -480,6 +480,26 @@ class PR(BaseModel):
     # статусы CI-сборок по head-коммиту (build-status API); пусто, если не запрашивались:
     builds: list[BuildStatus] = Field(default_factory=list)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def build_state(self) -> str:
+        """Сводный статус сборок PR: FAILED | INPROGRESS | SUCCESSFUL | "" (сборок нет).
+
+        Красная сборка — такое же состояние PR, как конфликт: она видна на странице
+        PR и блокирует мерж. Поэтому сводим список статусов в одно слово, которым
+        оперируют состояние PR, сигнатура снапшота (дельты) и дневной анализ.
+        Приоритет: хоть одна упавшая → FAILED; иначе хоть одна идущая → INPROGRESS;
+        иначе все зелёные → SUCCESSFUL.
+        """
+        states = {b.state for b in self.builds}
+        if "FAILED" in states:
+            return "FAILED"
+        if "INPROGRESS" in states:
+            return "INPROGRESS"
+        if states and states <= {"SUCCESSFUL"}:
+            return "SUCCESSFUL"
+        return ""
+
     @classmethod
     def from_bitbucket(cls, raw: dict) -> "PR":
         from_ref = raw.get("fromRef", {}) or {}

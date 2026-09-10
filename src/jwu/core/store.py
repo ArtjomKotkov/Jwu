@@ -267,6 +267,8 @@ def _pr_signature(pr: PR) -> dict:
         "latest_commit": pr.latest_commit,
         "conflicted": pr.conflicted,
         "reviewers": {r.name: r.approved for r in pr.reviewers},
+        # Сводный статус CI по head-коммиту: переход в FAILED/из FAILED — отдельные дельты.
+        "build_state": pr.build_state,
     }
 
 
@@ -1172,6 +1174,19 @@ class Store:
                 deltas.append(Delta(
                     key=pr_key, kind="new_conflict", summary=title,
                     detail="появился merge-конфликт",
+                ))
+            # Сборки: сообщаем о ПЕРЕХОДЕ, а не о состоянии — красный билд, который
+            # красный третий синк подряд, уже известен. Старые снапшоты без
+            # build_state (до 1.10) сравниваются как «сборок не было».
+            cur_build = cur.get("build_state") or ""
+            prev_build = prev.get("build_state") or ""
+            if cur_build == "FAILED" and prev_build != "FAILED":
+                deltas.append(Delta(
+                    key=pr_key, kind="build_failed", summary=title, detail="сборка упала",
+                ))
+            elif prev_build == "FAILED" and cur_build == "SUCCESSFUL":
+                deltas.append(Delta(
+                    key=pr_key, kind="build_fixed", summary=title, detail="сборка позеленела",
                 ))
 
         deltas.extend(self._gone_deltas(run_id))

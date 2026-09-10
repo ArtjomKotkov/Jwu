@@ -404,7 +404,7 @@ jwu install-claude-skills                   # каталог скиллов — 
 | `jwu sync` | разовый синк вью + PR, снапшот в память, расчёт дельт |
 | `jwu tasks --view mine\|mentions` | список задач (есть `--jql`) |
 | `jwu task ABC-123` | полная карточка: описание, комменты, связанные ветки и PR (у GitHub ключ — `repo#42`) |
-| `jwu prs --view mine\|review` / `jwu pr <id>` | PR с ревьюерами и статусом конфликта |
+| `jwu prs --view mine\|review` / `jwu pr <id>` | PR с ревьюерами, статусом конфликта и сводным статусом CI-сборки (`build_state`); красный билд — состояние PR и дельта `build_failed` / `build_fixed` |
 | `jwu note KEY "…"` / `jwu notes KEY` | заметки по задаче |
 | `jwu issue create -p PROJ -s "…" -F ./task.md` | завести задачу: поля сверяются с `createmeta` проекта, показываются похожие задачи, `--dry-run` печатает payload, без `--yes` ничего не создаётся; `--from-job <ID>` собирает описание из лога работы |
 | `jwu issue link KEY1 KEY2 --type Relates` | связать задачи (`jwu issue link-types` — какие типы знает инстанс) |

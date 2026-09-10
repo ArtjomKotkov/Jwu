@@ -525,3 +525,47 @@ def test_rules_are_isolated_and_removed_with_workspace(store):
         "SELECT COUNT(*) FROM workspace_rules WHERE workspace_id = ?",
         (home.id,),
     ).fetchone()[0] == 0
+
+
+def _pr_with_build(state: str, pr_id: int = 7) -> PR:
+    from jwu.core.models import BuildStatus
+
+    builds = [BuildStatus(state=state, key="ci", name="tests", url="https://ci/1")] if state else []
+    return PR(id=pr_id, title="T", project="PROJ", repository="repo",
+              latest_commit="abc", builds=builds)
+
+
+def test_build_failed_and_fixed_deltas(store):
+    """Сборка — переход, а не состояние: FAILED даёт build_failed один раз, возврат в
+    SUCCESSFUL — build_fixed; повторно красный билд не шумит."""
+    run1 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run1, _pr_with_build("SUCCESSFUL"), ["mine"])
+    store.compute_changes(run1)
+
+    run2 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run2, _pr_with_build("FAILED"), ["mine"])
+    kinds = [d.kind for d in store.compute_changes(run2)]
+    assert kinds.count("build_failed") == 1
+    assert "build_fixed" not in kinds
+
+    run3 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run3, _pr_with_build("FAILED"), ["mine"])
+    assert "build_failed" not in [d.kind for d in store.compute_changes(run3)]
+
+    run4 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run4, _pr_with_build("SUCCESSFUL"), ["mine"])
+    assert "build_fixed" in [d.kind for d in store.compute_changes(run4)]
+
+
+def test_old_snapshot_without_build_state_counts_as_no_builds(store):
+    """Снапшоты до 1.10 не знают build_state: первый красный билд после обновления
+    всё равно должен дать дельту, а зелёный — нет."""
+    run1 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run1, _pr_with_build(""), ["mine"])
+    store.conn.execute("UPDATE pr_snapshots SET signature = ?", ('{"comment_count": 0}',))
+    store.conn.commit()
+    store.compute_changes(run1)
+
+    run2 = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run2, _pr_with_build("FAILED"), ["mine"])
+    assert "build_failed" in [d.kind for d in store.compute_changes(run2)]

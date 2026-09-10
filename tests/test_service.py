@@ -853,3 +853,34 @@ def test_create_issue_with_unknown_type_never_posts(tmp_path):
         svc.close()
     assert res["ok"] is False and not post.called
     assert "Task, Bug" in res["check"]["problems"][0]
+
+
+@respx.mock
+def test_sync_stores_builds_and_reports_red_build(tmp_path):
+    """Синк тянет статусы сборок по head-коммиту в снапшот PR; падение сборки между
+    синками — дельта build_failed, а в памяти у PR виден build_state."""
+    respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
+        return_value=httpx.Response(200, json=bitbucket_dashboard_raw([bitbucket_pr_raw(pr_id=42)]))
+    )
+    respx.get(f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/42/merge").mock(
+        return_value=httpx.Response(200, json=bitbucket_merge_raw())
+    )
+    respx.get(f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/42/commits").mock(
+        return_value=httpx.Response(200, json=bitbucket_commits_raw())
+    )
+    builds = respx.get(f"{BB}/rest/build-status/1.0/commits/{'abc123def' + '0' * 30}")
+    builds.side_effect = [
+        httpx.Response(200, json={"values": [{"state": "SUCCESSFUL", "key": "ci", "url": "u"}]}),
+        httpx.Response(200, json={"values": [{"state": "FAILED", "key": "ci", "url": "u"}]}),
+    ]
+
+    svc = _service(tmp_path)
+    try:
+        r1 = svc.sync_section("prs_mine")
+        assert not any(d.kind == "build_failed" for d in r1.deltas)
+        r2 = svc.sync_section("prs_mine")
+        assert [d.kind for d in r2.deltas if d.kind.startswith("build")] == ["build_failed"]
+        latest = svc.store.latest_prs("mine")
+        assert latest[0].build_state == "FAILED"
+    finally:
+        svc.close()
