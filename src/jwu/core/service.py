@@ -1169,11 +1169,29 @@ class Service:
         except Exception:  # noqa: BLE001 — конфликт не критичен, PR полезен и без него
             pass
 
-    def prs(self, view: str = "review", *, with_conflicts: bool = True) -> list[PR]:
+    def _fill_builds(self, pr: PR) -> None:
+        """Догрузить head-коммит и статусы CI-сборок PR (два запроса; ошибки — не критичны)."""
+        client = self.pr_client
+        if client is None or not (pr.project and pr.repository):
+            return
+        try:
+            if not pr.latest_commit:
+                pr.latest_commit = client.latest_commit(pr.project, pr.repository, pr.id)
+            if pr.latest_commit:
+                pr.builds = client.build_statuses(
+                    pr.latest_commit, project=pr.project, repo=pr.repository
+                )
+        except Exception:  # noqa: BLE001 — без сборок PR всё равно полезен
+            pr.builds = []
+
+    def prs(self, view: str = "review", *, with_conflicts: bool = True,
+            with_builds: bool = True) -> list[PR]:
         prs = self._require_prs().dashboard_prs(view)
-        if with_conflicts:
-            for pr in prs:
+        for pr in prs:
+            if with_conflicts:
                 self._fill_merge_status(pr)
+            if with_builds:
+                self._fill_builds(pr)
         return prs
 
     def my_reviews(self, *, on: str | None = None) -> list[PR]:
@@ -1253,13 +1271,9 @@ class Service:
         for ref, pr in pr_seen.items():
             if pr.project and pr.repository:
                 self._fill_merge_status(pr)
-                if not pr.latest_commit:
-                    try:
-                        pr.latest_commit = self.pr_client.latest_commit(
-                            pr.project, pr.repository, pr.id
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
+                # Сборки по head-коммиту едут в снапшот вместе с PR: красный билд — такое
+                # же состояние PR, как конфликт, и дельта «сборка упала» считается по нему.
+                self._fill_builds(pr)
             self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(ref, [])))
         # Подтянуть статус/assignee задач, на которые ссылаются PR — нужно для
         # колонок «Назначен»/«Статус» в дашборде. PR на чужой релизной задаче

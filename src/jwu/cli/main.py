@@ -1501,6 +1501,7 @@ def _render_prs(prs: list[PR]) -> None:
     else:
         table.add_column("Состояние")
         table.add_column("Конфликт")
+        table.add_column("Сборка")
     table.add_column("Title")
     for pr in prs:
         if mine:
@@ -1509,7 +1510,8 @@ def _render_prs(prs: list[PR]) -> None:
             table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", f"{mark}{when}", pr.title)
         else:
             conflict = "—" if pr.conflicted is None else ("[red]да[/red]" if pr.conflicted else "нет")
-            table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", pr.state, conflict, pr.title)
+            build = _build_icon(pr.build_state) if pr.build_state else "—"
+            table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", pr.state, conflict, build, pr.title)
     console.print(table)
     console.print(f"[dim]Всего: {len(prs)}[/dim]")
 
@@ -2026,7 +2028,8 @@ _DAY_PROMPT = """## Что нужно сделать
 Сочетай ДВА среза: дельты (что изменилось) И текущее состояние PR/задач (даже без свежей дельты состояние может требовать действия).
 Для каждого моего PR/задачи — конкретный следующий шаг. Ориентиры:
 - PR `состояние: конфликт` → поправить merge-конфликт (приоритет, если апрувы собраны).
-- PR `апрувы собраны`, без NEEDS_WORK/конфликта, а задача не на тестах → перевести задачу на тесты.
+- PR `состояние: красный билд` (или дельта `build_failed`) → разобрать падение сборки (`jwu build <PR>`), починить; `build_fixed` — сборка снова зелёная.
+- PR `апрувы собраны`, без NEEDS_WORK/конфликта/красного билда, а задача не на тестах → перевести задачу на тесты.
 - PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
 - PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
 - Упоминание с пометкой `· новое` → прочитать, понять, что от меня хотят, и ответить.
@@ -2038,6 +2041,8 @@ def _pr_state(pr: PR) -> str:
     """Короткая готовность PR для эвристик: что мешает мержу прямо сейчас."""
     if pr.conflicted:
         return "конфликт"
+    if pr.build_state == "FAILED":
+        return "красный билд"
     if any((r.status or "") == "NEEDS_WORK" for r in pr.reviewers):
         return "есть NEEDS_WORK"
     if not pr.reviewers:
@@ -2054,8 +2059,13 @@ def _pr_line(pr: PR) -> str:
     ) or "—"
     conflict = "КОНФЛИКТ" if pr.conflicted else ("ok" if pr.conflicted is False else "?")
     return (f'- {pr.project}/{pr.repository}#{pr.id} "{pr.title}" — {conflict}; '
-            f"состояние: {_pr_state(pr)}; ревью: {revs}; комментов: {pr.comment_count}; "
+            f"состояние: {_pr_state(pr)}; сборка: {_BUILD_RU.get(pr.build_state, 'нет')}; "
+            f"ревью: {revs}; комментов: {pr.comment_count}; "
             f"обновлён: {fmt_ago(pr.updated)}")
+
+
+# Сводный статус сборок PR словами — для контекста дневного анализа и таблиц.
+_BUILD_RU = {"FAILED": "красная", "INPROGRESS": "идёт", "SUCCESSFUL": "зелёная", "": "нет"}
 
 
 def _render_day_context_md(ctx: DayContext) -> str:
