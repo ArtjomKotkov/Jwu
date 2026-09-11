@@ -33,16 +33,30 @@ def test_select_notable_filters_and_dedupes():
     assert [d.kind for d in notify.select_notable(deltas, kinds=["gone"])] == ["gone"]
 
 
-def test_format_message_escapes_html_and_lists_mentions():
+def test_format_message_groups_links_and_escapes():
     note = notify.Notification(
         workspace="work",
-        deltas=[Delta(key="P/r#1", kind="new_conflict", summary="<fix> & go", detail="появился")],
+        deltas=[
+            Delta(key="P/r#1", kind="reviewer_needs_work", summary="<fix> & go", detail="bob: needs work"),
+            Delta(key="P/r#2", kind="new_conflict", summary="second", detail="появился merge-конфликт"),
+            Delta(key="P/r#3", kind="new_conflict", summary="third"),
+        ],
         mentions=[Mention(task_key="PROJ-9", author="Ann", text="[~me] глянь <это>")],
     )
-    text = notify.format_message(note)
-    assert text.startswith("<b>jwu · work</b>")
-    assert "⚠️ конфликт: <b>P/r#1</b> — появился <i>&lt;fix&gt; &amp; go</i>" in text
-    assert "📣 упоминание: <b>PROJ-9</b> от Ann — [~me] глянь &lt;это&gt;" in text
+    links = notify.Links(jira="https://jira.x", bitbucket="https://git.x")
+    text = notify.format_message(note, links=links)
+    assert text.startswith("🔔 <b>jwu · work</b>")
+    # группы в порядке блокеров: конфликт раньше needs work; заголовок задачи — отдельной строкой
+    assert text.index("⚠️ конфликт") < text.index("✍️ needs work")
+    assert '• <a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a>\n   <i>second</i>' in text
+    assert "появился" not in text                      # деталь, дублирующая заголовок группы, убрана
+    assert '<a href="https://git.x/projects/P/repos/r/pull-requests/1">P/r#1</a> — bob' in text
+    assert "<i>&lt;fix&gt; &amp; go</i>" in text
+    assert '📣 упоминания\n• <a href="https://jira.x/browse/PROJ-9">PROJ-9</a> — Ann\n   <i>[~me] глянь &lt;это&gt;</i>' in text
+    # без хостов — жирный ключ без ссылки
+    assert "<b>P/r#1</b>" in notify.format_message(note)
+    assert notify.key_url("dndeck/ui#5", notify.Links(github="https://github.com")) == "https://github.com/dndeck/ui/pull/5"
+    assert notify.key_url("странный ключ", links) == ""
     assert not notify.Notification(workspace="w")  # пустое уведомление — ложь
 
 

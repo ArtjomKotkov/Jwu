@@ -20,6 +20,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Iterable, Optional
 
 import httpx
@@ -89,20 +90,90 @@ def _short(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def format_message(note: Notification) -> str:
-    """HTML-текст для Telegram: одна строка на событие, жирный ключ, кратко."""
-    lines = [f"<b>jwu · {html.escape(note.workspace)}</b>"]
+@dataclass
+class Links:
+    """Куда вести ссылки в уведомлении: задачи — в трекер, PR — в хостинг."""
+
+    jira: str = ""        # https://jira.example.com → /browse/KEY
+    bitbucket: str = ""   # https://git.example.com → /projects/P/repos/r/pull-requests/N
+    github: str = ""      # https://github.com → /owner/repo/pull/N
+
+
+PR_KEY_RE = re.compile(r"^(?P<project>[^/#]+)/(?P<repo>[^#]+)#(?P<id>\d+)$")
+
+
+def key_url(key: str, links: Optional[Links]) -> str:
+    """URL для ключа задачи или PR; пусто — если хостов нет или ключ не разобрать."""
+    if links is None:
+        return ""
+    m = PR_KEY_RE.match(key)
+    if m:
+        if links.bitbucket:
+            return (f"{links.bitbucket}/projects/{m.group('project')}/repos/{m.group('repo')}"
+                    f"/pull-requests/{m.group('id')}")
+        if links.github:
+            return f"{links.github}/{m.group('project')}/{m.group('repo')}/pull/{m.group('id')}"
+        return ""
+    if re.match(r"^[A-Z][A-Z0-9]+-\d+$", key) and links.jira:
+        return f"{links.jira}/browse/{key}"
+    return ""
+
+
+def _key_html(key: str, links: Optional[Links]) -> str:
+    url = key_url(key, links)
+    label = html.escape(key)
+    return f'<a href="{html.escape(url, quote=True)}">{label}</a>' if url else f"<b>{label}</b>"
+
+
+def _clean_detail(kind: str, detail: str) -> str:
+    """Деталь без повторения того, что уже сказано заголовком группы."""
+    text = " ".join((detail or "").split())
+    if kind == "reviewer_needs_work":
+        text = text.replace(": needs work", "")
+    if kind == "new_conflict" and text.startswith("появился"):
+        text = ""
+    if kind == "build_failed" and text == "сборка упала":
+        text = ""
+    return text
+
+
+# Порядок групп в сообщении: сначала блокеры мержа, потом остальное.
+_GROUP_ORDER = ["new_conflict", "build_failed", "reviewer_needs_work", "new_pr_task",
+                "returned_from_testing", "qa_comment", "new_pr_comment", "status_change"]
+
+
+def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
+    """HTML для Telegram: заголовок контура, группы по виду события, ключи — ссылками.
+
+    Одна строка на событие раньше не читалась: тип, ключ, деталь и заголовок задачи
+    слипались. Теперь событие — это две строки: ключ (ссылкой) с деталью и, ниже,
+    заголовок курсивом; события одного вида собраны под общим заголовком.
+    """
+    stamp = datetime.now().strftime("%d.%m %H:%M")
+    lines = [f"🔔 <b>jwu · {html.escape(note.workspace)}</b>  <i>{stamp}</i>"]
+    by_kind: dict[str, list[Delta]] = {}
     for d in note.deltas:
-        label = NOTABLE_KINDS.get(d.kind, d.kind)
-        detail = f" — {html.escape(_short(d.detail, 80))}" if d.detail else ""
-        title = f" <i>{html.escape(_short(d.summary, 90))}</i>" if d.summary else ""
-        lines.append(f"{label}: <b>{html.escape(d.key)}</b>{detail}{title}")
-    for m in note.mentions:
-        who = html.escape(m.author or "кто-то")
-        lines.append(
-            f"📣 упоминание: <b>{html.escape(m.task_key)}</b> от {who}"
-            f" — {html.escape(_short(m.text, 160))}"
-        )
+        by_kind.setdefault(d.kind, []).append(d)
+    order = [k for k in _GROUP_ORDER if k in by_kind] + [k for k in by_kind if k not in _GROUP_ORDER]
+    for kind in order:
+        items = by_kind[kind]
+        lines.append("")
+        lines.append(f"{NOTABLE_KINDS.get(kind, kind)}")
+        for d in items:
+            detail = _clean_detail(kind, d.detail)
+            head = f"• {_key_html(d.key, links)}"
+            if detail:
+                head += f" — {html.escape(_short(detail, 90))}"
+            lines.append(head)
+            if d.summary:
+                lines.append(f"   <i>{html.escape(_short(d.summary, 100))}</i>")
+    if note.mentions:
+        lines.append("")
+        lines.append("📣 упоминания")
+        for m in note.mentions:
+            who = html.escape(m.author or "кто-то")
+            lines.append(f"• {_key_html(m.task_key, links)} — {who}")
+            lines.append(f"   <i>{html.escape(_short(m.text, 180))}</i>")
     return "\n".join(lines)
 
 
@@ -186,6 +257,13 @@ class TelegramNotifier:
         return (resp.json() or {}).get("result") or {}
 
 
+def links_from_config(cfg: "Config") -> Links:
+    """Хосты для ссылок в уведомлении — из конфига контура."""
+    return Links(jira=(cfg.jira.base_url or "").rstrip("/"),
+                 bitbucket=(cfg.bitbucket.base_url or "").rstrip("/"),
+                 github=(cfg.github.web_url or "").rstrip("/"))
+
+
 def notifier_from_config(cfg: "Config") -> Optional[TelegramNotifier]:
     """Собрать отправщик из конфига воркспейса; None — уведомления не настроены."""
     from .config import telegram_token
@@ -208,11 +286,12 @@ def build_notification(workspace: str, deltas: Iterable[Delta], mentions: Iterab
     )
 
 
-def send_after_sync(notifier: TelegramNotifier, note: Notification) -> bool:
+def send_after_sync(notifier: TelegramNotifier, note: Notification,
+                    *, links: Optional[Links] = None) -> bool:
     """Отправить, если есть что. True — ушло."""
     if not note:
         return False
-    notifier.send(format_message(note))
+    notifier.send(format_message(note, links=links))
     return True
 
 

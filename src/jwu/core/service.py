@@ -1678,7 +1678,8 @@ class Service:
                 return
             slug = self.workspace.slug if self.workspace else ""
             note = notify.build_notification(slug, result.deltas, result.new_mentions)
-            result.notified = notify.send_after_sync(sender, note)
+            result.notified = notify.send_after_sync(sender, note,
+                                                     links=notify.links_from_config(self.cfg))
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning("уведомление после синка не ушло: %s", exc)
 
