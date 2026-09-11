@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import tempfile
 from datetime import datetime
@@ -41,6 +42,7 @@ from .config import (
 )
 from .github import GitHubClient
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
+from . import notify
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
     Attachment,
@@ -64,6 +66,9 @@ from .models import (
     WorkspaceRule,
 )
 from .store import Store
+
+# Маркер «ещё не вычисляли» для лениво создаваемых полей сервиса.
+_UNSET = object()
 
 _UNSAFE_NAME_RE = re.compile(r"[^\w.\- ]+", re.UNICODE)
 # Ключ Jira-задачи в имени ветки/заголовке PR (напр. PROJ-123 / ABC-4567).
@@ -160,6 +165,10 @@ class SyncResult:
     run_id: int
     counts: dict[str, int]
     deltas: list[Delta]
+    # Упоминания, впервые увиденные в этом синке: они не дельты (см. collect_mentions),
+    # но уведомить о них надо так же, как о конфликте.
+    new_mentions: list[Mention] = field(default_factory=list)
+    notified: bool = False  # ушло ли уведомление после этого синка
 
 
 @dataclass
@@ -401,6 +410,9 @@ class Service:
         self.store = store
         self._me: dict | None = None      # кэш /myself на время жизни сервиса
         self._cred_fp: str | None = None  # кэш отпечатка кредов
+        self._notifier: object = _UNSET   # отправщик уведомлений (лениво, см. notifier())
+        # Выключатель хука после синка: тестам и разовым скриптам уведомления не нужны.
+        self.notifications_enabled = True
 
     # --- какой провайдер перед нами --------------------------------------- #
 
@@ -551,6 +563,9 @@ class Service:
         return cls(cfg, None, bitbucket, store, jenkins, workspace=workspace)
 
     def close(self) -> None:
+        if isinstance(self._notifier, notify.TelegramNotifier):
+            self._notifier.close()
+            self._notifier = _UNSET
         clients = [self.tasks_client, self.pr_client, self.sdesk, self.jenkins]
         seen: list[int] = []
         for client in clients:
@@ -1358,11 +1373,13 @@ class Service:
             views += ["prs:mine", "prs:review"]
         run_id = self.store.start_sync_run(views)
         counts: dict[str, int] = {}
+        new_mentions: list[Mention] = []
         if self.tasks_client is not None:
             counts |= self._sync_tasks(run_id, ["mine"])
             # Упоминания живут отдельной сущностью, вне снапшотов и дельт (см.
             # collect_mentions): их «изменение» — это появление нового упоминания.
-            counts["mentions"] = len(self.collect_mentions())
+            new_mentions = self.collect_mentions()
+            counts["mentions"] = len(new_mentions)
         if self.pr_client is not None:
             counts |= self._sync_prs(run_id, ["mine", "review"])
         # counts фиксируем ДО compute_changes: детекция исчезновения (gone/pr_gone)
@@ -1371,7 +1388,10 @@ class Service:
         self.store.finish_sync_run(run_id, counts)
         deltas = self.store.compute_changes(run_id)
         self.store.add_pending_changes(run_id, deltas)  # копим до явного закрытия
-        return SyncResult(run_id=run_id, counts=counts, deltas=deltas)
+        result = SyncResult(run_id=run_id, counts=counts, deltas=deltas,
+                            new_mentions=new_mentions)
+        self._notify_after_sync(result)
+        return result
 
     def sync_section(self, section: str) -> SyncResult:
         """Синк одной секции/вкладки: mine | mentions | prs_mine | prs_review."""
@@ -1398,7 +1418,34 @@ class Service:
         self.store.finish_sync_run(run_id, counts)  # counts до compute_changes (см. sync())
         deltas = self.store.compute_changes(run_id)
         self.store.add_pending_changes(run_id, deltas)  # копим до явного закрытия
-        return SyncResult(run_id=run_id, counts=counts, deltas=deltas)
+        result = SyncResult(run_id=run_id, counts=counts, deltas=deltas)
+        self._notify_after_sync(result)
+        return result
+
+    # --- уведомления после синка ------------------------------------------ #
+
+    def notifier(self):
+        """Отправщик уведомлений по конфигу воркспейса (None — не настроен). Кэшируется."""
+        if self._notifier is _UNSET:
+            try:
+                self._notifier = notify.notifier_from_config(self.cfg)
+            except Exception:  # noqa: BLE001 — кривой конфиг уведомлений не ломает синк
+                self._notifier = None
+        return self._notifier
+
+    def _notify_after_sync(self, result: SyncResult) -> None:
+        """Хук после ЛЮБОГО сетевого синка: отобрать важное и отправить. Никогда не бросает."""
+        if not self.notifications_enabled:
+            return
+        try:
+            sender = self.notifier()
+            if sender is None:
+                return
+            slug = self.workspace.slug if self.workspace else ""
+            note = notify.build_notification(slug, result.deltas, result.new_mentions)
+            result.notified = notify.send_after_sync(sender, note)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("уведомление после синка не ушло: %s", exc)
 
     def pr_detail(self, project: str | None, repo: str | None, pr_id: int) -> "PRDetail":
         """Лениво: PR + статус конфликта + комменты (с дифф-контекстом) + коммиты."""

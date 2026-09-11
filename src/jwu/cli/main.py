@@ -17,7 +17,8 @@ from rich.table import Table
 from ..core.bitbucket import BitbucketError
 from ..core.github import GitHubError
 from ..core import secrets
-from ..core.config import ConfigError, db_path, load_config, save_config
+from ..core.config import ConfigError, db_path, load_config, save_config, telegram_token
+from ..core import notify
 from ..core.dates import fmt_ago, fmt_dt
 from ..core import daemon
 from ..core.maintenance import (
@@ -456,6 +457,10 @@ def configure_main(
     jenkins_user: Optional[str] = typer.Option(None, "--jenkins-user"),
     jenkins_token_opt: Optional[str] = typer.Option(None, "--jenkins-token",
         help="API-токен Jenkins (профиль → Security → API Token)."),
+    telegram_chat: Optional[str] = typer.Option(None, "--telegram-chat",
+        help="chat_id Telegram для уведомлений после синка (пусто — выключить)."),
+    telegram_token_opt: Optional[str] = typer.Option(None, "--telegram-token",
+        help="Токен бота Telegram (от @BotFather)."),
     db_path_opt: Optional[str] = typer.Option(None, "--db-path"),
 ) -> None:
     """Визард настройки (когда вызвано без подкоманды export/import)."""
@@ -503,7 +508,9 @@ def configure_main(
         if github_api is not None: cfg.github.api_url = github_api.rstrip("/")
         if github_web is not None: cfg.github.web_url = github_web.rstrip("/")
         if db_path_opt is not None: cfg.storage.db_path = db_path_opt
+        if telegram_chat is not None: cfg.telegram.chat_id = telegram_chat.strip()
         new_secrets = {
+            "telegram.token": telegram_token_opt,
             "jira.token": jira_token_opt,
             "jira.password": jira_password,
             "jira.gate_password": gate_password,
@@ -530,7 +537,8 @@ def configure_main(
             "Веб-хост GitHub", cfg.github.web_url)).rstrip("/")
         cur_db = cfg.storage.db_path or str(db_path(cfg))
         cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
-        new_secrets = {"github.token": gtok}
+        tg_tok = _prompt_telegram(cfg, telegram_chat, telegram_token_opt)
+        new_secrets = {"github.token": gtok, "telegram.token": tg_tok}
     elif provider == "local":
         cur_db = cfg.storage.db_path or str(db_path(cfg))
         cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
@@ -589,7 +597,9 @@ def configure_main(
             if cfg.jenkins.username else "")
         cur_db = cfg.storage.db_path or str(db_path(cfg))
         cfg.storage.db_path = db_path_opt or _prompt_default("Путь до БД", cur_db)
+        tg_tok = _prompt_telegram(cfg, telegram_chat, telegram_token_opt)
         new_secrets = {
+            "telegram.token": tg_tok,
             "jira.token": jtok,
             "jira.password": jpw,
             "jira.gate_password": gpw,
@@ -1711,6 +1721,78 @@ def changes(
         _emit_json([d.model_dump() for d in deltas])
     else:
         _render_deltas(deltas)
+
+
+def _prompt_telegram(cfg, chat_opt: Optional[str], token_opt: Optional[str]) -> str:
+    """Уведомления в Telegram в интерактивном визарде: chat_id (Enter — без них) и токен."""
+    cfg.telegram.chat_id = (chat_opt if chat_opt is not None else _prompt_default(
+        "Telegram chat_id для уведомлений (Enter — без уведомлений)", cfg.telegram.chat_id
+    )).strip()
+    if not cfg.telegram.chat_id:
+        return ""
+    if token_opt is not None:
+        return token_opt
+    return _prompt_default("Токен Telegram-бота (Enter — оставить прежний)", "", secret=True)
+
+
+# --------------------------------------------------------------------------- #
+# notify: уведомления после синка (Telegram)
+# --------------------------------------------------------------------------- #
+
+notify_app = typer.Typer(
+    help="Уведомления после синка в Telegram: проверка настройки и тестовое сообщение."
+)
+app.add_typer(notify_app, name="notify")
+
+
+@notify_app.command("status")
+def notify_status(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Настроены ли уведомления в этом воркспейсе и какие события уходят."""
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        cfg = workspaces.config_for_workspace(store, ws)
+        token = bool(telegram_token(cfg))
+        chat = cfg.telegram.chat_id
+    info = {
+        "workspace": ws.slug, "chat_id": chat, "token": token,
+        "enabled": bool(chat and token),
+        "kinds": list(notify.DEFAULT_KINDS) + ["new_mention"],
+    }
+    if json_out:
+        _emit_json(info)
+        return
+    if info["enabled"]:
+        console.print(f"[green]Уведомления включены[/green] · чат {chat}")
+    else:
+        missing = [n for n, ok in (("chat_id", bool(chat)), ("токен бота", token)) if not ok]
+        console.print(f"[yellow]Уведомления выключены[/yellow] — не задано: {', '.join(missing)}. "
+                      f"Настроить: [cyan]jwu configure --non-interactive --telegram-chat <id> "
+                      f"--telegram-token <token>[/cyan]")
+    console.print("События: " + ", ".join(
+        notify.NOTABLE_KINDS.get(k, k) for k in notify.DEFAULT_KINDS) + ", 📣 упоминание")
+
+
+@notify_app.command("test")
+def notify_test(
+    text: str = typer.Option("jwu: тестовое уведомление ✅", "--text", help="Текст сообщения."),
+) -> None:
+    """Отправить тестовое сообщение в настроенный чат (проверка токена и chat_id)."""
+    with _open_store() as store:
+        ws = _resolve_workspace(store)
+        cfg = workspaces.config_for_workspace(store, ws)
+        sender = notify.notifier_from_config(cfg)
+        if sender is None:
+            err.print("[red]Уведомления не настроены[/red] — см. jwu notify status")
+            raise typer.Exit(code=1)
+        try:
+            me = sender.get_me()
+            sender.send(f"<b>jwu · {ws.slug}</b>\n{text}")
+        except notify.NotifyError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        finally:
+            sender.close()
+    console.print(f"[green]Отправлено[/green] ботом @{me.get('username', '?')} в чат {cfg.telegram.chat_id}")
 
 
 # --------------------------------------------------------------------------- #
