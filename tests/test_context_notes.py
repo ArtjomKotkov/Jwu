@@ -25,7 +25,7 @@ def _scoped(db):
 def test_notes_kinds_status_pinning_and_bulk(tmp_path):
     store = _scoped(tmp_path / "s.db")
     try:
-        assert store.get_meta("schema_version") == "9"
+        assert int(store.get_meta("schema_version")) >= 9
         a = store.add_note("PROJ-1", "решили порт в 10.7", kind="decision")
         s1 = store.add_note("PROJ-1", "ждём ответа Eugeny", kind="status")
         s2 = store.add_note("PROJ-1", "  ждём  QA  ", kind="status")

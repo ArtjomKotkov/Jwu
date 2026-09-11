@@ -117,6 +117,12 @@ def test_archive_mentions_respects_seen(tmp_path):
         assert {m.task_key for m in store.list_mentions()} == {"A-1", "A-3"}
         assert store.archive_mentions(older_than_days=30, seen_only=False) == 1
         assert [m.task_key for m in store.list_mentions()] == ["A-1"]
+        # архив — не удаление: повторный синк с теми же комментариями не заводит их заново
+        again = store.add_mentions([
+            Mention(task_key="A-2", comment_id="2", author="Bob", text="[~me] старое", created=_iso(60), summary="s2"),
+            Mention(task_key="A-3", comment_id="3", author="Cid", text="[~me] старое непрочитанное", created=_iso(90), summary="s3"),
+        ])
+        assert again == [] and [m.task_key for m in store.list_mentions()] == ["A-1"]
     finally:
         store.close()
 
