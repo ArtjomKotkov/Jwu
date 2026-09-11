@@ -183,8 +183,12 @@ def test_announce_start_sends_once_per_chat(tmp_path, monkeypatch):
         def __init__(self, chat):
             self.chat_id = chat
 
-        def send(self, text):
+        def set_commands(self):
+            return True
+
+        def send(self, text, **kw):
             sent.append((self.chat_id, text))
+            assert kw.get("keyboard") is True
 
         def close(self):
             pass
@@ -196,7 +200,7 @@ def test_announce_start_sends_once_per_chat(tmp_path, monkeypatch):
     assert "work, gh" in sent[0][1]
     # ошибка Telegram не мешает старту
     class _Broken(_Sender):
-        def send(self, text):
+        def send(self, text, **kw):
             raise RuntimeError("нет сети")
 
     monkeypatch.setattr(notify, "notifier_from_config", lambda cfg: _Broken("7"))

@@ -37,6 +37,20 @@ KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+|[\w.-]+/[\w.-]+#\d+)\b")
 # Telegram режет сообщение на 4096 символов; оставляем запас на разметку.
 MAX_MESSAGE = 3800
 
+# Команды бота: меню на «/» (setMyCommands) и постоянная клавиатура под полем ввода.
+BOT_COMMANDS = [
+    {"command": "sync", "description": "Синк всех контуров сейчас"},
+    {"command": "status", "description": "Последний проход и что накопилось"},
+    {"command": "stuck", "description": "Что застряло по порогам"},
+    {"command": "mentions", "description": "Непрочитанные упоминания"},
+    {"command": "help", "description": "Как пользоваться"},
+]
+KEYBOARD = {
+    "keyboard": [["/sync", "/status"], ["/stuck", "/mentions"]],
+    "resize_keyboard": True, "is_persistent": True,
+    "input_field_placeholder": "PROJ-1 текст → заметка; ответ на уведомление → заметка",
+}
+
 # Дельты, о которых стоит будить человека. Остальное (апрувы чужих PR, новые задачи в
 # выборке, исчезновение из списка) подождёт дашборда.
 NOTABLE_KINDS: dict[str, str] = {
@@ -212,18 +226,28 @@ class TelegramNotifier:
         if self._owns_client:
             self._client.close()
 
-    def send(self, text: str) -> list[int]:
-        """Отправить текст (при необходимости — несколькими сообщениями). Вернуть их id."""
+    def send(self, text: str, *, reply_to: Optional[int] = None,
+             keyboard: bool = False) -> list[int]:
+        """Отправить текст (при необходимости — несколькими сообщениями). Вернуть их id.
+
+        ``reply_to`` — ответить на конкретное сообщение (подтверждение заметки, ответ на
+        команду), чтобы в чате было видно, к чему это. ``keyboard`` — приложить постоянную
+        клавиатуру с командами (к последнему куску).
+        """
         ids: list[int] = []
-        for chunk in split_message(text):
+        chunks = split_message(text)
+        for i, chunk in enumerate(chunks):
+            payload: dict = {
+                "chat_id": self.chat_id, "text": chunk, "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            if reply_to is not None:
+                payload["reply_to_message_id"] = int(reply_to)
+                payload["allow_sending_without_reply"] = True
+            if keyboard and i == len(chunks) - 1:
+                payload["reply_markup"] = KEYBOARD
             try:
-                resp = self._client.post(
-                    f"{self._api}/bot{self.token}/sendMessage",
-                    json={
-                        "chat_id": self.chat_id, "text": chunk, "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                )
+                resp = self._client.post(f"{self._api}/bot{self.token}/sendMessage", json=payload)
             except httpx.HTTPError as exc:
                 raise NotifyError(f"Telegram недоступен: {exc}") from exc
             if resp.status_code >= 400:
@@ -232,6 +256,15 @@ class TelegramNotifier:
             body = resp.json() if resp.content else {}
             ids.append(int((body.get("result") or {}).get("message_id", 0) or 0))
         return ids
+
+    def set_commands(self) -> bool:
+        """Меню команд бота (подсказки на «/»). Ошибка не критична."""
+        try:
+            resp = self._client.post(f"{self._api}/bot{self.token}/setMyCommands",
+                                     json={"commands": BOT_COMMANDS})
+        except httpx.HTTPError:
+            return False
+        return resp.status_code < 400
 
     def get_updates(self, offset: Optional[int] = None, *, limit: int = 100) -> list[dict]:
         """Входящие сообщения боту (long polling не используем — демон и так периодический)."""
