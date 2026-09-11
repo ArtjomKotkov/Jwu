@@ -45,7 +45,7 @@ from .jenkins import JenkinsClient, JenkinsError, parse_build_url
 from . import notify
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
-    PR_TASK_STATES, PRTask, check_task_text,
+    PR_TASK_STATES, PRAttachment, PRTask, check_task_text,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
     GITHUB_SHORT_REF_RE,
@@ -1533,6 +1533,41 @@ class Service:
         pr.tasks_open = sum(1 for t in tasks if not t.resolved)
         pr.tasks_resolved = sum(1 for t in tasks if t.resolved)
         return PRDetail(pr=pr, comments=comments, commits=commits)
+
+    def pr_attachments_dir(self, project: str, repo: str, pr_id: int) -> Path:
+        """Каталог по умолчанию для вложений PR: <tmp>/jwu/pr/<project>-<repo>-<id>."""
+        return Path(tempfile.gettempdir()) / "jwu" / "pr" / f"{project}-{repo}-{pr_id}"
+
+    def download_pr_attachments(
+        self, project: str | None, repo: str | None, pr_id: int, *,
+        dest: Optional[Path] = None, detail: "PRDetail | None" = None,
+        kinds: Optional[list[str]] = None,
+    ) -> list[tuple[PRAttachment, Path]]:
+        """Скачать файлы из описания PR и комментов (скриншоты ревьюверов) в dest.
+
+        Возвращает пары (вложение, локальный путь); у вложения есть ``comment_id`` —
+        по нему видно, к какой реплике относится картинка. Только Bitbucket: у GitHub
+        картинки в комментах — обычные URL, их качать незачем через jwu.
+        """
+        client = self._require_bitbucket()
+        default_project, default_repo = self.default_pr_ref()
+        project = project or default_project
+        repo = repo or default_repo
+        detail = detail or self.pr_detail(project, repo, pr_id)
+        wanted = set(kinds) if kinds is not None else set(DOWNLOADABLE_ATTACH_KINDS)
+        items = list(detail.pr.attachments) + [a for c in detail.comments for a in c.attachments]
+        dest = Path(dest) if dest is not None else self.pr_attachments_dir(project, repo, pr_id)
+        results: list[tuple[PRAttachment, Path]] = []
+        used: set[str] = set()
+        for att in items:
+            if att.kind not in wanted or not att.url:
+                continue
+            name = _safe_filename(att.name) or "attachment"
+            if name in used:  # одинаковые имена (image.png у каждого скрина) — развести хэшем
+                name = f"{att.path.split('/', 1)[0]}-{name}"
+            used.add(name)
+            results.append((att, client.download_attachment(att.url, dest / name)))
+        return results
 
     def build_statuses_for_pr(self, project: str, repo: str, pr_id: int) -> list[BuildStatus]:
         """Статусы CI-сборок по head-коммиту PR (то, что видно на странице PR)."""

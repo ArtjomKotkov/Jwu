@@ -31,6 +31,24 @@ def _get(d: Any, *path: str, default: Any = None) -> Any:
 # --------------------------------------------------------------------------- #
 
 
+# Картинка, вставленная в текст Jira: ``!screen.png!``, ``!screen.png|thumbnail!``,
+# ``!screen.png|width=600!``. Сам файл лежит во вложениях задачи под тем же именем —
+# по нему и связываем «какая картинка к какой реплике».
+INLINE_IMAGE_RE = re.compile(
+    r"!([^!|\n]+?\.(?:png|jpe?g|gif|webp|bmp|svg|heic))(?:\|[^!\n]*)?!", re.IGNORECASE
+)
+
+
+def inline_image_refs(text: str) -> list[str]:
+    """Имена файлов картинок, вставленных в текст Jira, в порядке появления, без дублей."""
+    out: list[str] = []
+    for name in INLINE_IMAGE_RE.findall(text or ""):
+        name = name.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 class Comment(BaseModel):
     id: str
     author: str = ""
@@ -38,16 +56,20 @@ class Comment(BaseModel):
     body: str = ""
     created: str = ""
     updated: str = ""
+    # Имена картинок, вставленных в текст (!name.png!) — ссылки на вложения задачи.
+    images: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_jira(cls, raw: dict) -> "Comment":
+        body = raw.get("body", "") or ""
         return cls(
             id=str(raw.get("id", "")),
             author=_get(raw, "author", "displayName", default="") or "",
             author_key=_get(raw, "author", "name", default="") or "",
-            body=raw.get("body", "") or "",
+            body=body,
             created=raw.get("created", "") or "",
             updated=raw.get("updated", "") or "",
+            images=inline_image_refs(body),
         )
 
     @classmethod
@@ -101,6 +123,9 @@ class Attachment(BaseModel):
     created: str = ""
     author: str = ""
     url: str = ""          # абсолютный URL контента на хосте Jira
+    # Откуда на файл ссылаются в тексте: "description" и/или id комментариев. Пусто —
+    # файл просто приложен, в тексте не упомянут. Заполняется в Issue.from_jira.
+    referenced_by: list[str] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -118,6 +143,24 @@ class Attachment(BaseModel):
             author=_get(raw, "author", "displayName", default="") or "",
             url=raw.get("content", "") or "",
         )
+
+
+def link_inline_images(description: str, comments: list["Comment"],
+                       attachments: list["Attachment"]) -> None:
+    """Проставить вложениям ``referenced_by``: где в тексте задачи они вставлены.
+
+    Скриншот без реплики, к которой он относится, почти бесполезен: разбор бага
+    начинается с «что показано на картинке под ЭТИМ комментом». Jira связь не хранит —
+    только имя файла в разметке, по нему и собираем.
+    """
+    refs: dict[str, list[str]] = {}
+    for name in inline_image_refs(description):
+        refs.setdefault(name, []).append("description")
+    for c in comments:
+        for name in c.images:
+            refs.setdefault(name, []).append(c.id)
+    for att in attachments:
+        att.referenced_by = refs.get(att.filename, [])
 
 
 class IssueLink(BaseModel):
@@ -183,6 +226,8 @@ class Issue(BaseModel):
     # Метки GitHub (у Jira роль меток играет status) — по ним в Issues и понимают,
     # что происходит с задачей, поэтому в карточке и в таблице они нужны.
     labels: list[str] = Field(default_factory=list)
+    # Картинки, вставленные в описание (!name.png!) — см. Comment.images.
+    description_images: list[str] = Field(default_factory=list)
     branches: list[DevBranch] = Field(default_factory=list)
     commits: list[DevCommit] = Field(default_factory=list)
     pull_requests: list[DevPullRequest] = Field(default_factory=list)
@@ -205,6 +250,8 @@ class Issue(BaseModel):
             for c in _get(f, "comment", "comments", default=[]) or []
         ]
         attachments = [Attachment.from_jira(a) for a in f.get("attachment", []) or []]
+        description = f.get("description", "") or ""
+        link_inline_images(description, comments, attachments)
         return cls(
             key=raw.get("key", ""),
             summary=f.get("summary", "") or "",
@@ -215,7 +262,8 @@ class Issue(BaseModel):
             created=f.get("created", "") or "",
             updated=f.get("updated", "") or "",
             resolution=_get(f, "resolution", "name", default="") or "",
-            description=f.get("description", "") or "",
+            description=description,
+            description_images=inline_image_refs(description),
             comments=comments,
             attachments=attachments,
             links=links,
@@ -466,6 +514,40 @@ def check_task_text(text: str) -> str:
     return text
 
 
+# Вложение в тексте PR/коммента Bitbucket Server: ``[![image.png](attachment:101/626b%2Fimage.png)]``.
+# После ``attachment:`` — id репозитория и путь ``<hash>/<имя>`` (слэш закодирован).
+BB_ATTACHMENT_RE = re.compile(r"attachment:(\d+)/([^\s)\]]+)")
+
+
+class PRAttachment(BaseModel):
+    """Файл, вставленный в описание PR или коммент (Bitbucket): имя, путь, URL, якорь."""
+
+    name: str = ""
+    path: str = ""          # <hash>/<имя файла> внутри репозитория
+    url: str = ""           # прямой URL скачивания (заполняет клиент — нужен хост и repo)
+    comment_id: str = ""    # пусто — из описания PR
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def kind(self) -> str:
+        return classify_attachment(self.name)
+
+
+def pr_attachment_refs(text: str, *, comment_id: str = "") -> list[PRAttachment]:
+    """Вложения из разметки Bitbucket, без дублей (одна картинка = превью + ссылка)."""
+    from urllib.parse import unquote
+
+    out: list[PRAttachment] = []
+    seen: set[str] = set()
+    for _repo_id, raw_path in BB_ATTACHMENT_RE.findall(text or ""):
+        path = unquote(raw_path)
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(PRAttachment(name=path.rsplit("/", 1)[-1], path=path, comment_id=comment_id))
+    return out
+
+
 class PRTask(BaseModel):
     """Задача (task) на комменте PR в Bitbucket Server: id, текст, OPEN | RESOLVED."""
 
@@ -506,6 +588,8 @@ class PRComment(BaseModel):
     anchor_idx: int = -1    # индекс прокомментированной строки в context (-1 = неизвестно)
     # Задачи, повешенные на этот коммент (чек-лист «что сделано, что нет»).
     tasks: list[PRTask] = Field(default_factory=list)
+    # Файлы, вставленные в текст коммента (скриншоты ревьювера).
+    attachments: list[PRAttachment] = Field(default_factory=list)
 
 
 class PR(BaseModel):
@@ -537,6 +621,8 @@ class PR(BaseModel):
     # Открытые — это и есть «что ещё надо поправить» по этому PR.
     tasks_open: int = 0
     tasks_resolved: int = 0
+    # Файлы, вставленные в описание PR (скриншоты «как выглядит»).
+    attachments: list[PRAttachment] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -580,6 +666,7 @@ class PR(BaseModel):
             updated=int(raw.get("updatedDate", 0) or 0),
             reviewers=[Reviewer.from_bitbucket(r) for r in raw.get("reviewers", []) or []],
             comment_count=int(_get(raw, "properties", "commentCount", default=0) or 0),
+            attachments=pr_attachment_refs(raw.get("description", "") or ""),
         )
 
     @classmethod
