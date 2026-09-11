@@ -60,7 +60,7 @@ def test_job_record_keeps_git_state_and_migrates(tmp_path):
         recs = store.get_job(job.id).records
         assert (recs[0].branch, recs[0].commit) == ("PROJ-1-fix", "abc123")
         assert (recs[1].branch, recs[1].commit) == ("", "")
-        assert store.get_meta("schema_version") == "8"
+        assert int(store.get_meta("schema_version")) >= 8
     finally:
         store.close()
 

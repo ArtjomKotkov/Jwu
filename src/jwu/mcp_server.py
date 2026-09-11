@@ -1063,10 +1063,73 @@ async def jwu_feature_status(
 
 
 @mcp.tool()
-async def jwu_note(key: str, text: str, workspace: Optional[str] = None) -> dict:
-    """Записать заметку по задаче в локальную память воркспейса (в Jira не постит)."""
+async def jwu_note(key: str, text: str, kind: str = "context", pin: bool = False,
+                   workspace: Optional[str] = None) -> dict:
+    """Заметка-контекст в локальную память (наружу не постит) по ЛЮБОМУ ключу: задача
+    PROJ-1, PR PROJ/repo#42 (см. pr_note_key), ветка. kind — context | decision | gotcha |
+    todo | status; status — одна закреплённая строка «почему висит / что сейчас», её
+    видно в jwu prs, дневном анализе и дашборде. Читается там, где сущность открывают:
+    jwu_task, jwu_pr, jwu_context, handoff — без поиска работы.
+    """
     ws = _resolve(workspace)
-    return _stamp(_store_only(workspace).add_note(key, text).model_dump(), ws)
+    return _stamp(_store_only(workspace).add_note(key, text, kind=kind, pinned=pin).model_dump(), ws)
+
+
+@mcp.tool()
+async def jwu_notes(key: str, workspace: Optional[str] = None) -> list[dict]:
+    """Заметки-контекст по ключу (задача, PR PROJ/repo#42, ветка). Без сети."""
+    return [n.model_dump() for n in _store_only(workspace).get_notes(key)]
+
+
+@mcp.tool()
+async def jwu_context(key: str, workspace: Optional[str] = None) -> dict:
+    """Что я знаю по задаче или PR БЕЗ разбора работ и без сети: заметки-контекст
+    (закреплённый status первым), последняя работа с её последней записью и git-состоянием,
+    у PR — снапшот последнего синка (состояние, сборка, задачи). Ключ: PROJ-1 либо PROJ/repo#42.
+
+    Зови первым, когда открываешь задачу/PR в новой сессии: обычно этого хватает, чтобы
+    понять «где мы», а jwu_job_handoff нужен уже для продолжения конкретной работы.
+    """
+    import re as _re
+
+    store = _store_only(workspace)
+    notes = store.get_notes(key)
+    payload: dict = {
+        "key": key,
+        "status": next((n.text for n in reversed(notes) if n.kind == "status" and n.pinned), ""),
+        "notes": [n.model_dump() for n in notes],
+    }
+    match = _re.match(r"^(?P<project>[^/#]+)/(?P<repo>[^#]+)#(?P<id>\d+)$", key)
+    if match:
+        pr_id = int(match.group("id"))
+        jobs = store.jobs_for_pr(pr_id, match.group("project"), match.group("repo"))
+        snap = next((p for p in store.latest_prs(None)
+                     if p.id == pr_id and p.project == match.group("project") and p.repository == match.group("repo")), None)
+        if snap is not None:
+            payload["pr"] = {
+                "title": snap.title, "state": snap.state, "conflicted": snap.conflicted,
+                "build_state": snap.build_state, "tasks_open": snap.tasks_open,
+                "reviewers": [{"name": r.display_name or r.name, "status": r.status} for r in snap.reviewers],
+                "updated": snap.updated,
+            }
+    else:
+        jobs = store.jobs_for_task(key)
+        snap_issue = next((i for i in store.latest_issues(None) if i.key == key), None)
+        if snap_issue is not None:
+            payload["task"] = {"summary": snap_issue.summary, "status": snap_issue.status,
+                               "assignee": snap_issue.assignee, "updated": snap_issue.updated}
+    if jobs:
+        last = jobs[0]
+        rec = last.records[-1] if last.records else None
+        payload["last_job"] = {
+            "id": last.id, "status": last.status, "title": last.title, "updated_at": last.updated_at,
+            "last_record": rec.model_dump() if rec else None,
+            "branch": next((r.branch for r in reversed(last.records) if r.branch), ""),
+            "commit": next((r.commit for r in reversed(last.records) if r.commit), ""),
+            "prs": [p.model_dump() for p in last.prs],
+        }
+        payload["jobs_total"] = len(jobs)
+    return payload
 
 
 @mcp.tool()
@@ -1177,6 +1240,7 @@ async def jwu_job_add(
 async def jwu_job_handoff(
     job_id: int,
     offline: bool = False,
+    save: bool = False,
     workspace: Optional[str] = None,
 ) -> dict:
     """Передача работы другой сессии: самодостаточный markdown-промпт (поле `markdown`)
@@ -1184,7 +1248,8 @@ async def jwu_job_handoff(
     осталось, запреты и решения, состояние PR (блокеры, открытые задачи на комментах,
     замечания без ответа), правила воркспейса и шаги «как продолжить».
 
-    offline=True — без сети (задача и PR из снапшотов последнего синка). Это read-only.
+    offline=True — без сети (задача и PR из снапшотов последнего синка). save=True —
+    записать выжимку заметкой-контекстом на задачу и PR (jwu_context их покажет).
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
@@ -1200,8 +1265,10 @@ async def jwu_job_handoff(
         except Exception:  # noqa: BLE001 — нет доступов: соберём из памяти
             svc = None
     data = handoff.collect(store, job, svc=svc, offline=offline or svc is None)
+    saved = handoff.save_context_notes(store, data) if save else []
     return _stamp({
         "job_id": job.id, "anchor": job.anchor, "branch": data.branch, "commit": data.commit,
+        "context_notes": saved,
         "issue_source": data.issue_source,
         "open_tasks": [t.model_dump() for p in data.prs for t in p.open_tasks],
         "markdown": handoff.render(data),
@@ -1229,7 +1296,13 @@ async def jwu_job_status(job_id: int, status: str, workspace: Optional[str] = No
     if store.get_job(job_id) is None:
         raise ValueError(f"Работа #{job_id} не найдена")
     store.set_job_status(job_id, status)
-    return _stamp({"ok": True, "job_id": job_id, "status": status}, _resolve(workspace))
+    keys: list[str] = []
+    if status == "done":
+        # выжимка работы уезжает заметкой-контекстом на задачу и её PR
+        job = store.get_job(job_id)
+        keys = handoff.save_context_notes(store, handoff.collect(store, job, offline=True))
+    return _stamp({"ok": True, "job_id": job_id, "status": status, "context_notes": keys},
+                  _resolve(workspace))
 
 
 @mcp.tool()

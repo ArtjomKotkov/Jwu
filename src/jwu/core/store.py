@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import (
+    NOTE_KINDS,
     WORKSPACE_PROVIDERS, WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS, Delta, Issue, Job,
     JobPRLink, JobRecord, LocalFeature, Mention, Note, PR, Workspace, WorkspacePath,
     WorkspaceRule,
@@ -123,7 +124,9 @@ CREATE TABLE IF NOT EXISTS notes (
     author       TEXT NOT NULL DEFAULT 'claude',
     text         TEXT NOT NULL,
     ts           TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    kind         TEXT NOT NULL DEFAULT 'context',
+    pinned       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_notes_key ON notes(key);
 CREATE TABLE IF NOT EXISTS workspace_rules (
@@ -294,7 +297,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -445,6 +448,12 @@ def _m008_job_git_state(conn: sqlite3.Connection) -> None:
     _add_column(conn, "job_records", "commit_sha", "TEXT NOT NULL DEFAULT ''")
 
 
+def _m009_note_kinds(conn: sqlite3.Connection) -> None:
+    """v8 → v9: заметки с видом и закреплением — контекст сущности без разбора работ."""
+    _add_column(conn, "notes", "kind", "TEXT NOT NULL DEFAULT 'context'")
+    _add_column(conn, "notes", "pinned", "INTEGER NOT NULL DEFAULT 0")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
@@ -453,6 +462,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (6, _m006_drop_analyses),
     (7, _m007_provider),
     (8, _m008_job_git_state),
+    (9, _m009_note_kinds),
 ]
 
 
@@ -1558,25 +1568,76 @@ class Store:
 
     # --- заметки -------------------------------------------------------- #
 
-    def add_note(self, key: str, text: str, author: str = "claude") -> Note:
+    @staticmethod
+    def _note_from_row(r) -> Note:
+        keys = r.keys()
+        return Note(id=int(r["id"]) if "id" in keys else 0, key=r["key"], author=r["author"],
+                    text=r["text"], ts=r["ts"],
+                    kind=(r["kind"] if "kind" in keys else "context") or "context",
+                    pinned=bool(r["pinned"]) if "pinned" in keys else False)
+
+    def add_note(self, key: str, text: str, author: str = "claude", *,
+                 kind: str = "context", pinned: bool = False) -> Note:
+        """Заметка по ключу (задача, PR, ветка). ``status`` — одна актуальная: прежняя
+        status-заметка того же ключа открепляется, новая закрепляется."""
+        if kind not in NOTE_KINDS:
+            raise ValueError(f"Неизвестный вид заметки: {kind!r}. Допустимо: {', '.join(NOTE_KINDS)}")
+        text = " ".join(text.split()) if kind == "status" else text.strip()
+        if not text:
+            raise ValueError("Пустая заметка")
         ts = _now()
-        self.conn.execute(
-            "INSERT INTO notes (key, author, text, ts, workspace_id) VALUES (?, ?, ?, ?, ?)",
-            (key, author, text, ts, self.workspace_id),
+        if kind == "status":
+            pinned = True
+            self.conn.execute(
+                "UPDATE notes SET pinned = 0 WHERE key = ? AND workspace_id = ? AND kind = 'status'",
+                (key, self.workspace_id),
+            )
+        cur = self.conn.execute(
+            "INSERT INTO notes (key, author, text, ts, workspace_id, kind, pinned)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (key, author, text, ts, self.workspace_id, kind, int(pinned)),
         )
         self.conn.commit()
-        return Note(key=key, author=author, text=text, ts=ts)
+        return Note(id=int(cur.lastrowid), key=key, author=author, text=text, ts=ts,
+                    kind=kind, pinned=pinned)
 
     def get_notes(self, key: str) -> list[Note]:
         rows = self.conn.execute(
-            "SELECT key, author, text, ts FROM notes WHERE key = ? AND workspace_id = ?"
-            " ORDER BY ts",
+            "SELECT * FROM notes WHERE key = ? AND workspace_id = ? ORDER BY ts, id",
             (key, self.workspace_id),
         ).fetchall()
-        return [
-            Note(key=r["key"], author=r["author"], text=r["text"], ts=r["ts"])
-            for r in rows
-        ]
+        return [self._note_from_row(r) for r in rows]
+
+    def notes_for_keys(self, keys: list[str]) -> dict[str, list[Note]]:
+        """Заметки по нескольким ключам одним запросом (таблицы, дневной анализ)."""
+        keys = [k for k in keys if k]
+        if not keys:
+            return {}
+        out: dict[str, list[Note]] = {}
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            rows = self.conn.execute(
+                f"SELECT * FROM notes WHERE workspace_id = ? AND key IN ({','.join('?' * len(chunk))})"
+                " ORDER BY ts, id",
+                (self.workspace_id, *chunk),
+            ).fetchall()
+            for r in rows:
+                out.setdefault(r["key"], []).append(self._note_from_row(r))
+        return out
+
+    def status_notes(self, keys: list[str]) -> dict[str, str]:
+        """Закреплённая status-строка по ключам — то, что показывают в таблицах."""
+        return {
+            key: next((n.text for n in reversed(notes) if n.kind == "status" and n.pinned), "")
+            for key, notes in self.notes_for_keys(keys).items()
+        }
+
+    def delete_note(self, note_id: int) -> bool:
+        cur = self.conn.execute(
+            "DELETE FROM notes WHERE id = ? AND workspace_id = ?", (note_id, self.workspace_id)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     # --- упоминания ------------------------------------------------------ #
 

@@ -41,6 +41,7 @@ class PRState:
 @dataclass
 class Handoff:
     job: Job
+    notes: dict[str, list] = field(default_factory=dict)  # ключ → заметки-контекст
     issue: Optional[Issue] = None
     issue_source: str = "нет данных"
     branch: str = ""
@@ -136,6 +137,13 @@ def collect(store: "Store", job: Job, *, svc: "Optional[Service]" = None,
     ctx = store.workspace_context()
     out.rules_md = ctx.get("rules_md", "") or ""
     out.paths = ctx.get("paths", []) or []
+    from .models import pr_note_key
+
+    note_keys = [k for k in (job.task_key, job.feature_key) if k]
+    note_keys += [pr_note_key(l.project, l.repo, l.pr_id) for l in job.prs]
+    if out.branch:
+        note_keys.append(out.branch)
+    out.notes = {k: v for k, v in store.notes_for_keys(note_keys).items() if v}
     return out
 
 
@@ -173,6 +181,52 @@ def _pr_block(state: PRState) -> list[str]:
     return L
 
 
+def summary_note(h: Handoff, *, limit: int = 700) -> str:
+    """Короткая выжимка для заметки-контекста: что сделано, что осталось, где стоять в git.
+
+    Это то, что следующая сессия увидит в `jwu task` / `jwu pr` без поиска работы.
+    """
+    job = h.job
+    recs = job.records
+    done = [r.text for r in recs if r.kind == "phase" and (r.status or "").lower() == "done"]
+    rest = ([r.text for r in recs if r.kind == "phase" and (r.status or "").lower() != "done"]
+            + [r.text for r in recs if r.kind == "todo" and (r.status or "").lower() != "done"]
+            + [f"баг: {r.text}" for r in _open_bugs(recs)])
+    parts = [f"Работа #{job.id} ({job.status})" + (f": {job.title}" if job.title else "")]
+    if h.branch or h.commit:
+        parts.append(f"git: {h.branch or '(detached)'}@{h.commit or '?'}")
+    if done:
+        parts.append("сделано: " + "; ".join(done[-4:]))
+    if rest:
+        parts.append("осталось: " + "; ".join(rest[:4]))
+    open_tasks = [t.text for p in h.prs for t in p.open_tasks]
+    if open_tasks:
+        parts.append("открытые задачи PR: " + "; ".join(open_tasks[:4]))
+    text = " · ".join(parts)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def save_context_notes(store: "Store", h: Handoff, *, author: str = "jwu") -> list[str]:
+    """Положить выжимку работы заметкой-контекстом на задачу и на каждый привязанный PR.
+
+    Возвращает ключи, куда записано. Именно так «лезть без разбора работ»: контекст
+    едет вслед за сущностью, а не за id работы.
+    """
+    from .models import pr_note_key
+
+    text = summary_note(h)
+    keys: list[str] = []
+    if h.job.task_key:
+        keys.append(h.job.task_key)
+    elif h.job.feature_key:
+        keys.append(h.job.feature_key)
+    for link in h.job.prs:
+        keys.append(pr_note_key(link.project, link.repo, link.pr_id))
+    for key in keys:
+        store.add_note(key, text, author, kind="context")
+    return keys
+
+
 def render(h: Handoff) -> str:
     """Markdown-промпт для следующей сессии."""
     job = h.job
@@ -202,6 +256,14 @@ def render(h: Handoff) -> str:
         L.append(f"- {job.task_key}: карточка недоступна (нет снапшота и сети)")
     else:
         L.append(f"- работа без задачи трекера; якорь: {anchor}")
+
+    if h.notes:
+        L.append("")
+        L.append("## Заметки-контекст")
+        for key, notes in h.notes.items():
+            for n in notes[-6:]:
+                mark = {"decision": "🧭", "gotcha": "⚠", "todo": "📌", "status": "📍"}.get(n.kind, "·")
+                L.append(f"- {mark} [{key}] {_short(n.text, 300)}")
 
     # git
     L.append("")

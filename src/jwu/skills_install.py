@@ -35,6 +35,7 @@ EXPECTED_SKILLS = {
     "duty-support",
     "jwu-pr-task",
     "jwu-pr-comment",
+    "jwu-context",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:

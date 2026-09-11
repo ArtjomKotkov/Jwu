@@ -926,11 +926,31 @@ class Delta(BaseModel):
     section: str = ""
 
 
+# Виды заметок-контекста. Заметка вешается на ЛЮБОЙ ключ — задачу (PROJ-1), PR
+# (PROJ/repo#42) или ветку — и читается там, где сущность открывают, без разбора работ.
+# ``status`` — одна закреплённая строка «почему висит / что сейчас», видна в таблицах.
+NOTE_KINDS = ["context", "decision", "gotcha", "todo", "status"]
+NOTE_BADGES: dict[str, tuple[str, str]] = {
+    "decision": ("🧭 РЕШЕНИЕ", "cyan"),
+    "gotcha": ("⚠ ГРАБЛИ", "yellow"),
+    "todo": ("📌 TODO", "magenta"),
+    "status": ("📍 СТАТУС", "green"),
+}
+
+
+def pr_note_key(project: str, repo: str, pr_id: int | str) -> str:
+    """Ключ заметок по PR — тот же, что у дельт: ``PROJ/repo#42``."""
+    return f"{project}/{repo}#{pr_id}" if project and repo else f"#{pr_id}"
+
+
 class Note(BaseModel):
     key: str
     author: str = "claude"
     text: str = ""
     ts: str = ""
+    id: int = 0
+    kind: str = "context"   # см. NOTE_KINDS
+    pinned: bool = False    # закреплённая (для status — единственная актуальная)
 
 
 class Mention(BaseModel):
