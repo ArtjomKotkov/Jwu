@@ -435,6 +435,12 @@ jwu notify test        # тестовое сообщение — проверк�
 Токен — секрет воркспейса (слот `telegram.token`, переменная `TELEGRAM_BOT_TOKEN`
 перекрывает), `chat_id` — обычная настройка. Пустой `chat_id` выключает уведомления.
 
+**Обратно тоже работает:** ответ боту на уведомление становится заметкой-контекстом по
+первому ключу из этого уведомления, сообщение вида `PROJ-1 ждём ответа QA` — заметкой по
+`PROJ-1`. Забирает демон после каждого прохода (или `jwu notify poll`); чужие чаты
+игнорируются. В дашборде и `jwu prs` закреплённая `status`-заметка видна рядом с заголовком,
+открытые задачи PR — в ячейке блокеров (`☐N`).
+
 ## 5. Скиллы и субагенты для Claude
 
 В репозитории шипуются и **скиллы** (`src/jwu/skills/<имя>/SKILL.md`), и **дефолтные субагенты**
@@ -520,10 +526,11 @@ jwu install-claude-skills                   # каталог скиллов — 
 | `jwu backup [--out] [--no-secrets]` / `jwu restore <архив> [--force]` | переезд между машинами: архив с БД, конфигом, проектными субагентами/скиллами и RESTORE.md; восстановление с проверкой сумм |
 | `jwu memory export\|import\|sync` | память (работы, заметки, правила, фичи, воркспейсы) как JSON без секретов и снапшотов; `sync` — через свой приватный git |
 | `jwu daemon run\|install\|status\|uninstall` | фоновый синк всех контуров без дашборда; `install` ставит службу launchd/systemd |
-| `jwu notify status\|test` | уведомления в Telegram после синка: настроены ли, тестовое сообщение |
+| `jwu notify status\|test\|poll` | уведомления в Telegram после синка: настроены ли, тестовое сообщение; `poll` — ответы боту → заметки-контекст (демон делает это сам) |
 | `jwu pr <id> --diff [--path f]` | unified diff PR без клона (Bitbucket и GitHub); большой PR — по файлам |
 | `jwu pr-comment <id> -m … [--reply-to CID \| --path f --line N]` | комментарий в PR: общий, ответ в тред замечания, на строку; только после подтверждения / `--yes` |
 | `jwu pr-review <id> approve\|needs-work\|unapprove [-m …]` | мой статус ревью на PR (`unapprove` — только Bitbucket; у GitHub `needs-work` требует текст); только с `--yes` |
+| `jwu pr-create --to develop [--from BRANCH] [--from-job ID] [--reviewer u]` | создать PR из уже запушенной ветки; заголовок и описание из работы; только с `--yes` |
 | `jwu pr-task list\|add\|done\|reopen` | задачи на комментах PR (Bitbucket tasks) — чек-лист правок; `add`/`done` пишут в Bitbucket только с `--yes`, текст задачи до 10 слов |
 | `jwu tasks --view mine\|mentions` | список задач (есть `--jql`) |
 | `jwu task ABC-123` | полная карточка: описание, комменты, связанные ветки и PR (у GitHub ключ — `repo#42`) |

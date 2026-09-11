@@ -676,6 +676,22 @@ class GitHubClient:
             payload["body"] = body
         return self._post(f"/repos/{owner}/{name}/pulls/{pr_id}/reviews", payload)
 
+    def pr_create(self, project: str, repo: str, *, source: str, target: str, title: str,
+                  description: str = "", reviewers: list[str] | None = None) -> PR:
+        """Создать PR (head → base); ревьюверы запрашиваются отдельным вызовом."""
+        owner, name = self._split_repo(project, repo)
+        raw = self._post(f"/repos/{owner}/{name}/pulls",
+                         {"title": title, "head": source, "base": target, "body": description or ""})
+        pull = PR.from_github(raw)
+        wanted = [r for r in (reviewers or []) if r]
+        if wanted:
+            try:
+                self._post(f"/repos/{owner}/{name}/pulls/{pull.id}/requested_reviewers",
+                           {"reviewers": wanted})
+            except GitHubError:
+                pass  # PR уже создан; ревьюверов можно добавить руками
+        return pull
+
     # --- сборки (GitHub Actions) ------------------------------------------ #
 
     def build_statuses(

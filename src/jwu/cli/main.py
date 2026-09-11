@@ -1900,6 +1900,65 @@ def pr_comment(
         console.print(f"[green]✓[/green] PR #{pr_id}: комментарий #{result.get('id', '?')} добавлен ({where})")
 
 
+@app.command("pr-create")
+def pr_create(
+    source: Optional[str] = typer.Option(None, "--from", "-f", help="Ветка-источник (по умолчанию текущая ветка в этой папке)."),
+    target: str = typer.Option(..., "--to", "-t", help="Целевая ветка (develop, release/…)."),
+    title: Optional[str] = typer.Option(None, "--title", help="Заголовок (по умолчанию из работы: «KEY: название»)."),
+    text: Optional[str] = typer.Option(None, "--text", "-m", help="Описание."),
+    text_file: Optional[str] = typer.Option(None, "--file", "-F", help="Файл с описанием; «-» — stdin."),
+    from_job: Optional[int] = typer.Option(None, "--from-job", help="Заголовок и описание из журнала работы."),
+    reviewers: Optional[list[str]] = typer.Option(None, "--reviewer", "-r", help="Логин ревьювера (повторяй)."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта / owner."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug / имя репозитория."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Показать, что будет создано."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Создать. Без флага — превью."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Создать PR (ВНЕШНЯЯ запись, только с --yes). Ветка должна быть уже запушена."""
+    branch = source or gitinfo.head_state(Path.cwd())[0]
+    if not branch:
+        err.print("[red]Не понять ветку-источник:[/red] задай --from или запусти из репозитория.")
+        raise typer.Exit(code=1)
+    body = _read_description(text, text_file) or ""
+    with _service_with_prs() as svc:
+        if from_job is not None:
+            try:
+                job_title, job_body = svc.pr_draft_from_job(from_job)
+            except ValueError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1)
+            title = title or job_title
+            body = body or job_body
+        title = title or branch
+        preview = {"from": branch, "to": target, "title": title, "description": body,
+                   "reviewers": list(reviewers or [])}
+        if dry_run or not yes:
+            if json_out:
+                _emit_json({"ok": False, "reason": "dry_run" if dry_run else "confirm_required", **preview,
+                            "hint": "Показать пользователю и повторить с --yes"})
+                raise typer.Exit(code=0)
+            console.print(f"[bold]PR {branch} → {target}[/bold]\n[cyan]{title}[/cyan]"
+                          + (f"\nревьюверы: {', '.join(preview['reviewers'])}" if reviewers else "")
+                          + (f"\n\n{body}" if body else ""))
+            console.print("[dim]--dry-run: ничего не создано.[/dim]" if dry_run else
+                          "[yellow]Превью[/yellow] — добавь --yes, чтобы создать.")
+            raise typer.Exit(code=0 if dry_run else 1)
+        try:
+            pull = svc.pr_create(project, repo, source=branch, target=target, title=title,
+                                 description=body, reviewers=list(reviewers or []))
+        except (BitbucketError, GitHubError, ValueError) as exc:
+            if json_out:
+                _emit_json({"ok": False, "error": str(exc), **preview})
+            else:
+                err.print(f"[red]✗[/red] PR не создан — {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json({"ok": True, **pull.model_dump()})
+    else:
+        console.print(f"[green]✓[/green] PR #{pull.id} создан: {pull.url or pull.title}")
+
+
 @app.command("pr-review")
 def pr_review(
     pr_id: int = typer.Argument(..., help="Числовой id PR."),
@@ -2098,6 +2157,24 @@ def notify_status(json_out: bool = typer.Option(False, "--json", help="Выве�
                       f"--telegram-token <token>[/cyan]")
     console.print("События: " + ", ".join(
         notify.NOTABLE_KINDS.get(k, k) for k in notify.DEFAULT_KINDS) + ", 📣 упоминание")
+
+
+@notify_app.command("poll")
+def notify_poll(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Забрать ответы боту в Telegram и записать их заметками-контекстом (демон делает это сам)."""
+    with _service() as svc:
+        try:
+            written = svc.poll_telegram_replies()
+        except notify.NotifyError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(written)
+        return
+    if not written:
+        console.print("[dim]Новых сообщений боту нет (или уведомления не настроены).[/dim]")
+    for w in written:
+        console.print(f"[green]📝 {w['key']}[/green] {w['text']}")
 
 
 @notify_app.command("test")

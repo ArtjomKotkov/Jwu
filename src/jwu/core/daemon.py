@@ -163,6 +163,13 @@ def _default_factory(ws: "Workspace") -> "Service":
     return Service.for_workspace(ws)
 
 
+def default_after_sync(svc: "Service", result: "SyncResult") -> None:
+    """Хук по умолчанию: забрать ответы боту в Telegram и превратить их в заметки."""
+    written = svc.poll_telegram_replies()
+    if written:
+        log(f"[{svc.workspace.slug if svc.workspace else '?'}] заметок из Telegram: {len(written)}")
+
+
 def syncable(workspaces: Iterable["Workspace"]) -> tuple[list["Workspace"], list["Workspace"]]:
     """Разделить контуры на те, что есть чем синкать, и локальные."""
     todo: list["Workspace"] = []
@@ -191,6 +198,8 @@ def run_pass(
     протухает быстрее.
     """
     factory = factory or _default_factory
+    if after_sync is None:
+        after_sync = default_after_sync
     report = PassReport(started_at=_now())
     todo, skipped = syncable(store.list_workspaces())
     report.skipped = [w.slug for w in skipped]

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Optional
 
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
     from .config import Config
 
 TELEGRAM_API = "https://api.telegram.org"
+OFFSET_META = "telegram:offset"   # последний обработанный update_id (meta воркспейса)
+# Ключ сущности в тексте: задача PROJ-1 либо PR PROJ/repo#42.
+KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+|[\w.-]+/[\w.-]+#\d+)\b")
 # Telegram режет сообщение на 4096 символов; оставляем запас на разметку.
 MAX_MESSAGE = 3800
 
@@ -158,6 +162,19 @@ class TelegramNotifier:
             ids.append(int((body.get("result") or {}).get("message_id", 0) or 0))
         return ids
 
+    def get_updates(self, offset: Optional[int] = None, *, limit: int = 100) -> list[dict]:
+        """Входящие сообщения боту (long polling не используем — демон и так периодический)."""
+        params: dict = {"limit": limit, "timeout": 0, "allowed_updates": '["message"]'}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            resp = self._client.get(f"{self._api}/bot{self.token}/getUpdates", params=params)
+        except httpx.HTTPError as exc:
+            raise NotifyError(f"Telegram недоступен: {exc}") from exc
+        if resp.status_code >= 400:
+            raise NotifyError(f"Telegram ответил {resp.status_code}: {resp.text[:200]}")
+        return list((resp.json() or {}).get("result") or [])
+
     def get_me(self) -> dict:
         """Проверка токена: кто мы (`/getMe`)."""
         try:
@@ -197,3 +214,27 @@ def send_after_sync(notifier: TelegramNotifier, note: Notification) -> bool:
         return False
     notifier.send(format_message(note))
     return True
+
+
+def parse_incoming(update: dict, *, chat_id: str) -> Optional[tuple[str, str]]:
+    """Сообщение боту → (ключ, текст заметки) либо None.
+
+    Принимаются только сообщения из настроенного чата (чужой чат — молча мимо). Ответ на
+    уведомление (reply) относится к ПЕРВОМУ ключу в тексте уведомления; сообщение
+    «PROJ-1 текст» — к этому ключу. Всё остальное — не заметка.
+    """
+    msg = update.get("message") or {}
+    if str((msg.get("chat") or {}).get("id", "")) != str(chat_id):
+        return None
+    text = " ".join((msg.get("text") or "").split())
+    if not text:
+        return None
+    replied = (msg.get("reply_to_message") or {}).get("text") or ""
+    if replied:
+        found = KEY_RE.search(replied)
+        if found:
+            return found.group(1), text
+    lead = KEY_RE.match(text)
+    if lead and len(text) > len(lead.group(1)):
+        return lead.group(1), text[len(lead.group(1)):].strip(" :—-")
+    return None
