@@ -2077,6 +2077,97 @@ def notify_test(
     console.print(f"[green]Отправлено[/green] ботом @{me.get('username', '?')} в чат {cfg.telegram.chat_id}")
 
 
+@workspace_app.command("thresholds")
+def workspace_thresholds(
+    stale_pr: Optional[int] = typer.Option(None, "--stale-pr", help="Дней без движения, после которых мой PR застрял."),
+    approval_wait: Optional[int] = typer.Option(None, "--approval-wait", help="Дней ожидания апрувов до «пнуть»."),
+    review_wait: Optional[int] = typer.Option(None, "--review-wait", help="Дней, сколько чужой PR может ждать моего ревью."),
+    testing: Optional[int] = typer.Option(None, "--testing", help="Дней задачи на тестах без движения."),
+    mention: Optional[int] = typer.Option(None, "--mention-days", help="Давность упоминаний в кратком дневном анализе."),
+    reset: bool = typer.Option(False, "--reset", help="Вернуть дефолты."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Пороги «давно» для дневного анализа: показать или задать (настройка воркспейса)."""
+    from ..core import thresholds as th_mod
+
+    with _store() as store:
+        wid = store.workspace_id
+        if reset:
+            th = th_mod.reset(store, wid)
+        else:
+            th = th_mod.save(store, wid, stale_pr_days=stale_pr, approval_wait_days=approval_wait,
+                             review_wait_days=review_wait, testing_days=testing, mention_days=mention)
+    if json_out:
+        _emit_json(th.as_dict())
+        return
+    labels = {
+        "stale_pr_days": "мой PR без движения", "approval_wait_days": "мой PR ждёт апрувов",
+        "review_wait_days": "чужой PR ждёт моего ревью", "testing_days": "задача на тестах",
+        "mention_days": "упоминания в кратком анализе",
+    }
+    for name, value in th.as_dict().items():
+        console.print(f"  {labels[name]:<32} {value} дн   [dim]--{name.replace('_days', '').replace('_', '-')}[/dim]")
+
+
+# --------------------------------------------------------------------------- #
+# mentions: упоминания меня — список, прочитано, архив (без дашборда)
+# --------------------------------------------------------------------------- #
+
+mentions_app = typer.Typer(help="Упоминания меня в комментариях: список, пометить прочитанными, архив.")
+app.add_typer(mentions_app, name="mentions")
+
+
+def _render_mentions(items: list) -> None:
+    if not items:
+        console.print("[dim]Упоминаний нет.[/dim]")
+        return
+    for m in items:
+        mark = "[yellow]●[/yellow]" if not m.seen else "[dim]○[/dim]"
+        console.print(f"{mark} [dim]#{m.id}[/dim] [cyan]{m.task_key}[/cyan] [dim]{fmt_dt(m.created)} · {m.author}[/dim] — {m.summary}")
+        console.print(f"    {' '.join((m.text or '').split())[:240]}")
+
+
+@mentions_app.command("list")
+def mentions_list(
+    unseen: bool = typer.Option(False, "--unseen", "-u", help="Только непрочитанные."),
+    limit: int = typer.Option(50, "--limit", "-n", help="Сколько показать."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Упоминания меня, свежие сверху. Без сети — из памяти последнего синка."""
+    with _store() as store:
+        items = store.unseen_mentions() if unseen else store.list_mentions(limit=limit)
+    items = items[:limit]
+    if json_out:
+        _emit_json([m.model_dump() for m in items])
+    else:
+        _render_mentions(items)
+
+
+@mentions_app.command("read")
+def mentions_read(
+    ids: Optional[list[int]] = typer.Argument(None, help="id упоминаний (пусто с --all — все)."),
+    all_: bool = typer.Option(False, "--all", help="Пометить прочитанными все."),
+) -> None:
+    """Пометить упоминания прочитанными (снять точку в дашборде и «· новое» в анализе)."""
+    if not ids and not all_:
+        err.print("[red]Укажи id упоминаний или --all.[/red]")
+        raise typer.Exit(code=1)
+    with _store() as store:
+        store.mark_mentions_seen(None if all_ else list(ids or []))
+    console.print("[green]Готово.[/green]")
+
+
+@mentions_app.command("archive")
+def mentions_archive(
+    older_than: int = typer.Option(30, "--older-than", help="Удалить упоминания старше N дней."),
+    include_unseen: bool = typer.Option(False, "--include-unseen", help="Удалять и непрочитанные."),
+) -> None:
+    """Убрать старые упоминания из памяти (по умолчанию — только прочитанные)."""
+    with _store() as store:
+        n = store.archive_mentions(older_than_days=older_than, seen_only=not include_unseen)
+    console.print(f"[green]Удалено упоминаний: {n}[/green]")
+
+
 # --------------------------------------------------------------------------- #
 # doctor: что не так с окружением и доступами — одной командой
 # --------------------------------------------------------------------------- #
@@ -2649,6 +2740,7 @@ _DAY_PROMPT = """## Что нужно сделать
 - PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
 - PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
 - Дельта `returned_from_testing` (задачу вернули с тестов) и `qa_comment` (комментарий тестировщика в задаче на тестах) → это доработка: разобрать, что нашли, и запланировать.
+- Раздел «Застряло» (пороги — настройка воркспейса `jwu workspace thresholds`) → назови КАЖДЫЙ пункт явно: «PR … застрял N дн», «задача … на тестах N дн» и что с ним делать (пнуть / мержить / закрыть).
 - Упоминание с пометкой `· новое` → прочитать, понять, что от меня хотят, и ответить.
 - База — дельты: новые комменты, смена статуса, апрувы, новые PR; `resolved` → закрыть работу.
 Пиши сжато, маркерами, без воды; группируй по действиям."""
@@ -2700,6 +2792,12 @@ def _render_day_context_md(ctx: DayContext) -> str:
     ]
     L += [f"- [{d.kind}] {d.key} {d.detail} — {d.summary}" for d in ctx.deltas] or ["- нет"]
 
+    if ctx.stuck:
+        th = ctx.thresholds
+        L.append(f"\n## Застряло ({len(ctx.stuck)}) — пороги: PR без движения {th.get('stale_pr_days')} дн, "
+                 f"ждёт апрувов {th.get('approval_wait_days')} дн, ждёт моего ревью {th.get('review_wait_days')} дн, "
+                 f"на тестах {th.get('testing_days')} дн")
+        L += [f"- ⏳ {x['key']} — {x['days']} дн: {x['reason']} — {x['title']}" for x in ctx.stuck]
     L.append(f"\n## Мои задачи ({len(ctx.mine)})")
     L += [
         f"- {it.key} [{it.status}] ({it.priority}) assignee: {it.assignee or '—'} — {it.summary}"
@@ -2735,6 +2833,8 @@ def _day_context_json(ctx: DayContext) -> dict:
         "me_display": ctx.me_display,
         "synced_at": ctx.synced_at,
         "brief": ctx.brief,
+        "thresholds": ctx.thresholds,
+        "stuck": ctx.stuck,
         "deltas": [d.model_dump() for d in ctx.deltas],
         "mine": [i.model_dump() for i in ctx.mine],
         "prs_mine": [p.model_dump() for p in ctx.prs_mine],

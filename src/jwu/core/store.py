@@ -1626,6 +1626,38 @@ class Store:
         ).fetchall()
         return [self._mention_from_row(r) for r in rows]
 
+    def archive_mentions(self, *, older_than_days: int, seen_only: bool = True) -> int:
+        """Удалить старые упоминания (по дате комментария); по умолчанию — только прочитанные.
+
+        Упоминание — событие: через месяц оно не нужно ни в списке, ни в дневном анализе.
+        Непрочитанные по умолчанию не трогаем — вдруг их ещё не смотрели.
+        """
+        from datetime import timedelta
+        from .dates import _to_dt
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, int(older_than_days)))
+        rows = self.conn.execute(
+            "SELECT id, created, seen FROM mentions WHERE workspace_id = ?", (self.workspace_id,)
+        ).fetchall()
+        doomed: list[int] = []
+        for r in rows:
+            if seen_only and not r["seen"]:
+                continue
+            ts = _to_dt(r["created"])
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts < cutoff:
+                doomed.append(int(r["id"]))
+        if doomed:
+            self.conn.executemany(
+                "DELETE FROM mentions WHERE id = ? AND workspace_id = ?",
+                [(mid, self.workspace_id) for mid in doomed],
+            )
+            self.conn.commit()
+        return len(doomed)
+
     def mark_mentions_seen(self, mention_ids: list[int] | None = None) -> None:
         """Пометить упоминания прочитанными: все (None) или перечисленные."""
         if mention_ids is None:

@@ -312,6 +312,61 @@ async def jwu_changes(workspace: Optional[str] = None) -> list[dict]:
 
 
 @mcp.tool()
+async def jwu_mentions(unseen: bool = False, limit: int = 50, workspace: Optional[str] = None) -> list[dict]:
+    """Упоминания меня в комментариях (из памяти последнего синка, без сети): задача,
+    автор, текст, дата, seen. unseen=True — только непрочитанные.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    store = _store_only(workspace)
+    items = store.unseen_mentions() if unseen else store.list_mentions(limit=limit)
+    return [m.model_dump() for m in items[:limit]]
+
+
+@mcp.tool()
+async def jwu_mentions_seen(ids: Optional[list[int]] = None, workspace: Optional[str] = None) -> dict:
+    """Пометить упоминания прочитанными (локальная запись): перечисленные ids или все
+    (ids=None). Зови, когда пользователь разобрал упоминания в сводке.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    store = _store_only(workspace)
+    store.mark_mentions_seen(None if ids is None else list(ids))
+    return _stamp({"ok": True, "ids": ids}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_mentions_archive(older_than_days: int = 30, include_unseen: bool = False,
+                               workspace: Optional[str] = None) -> dict:
+    """Удалить из памяти упоминания старше N дней (локальная запись; по умолчанию только
+    прочитанные).
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    store = _store_only(workspace)
+    n = store.archive_mentions(older_than_days=older_than_days, seen_only=not include_unseen)
+    return _stamp({"removed": n}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_thresholds(workspace: Optional[str] = None) -> dict:
+    """Пороги «давно» контура (дни): stale_pr_days, approval_wait_days, review_wait_days,
+    testing_days, mention_days. По ним day-analyze считает раздел «Застряло». Менять —
+    `jwu workspace thresholds --stale-pr N …`.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    from .core import thresholds as th_mod
+
+    store = _store_only(workspace)
+    return th_mod.load(store, store.workspace_id).as_dict()
+
+
+@mcp.tool()
 async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
     """Полная карточка задачи Jira/SDESK по ключу (напр. WMCTASKS-123 или SDESK-39336).
 

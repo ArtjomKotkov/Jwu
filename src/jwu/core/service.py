@@ -44,6 +44,7 @@ from .config import (
 from .github import GitHubClient
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
 from . import notify
+from . import thresholds as thresholds_mod
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
     PR_TASK_STATES, PRAttachment, PRTask, check_task_text,
@@ -240,6 +241,9 @@ class DayContext:
     # pr_id -> комменты (только для flagged PR: конфликт / NEEDS_WORK)
     pr_comments: dict[int, list[PRComment]] = field(default_factory=dict)
     brief: bool = False  # контекст отфильтрован до «требует действия»
+    # Пороги «давно» этого контура и что по ним застряло (см. core.thresholds).
+    thresholds: dict[str, int] = field(default_factory=dict)
+    stuck: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1777,8 +1781,11 @@ class Service:
         login, display, _ = self._identity()
         user = login or self._configured_username()
         d = dashboard_from_memory(self.store, user)
+        th = thresholds_mod.load(self.store, self.store.workspace_id)
+        stuck = thresholds_mod.collect_stuck(prs_mine=d.prs_mine, prs_review=d.prs_review,
+                                             mine=d.mine, th=th, login=user)
         if brief:
-            d = _brief_dashboard(d, user, mention_days=mention_days)
+            d = _brief_dashboard(d, user, mention_days=th.mention_days or mention_days)
 
         # подтянуть комменты только для проблемных PR (конфликт / есть NEEDS_WORK)
         pr_comments: dict[int, list[PRComment]] = {}
@@ -1809,6 +1816,8 @@ class Service:
             mentions=d.mentions,
             pr_comments=pr_comments,
             brief=brief,
+            thresholds=th.as_dict(),
+            stuck=stuck,
         )
 
     def changes(self) -> list[Delta]:
