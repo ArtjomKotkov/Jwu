@@ -1632,30 +1632,24 @@ class Service:
     # --- Telegram: ответы боту → заметки ----------------------------------- #
 
     def poll_telegram_replies(self) -> list[dict]:
-        """Забрать новые сообщения боту и превратить их в заметки-контекст.
+        """Забрать новые сообщения боту: команды выполнить, ответы записать заметками.
 
-        Ответ на уведомление (reply) — заметка по первому ключу из текста уведомления;
-        сообщение вида «PROJ-1 текст» — заметка по этому ключу. Сообщения не из
-        настроенного чата игнорируются. Смещение хранится в meta воркспейса.
+        Логика — в ``core.bot``; здесь только сборка контекста. Вне демона «/sync»
+        будит демон сигналом, если он запущен.
         """
+        from . import bot, daemon
+
         sender = self.notifier()
         if sender is None:
             return []
-        offset = int(self.store.get_workspace_meta(notify.OFFSET_META) or 0)
-        updates = sender.get_updates(offset + 1 if offset else None)
-        written: list[dict] = []
-        last = offset
-        for upd in updates:
-            last = max(last, int(upd.get("update_id", 0) or 0))
-            parsed = notify.parse_incoming(upd, chat_id=sender.chat_id)
-            if parsed is None:
-                continue
-            key, text = parsed
-            note = self.store.add_note(key, text, author="telegram", kind="context")
-            written.append({"key": key, "note_id": note.id, "text": text})
-        if last != offset:
-            self.store.set_workspace_meta(notify.OFFSET_META, str(last))
-        return written
+        ws = self.workspace or self.store.get_workspace(self.store.workspace_id)
+        if ws is None:
+            return []
+        names = self._me_names()
+        return bot.process_updates(
+            self.store, ws, self.cfg, sender, login=names[0] if names else "",
+            on_sync=lambda: daemon.kick() is not None,
+        )
 
     # --- уведомления после синка ------------------------------------------ #
 

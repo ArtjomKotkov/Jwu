@@ -114,10 +114,11 @@ def test_poll_replies_writes_notes_and_advances_offset(tmp_path, monkeypatch):
         ]}),
         httpx.Response(200, json={"ok": True, "result": []}),
     ]
+    respx.post(f"{TG}/bottok/sendMessage").mock(return_value=httpx.Response(200, json={"ok": True, "result": {}}))
     svc = _service(tmp_path, chat_id="42")
     try:
         written = svc.poll_telegram_replies()
-        assert [w["key"] for w in written] == ["PROJ-1"]
+        assert [w["key"] for w in written if w["kind"] == "note"] == ["PROJ-1"]
         notes = svc.store.get_notes("PROJ-1")
         assert notes[0].author == "telegram" and notes[0].text == "ждём QA"
         assert svc.store.get_workspace_meta(notify.OFFSET_META) == "12"

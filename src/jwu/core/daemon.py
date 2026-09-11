@@ -47,6 +47,7 @@ LAUNCHD_LABEL = "dev.jwu.daemon"
 SYSTEMD_UNIT = "jwu-daemon.service"
 DEFAULT_INTERVAL = 600  # секунд между проходами; отсчёт — от ОКОНЧАНИЯ прохода
 MIN_INTERVAL = 60
+DEFAULT_POLL_INTERVAL = 60  # секунд между опросами бота Telegram (дёшево: без сети к трекеру)
 
 
 class DaemonError(RuntimeError):
@@ -279,15 +280,48 @@ def announce_start(store: "Store", interval: int) -> int:
         seen_chats.add(sender.chat_id)
         text = (f"🟢 <b>jwu-демон запущен</b> на {socket.gethostname()}\n"
                 f"интервал {interval // 60} мин · контуры: {', '.join(w.slug for w in todo)}\n"
-                f"первый проход — сейчас; внеплановый — <code>jwu daemon kick</code>")
+                f"первый проход — сейчас; внеплановый — /sync или <code>jwu daemon kick</code>")
         try:
-            sender.send(text)
+            sender.set_commands()          # меню на «/» в клиенте
+            sender.send(text, keyboard=True)  # и постоянная клавиатура с командами
             sent += 1
         except Exception as exc:  # noqa: BLE001
             log(f"[{ws.slug}] стартовое сообщение не ушло: {exc}")
         finally:
             sender.close()
     return sent
+
+
+def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None) -> list[dict]:
+    """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
+
+    Команды (/sync, /status, /stuck, /mentions) и ответы-заметки обрабатывает
+    ``core.bot``; здесь только обход контуров и сбор отправщиков из конфига.
+    """
+    from . import bot, notify
+    from .service import _read_identity
+    from .workspaces import config_for_workspace
+
+    handled: list[dict] = []
+    todo, _ = syncable(store.list_workspaces())
+    for ws in todo:
+        try:
+            cfg = config_for_workspace(store, ws)
+            sender = notify.notifier_from_config(cfg)
+        except Exception:  # noqa: BLE001
+            sender = None
+        if sender is None:
+            continue
+        store.use_workspace(ws.id)
+        login = _read_identity(store).get("user", "")
+        try:
+            for item in bot.process_updates(store, ws, cfg, sender, login=login, on_sync=on_sync):
+                handled.append({"workspace": ws.slug, **item})
+        except Exception as exc:  # noqa: BLE001 — Telegram лежит: попробуем через минуту
+            log(f"[{ws.slug}] опрос бота не удался: {exc}")
+        finally:
+            sender.close()
+    return handled
 
 
 def run_loop(
@@ -299,6 +333,7 @@ def run_loop(
     after_sync: Callable[["Service", "SyncResult"], None] | None = None,
     sleep: Callable[[float], None] | None = None,
     announce: bool = True,
+    poll_interval: int = DEFAULT_POLL_INTERVAL,
 ) -> None:
     """Главный цикл демона: проход → пауза ``interval`` → проход… (``once`` — один проход).
 
@@ -334,7 +369,30 @@ def run_loop(
                 return
             if sleep is not None:
                 sleep(interval)
-            elif waiter.wait(interval):
+                continue
+            # Между проходами — опрос бота раз в poll_interval: команды и ответы-заметки
+            # не должны ждать час до следующего синка. /sync будит цикл через waiter.
+            deadline = time.monotonic() + interval
+            kicked = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if waiter.wait(min(max(1, poll_interval), remaining)):
+                    kicked = True
+                    break
+                store = open_store()
+                try:
+                    handled = poll_bots(store, on_sync=lambda: (waiter.kick() or True))
+                finally:
+                    store.close()
+                if handled:
+                    log(f"бот: обработано {len(handled)} сообщений "
+                        f"({', '.join(sorted({h['kind'] for h in handled}))})")
+                    if any(h["kind"] == "command" and h["text"].startswith("/sync") for h in handled):
+                        kicked = True
+                        break
+            if kicked:
                 log("внеплановый проход по kick")
 
 

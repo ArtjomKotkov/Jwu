@@ -2178,7 +2178,12 @@ def notify_poll(json_out: bool = typer.Option(False, "--json", help="Вывес�
     if not written:
         console.print("[dim]Новых сообщений боту нет (или уведомления не настроены).[/dim]")
     for w in written:
-        console.print(f"[green]📝 {w['key']}[/green] {w['text']}")
+        if w["kind"] == "note":
+            console.print(f"[green]📝 {w['key']}[/green] {w['text']}")
+        elif w["kind"] == "command":
+            console.print(f"[cyan]{w['text']}[/cyan] → ответ отправлен")
+        else:
+            console.print(f"[dim]пропущено: {w.get('text', '')[:60]}[/dim]")
 
 
 @notify_app.command("test")
@@ -2490,6 +2495,8 @@ def daemon_run(
     ),
     once: bool = typer.Option(False, "--once", help="Один проход и выход (для cron/проверки)."),
     quiet: bool = typer.Option(False, "--quiet", help="Не слать стартовое сообщение в Telegram."),
+    poll_interval: int = typer.Option(daemon.DEFAULT_POLL_INTERVAL, "--poll-interval",
+        help="Как часто между проходами опрашивать бота Telegram (команды, ответы), сек."),
 ) -> None:
     """Цикл: синк каждого контура с внешним провайдером → хуки после синка → пауза.
 
@@ -2501,7 +2508,8 @@ def daemon_run(
     for warn in warn_if_cloud_path(db_path()):
         daemon.log(f"⚠ {warn}")
     try:
-        daemon.run_loop(_daemon_open_store, interval=interval, once=once, announce=not quiet)
+        daemon.run_loop(_daemon_open_store, interval=interval, once=once, announce=not quiet,
+                        poll_interval=poll_interval)
     except daemon.DaemonError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
