@@ -2489,16 +2489,19 @@ def daemon_run(
         help=f"Пауза между проходами, сек (минимум {daemon.MIN_INTERVAL}); отсчёт от конца прохода.",
     ),
     once: bool = typer.Option(False, "--once", help="Один проход и выход (для cron/проверки)."),
+    quiet: bool = typer.Option(False, "--quiet", help="Не слать стартовое сообщение в Telegram."),
 ) -> None:
     """Цикл: синк каждого контура с внешним провайдером → хуки после синка → пауза.
 
     Один экземпляр на машину (файловый лок). Обычно запускается службой
     (`jwu daemon install`), руками — для проверки: `jwu daemon run --once`.
+    При старте пишет в настроенные чаты Telegram, что поднялся; `jwu daemon kick` —
+    внеплановый проход прямо сейчас.
     """
     for warn in warn_if_cloud_path(db_path()):
         daemon.log(f"⚠ {warn}")
     try:
-        daemon.run_loop(_daemon_open_store, interval=interval, once=once)
+        daemon.run_loop(_daemon_open_store, interval=interval, once=once, announce=not quiet)
     except daemon.DaemonError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
@@ -2519,6 +2522,22 @@ def daemon_install(
     except daemon.DaemonError as exc:
         err.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
+
+
+@daemon_app.command("kick")
+def daemon_kick() -> None:
+    """Разбудить демон: проход по всем контурам прямо сейчас, не дожидаясь интервала."""
+    try:
+        pid = daemon.kick()
+    except daemon.DaemonError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if pid is None:
+        err.print("[yellow]Демон не запущен.[/yellow] Разовый проход: jwu daemon run --once; "
+                  "службой: jwu daemon install")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Сигнал отправлен[/green] демону (pid {pid}) — проход начнётся сейчас, "
+                  f"итог: jwu daemon status / лог {daemon.log_path()}")
 
 
 @daemon_app.command("uninstall")

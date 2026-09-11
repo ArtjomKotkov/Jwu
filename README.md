@@ -102,14 +102,15 @@ Actions; для репозиториев организации Resource owner �
 ```bash
 jwu daemon run --once            # один проход руками
 jwu daemon install --interval 600   # службой: launchd (macOS) / systemd --user (Linux)
+jwu daemon kick                  # внеплановый проход прямо сейчас
 jwu daemon status · jwu daemon uninstall
 ```
 
 Как он работает: один процесс на машину (файловый лок в `~/.local/share/jwu/`), раз в
 `--interval` секунд от конца прошлого прохода обходит все контуры с Jira или GitHub,
 для каждого открывает сервис, делает `sync`, после синка отправляет уведомления и забирает
-ответы боту, закрывает соединения. Ошибка одного контура пишется в лог
-(`~/.local/share/jwu/daemon.log`) и не мешает остальным. Служба стартует при входе и
+ответы боту, закрывает соединения. При старте пишет в настроенные чаты Telegram, что поднялся. Ошибка одного контура
+пишется в лог (`~/.local/share/jwu/daemon.log`) и не мешает остальным. Служба стартует при входе и
 перезапускается сама; итог последнего прохода — в `jwu daemon status` и `jwu doctor`.
 
 **Telegram.** После **каждого** сетевого синка (руками, из дашборда, из демона, из
@@ -217,6 +218,6 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
 | внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklogs`, `pr-comment`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |
-| фон и данные | `daemon run\|install\|uninstall\|status`, `notify status\|test\|poll`, `backup`, `restore`, `db stats\|prune\|vacuum`, `dashboard`, `install-claude-skills` |
+| фон и данные | `daemon run\|install\|uninstall\|status\|kick`, `notify status\|test\|poll`, `backup`, `restore`, `db stats\|prune\|vacuum`, `dashboard`, `install-claude-skills` |
 
 У большинства команд есть `--json`.

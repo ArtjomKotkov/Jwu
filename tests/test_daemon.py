@@ -159,3 +159,79 @@ def test_cli_daemon_status_json(tmp_path, monkeypatch):
     assert res.exit_code == 0, res.output
     payload = json.loads(res.stdout)
     assert payload["installed"] is False and payload["running"] is False
+
+
+def test_waiter_kick_interrupts_wait():
+    import threading
+    import time as _t
+
+    w = daemon.Waiter()
+    threading.Timer(0.05, w.kick).start()
+    started = _t.monotonic()
+    assert w.wait(5) is True                      # разбудили раньше срока
+    assert _t.monotonic() - started < 2
+    assert w.wait(0.01) is False                  # обычная пауза вышла целиком
+
+
+def test_announce_start_sends_once_per_chat(tmp_path, monkeypatch):
+    from jwu.core import notify
+
+    store = _registry(tmp_path)
+    sent = []
+
+    class _Sender:
+        def __init__(self, chat):
+            self.chat_id = chat
+
+        def send(self, text):
+            sent.append((self.chat_id, text))
+
+        def close(self):
+            pass
+
+    # work и gh настроены на один чат, третий контур локальный — без уведомлений
+    monkeypatch.setattr(notify, "notifier_from_config", lambda cfg: _Sender("42"))
+    assert daemon.announce_start(store, 3600) == 1
+    assert sent[0][0] == "42" and "jwu-демон запущен" in sent[0][1] and "60 мин" in sent[0][1]
+    assert "work, gh" in sent[0][1]
+    # ошибка Telegram не мешает старту
+    class _Broken(_Sender):
+        def send(self, text):
+            raise RuntimeError("нет сети")
+
+    monkeypatch.setattr(notify, "notifier_from_config", lambda cfg: _Broken("7"))
+    assert daemon.announce_start(store, 60) == 0
+    store.close()
+
+
+def test_kick_without_daemon_and_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon, "lock_path", lambda: tmp_path / "d.lock")
+    assert daemon.kick() is None
+    res = runner.invoke(cli.app, ["daemon", "kick"])
+    assert res.exit_code == 1 and "не запущен" in res.output
+    # держим лок сами — kick найдёт pid и пошлёт сигнал (SIGUSR1 в тестовом процессе игнорируем)
+    import signal
+
+    monkeypatch.setattr(signal, "SIGUSR1", 0) if False else None
+    lock = daemon.SingleInstance(tmp_path / "d.lock")
+    assert lock.acquire()
+    received = []
+    old = signal.signal(signal.SIGUSR1, lambda *_: received.append(1))
+    try:
+        assert daemon.kick() == __import__("os").getpid()
+        import time as _t
+        _t.sleep(0.05)
+        assert received
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+        lock.release()
+
+
+def test_run_loop_once_skips_announce(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon, "lock_path", lambda: tmp_path / "d.lock")
+    called = []
+    monkeypatch.setattr(daemon, "announce_start", lambda store, interval: called.append(1) or 0)
+    db = tmp_path / "state.db"
+    Store(db).close()
+    daemon.run_loop(lambda: Store(db), once=True, factory=lambda ws: _FakeService(ws), sleep=lambda s: None)
+    assert not called
