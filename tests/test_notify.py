@@ -33,31 +33,37 @@ def test_select_notable_filters_and_dedupes():
     assert [d.kind for d in notify.select_notable(deltas, kinds=["gone"])] == ["gone"]
 
 
-def test_format_message_groups_links_and_escapes():
+def test_format_message_sections_links_and_escapes():
     note = notify.Notification(
         workspace="work",
         deltas=[
             Delta(key="P/r#1", kind="reviewer_needs_work", summary="<fix> & go", detail="bob: needs work"),
             Delta(key="P/r#2", kind="new_conflict", summary="second", detail="появился merge-конфликт"),
             Delta(key="P/r#3", kind="new_conflict", summary="third"),
+            Delta(key="TS-5", kind="qa_comment", summary="задача", detail="+2 комм. от Anna QA"),
         ],
         mentions=[Mention(task_key="PROJ-9", author="Ann", text="[~me] глянь <это>")],
     )
     links = notify.Links(jira="https://jira.x", bitbucket="https://git.x")
     text = notify.format_message(note, links=links)
-    assert text.startswith("🔔 <b>jwu · work</b>")
-    # группы в порядке блокеров: конфликт раньше needs work; заголовок задачи — отдельной строкой
-    assert text.index("⚠️ конфликт") < text.index("✍️ needs work")
-    assert '• <a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a>\n   <i>second</i>' in text
-    assert "появился" not in text                      # деталь, дублирующая заголовок группы, убрана
-    assert '<a href="https://git.x/projects/P/repos/r/pull-requests/1">P/r#1</a> — bob' in text
-    assert "<i>&lt;fix&gt; &amp; go</i>" in text
-    assert '📣 упоминания\n• <a href="https://jira.x/browse/PROJ-9">PROJ-9</a> — Ann\n   <i>[~me] глянь &lt;это&gt;</i>' in text
-    # без хостов — жирный ключ без ссылки
-    assert "<b>P/r#1</b>" in notify.format_message(note)
+    head, _, rest = text.partition("\n\n")
+    assert head.startswith("🔔 <b>jwu · work</b>\n")            # контур, дата отдельной строкой
+    blocks = rest.split("\n\n")
+    assert blocks[0] == "<b>⚠️ КОНФЛИКТ</b>"                     # секции в порядке блокеров
+    assert blocks[1] == '<a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a>\n<i>second</i>'
+    assert blocks[2] == '<a href="https://git.x/projects/P/repos/r/pull-requests/3">P/r#3</a>\n<i>third</i>'
+    assert blocks[3] == "<b>✍️ NEEDS WORK</b>"
+    assert blocks[4] == ('<a href="https://git.x/projects/P/repos/r/pull-requests/1">P/r#1</a> · bob'
+                         "\n<i>&lt;fix&gt; &amp; go</i>")
+    assert blocks[5] == "<b>🧪 КОММЕНТАРИЙ QA</b>"
+    assert blocks[6].startswith('<a href="https://jira.x/browse/TS-5">TS-5</a> · Anna QA · +2')
+    assert blocks[7] == "<b>📣 УПОМИНАНИЯ</b>"
+    assert blocks[8] == '<a href="https://jira.x/browse/PROJ-9">PROJ-9</a> · Ann\n<i>«глянь &lt;это&gt;»</i>'
+    assert "•" not in text and "появился" not in text
+    assert "<b>P/r#1</b>" in notify.format_message(note)          # без хостов — жирный ключ
     assert notify.key_url("dndeck/ui#5", notify.Links(github="https://github.com")) == "https://github.com/dndeck/ui/pull/5"
-    assert notify.key_url("странный ключ", links) == ""
-    assert not notify.Notification(workspace="w")  # пустое уведомление — ложь
+    assert notify.strip_mention_tags("[~akotkov] [~asmirnov] - как дела?") == "как дела?"
+    assert not notify.Notification(workspace="w")
 
 
 def test_split_message_by_lines():
@@ -141,7 +147,7 @@ def test_sync_sends_notification_when_configured(tmp_path, monkeypatch):
         r2 = svc.sync_section("prs_mine")
         assert [d.kind for d in r2.deltas] == ["reviewer_needs_work"]
         assert r2.notified and tg.call_count == 1
-        assert "needs work" in tg.calls.last.request.content.decode()
+        assert "NEEDS WORK" in tg.calls.last.request.content.decode()
         assert "PROJ/repo#42" in tg.calls.last.request.content.decode()
     finally:
         svc.close()
