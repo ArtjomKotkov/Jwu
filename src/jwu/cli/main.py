@@ -20,7 +20,7 @@ from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config, telegram_token
 from ..core import notify
 from ..core.dates import fmt_ago, fmt_dt
-from ..core import daemon, gitinfo, handoff
+from ..core import daemon, gitinfo, handoff, memory
 from ..core.maintenance import (
     AUTO_PRUNE_DAYS, ensure_db_available, run_daily_maintenance, run_daily_prune,
     warn_if_cloud_path,
@@ -2068,6 +2068,77 @@ def notify_test(
         finally:
             sender.close()
     console.print(f"[green]Отправлено[/green] ботом @{me.get('username', '?')} в чат {cfg.telegram.chat_id}")
+
+
+# --------------------------------------------------------------------------- #
+# memory: память отдельно от кэша — экспорт / импорт / синк через git
+# --------------------------------------------------------------------------- #
+
+memory_app = typer.Typer(
+    help="Память (работы, заметки, правила, фичи, воркспейсы) как JSON: экспорт, импорт, синк через git."
+)
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("export")
+def memory_export(
+    dest: Optional[str] = typer.Option(None, "--dir", "-d",
+        help="Каталог (по умолчанию ~/.local/share/jwu/memory)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Выгрузить память всех воркспейсов в каталог JSON-файлов (без секретов и снапшотов)."""
+    with _open_store() as store:
+        report = memory.export_memory(store, Path(dest) if dest else None)
+    if json_out:
+        _emit_json(report.__dict__)
+    else:
+        console.print(f"[green]Экспорт:[/green] {report.summary()}")
+
+
+@memory_app.command("import")
+def memory_import(
+    src: Optional[str] = typer.Argument(None, help="Каталог памяти (по умолчанию ~/.local/share/jwu/memory)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Только посчитать, что изменится."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Слить память из каталога в БД: по естественным ключам, без дублей, ничего не удаляя."""
+    with _open_store() as store:
+        try:
+            report = memory.import_memory(store, Path(src) if src else None, dry_run=dry_run)
+        except memory.MemoryError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(report.__dict__)
+    else:
+        console.print(f"[green]Импорт:[/green] {report.summary()}")
+
+
+@memory_app.command("sync")
+def memory_sync(
+    repo: Optional[str] = typer.Option(None, "--repo", "-r",
+        help="Git-каталог памяти (запоминается; по умолчанию — прошлый или ~/.local/share/jwu/memory)."),
+    no_push: bool = typer.Option(False, "--no-push", help="Закоммитить, но не пушить."),
+    message: Optional[str] = typer.Option(None, "--message", "-m", help="Текст коммита."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """pull → импорт чужих изменений → экспорт → commit → push. Свой ПРИВАТНЫЙ репозиторий памяти."""
+    with _open_store() as store:
+        try:
+            result = memory.sync_memory(store, Path(repo) if repo else None, push=not no_push,
+                                        message=message)
+        except memory.MemoryError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(result)
+    else:
+        console.print(f"[green]Память синхронизирована[/green] · {result['repo']}")
+        for k in ("import", "export"):
+            if result.get(k):
+                console.print(f"  {k}: {result[k]}")
+        console.print(f"  pull: {'да' if result['pulled'] else '—'} · commit: {'да' if result['committed'] else 'нечего'}"
+                      f" · push: {'да' if result['pushed'] else '—'}")
 
 
 # --------------------------------------------------------------------------- #
