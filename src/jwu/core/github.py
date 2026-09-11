@@ -621,6 +621,61 @@ class GitHubClient:
         threads.sort(key=lambda group: group[0].created, reverse=True)
         return [c for group in threads for c in group]
 
+    # --- дифф, комментарии и ревью PR ------------------------------------------ #
+
+    def pr_diff(self, project: str, repo: str, pr_id: int, *, path: str | None = None,
+                context: int = 3) -> str:
+        """Unified diff PR (``Accept: application/vnd.github.diff``); ``path`` — один файл."""
+        owner, name = self._split_repo(project, repo)
+        try:
+            resp = self._client.get(f"/repos/{owner}/{name}/pulls/{pr_id}",
+                                    headers={"Accept": "application/vnd.github.diff"})
+        except httpx.HTTPError as exc:
+            raise GitHubError(f"Сеть/GitHub недоступен: {exc}") from exc
+        self._raise_for(resp)
+        text = resp.text
+        if not path:
+            return text
+        # один файл: вырезаем блок от его "diff --git" до следующего
+        chunks = text.split("\ndiff --git ")
+        keep = [c for c in chunks if f" b/{path}\n" in ("diff --git " + c if not c.startswith("diff --git") else c) + "\n"]
+        return "".join(("diff --git " + c if not c.startswith("diff --git") else c) for c in keep)
+
+    def pr_comment_add(
+        self, project: str, repo: str, pr_id: int, text: str, *,
+        parent_id: int | str | None = None, path: str | None = None,
+        line: int | None = None, line_type: str = "CONTEXT", file_type: str = "TO",
+    ) -> dict:
+        """Коммент к PR: общий (issue comment), ответ в inline-тред либо новый inline."""
+        owner, name = self._split_repo(project, repo)
+        if parent_id is not None:
+            return self._post(
+                f"/repos/{owner}/{name}/pulls/{pr_id}/comments/{int(parent_id)}/replies",
+                {"body": text},
+            )
+        if path:
+            sha = self.latest_commit(project, repo, pr_id)
+            body: dict = {"body": text, "commit_id": sha, "path": path,
+                          "side": "LEFT" if file_type == "FROM" else "RIGHT"}
+            if line is not None:
+                body["line"] = int(line)
+            return self._post(f"/repos/{owner}/{name}/pulls/{pr_id}/comments", body)
+        return self._post(f"/repos/{owner}/{name}/issues/{pr_id}/comments", {"body": text})
+
+    def pr_review(self, project: str, repo: str, pr_id: int, user_slug: str, status: str,
+                  body: str = "") -> dict:
+        """Отзыв на PR: APPROVED → APPROVE, NEEDS_WORK → REQUEST_CHANGES (нужен текст)."""
+        owner, name = self._split_repo(project, repo)
+        event = {"APPROVED": "APPROVE", "NEEDS_WORK": "REQUEST_CHANGES"}.get(status.upper())
+        if event is None:
+            raise GitHubError("GitHub не умеет «снять апрув» отзывом; UNAPPROVED тут недоступен")
+        if event == "REQUEST_CHANGES" and not body.strip():
+            raise GitHubError("Для REQUEST_CHANGES GitHub требует текст отзыва")
+        payload: dict = {"event": event}
+        if body.strip():
+            payload["body"] = body
+        return self._post(f"/repos/{owner}/{name}/pulls/{pr_id}/reviews", payload)
+
     # --- сборки (GitHub Actions) ------------------------------------------ #
 
     def build_statuses(

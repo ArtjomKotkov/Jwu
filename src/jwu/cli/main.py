@@ -1561,10 +1561,24 @@ def pr(
     download: bool = typer.Option(False, "--download", "-d",
         help="Скачать вложения из описания PR и комментов (скриншоты) в tmp."),
     dest: Optional[str] = typer.Option(None, "--dest", help="Каталог для скачивания."),
+    diff: bool = typer.Option(False, "--diff", help="Напечатать unified diff PR (и ничего больше)."),
+    diff_path: Optional[str] = typer.Option(None, "--path", help="Только этот файл в диффе."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Детали одного PR + статус merge-конфликта + комментарии ревью."""
     downloaded: list[tuple] = []
+    if diff:
+        with _service_with_prs() as svc:
+            try:
+                text = svc.pr_diff(project, repo, pr_id, path=diff_path)
+            except (BitbucketError, GitHubError) as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1)
+        if json_out:
+            _emit_json({"pr": pr_id, "path": diff_path, "diff": text})
+        else:
+            typer.echo(text, nl=False)
+        return
     with _service_with_prs() as svc:
         detail = svc.pr_detail(project, repo, pr_id)
         pull = detail.pr
@@ -1773,6 +1787,104 @@ def _prompt_telegram(cfg, chat_opt: Optional[str], token_opt: Optional[str]) -> 
     if token_opt is not None:
         return token_opt
     return _prompt_default("Токен Telegram-бота (Enter — оставить прежний)", "", secret=True)
+
+
+# --------------------------------------------------------------------------- #
+# pr-comment / pr-review: ответить в PR и поставить статус ревью (ВНЕШНЯЯ запись)
+# --------------------------------------------------------------------------- #
+
+
+@app.command("pr-comment")
+def pr_comment(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    text: Optional[str] = typer.Option(None, "--text", "-m", help="Текст комментария."),
+    text_file: Optional[str] = typer.Option(None, "--file", "-F", help="Файл с текстом; «-» — stdin."),
+    reply_to: Optional[int] = typer.Option(None, "--reply-to", "-r", help="id комментария, в тред которого отвечаем."),
+    path: Optional[str] = typer.Option(None, "--path", help="Файл для нового inline-коммента."),
+    line: Optional[int] = typer.Option(None, "--line", help="Строка файла для inline-коммента."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта / owner."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug / имя репозитория."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Показать текст, ничего не отправляя."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Комментарий в PR: общий, ответ на замечание ревьювера (--reply-to) или на строку файла.
+
+    ВНЕШНЯЯ запись в Bitbucket/GitHub — только после подтверждения (или --yes).
+    """
+    body = _read_description(text, text_file)
+    if not (body or "").strip():
+        err.print("[red]Пустой комментарий:[/red] задай --text или --file.")
+        raise typer.Exit(code=1)
+    where = (f"ответ в тред #{reply_to}" if reply_to is not None
+             else f"inline {path}:{line}" if path else "общий комментарий")
+    if dry_run or not yes:
+        if json_out:
+            _emit_json({"ok": False, "reason": "confirm_required" if not dry_run else "dry_run",
+                        "pr": pr_id, "where": where, "text": body,
+                        "hint": "Показать текст пользователю целиком и повторить с --yes"})
+            raise typer.Exit(code=0)
+        console.print(f"[bold]PR #{pr_id} · {where}[/bold]\n{body}")
+        if dry_run:
+            console.print("[dim]--dry-run: ничего не отправлено.[/dim]")
+            raise typer.Exit(code=0)
+        if not typer.confirm(f"Отправить в PR #{pr_id}?", default=False):
+            console.print("[dim]Отменено.[/dim]")
+            raise typer.Exit(code=1)
+    with _service_with_prs() as svc:
+        try:
+            result = svc.pr_comment_add(project, repo, pr_id, body, parent_id=reply_to,
+                                        path=path, line=line)
+        except (BitbucketError, GitHubError, ValueError) as exc:
+            if json_out:
+                _emit_json({"ok": False, "pr": pr_id, "error": str(exc)})
+            else:
+                err.print(f"[red]✗[/red] PR #{pr_id}: комментарий не отправлен — {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json({"ok": True, "pr": pr_id, "id": result.get("id", ""), "where": where})
+    else:
+        console.print(f"[green]✓[/green] PR #{pr_id}: комментарий #{result.get('id', '?')} добавлен ({where})")
+
+
+@app.command("pr-review")
+def pr_review(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    status: str = typer.Argument(..., help="approve | needs-work | unapprove"),
+    text: Optional[str] = typer.Option(None, "--text", "-m",
+        help="Текст отзыва (у GitHub обязателен для needs-work; у Bitbucket уходит отдельным комментом)."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта / owner."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug / имя репозитория."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Поставить статус. Без флага — превью."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Мой статус ревью на PR (ВНЕШНЯЯ запись — только с --yes)."""
+    mapping = {"approve": "APPROVED", "approved": "APPROVED", "needs-work": "NEEDS_WORK",
+               "needs_work": "NEEDS_WORK", "unapprove": "UNAPPROVED", "unapproved": "UNAPPROVED"}
+    st = mapping.get(status.lower())
+    if st is None:
+        err.print("[red]Статус: approve | needs-work | unapprove[/red]")
+        raise typer.Exit(code=1)
+    if not yes:
+        console.print(f"[yellow]Превью[/yellow] (ничего не изменено, добавь --yes): PR #{pr_id} → {st}"
+                      + (f"\n{text}" if text else ""))
+        raise typer.Exit(code=1)
+    with _service_with_prs() as svc:
+        try:
+            result = svc.pr_review(project, repo, pr_id, st, body=text or "")
+            if text and svc.bitbucket is not None:
+                # у Bitbucket статус без текста; замечание — отдельным общим комментом
+                svc.pr_comment_add(project, repo, pr_id, text)
+        except (BitbucketError, GitHubError, ValueError) as exc:
+            if json_out:
+                _emit_json({"ok": False, "pr": pr_id, "error": str(exc)})
+            else:
+                err.print(f"[red]✗[/red] PR #{pr_id}: статус не поставлен — {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json({"ok": True, "pr": pr_id, "status": st, "result": result})
+    else:
+        console.print(f"[green]✓[/green] PR #{pr_id}: мой статус ревью — {st}")
 
 
 # --------------------------------------------------------------------------- #

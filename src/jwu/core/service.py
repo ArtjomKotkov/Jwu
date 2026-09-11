@@ -1269,6 +1269,54 @@ class Service:
             self._fill_tasks(pr)
         return prs
 
+    # --- дифф, комментарии и ревью PR (оба провайдера) ----------------------- #
+
+    def pr_diff(self, project: str | None, repo: str | None, pr_id: int, *,
+                path: str | None = None, max_chars: int | None = None) -> str:
+        """Unified diff PR; ``path`` — один файл; ``max_chars`` — обрезать с пометкой."""
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        text = client.pr_diff(project or default_project, repo or default_repo, pr_id, path=path)
+        if max_chars is not None and len(text) > max_chars:
+            cut = text[:max_chars]
+            cut = cut[: cut.rfind("\n") + 1] if "\n" in cut else cut
+            note = (f"\n\\ ... (обрезано jwu: показано {len(cut)} из {len(text)} символов; "
+                    f"возьми по файлам через path)\n")
+            return cut + note
+        return text
+
+    def pr_comment_add(
+        self, project: str | None, repo: str | None, pr_id: int, text: str, *,
+        parent_id: int | str | None = None, path: str | None = None, line: int | None = None,
+    ) -> dict:
+        """Коммент к PR: общий, ответ в тред (``parent_id``) или на строку файла.
+
+        ВНЕШНЯЯ запись — звать после подтверждения пользователя.
+        """
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Пустой комментарий")
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        return client.pr_comment_add(project or default_project, repo or default_repo, pr_id,
+                                     text, parent_id=parent_id, path=path, line=line)
+
+    def pr_review(self, project: str | None, repo: str | None, pr_id: int, status: str,
+                  body: str = "") -> dict:
+        """Мой статус ревью на PR: APPROVED | NEEDS_WORK | UNAPPROVED. ВНЕШНЯЯ запись."""
+        status = (status or "").upper().replace("-", "_")
+        if status not in ("APPROVED", "NEEDS_WORK", "UNAPPROVED"):
+            raise ValueError("Статус ревью: APPROVED | NEEDS_WORK | UNAPPROVED")
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        login = self._resolve_username()
+        if isinstance(client, GitHubClient):
+            return client.pr_review(project or default_project, repo or default_repo, pr_id,
+                                    login, status, body=body)
+        if not login:
+            raise ValueError("Не знаю свой логин Bitbucket — задай jira.username в конфиге")
+        return client.pr_review(project or default_project, repo or default_repo, pr_id, login, status)
+
     # --- задачи на комментах PR (Bitbucket tasks) ------------------------- #
 
     def _require_bitbucket(self) -> BitbucketClient:
