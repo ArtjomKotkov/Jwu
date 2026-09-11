@@ -83,3 +83,12 @@ def fmt_ago(value: TimeLike, *, fallback: str = "не синкано — наж�
     if mins < 60 * 24:
         return f"{mins // 60} ч назад"
     return f"{mins // 1440} дн назад"
+
+
+def age_days(value: TimeLike) -> "int | None":
+    """Сколько полных дней прошло с момента ``value``; None — пусто/невалидно."""
+    ts = _to_dt(value)
+    if ts is None:
+        return None
+    now = datetime.now(ts.tzinfo or timezone.utc)
+    return max(0, int((now - ts).total_seconds() // 86400))
