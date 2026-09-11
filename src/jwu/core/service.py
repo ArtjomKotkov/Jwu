@@ -45,6 +45,7 @@ from .jenkins import JenkinsClient, JenkinsError, parse_build_url
 from . import notify
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
+    PR_TASK_STATES, PRTask, check_task_text,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
     GITHUB_SHORT_REF_RE,
@@ -1199,6 +1200,17 @@ class Service:
         except Exception:  # noqa: BLE001 — без сборок PR всё равно полезен
             pr.builds = []
 
+    def _fill_tasks(self, pr: PR) -> None:
+        """Счётчики задач на комментах (один запрос; у GitHub задач нет — молча 0)."""
+        client = self.pr_client
+        counter = getattr(client, "pr_task_count", None)
+        if counter is None or not (pr.project and pr.repository):
+            return
+        try:
+            pr.tasks_open, pr.tasks_resolved = counter(pr.project, pr.repository, pr.id)
+        except Exception:  # noqa: BLE001 — счётчик не критичен
+            pass
+
     def prs(self, view: str = "review", *, with_conflicts: bool = True,
             with_builds: bool = True) -> list[PR]:
         prs = self._require_prs().dashboard_prs(view)
@@ -1207,7 +1219,56 @@ class Service:
                 self._fill_merge_status(pr)
             if with_builds:
                 self._fill_builds(pr)
+            self._fill_tasks(pr)
         return prs
+
+    # --- задачи на комментах PR (Bitbucket tasks) ------------------------- #
+
+    def _require_bitbucket(self) -> BitbucketClient:
+        client = self.bitbucket
+        if client is None:
+            raise ValueError(
+                "Задачи на комментах PR есть только у Bitbucket: у GitHub-контура "
+                "такого механизма нет (там — чек-листы в теле PR)."
+            )
+        return client
+
+    def pr_tasks(self, project: str | None, repo: str | None, pr_id: int) -> list[PRTask]:
+        client = self._require_bitbucket()
+        default_project, default_repo = self.default_pr_ref()
+        return client.pr_tasks(project or default_project, repo or default_repo, pr_id)
+
+    def pr_task_add(
+        self, project: str | None, repo: str | None, pr_id: int, text: str, *,
+        comment_id: int | str | None = None, comment_text: str | None = None,
+        path: str | None = None, line: int | None = None,
+    ) -> PRTask:
+        """Повесить задачу на коммент PR. ВНЕШНЯЯ запись — звать после подтверждения.
+
+        Без ``comment_id`` задача вешается на СВОЙ новый коммент: общий или, если задан
+        ``path`` (и ``line``), на строку файла. Текст коммента — ``comment_text``, по
+        умолчанию тот же, что у задачи. Текст задачи проверяется: не пустой, до 10 слов.
+        """
+        text = check_task_text(text)
+        client = self._require_bitbucket()
+        default_project, default_repo = self.default_pr_ref()
+        project = project or default_project
+        repo = repo or default_repo
+        if comment_id is None:
+            raw = client.pr_comment_add(
+                project, repo, pr_id, comment_text or text, path=path, line=line
+            )
+            comment_id = raw.get("id")
+            if comment_id is None:
+                raise ValueError("Bitbucket не вернул id созданного комментария")
+        return client.task_create(comment_id, text)
+
+    def pr_task_set_state(self, task_ids: list[int], state: str) -> list[PRTask]:
+        """Закрыть (RESOLVED) / открыть (OPEN) задачи. ВНЕШНЯЯ запись — после подтверждения."""
+        if state not in PR_TASK_STATES:
+            raise ValueError(f"Недопустимое состояние {state!r}: {' | '.join(PR_TASK_STATES)}")
+        client = self._require_bitbucket()
+        return [client.task_set_state(int(tid), state) for tid in task_ids]
 
     def my_reviews(self, *, on: str | None = None) -> list[PR]:
         """PR на ревью, где мой статус — APPROVED или NEEDS_WORK, с датой моего ревью.
@@ -1289,6 +1350,8 @@ class Service:
                 # Сборки по head-коммиту едут в снапшот вместе с PR: красный билд — такое
                 # же состояние PR, как конфликт, и дельта «сборка упала» считается по нему.
                 self._fill_builds(pr)
+                # Счётчики задач на комментах — для состояния «открытые задачи» и дельт.
+                self._fill_tasks(pr)
             self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(ref, [])))
         # Подтянуть статус/assignee задач, на которые ссылаются PR — нужно для
         # колонок «Назначен»/«Статус» в дашборде. PR на чужой релизной задаче
@@ -1466,6 +1529,9 @@ class Service:
             pr.builds = self.build_statuses_for_pr(project, repo, pr_id)
         except Exception:  # noqa: BLE001
             pr.builds = []
+        tasks = [t for c in comments for t in c.tasks]
+        pr.tasks_open = sum(1 for t in tasks if not t.resolved)
+        pr.tasks_resolved = sum(1 for t in tasks if t.resolved)
         return PRDetail(pr=pr, comments=comments, commits=commits)
 
     def build_statuses_for_pr(self, project: str, repo: str, pr_id: int) -> list[BuildStatus]:

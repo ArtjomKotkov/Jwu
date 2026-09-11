@@ -272,6 +272,9 @@ def _pr_signature(pr: PR) -> dict:
         "reviewer_status": {r.name: (r.status or "") for r in pr.reviewers},
         # Сводный статус CI по head-коммиту: переход в FAILED/из FAILED — отдельные дельты.
         "build_state": pr.build_state,
+        # Задачи на комментах: рост общего числа — новая задача, рост закрытых — закрыли.
+        "tasks_open": pr.tasks_open,
+        "tasks_resolved": pr.tasks_resolved,
     }
 
 
@@ -1184,6 +1187,18 @@ class Store:
                 deltas.append(Delta(
                     key=pr_key, kind="new_conflict", summary=title,
                     detail="появился merge-конфликт",
+                ))
+            cur_total = (cur.get("tasks_open") or 0) + (cur.get("tasks_resolved") or 0)
+            prev_total = (prev.get("tasks_open") or 0) + (prev.get("tasks_resolved") or 0)
+            if cur_total > prev_total:
+                deltas.append(Delta(
+                    key=pr_key, kind="new_pr_task", summary=title,
+                    detail=f"+{cur_total - prev_total} задач в PR, открыто {cur.get('tasks_open') or 0}",
+                ))
+            if (cur.get("tasks_resolved") or 0) > (prev.get("tasks_resolved") or 0):
+                deltas.append(Delta(
+                    key=pr_key, kind="pr_task_resolved", summary=title,
+                    detail=f"закрыто {cur.get('tasks_resolved')}, открыто {cur.get('tasks_open') or 0}",
                 ))
             # Сборки: сообщаем о ПЕРЕХОДЕ, а не о состоянии — красный билд, который
             # красный третий синк подряд, уже известен. Старые снапшоты без

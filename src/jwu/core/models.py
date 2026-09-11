@@ -442,6 +442,58 @@ class BuildReport(BaseModel):
         return self.details_available and self.ci == "jenkins"
 
 
+# Задача на комменте PR — короткая текстовая «галочка» под репликой ревьювера. Текст
+# пишет человек и держит его коротким: это чек-лист, а не описание.
+PR_TASK_MAX_WORDS = 10
+PR_TASK_STATES = ("OPEN", "RESOLVED")
+
+
+def check_task_text(text: str) -> str:
+    """Нормализовать текст задачи PR и отказать, если он пустой или длиннее лимита.
+
+    Лимит стоит здесь, в модели, а не в скилле: какая бы сессия ни звала инструмент,
+    обойти правило «до 10 слов» она не сможет.
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        raise ValueError("Текст задачи пустой — его должен задать пользователь")
+    words = text.split(" ")
+    if len(words) > PR_TASK_MAX_WORDS:
+        raise ValueError(
+            f"Текст задачи слишком длинный: {len(words)} слов, лимит {PR_TASK_MAX_WORDS}. "
+            f"Сформулируй короче, это чек-лист, а не описание"
+        )
+    return text
+
+
+class PRTask(BaseModel):
+    """Задача (task) на комменте PR в Bitbucket Server: id, текст, OPEN | RESOLVED."""
+
+    id: int = 0
+    text: str = ""
+    state: str = "OPEN"
+    author: str = ""
+    created: int = 0          # epoch ms
+    comment_id: str = ""      # коммент-якорь (у Bitbucket 6.x задача без коммента не бывает)
+
+    @property
+    def resolved(self) -> bool:
+        return self.state == "RESOLVED"
+
+    @classmethod
+    def from_bitbucket(cls, raw: dict) -> "PRTask":
+        anchor = raw.get("anchor") or {}
+        return cls(
+            id=int(raw.get("id", 0) or 0),
+            text=raw.get("text", "") or "",
+            state=(raw.get("state", "") or "OPEN").upper(),
+            author=_get(raw, "author", "displayName", default="")
+            or _get(raw, "author", "name", default="") or "",
+            created=int(raw.get("createdDate", 0) or 0),
+            comment_id=str(anchor.get("id", "") or ""),
+        )
+
+
 class PRComment(BaseModel):
     id: str
     author: str = ""
@@ -452,6 +504,8 @@ class PRComment(BaseModel):
     depth: int = 0          # 0 — верхний уровень, >0 — ответ
     context: list[str] = Field(default_factory=list)  # строки диффа вокруг (с +/-/ )
     anchor_idx: int = -1    # индекс прокомментированной строки в context (-1 = неизвестно)
+    # Задачи, повешенные на этот коммент (чек-лист «что сделано, что нет»).
+    tasks: list[PRTask] = Field(default_factory=list)
 
 
 class PR(BaseModel):
@@ -479,6 +533,10 @@ class PR(BaseModel):
     my_review_at: Optional[int] = None   # дата (ms) моего апрува/needs-work, из activities
     # статусы CI-сборок по head-коммиту (build-status API); пусто, если не запрашивались:
     builds: list[BuildStatus] = Field(default_factory=list)
+    # Задачи на комментах PR (Bitbucket tasks): сколько открыто и сколько закрыто.
+    # Открытые — это и есть «что ещё надо поправить» по этому PR.
+    tasks_open: int = 0
+    tasks_resolved: int = 0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
