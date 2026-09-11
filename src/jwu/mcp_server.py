@@ -13,7 +13,8 @@ issue_link, issue_transition, issue_attach, job_start, job_add,
 job_link, job_status, feature_add, feature_status, feature_edit, feature_rm. Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
 у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в SDESK его читает КЛИЕНТ),
 `jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition`, `jwu_issue_attach`,
-`jwu_pr_task_add` и `jwu_pr_task_done` (задачи на комментах PR в Bitbucket) —
+`jwu_pr_task_add` и `jwu_pr_task_done` (задачи на комментах PR в Bitbucket),
+`jwu_pr_comment` (комментарий/ответ в PR) и `jwu_pr_review` (мой статус ревью) —
 вызывать только по явному подтверждению пользователя. У пишущих инструментов с
 `dry_run` порядок обязателен: сначала превью, показать его пользователю, потом запись.
 
@@ -399,6 +400,86 @@ async def jwu_pr_attachments(
             for a, p in downloaded
         ]
     return payload
+
+
+@mcp.tool()
+async def jwu_pr_diff(
+    pr_id: int,
+    path: Optional[str] = None,
+    max_chars: int = 60000,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Unified diff PR — ревью и ответы на замечания без локального клона репозитория.
+
+    path — только один файл (так и бери большие PR: сначала список файлов из общего
+    диффа по строкам `diff --git`, потом по файлам). max_chars — обрезать с пометкой.
+    Работает у Bitbucket и GitHub.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    text = svc.pr_diff(project, repo, pr_id, path=path, max_chars=max_chars)
+    files = [ln.split(" b/", 1)[-1] for ln in text.splitlines() if ln.startswith("diff --git ")]
+    return {"pr": pr_id, "path": path, "files": files, "diff": text}
+
+
+@mcp.tool()
+async def jwu_pr_comment(
+    pr_id: int,
+    text: str,
+    reply_to: Optional[int] = None,
+    path: Optional[str] = None,
+    line: Optional[int] = None,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: комментарий в PR (Bitbucket/GitHub) — звать только после того, как
+    пользователь увидел текст целиком и явно подтвердил (скилл jwu-pr-comment).
+
+    reply_to — id комментария ревьювера, в тред которого отвечаем («поправил», «не
+    согласен, потому что…»); path+line — новый inline-коммент на строку файла; без
+    обоих — общий комментарий к PR.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    result = svc.pr_comment_add(project, repo, pr_id, text, parent_id=reply_to, path=path, line=line)
+    return _stamp({"pr": pr_id, "id": result.get("id", ""), "reply_to": reply_to,
+                   "path": path, "line": line}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_review(
+    pr_id: int,
+    status: str,
+    text: str = "",
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: мой статус ревью на чужом PR — APPROVED | NEEDS_WORK | UNAPPROVED.
+    Только после явного подтверждения пользователя; обычно после ревью субагентом
+    (скилл jwu-job-review) и показа выводов.
+
+    text — замечание: у GitHub обязательно для NEEDS_WORK и уходит в отзыв; у Bitbucket
+    статус без текста, поэтому текст отправляется отдельным общим комментарием.
+    UNAPPROVED (снять апрув) есть только у Bitbucket.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    result = svc.pr_review(project, repo, pr_id, status, body=text)
+    comment_id = None
+    if text.strip() and svc.bitbucket is not None:
+        comment_id = svc.pr_comment_add(project, repo, pr_id, text).get("id")
+    return _stamp({"pr": pr_id, "status": status.upper().replace("-", "_"),
+                   "comment_id": comment_id, "result": result}, _resolve(workspace))
 
 
 @mcp.tool()

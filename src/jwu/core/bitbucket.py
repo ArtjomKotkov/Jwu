@@ -77,6 +77,42 @@ def _flatten_comment(
                          anchor_idx=-1, depth=depth + 1)
 
 
+def render_unified_diff(data: dict) -> str:
+    """JSON-дифф Bitbucket → unified diff (то, что читают люди и `git apply --check`)."""
+    out: list[str] = []
+    for diff in data.get("diffs", []) or []:
+        src = (diff.get("source") or {}).get("toString") or ""
+        dst = (diff.get("destination") or {}).get("toString") or ""
+        out.append(f"diff --git a/{src or dst} b/{dst or src}")
+        if not src:
+            out.append("new file")
+        elif not dst:
+            out.append("deleted file")
+        if diff.get("binary"):
+            out.append("Binary files differ")
+            continue
+        out.append(f"--- {'a/' + src if src else '/dev/null'}")
+        out.append(f"+++ {'b/' + dst if dst else '/dev/null'}")
+        for hunk in diff.get("hunks", []) or []:
+            out.append(
+                f"@@ -{hunk.get('sourceLine', 0)},{hunk.get('sourceSpan', 0)} "
+                f"+{hunk.get('destinationLine', 0)},{hunk.get('destinationSpan', 0)} @@"
+            )
+            for seg in hunk.get("segments", []) or []:
+                prefix = {"ADDED": "+", "REMOVED": "-"}.get(seg.get("type"), " ")
+                for ln in seg.get("lines", []) or []:
+                    out.append(prefix + (ln.get("line", "") or ""))
+                if seg.get("truncated"):
+                    out.append("\\ ... (сегмент обрезан Bitbucket)")
+            if hunk.get("truncated"):
+                out.append("\\ ... (хунк обрезан Bitbucket)")
+        if diff.get("truncated"):
+            out.append("\\ ... (файл обрезан Bitbucket)")
+    if data.get("truncated"):
+        out.append("\\ ... (дифф обрезан Bitbucket: слишком большой)")
+    return "\n".join(out) + ("\n" if out else "")
+
+
 def _get_dn(c: dict) -> str:
     author = c.get("author") or {}
     return author.get("displayName", "") or author.get("name", "")
@@ -302,6 +338,33 @@ class BitbucketClient:
             if best is None or ts > best:
                 best = ts
         return best
+
+    # --- дифф и ревью --------------------------------------------------------- #
+
+    def pr_diff(self, project: str, repo: str, pr_id: int, *, path: str | None = None,
+                context: int = 3) -> str:
+        """Дифф PR в unified-виде, собранный из JSON-ответа ``/diff``.
+
+        Текстовый вариант (``.diff``, ``Accept: text/plain``) на 6.1 отдаёт 406, поэтому
+        берём JSON с хунками и рендерим сами: ``--- a/…``, ``+++ b/…``, ``@@ … @@`` и
+        строки с префиксами. ``path`` — только один файл.
+        """
+        url = f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/diff"
+        if path:
+            url += "/" + path.lstrip("/")
+        data = self._get(url, params={"contextLines": context})
+        return render_unified_diff(data)
+
+    def pr_review(self, project: str, repo: str, pr_id: int, user_slug: str, status: str) -> dict:
+        """Поставить свой статус ревью: APPROVED | NEEDS_WORK | UNAPPROVED (снять)."""
+        status = status.upper()
+        if status not in ("APPROVED", "NEEDS_WORK", "UNAPPROVED"):
+            raise BitbucketError(f"Неизвестный статус ревью {status!r}")
+        return self._send(
+            "PUT",
+            f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user_slug}",
+            {"user": {"name": user_slug}, "approved": status == "APPROVED", "status": status},
+        )
 
     # --- задачи на комментах (Bitbucket Server tasks API) ------------------ #
 
