@@ -1420,9 +1420,8 @@ def task(
             console.print(f"  #{j.id} [{j.status}] {j.title or '—'} "
                           f"[dim]записей: {len(j.records)}; PR: {prs}[/dim]")
     if notes:
-        console.print(f"\n[bold]Заметки[/bold]")
-        for n in notes:
-            console.print(f"[dim]{n.ts} · {n.author}[/dim] {n.text}")
+        console.print(f"\n[bold]Заметки ({len(notes)})[/bold]")
+        _render_notes(notes, indent="  ")
 
 
 def _extract_archive(path: Path) -> list[Path]:
@@ -1526,6 +1525,8 @@ def _render_prs(prs: list[PR]) -> None:
         table.add_column("Конфликт")
         table.add_column("Сборка")
     table.add_column("Title")
+    with _store() as store:
+        status = store.status_notes([models.pr_note_key(p.project, p.repository, p.id) for p in prs])
     for pr in prs:
         if mine:
             mark = "[green]галка[/green]" if pr.my_review_status == "APPROVED" else "[yellow]needs work[/yellow]"
@@ -1534,7 +1535,9 @@ def _render_prs(prs: list[PR]) -> None:
         else:
             conflict = "—" if pr.conflicted is None else ("[red]да[/red]" if pr.conflicted else "нет")
             build = _build_icon(pr.build_state) if pr.build_state else "—"
-            table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", pr.state, conflict, build, pr.title)
+            note = status.get(models.pr_note_key(pr.project, pr.repository, pr.id), "")
+            title = f"{pr.title}\n[green]📍 {note}[/green]" if note else pr.title
+            table.add_row(str(pr.id), f"{pr.project}/{pr.repository}", pr.state, conflict, build, title)
     console.print(table)
     console.print(f"[dim]Всего: {len(prs)}[/dim]")
 
@@ -1604,6 +1607,8 @@ def pr(
         payload["commits"] = detail.commits
         payload["jobs"] = [j.model_dump() for j in jobs_list]
         payload["attachments"] = [a.model_dump() for a in attachments]
+        payload["notes"] = [n.model_dump() for n in detail.notes]
+        payload["task_key"] = detail.task_key
         if download:
             payload["downloaded"] = [
                 {"name": a.name, "kind": a.kind, "comment_id": a.comment_id, "path": str(p)}
@@ -1646,6 +1651,10 @@ def pr(
     if pull.tasks_open or pull.tasks_resolved:
         console.print(f"[bold]Задачи в PR:[/bold] открытых {pull.tasks_open}, закрытых {pull.tasks_resolved}"
                       f"  [dim](jwu pr-task list {pull.id})[/dim]")
+    if detail.notes:
+        console.print(f"[bold]Заметки ({len(detail.notes)})[/bold]"
+                      + (f" [dim]PR и задача {detail.task_key}[/dim]" if detail.task_key else ""))
+        _render_notes(detail.notes, indent="  ")
     if jobs_list:
         console.print(f"[bold]Работы ({len(jobs_list)})[/bold]")
         for j in jobs_list:
@@ -2740,6 +2749,7 @@ _DAY_PROMPT = """## Что нужно сделать
 - PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
 - PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
 - Дельта `returned_from_testing` (задачу вернули с тестов) и `qa_comment` (комментарий тестировщика в задаче на тестах) → это доработка: разобрать, что нашли, и запланировать.
+- `заметка: «…»` у задачи/PR — закреплённая status-заметка (jwu note … --kind status): это и есть «почему висит», учитывай её раньше эвристик; обновить — `jwu note <ключ> "…" --kind status`.
 - Раздел «Застряло» (пороги — настройка воркспейса `jwu workspace thresholds`) → назови КАЖДЫЙ пункт явно: «PR … застрял N дн», «задача … на тестах N дн» и что с ним делать (пнуть / мержить / закрыть).
 - Упоминание с пометкой `· новое` → прочитать, понять, что от меня хотят, и ответить.
 - База — дельты: новые комменты, смена статуса, апрувы, новые PR; `resolved` → закрыть работу.
@@ -2763,7 +2773,8 @@ def _pr_state(pr: PR) -> str:
     return "ждёт апрувов"
 
 
-def _pr_line(pr: PR) -> str:
+def _pr_line(pr: PR, status_note: str = "") -> str:
+    note = f'; заметка: «{status_note}»' if status_note else ""
     revs = ", ".join(
         f"{r.display_name or r.name}:{'A' if r.approved else (r.status or 'N')}"
         for r in pr.reviewers
@@ -2773,7 +2784,7 @@ def _pr_line(pr: PR) -> str:
             f"состояние: {_pr_state(pr)}; сборка: {_BUILD_RU.get(pr.build_state, 'нет')}; "
             f"задач: {pr.tasks_open} открытых / {pr.tasks_resolved} закрытых; "
             f"ревью: {revs}; комментов: {pr.comment_count}; "
-            f"обновлён: {fmt_ago(pr.updated)}")
+            f"обновлён: {fmt_ago(pr.updated)}{note}")
 
 
 # Сводный статус сборок PR словами — для контекста дневного анализа и таблиц.
@@ -2801,6 +2812,7 @@ def _render_day_context_md(ctx: DayContext) -> str:
     L.append(f"\n## Мои задачи ({len(ctx.mine)})")
     L += [
         f"- {it.key} [{it.status}] ({it.priority}) assignee: {it.assignee or '—'} — {it.summary}"
+        + (f"; заметка: «{ctx.status_notes[it.key]}»" if ctx.status_notes.get(it.key) else "")
         for it in ctx.mine
     ] or ["- нет"]
 
@@ -2809,7 +2821,7 @@ def _render_day_context_md(ctx: DayContext) -> str:
         if not prs:
             L.append("- нет")
         for pr in prs:
-            L.append(_pr_line(pr))
+            L.append(_pr_line(pr, ctx.status_notes.get(models.pr_note_key(pr.project, pr.repository, pr.id), "")))
             for c in ctx.pr_comments.get(pr.id, [])[:8]:
                 loc = f"{c.file}:{c.line} " if c.file else ""
                 text = " ".join((c.text or "").split())[:200]
@@ -2835,6 +2847,7 @@ def _day_context_json(ctx: DayContext) -> dict:
         "brief": ctx.brief,
         "thresholds": ctx.thresholds,
         "stuck": ctx.stuck,
+        "status_notes": ctx.status_notes,
         "deltas": [d.model_dump() for d in ctx.deltas],
         "mine": [i.model_dump() for i in ctx.mine],
         "prs_mine": [p.model_dump() for p in ctx.prs_mine],
@@ -2987,28 +3000,49 @@ def db_vacuum() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _render_notes(items: list, *, indent: str = "") -> None:
+    for n in items:
+        badge = models.NOTE_BADGES.get(n.kind)
+        head = f"[bold {badge[1]}]{badge[0]}[/bold {badge[1]}] " if badge else ""
+        pin = "[green]📌[/green] " if n.pinned and n.kind != "status" else ""
+        console.print(f"{indent}[dim]#{n.id} {fmt_dt(n.ts)} · {n.author}[/dim] {pin}{head}{n.text}")
+
+
 @app.command()
 def note(
-    key: str = typer.Argument(..., help="Ключ задачи."),
+    key: str = typer.Argument(..., help="Ключ: задача PROJ-1, PR PROJ/repo#42 или ветка."),
     text: str = typer.Argument(..., help="Текст заметки."),
+    kind: str = typer.Option("context", "--kind", "-k",
+        help=" | ".join(models.NOTE_KINDS) + " (status — одна строка «почему висит», закреплена и видна в таблицах).",
+        click_type=click.Choice(models.NOTE_KINDS)),
+    pin: bool = typer.Option(False, "--pin", help="Закрепить (показывать первой)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Записать заметку Claude по задаче."""
+    """Заметка-контекст по задаче, PR или ветке: читается везде, где сущность открывают."""
     with _store() as store:
-        saved = store.add_note(key, text)
+        try:
+            saved = store.add_note(key, text, kind=kind, pinned=pin)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
     if json_out:
         _emit_json(saved.model_dump())
     else:
-        console.print(f"[green]Заметка сохранена[/green] для {key}")
+        console.print(f"[green]Заметка #{saved.id} сохранена[/green] для {key} ({kind})")
 
 
 @app.command()
 def notes(
-    key: str = typer.Argument(..., help="Ключ задачи."),
+    key: str = typer.Argument(..., help="Ключ: задача, PR PROJ/repo#42 или ветка."),
+    rm: Optional[int] = typer.Option(None, "--rm", help="Удалить заметку по id."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Показать заметки по задаче."""
+    """Заметки-контекст по ключу (задача, PR, ветка)."""
     with _store() as store:
+        if rm is not None:
+            ok = store.delete_note(rm)
+            console.print("[green]Удалено.[/green]" if ok else "[yellow]Такой заметки нет.[/yellow]")
+            return
         items = store.get_notes(key)
     if json_out:
         _emit_json([n.model_dump() for n in items])
@@ -3016,8 +3050,7 @@ def notes(
     if not items:
         console.print(f"[dim]Заметок по {key} нет.[/dim]")
         return
-    for n in items:
-        console.print(f"[dim]{n.ts} · {n.author}[/dim] {n.text}")
+    _render_notes(items)
 
 
 @app.command()
@@ -3666,14 +3699,23 @@ def job_status(
 
 
 @job_app.command("done")
-def job_done(job_id: int = typer.Argument(..., help="ID работы.")) -> None:
-    """Пометить работу завершённой."""
+def job_done(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    no_note: bool = typer.Option(False, "--no-note", help="Не писать заметку-контекст на задачу и PR."),
+) -> None:
+    """Пометить работу завершённой; выжимка уезжает заметкой-контекстом на задачу и её PR."""
     with _store() as store:
-        if store.get_job(job_id) is None:
+        job = store.get_job(job_id)
+        if job is None:
             err.print(f"[red]Работа #{job_id} не найдена.[/red]")
             raise typer.Exit(code=1)
         store.set_job_status(job_id, "done")
-    console.print(f"[green]Работа #{job_id}[/green] завершена")
+        keys: list[str] = []
+        if not no_note:
+            job = store.get_job(job_id) or job
+            keys = handoff.save_context_notes(store, handoff.collect(store, job, offline=True))
+    console.print(f"[green]Работа #{job_id}[/green] завершена"
+                  + (f" · контекст записан: {', '.join(keys)}" if keys else ""))
 
 
 @job_app.command("cancel")
@@ -3746,6 +3788,8 @@ def job_handoff(
     job_id: int = typer.Argument(..., help="ID работы."),
     offline: bool = typer.Option(False, "--offline",
         help="Не ходить в сеть: задача и PR — из снапшотов последнего синка."),
+    save: bool = typer.Option(False, "--save",
+        help="Записать выжимку заметкой-контекстом на задачу и PR (видно в jwu task / jwu pr)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON вместо markdown."),
 ) -> None:
     """Самодостаточный промпт для следующей сессии: задача, git, сделано/осталось, PR, правила."""
@@ -3762,9 +3806,12 @@ def job_handoff(
                 svc = None  # нет доступов — соберём из памяти
         try:
             data = handoff.collect(store, job, svc=svc, offline=offline or svc is None)
+            saved = handoff.save_context_notes(store, data) if save else []
         finally:
             if svc is not None:
                 svc.close()
+    if saved and not json_out:
+        err.print(f"[dim]контекст записан: {', '.join(saved)}[/dim]")
     if json_out:
         _emit_json({
             "job": job.model_dump(), "branch": data.branch, "commit": data.commit,

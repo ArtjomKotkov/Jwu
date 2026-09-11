@@ -1305,6 +1305,19 @@ class PRDetailScreen(Screen):
                 commit_lines.append(f"[yellow]{escape(c.get('id', ''))}[/yellow] {_msafe(msg[:70])}")
             parts.append(Text.from_markup("\n".join(commit_lines)))
 
+        open_tasks = [t for c in detail.comments for t in c.tasks if not t.resolved]
+        if open_tasks:
+            parts.append(Text("\n"))
+            parts.append(Rule(f"Открытые задачи ({len(open_tasks)})", align="left", style="cyan"))
+            parts.append(Text.from_markup("\n".join(
+                f"[yellow]☐[/yellow] [dim]#{t.id}[/dim] {escape(t.text)}" for t in open_tasks)))
+        if detail.notes:
+            parts.append(Text("\n"))
+            parts.append(Rule(f"Заметки ({len(detail.notes)})", align="left", style="cyan"))
+            marks = {"decision": "🧭", "gotcha": "⚠", "todo": "📌", "status": "📍"}
+            parts.append(Text.from_markup("\n".join(
+                f"{marks.get(n.kind, '·')} [dim]{escape(n.key)}[/dim] {escape(n.text)}" for n in detail.notes)))
+
         parts.append(Text("\n"))  # отступ перед секцией
         parts.append(Rule(f"Комментарии ({len(detail.comments)})", align="left", style="cyan"))
         if not detail.comments:

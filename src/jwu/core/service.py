@@ -47,7 +47,7 @@ from . import notify
 from . import thresholds as thresholds_mod
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
-    PR_TASK_STATES, PRAttachment, PRTask, check_task_text,
+    PR_TASK_STATES, PRAttachment, PRTask, check_task_text, pr_note_key,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
     GITHUB_SHORT_REF_RE,
@@ -179,6 +179,9 @@ class PRDetail:
     pr: PR
     comments: list[PRComment] = field(default_factory=list)
     commits: list[dict] = field(default_factory=list)
+    # Заметки-контекст: по ключу PR и по ключу его задачи (из ветки/заголовка).
+    notes: list[Note] = field(default_factory=list)
+    task_key: str = ""
 
 
 # Дельты, которые в кратком режиме не требуют действия: исчезновение из выборки —
@@ -244,6 +247,8 @@ class DayContext:
     # Пороги «давно» этого контура и что по ним застряло (см. core.thresholds).
     thresholds: dict[str, int] = field(default_factory=dict)
     stuck: list[dict] = field(default_factory=list)
+    # Закреплённые status-заметки по ключам задач и PR («почему висит»).
+    status_notes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1642,7 +1647,11 @@ class Service:
         tasks = [t for c in comments for t in c.tasks]
         pr.tasks_open = sum(1 for t in tasks if not t.resolved)
         pr.tasks_resolved = sum(1 for t in tasks if t.resolved)
-        return PRDetail(pr=pr, comments=comments, commits=commits)
+        task_key = self._task_key_from_pr(pr)
+        notes = self.store.get_notes(pr_note_key(project, repo, pr_id))
+        if task_key:
+            notes += self.store.get_notes(task_key)
+        return PRDetail(pr=pr, comments=comments, commits=commits, notes=notes, task_key=task_key)
 
     def pr_attachments_dir(self, project: str, repo: str, pr_id: int) -> Path:
         """Каталог по умолчанию для вложений PR: <tmp>/jwu/pr/<project>-<repo>-<id>."""
@@ -1784,6 +1793,10 @@ class Service:
         th = thresholds_mod.load(self.store, self.store.workspace_id)
         stuck = thresholds_mod.collect_stuck(prs_mine=d.prs_mine, prs_review=d.prs_review,
                                              mine=d.mine, th=th, login=user)
+        note_keys = [i.key for i in d.mine] + [
+            pr_note_key(p.project, p.repository, p.id) for p in d.prs_mine + d.prs_review
+        ]
+        status_notes = {k: v for k, v in self.store.status_notes(note_keys).items() if v}
         if brief:
             d = _brief_dashboard(d, user, mention_days=th.mention_days or mention_days)
 
@@ -1818,6 +1831,7 @@ class Service:
             brief=brief,
             thresholds=th.as_dict(),
             stuck=stuck,
+            status_notes=status_notes,
         )
 
     def changes(self) -> list[Delta]:
