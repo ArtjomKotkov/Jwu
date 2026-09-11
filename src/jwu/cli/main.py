@@ -264,8 +264,13 @@ def _render_attachments(attachments: list) -> None:
     console.print(f"\n[bold]Вложения ({len(attachments)})[/bold]  [dim]{summary}[/dim]")
     for a in attachments:
         icon = _ATTACH_ICON.get(a.kind, "📎")
+        refs = getattr(a, "referenced_by", None) or []
+        where = ""
+        if refs:
+            spots = ["описание" if r == "description" else f"коммент #{r}" for r in refs]
+            where = f" [dim]· вставлено в: {', '.join(spots)}[/dim]"
         console.print(f"  {icon} {a.filename} [dim]{_human_size(a.size)} · {a.kind}"
-                      f" · {a.author} · {fmt_dt(a.created)}[/dim]")
+                      f" · {a.author} · {fmt_dt(a.created)}[/dim]{where}")
 
 
 _BUILD_ICON = {"SUCCESSFUL": "[green]✅[/green]", "FAILED": "[red]❌[/red]",
@@ -1553,18 +1558,36 @@ def pr(
     pr_id: int = typer.Argument(..., help="Числовой id PR."),
     project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта Bitbucket."),
     repo: Optional[str] = typer.Option(None, "--repo", help="Slug репозитория."),
+    download: bool = typer.Option(False, "--download", "-d",
+        help="Скачать вложения из описания PR и комментов (скриншоты) в tmp."),
+    dest: Optional[str] = typer.Option(None, "--dest", help="Каталог для скачивания."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Детали одного PR + статус merge-конфликта + комментарии ревью."""
+    downloaded: list[tuple] = []
     with _service_with_prs() as svc:
         detail = svc.pr_detail(project, repo, pr_id)
         pull = detail.pr
         jobs_list = svc.jobs_for_pr(pr_id, project or "", repo or "")
+        if download:
+            try:
+                downloaded = svc.download_pr_attachments(
+                    project, repo, pr_id, dest=Path(dest) if dest else None, detail=detail)
+            except (ValueError, BitbucketError) as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1)
+    attachments = list(pull.attachments) + [a for c in detail.comments for a in c.attachments]
     if json_out:
         payload = pull.model_dump()
         payload["comments"] = [c.model_dump() for c in detail.comments]
         payload["commits"] = detail.commits
         payload["jobs"] = [j.model_dump() for j in jobs_list]
+        payload["attachments"] = [a.model_dump() for a in attachments]
+        if download:
+            payload["downloaded"] = [
+                {"name": a.name, "kind": a.kind, "comment_id": a.comment_id, "path": str(p)}
+                for a, p in downloaded
+            ]
         _emit_json(payload)
         return
     console.print(f"[bold cyan]PR {pull.id}[/bold cyan] [{pull.state}] {pull.title}")
@@ -1588,6 +1611,17 @@ def pr(
         for t in c.tasks:
             mark = "[green]☑[/green]" if t.resolved else "[yellow]☐[/yellow]"
             console.print(f"{indent}    {mark} [dim]#{t.id}[/dim] {t.text}")
+        for a in c.attachments:
+            console.print(f"{indent}    {_ATTACH_ICON.get(a.kind, '📎')} [dim]{a.name}[/dim]")
+    if attachments:
+        console.print(f"[bold]Вложения в тексте PR:[/bold] {len(attachments)} "
+                      f"[dim](из описания {len(pull.attachments)}, в комментах "
+                      f"{len(attachments) - len(pull.attachments)}; jwu pr {pull.id} --download)[/dim]")
+    if downloaded:
+        console.print(f"[bold]Скачано ({len(downloaded)})[/bold]")
+        for a, path in downloaded:
+            where = f" [dim]коммент #{a.comment_id}[/dim]" if a.comment_id else " [dim]описание[/dim]"
+            console.print(f"  {path}{where}")
     if pull.tasks_open or pull.tasks_resolved:
         console.print(f"[bold]Задачи в PR:[/bold] открытых {pull.tasks_open}, закрытых {pull.tasks_resolved}"
                       f"  [dim](jwu pr-task list {pull.id})[/dim]")

@@ -9,8 +9,9 @@ from __future__ import annotations
 from typing import Optional
 
 import httpx
+from pathlib import Path
 
-from .models import PR, BuildStatus, PRComment, PRTask, _get
+from .models import PR, BuildStatus, PRAttachment, PRComment, PRTask, _get, pr_attachment_refs
 
 # роль в dashboard/pull-requests
 ROLE_BY_VIEW = {"mine": "AUTHOR", "review": "REVIEWER"}
@@ -66,6 +67,7 @@ def _flatten_comment(
             context=context if depth == 0 else [],
             anchor_idx=anchor_idx if depth == 0 else -1,
             tasks=[PRTask.from_bitbucket(t) for t in c.get("tasks", []) or []],
+            attachments=pr_attachment_refs(c.get("text", "") or "", comment_id=str(c.get("id", ""))),
         )
     )
     for reply in c.get("comments", []) or []:
@@ -169,7 +171,39 @@ class BitbucketClient:
         raw = self._paged(
             "/dashboard/pull-requests", params={"role": role, "state": state}
         )
-        return [PR.from_bitbucket(r) for r in raw]
+        prs = [PR.from_bitbucket(r) for r in raw]
+        for pr in prs:
+            self._fill_attachment_urls(pr.project, pr.repository, pr.attachments)
+        return prs
+
+    def attachment_url(self, project: str, repo: str, path: str) -> str:
+        """Прямой URL вложения PR: веб-роут ``/projects/K/repos/S/attachments/<hash>/<имя>``.
+
+        REST-роут на этом инстансе (6.1) отдаёт 400 на закодированный слэш и 404 без
+        него; веб-роут с обычным слэшем отвечает файлом — но только без follow-redirect.
+        """
+        return f"{self.base_url}/projects/{project}/repos/{repo}/attachments/{path}"
+
+    def _fill_attachment_urls(self, project: str, repo: str, items: list[PRAttachment]) -> None:
+        for a in items:
+            if not a.url:
+                a.url = self.attachment_url(project, repo, a.path)
+
+    def download_attachment(self, url: str, dest: Path) -> Path:
+        """Скачать вложение PR в dest (стримингом; файл пишется только при успехе)."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self._client.stream("GET", url, headers={"Accept": "*/*"},
+                                     follow_redirects=False) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    raise BitbucketError(f"{resp.status_code}: не скачать {url}", resp.status_code)
+                with dest.open("wb") as fh:
+                    for chunk in resp.iter_bytes():
+                        fh.write(chunk)
+        except httpx.HTTPError as exc:
+            raise BitbucketError(f"Сеть/Bitbucket недоступен: {exc}") from exc
+        return dest
 
     def pr(self, project: str, repo: str, pr_id: int, *, with_merge: bool = True) -> PR:
         """Детали PR + (опционально) статус merge-конфликта."""
@@ -177,6 +211,7 @@ class BitbucketClient:
             f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
         )
         pull = PR.from_bitbucket(raw)
+        self._fill_attachment_urls(project, repo, pull.attachments)
         if with_merge:
             try:
                 pull.apply_merge_status(self.merge_status(project, repo, pr_id))
@@ -340,4 +375,7 @@ class BitbucketClient:
                 depth=0,
             )
             groups.append(group)
-        return [comment for group in groups for comment in group]
+        comments = [comment for group in groups for comment in group]
+        for c in comments:
+            self._fill_attachment_urls(project, repo, c.attachments)
+        return comments

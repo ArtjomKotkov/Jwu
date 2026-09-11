@@ -354,6 +354,50 @@ async def jwu_pr(
     payload["open_tasks"] = [
         t.model_dump() for c in detail.comments for t in c.tasks if not t.resolved
     ]
+    # Файлы в описании и комментах (скриншоты): скачать — jwu_pr_attachments(download=True).
+    payload["attachments"] = [a.model_dump() for a in detail.pr.attachments] + [
+        a.model_dump() for c in detail.comments for a in c.attachments
+    ]
+    return payload
+
+
+@mcp.tool()
+async def jwu_pr_attachments(
+    pr_id: int,
+    download: bool = False,
+    dest: Optional[str] = None,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Вложения PR Bitbucket: файлы, вставленные в описание и в комментарии ревью
+    (скриншоты «как выглядит» / «что сломано»). У каждого — `comment_id` якоря (пусто —
+    из описания), чтобы понимать, к какой реплике относится картинка.
+
+    download=True — скачать в dest (по умолчанию <tmp>/jwu/pr/<project>-<repo>-<id>);
+    локальные пути в `downloaded[].path` — их потом читать через Read. Только Bitbucket.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    default_project, default_repo = svc.default_pr_ref()
+    proj = project or default_project
+    rp = repo or default_repo
+    detail = svc.pr_detail(proj, rp, pr_id)
+    items = list(detail.pr.attachments) + [a for c in detail.comments for a in c.attachments]
+    payload: dict = {
+        "pr": pr_id, "project": proj, "repo": rp,
+        "attachments": [a.model_dump() for a in items],
+    }
+    if download:
+        dest_dir = Path(dest) if dest else svc.pr_attachments_dir(proj, rp, pr_id)
+        downloaded = svc.download_pr_attachments(proj, rp, pr_id, dest=dest_dir, detail=detail)
+        payload["dest"] = str(dest_dir)
+        payload["downloaded"] = [
+            {"name": a.name, "kind": a.kind, "comment_id": a.comment_id, "path": str(p)}
+            for a, p in downloaded
+        ]
     return payload
 
 
@@ -474,6 +518,8 @@ async def jwu_attachments(
     workspace: Optional[str] = None,
 ) -> dict:
     """Вложения задачи: список с видами и счётчиками; с download=True — скачать в tmp.
+    У каждого вложения `referenced_by` — где оно вставлено в текст: "description" и/или
+    id комментариев (у комментария есть `images`). Так понятно, к какой реплике скриншот.
 
     kinds — какие виды качать (image|log|doc|archive); по умолчанию все, кроме видео
     (видео никогда не качается). dest — каталог (по умолчанию <tmp>/jwu/<KEY>). При
