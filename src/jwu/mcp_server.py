@@ -131,6 +131,27 @@ def _installed_version() -> str:
         return "dev"
 
 
+def _version_warning() -> Optional[str]:
+    """Сервер живёт на старом коде, а пакет уже обновлён: пора перезапустить сессию.
+
+    Метаданные читаются с диска при каждом вызове, `__version__` — из памяти процесса.
+    Расхождение появляется ровно после `pipx install --force` и исчезает после
+    перезапуска Claude Code. Скилл jwu-update это видит и говорит пользователю.
+    """
+    running, installed = _version(), _installed_version()
+    if installed in ("dev", running):
+        return None
+    return (f"MCP-сервер jwu работает на версии {running}, а установлена {installed}: "
+            f"перезапусти сессию Claude Code, иначе новых инструментов не будет.")
+
+
+def _with_version(payload: dict) -> dict:
+    warning = _version_warning()
+    if warning:
+        payload["version_warning"] = warning
+    return payload
+
+
 def _stamp(payload: dict, workspace: Workspace) -> dict:
     """Пометить ответ воркспейсом: запись не должна молча уехать не в тот контур."""
     payload["workspace"] = workspace.slug
@@ -230,7 +251,17 @@ async def jwu_workspace_current() -> dict:
     payload.update({"source": res.source, "matched_path": res.matched_path,
                     "cwd": str(Path.cwd()), "jwu_version": _version(),
                     "installed_version": _installed_version()})
-    return payload
+    return _with_version(payload)
+
+
+@mcp.tool()
+async def jwu_version() -> dict:
+    """Версия кода, на котором работает MCP-сервер, и версия установленного пакета.
+
+    Расходятся — пакет обновили, а сессия ещё на старом коде: перезапусти Claude Code
+    (`version_warning` говорит то же самое). Без сети.
+    """
+    return _with_version({"running": _version(), "installed": _installed_version()})
 
 
 @mcp.tool()
@@ -1054,7 +1085,7 @@ async def jwu_job_start(
     # Контекст проекта приезжает ровно в момент старта работы: даже если скилл пропустил
     # шаг с jwu_workspace_current, папки с тегами и правила окажутся в контексте ДО правок.
     payload.update(store.workspace_context())
-    return _stamp(payload, _resolve(workspace))
+    return _with_version(_stamp(payload, _resolve(workspace)))
 
 
 @mcp.tool()

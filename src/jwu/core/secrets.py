@@ -45,6 +45,12 @@ SLOT_ENV: dict[str, str] = {
     "github.token": "GITHUB_TOKEN",
     "jenkins.token": "JENKINS_TOKEN",
     "telegram.token": "TELEGRAM_BOT_TOKEN",
+    # Пароли для сессионного логина и nginx-гейта — чтобы контур поднимался из одних
+    # переменных окружения, без keyring и визарда (облачная сессия, CI).
+    "jira.password": "JIRA_PASSWORD",
+    "jira.gate_password": "JIRA_GATE_PASSWORD",
+    "sdesk.password": "SDESK_PASSWORD",
+    "sdesk.gate_password": "SDESK_GATE_PASSWORD",
 }
 
 KeyringRef = Optional[Tuple[str, str]]  # (service, account) в системном keyring
