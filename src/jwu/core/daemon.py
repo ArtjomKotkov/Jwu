@@ -47,7 +47,9 @@ LAUNCHD_LABEL = "dev.jwu.daemon"
 SYSTEMD_UNIT = "jwu-daemon.service"
 DEFAULT_INTERVAL = 600  # секунд между проходами; отсчёт — от ОКОНЧАНИЯ прохода
 MIN_INTERVAL = 60
-DEFAULT_POLL_INTERVAL = 60  # секунд между опросами бота Telegram (дёшево: без сети к трекеру)
+# Long polling бота Telegram: запрос getUpdates висит до N секунд и возвращается сразу,
+# как только пришло сообщение. Реакция мгновенная, пустых опросов нет.
+DEFAULT_POLL_INTERVAL = 25
 
 
 class DaemonError(RuntimeError):
@@ -292,7 +294,8 @@ def announce_start(store: "Store", interval: int) -> int:
     return sent
 
 
-def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None) -> list[dict]:
+def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
+              long_poll: int = 0) -> list[dict]:
     """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
 
     Команды (/sync, /status, /stuck, /mentions) и ответы-заметки обрабатывает
@@ -315,7 +318,8 @@ def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None) -> l
         store.use_workspace(ws.id)
         login = _read_identity(store).get("user", "")
         try:
-            for item in bot.process_updates(store, ws, cfg, sender, login=login, on_sync=on_sync):
+            for item in bot.process_updates(store, ws, cfg, sender, login=login, on_sync=on_sync,
+                                            long_poll=long_poll):
                 handled.append({"workspace": ws.slug, **item})
         except Exception as exc:  # noqa: BLE001 — Telegram лежит: попробуем через минуту
             log(f"[{ws.slug}] опрос бота не удался: {exc}")
@@ -370,20 +374,22 @@ def run_loop(
             if sleep is not None:
                 sleep(interval)
                 continue
-            # Между проходами — опрос бота раз в poll_interval: команды и ответы-заметки
-            # не должны ждать час до следующего синка. /sync будит цикл через waiter.
+            # Между проходами — long polling бота: запрос висит до poll_interval секунд и
+            # возвращается сразу по сообщению, поэтому команды и ответы-заметки не ждут
+            # ни часа, ни минуты. /sync и SIGUSR1 будят цикл через waiter.
             deadline = time.monotonic() + interval
             kicked = False
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                if waiter.wait(min(max(1, poll_interval), remaining)):
+                if waiter.wait(1):
                     kicked = True
                     break
                 store = open_store()
                 try:
-                    handled = poll_bots(store, on_sync=lambda: (waiter.kick() or True))
+                    handled = poll_bots(store, on_sync=lambda: (waiter.kick() or True),
+                                        long_poll=int(min(max(1, poll_interval), remaining)))
                 finally:
                     store.close()
                 if handled:

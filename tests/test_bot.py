@@ -98,3 +98,17 @@ def test_daemon_poll_bots_iterates_configured_workspaces(tmp_path, monkeypatch):
     store.use_workspace(work.id)
     assert store.get_notes("PROJ-1")[0].author == "telegram"
     store.close()
+
+
+@respx.mock
+def test_get_updates_long_poll_passes_timeout():
+    route = respx.get(f"{TG}/bottok/getUpdates").mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
+    sender = notify.TelegramNotifier("tok", "42")
+    try:
+        assert sender.get_updates(5, timeout=25) == []
+        params = route.calls.last.request.url.params
+        assert params["timeout"] == "25" and params["offset"] == "5"
+        sender.get_updates()
+        assert route.calls.last.request.url.params["timeout"] == "0"
+    finally:
+        sender.close()
