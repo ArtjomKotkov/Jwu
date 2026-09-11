@@ -2115,6 +2115,70 @@ def doctor(
 
 
 # --------------------------------------------------------------------------- #
+# backup / restore: переезд между машинами одной командой в обе стороны
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def backup(
+    out: Optional[str] = typer.Option(None, "--out", "-o",
+        help="Файл или каталог для архива (по умолчанию jwu-backup-<дата>.tar.gz в текущей папке)."),
+    no_secrets: bool = typer.Option(False, "--no-secrets", help="Вычистить секреты воркспейсов из копии БД."),
+    no_extras: bool = typer.Option(False, "--no-extras", help="Не класть проектные субагенты/скиллы из ~/.claude."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Собрать архив: БД (консистентная копия), config.toml, проектные субагенты и скиллы, RESTORE.md."""
+    from ..core import backup as bk
+
+    try:
+        _prepare_db()
+        report = bk.create_backup(Path(out) if out else None, with_secrets=not no_secrets,
+                                  extras=not no_extras)
+    except (bk.BackupError, ConfigError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if json_out:
+        _emit_json({"archive": str(report.archive), "files": report.files,
+                    "with_secrets": report.with_secrets, "size": report.size})
+        return
+    console.print(f"[green]Бэкап собран:[/green] {report.archive} ({_size_human(report.size)})")
+    console.print("  " + ", ".join(report.files))
+    if report.with_secrets:
+        console.print("[yellow]В архиве токены в открытом виде[/yellow] — передавать только по "
+                      "защищённому каналу, после переноса удалить.")
+
+
+@app.command()
+def restore(
+    archive: str = typer.Argument(..., help="Архив jwu-backup-*.tar.gz."),
+    db_only: bool = typer.Option(False, "--db-only", help="Только БД, без конфига и ~/.claude."),
+    force: bool = typer.Option(False, "--force", help="Перезаписать существующую БД (копия останется рядом)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Показать, что будет сделано."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Разложить архив по местам: БД, config.toml (путь к БД под эту машину), субагенты и скиллы."""
+    from ..core import backup as bk
+
+    try:
+        report = bk.restore_backup(Path(archive), db_only=db_only, force=force, dry_run=dry_run)
+    except bk.BackupError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(report.__dict__)
+        return
+    head = "[yellow]Сухой прогон[/yellow]" if dry_run else "[green]Восстановлено[/green]"
+    console.print(f"{head} из {report.archive}")
+    console.print(f"  БД → {report.db}" + (f"  [dim](старая: {report.db_backup})[/dim]" if report.db_backup else ""))
+    if report.config:
+        console.print(f"  конфиг → {report.config}")
+    for e in report.extras:
+        console.print(f"  ~/.claude/{e}")
+    for n in report.notes:
+        console.print(f"  [dim]{n}[/dim]")
+
+
+# --------------------------------------------------------------------------- #
 # memory: память отдельно от кэша — экспорт / импорт / синк через git
 # --------------------------------------------------------------------------- #
 
