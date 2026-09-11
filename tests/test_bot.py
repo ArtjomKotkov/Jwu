@@ -80,6 +80,12 @@ def test_sync_without_daemon_explains(tmp_path):
     reply = bot.handle_command("/sync@jwu_bot", store=store, ws=ws, login="", links=None, on_sync=None)
     assert "не запущен" in reply
     assert "Не знаю команду /foo" in bot.handle_command("/foo", store=store, ws=ws, login="", links=None, on_sync=None)
+    from jwu.core.models import Mention
+
+    store.add_mentions([Mention(task_key="A-1", comment_id="1", author="x", text="[~me]", created="2026-09-01T10:00:00+03:00")])
+    assert "Помечено прочитанными: 1" in bot.handle_command("/seen", store=store, ws=ws, login="", links=None, on_sync=None)
+    assert store.unseen_mentions() == []
+    assert "не было" in bot.handle_command("/seen", store=store, ws=ws, login="", links=None, on_sync=None)
     store.close()
 
 

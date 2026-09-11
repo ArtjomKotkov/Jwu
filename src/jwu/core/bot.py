@@ -32,6 +32,7 @@ HELP = (
     "/status — последний проход и что накопилось\n"
     "/stuck — что застряло по порогам контура\n"
     "/mentions — непрочитанные упоминания\n"
+    "/seen — пометить все упоминания прочитанными\n"
     "/help — это сообщение\n\n"
     "Ответ на уведомление → заметка по его ключу. "
     "Сообщение вида <code>PROJ-1 текст</code> → заметка по PROJ-1."
@@ -102,6 +103,10 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
         return _cmd_stuck(store, ws, login, links)
     if cmd == "/mentions":
         return _cmd_mentions(store, links)
+    if cmd == "/seen":
+        n = len(store.unseen_mentions())
+        store.mark_mentions_seen(None)
+        return f"✅ Помечено прочитанными: {n}." if n else "✅ Непрочитанных и не было."
     if cmd in ("/help", "/start"):
         return HELP
     return f"Не знаю команду {html.escape(cmd)}.\n\n{HELP}"
