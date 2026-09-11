@@ -150,7 +150,8 @@ CREATE TABLE IF NOT EXISTS mentions (
     created      TEXT NOT NULL DEFAULT '',
     summary      TEXT NOT NULL DEFAULT '',
     seen         INTEGER NOT NULL DEFAULT 0,
-    added_at     TEXT NOT NULL
+    added_at     TEXT NOT NULL,
+    archived     INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mentions_comment
     ON mentions(workspace_id, task_key, comment_id);
@@ -297,7 +298,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -454,6 +455,16 @@ def _m009_note_kinds(conn: sqlite3.Connection) -> None:
     _add_column(conn, "notes", "pinned", "INTEGER NOT NULL DEFAULT 0")
 
 
+def _m010_mention_archive(conn: sqlite3.Connection) -> None:
+    """v9 → v10: архив упоминаний прячет запись, а не удаляет.
+
+    Удалённое упоминание следующий синк находил заново в том же комментарии и заводил
+    как новое — с уведомлением. Теперь запись остаётся (уникальный индекс не даёт
+    завести дубль), а из списков её убирает флаг.
+    """
+    _add_column(conn, "mentions", "archived", "INTEGER NOT NULL DEFAULT 0")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
@@ -463,6 +474,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (7, _m007_provider),
     (8, _m008_job_git_state),
     (9, _m009_note_kinds),
+    (10, _m010_mention_archive),
 ]
 
 
@@ -1673,7 +1685,7 @@ class Store:
     def list_mentions(self, limit: int = 200) -> list[Mention]:
         """Упоминания, свежие сверху (по дате комментария, затем по порядку появления)."""
         rows = self.conn.execute(
-            "SELECT * FROM mentions WHERE workspace_id = ?"
+            "SELECT * FROM mentions WHERE workspace_id = ? AND archived = 0"
             " ORDER BY created DESC, id DESC LIMIT ?",
             (self.workspace_id, limit),
         ).fetchall()
@@ -1681,24 +1693,24 @@ class Store:
 
     def unseen_mentions(self) -> list[Mention]:
         rows = self.conn.execute(
-            "SELECT * FROM mentions WHERE workspace_id = ? AND seen = 0"
+            "SELECT * FROM mentions WHERE workspace_id = ? AND seen = 0 AND archived = 0"
             " ORDER BY created DESC, id DESC",
             (self.workspace_id,),
         ).fetchall()
         return [self._mention_from_row(r) for r in rows]
 
     def archive_mentions(self, *, older_than_days: int, seen_only: bool = True) -> int:
-        """Удалить старые упоминания (по дате комментария); по умолчанию — только прочитанные.
-
-        Упоминание — событие: через месяц оно не нужно ни в списке, ни в дневном анализе.
-        Непрочитанные по умолчанию не трогаем — вдруг их ещё не смотрели.
+        """Убрать старые упоминания из списков (по дате комментария); по умолчанию — только
+        прочитанные. Запись остаётся с флагом archived: иначе следующий синк нашёл бы тот же
+        комментарий и завёл его заново как новое упоминание — с уведомлением.
         """
         from datetime import timedelta
         from .dates import _to_dt
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, int(older_than_days)))
         rows = self.conn.execute(
-            "SELECT id, created, seen FROM mentions WHERE workspace_id = ?", (self.workspace_id,)
+            "SELECT id, created, seen FROM mentions WHERE workspace_id = ? AND archived = 0",
+            (self.workspace_id,),
         ).fetchall()
         doomed: list[int] = []
         for r in rows:
@@ -1713,7 +1725,7 @@ class Store:
                 doomed.append(int(r["id"]))
         if doomed:
             self.conn.executemany(
-                "DELETE FROM mentions WHERE id = ? AND workspace_id = ?",
+                "UPDATE mentions SET archived = 1, seen = 1 WHERE id = ? AND workspace_id = ?",
                 [(mid, self.workspace_id) for mid in doomed],
             )
             self.conn.commit()
