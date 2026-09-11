@@ -157,38 +157,86 @@ _GROUP_ORDER = ["new_conflict", "build_failed", "reviewer_needs_work", "new_pr_t
                 "returned_from_testing", "qa_comment", "new_pr_comment", "status_change"]
 
 
-def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
-    """HTML для Telegram: заголовок контура, группы по виду события, ключи — ссылками.
+SECTION_TITLES: dict[str, str] = {
+    "new_conflict": "⚠️ КОНФЛИКТ",
+    "build_failed": "❌ СБОРКА УПАЛА",
+    "reviewer_needs_work": "✍️ NEEDS WORK",
+    "new_pr_task": "☑️ НОВАЯ ЗАДАЧА В PR",
+    "new_pr_comment": "💬 КОММЕНТАРИЙ В PR",
+    "status_change": "🔀 СТАТУС",
+    "returned_from_testing": "↩️ ВЕРНУЛИ С ТЕСТОВ",
+    "qa_comment": "🧪 КОММЕНТАРИЙ QA",
+    "build_fixed": "✅ СБОРКА ПОЗЕЛЕНЕЛА",
+}
+MENTION_TAG_RE = re.compile(r"\[~[^\]]+\]\s*[-—:,]?\s*")
 
-    Одна строка на событие раньше не читалась: тип, ключ, деталь и заголовок задачи
-    слипались. Теперь событие — это две строки: ключ (ссылкой) с деталью и, ниже,
-    заголовок курсивом; события одного вида собраны под общим заголовком.
+
+def strip_mention_tags(text: str) -> str:
+    """Убрать ``[~логин]`` из текста упоминания — в чате это шум."""
+    return " ".join(MENTION_TAG_RE.sub("", text or "").split())
+
+
+def _who(kind: str, detail: str) -> str:
+    """Короткое «кто / сколько» для строки ключа: автор needs work, «+2» у комментов."""
+    text = " ".join((detail or "").split())
+    if kind == "reviewer_needs_work":
+        return text.replace(": needs work", "")
+    if kind in ("new_pr_comment", "new_comment", "qa_comment"):
+        m = re.match(r"\+(\d+) комм\.(?: от (.+))?", text)
+        if m:
+            return (f"{m.group(2)} · +{m.group(1)}" if m.group(2) else f"+{m.group(1)}")
+        return text
+    if kind in ("new_pr_task", "pr_task_resolved", "status_change", "returned_from_testing"):
+        return text
+    return ""
+
+
+def item_block(key: str, who: str, body: str, *, links: Optional[Links], quote: bool = False,
+               body_limit: int = 110) -> list[str]:
+    """Элемент секции: строка «ключ · кто» и ниже курсивом заголовок либо цитата."""
+    head = _key_html(key, links)
+    if who:
+        head += f" · {html.escape(_short(who, 60))}"
+    lines = [head]
+    if body:
+        text = html.escape(_short(body, body_limit))
+        lines.append(f"<i>«{text}»</i>" if quote else f"<i>{text}</i>")
+    return lines
+
+
+def section(title: str, items: list[list[str]]) -> list[str]:
+    """Секция: пустая строка, жирный заголовок, пустая строка, элементы через пустую."""
+    out = ["", f"<b>{title}</b>"]
+    for block in items:
+        out.append("")
+        out += block
+    return out
+
+
+def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
+    """HTML для Telegram: шапка, секции по виду события, элементы через пустую строку.
+
+    Ключ — ссылкой на PR или задачу, рядом кто/сколько; ниже курсивом заголовок задачи
+    (у упоминаний — цитата без тега [~логин]). Никаких буллетов и отступов: в чате они
+    только шумят.
     """
     stamp = datetime.now().strftime("%d.%m %H:%M")
-    lines = [f"🔔 <b>jwu · {html.escape(note.workspace)}</b>  <i>{stamp}</i>"]
+    lines = [f"🔔 <b>jwu · {html.escape(note.workspace)}</b>", stamp]
     by_kind: dict[str, list[Delta]] = {}
     for d in note.deltas:
         by_kind.setdefault(d.kind, []).append(d)
     order = [k for k in _GROUP_ORDER if k in by_kind] + [k for k in by_kind if k not in _GROUP_ORDER]
     for kind in order:
-        items = by_kind[kind]
-        lines.append("")
-        lines.append(f"{NOTABLE_KINDS.get(kind, kind)}")
-        for d in items:
-            detail = _clean_detail(kind, d.detail)
-            head = f"• {_key_html(d.key, links)}"
-            if detail:
-                head += f" — {html.escape(_short(detail, 90))}"
-            lines.append(head)
-            if d.summary:
-                lines.append(f"   <i>{html.escape(_short(d.summary, 100))}</i>")
+        title = SECTION_TITLES.get(kind, NOTABLE_KINDS.get(kind, kind).upper())
+        lines += section(title, [
+            item_block(d.key, _who(kind, d.detail), d.summary, links=links) for d in by_kind[kind]
+        ])
     if note.mentions:
-        lines.append("")
-        lines.append("📣 упоминания")
-        for m in note.mentions:
-            who = html.escape(m.author or "кто-то")
-            lines.append(f"• {_key_html(m.task_key, links)} — {who}")
-            lines.append(f"   <i>{html.escape(_short(m.text, 180))}</i>")
+        lines += section("📣 УПОМИНАНИЯ", [
+            item_block(m.task_key, m.author or "кто-то", strip_mention_tags(m.text),
+                       links=links, quote=True, body_limit=160)
+            for m in note.mentions
+        ])
     return "\n".join(lines)
 
 

@@ -67,26 +67,27 @@ def _cmd_stuck(store: "Store", ws: "Workspace", login: str,
     )
     if not items:
         return "⏳ Застрявшего нет — по порогам контура всё движется."
-    lines = [f"⏳ <b>Застряло ({len(items)})</b>"]
-    for x in items[:15]:
-        key = notify._key_html(x["key"], links)
-        lines.append(f"• {key} — {x['days']} дн: {html.escape(x['reason'])}")
-        if x.get("title"):
-            lines.append(f"   <i>{html.escape(notify._short(x['title'], 90))}</i>")
+    lines = notify.section(f"⏳ ЗАСТРЯЛО ({len(items)})", [
+        notify.item_block(x["key"], f"{x['days']} дн · {x['reason']}", x.get("title", ""), links=links)
+        for x in items[:15]
+    ])
     if len(items) > 15:
-        lines.append(f"… и ещё {len(items) - 15}")
-    return "\n".join(lines)
+        lines += ["", f"… и ещё {len(items) - 15}"]
+    return "\n".join(lines).lstrip("\n")
 
 
 def _cmd_mentions(store: "Store", links: Optional[notify.Links]) -> str:
     items = store.unseen_mentions()
     if not items:
         return "📣 Непрочитанных упоминаний нет."
-    lines = [f"📣 <b>Непрочитанные упоминания ({len(items)})</b>"]
-    for m in items[:10]:
-        lines.append(f"• {notify._key_html(m.task_key, links)} — {html.escape(m.author or 'кто-то')}")
-        lines.append(f"   <i>{html.escape(notify._short(m.text, 160))}</i>")
-    return "\n".join(lines)
+    lines = notify.section(f"📣 НЕПРОЧИТАННЫЕ УПОМИНАНИЯ ({len(items)})", [
+        notify.item_block(m.task_key, m.author or "кто-то", notify.strip_mention_tags(m.text),
+                          links=links, quote=True, body_limit=160)
+        for m in items[:10]
+    ])
+    if len(items) > 10:
+        lines += ["", f"… и ещё {len(items) - 10}, /seen — пометить все прочитанными"]
+    return "\n".join(lines).lstrip("\n")
 
 
 def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
