@@ -25,8 +25,11 @@ import fcntl
 import os
 import platform
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -238,6 +241,55 @@ LAST_PASS_META = "daemon:last_pass"
 LAST_PASS_SUMMARY_META = "daemon:last_summary"
 
 
+class Waiter:
+    """Пауза между проходами, которую можно прервать: SIGUSR1 → внеплановый проход."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def kick(self, *_args) -> None:
+        self._event.set()
+
+    def wait(self, seconds: float) -> bool:
+        """True — разбудили раньше срока (kick), False — пауза вышла целиком."""
+        kicked = self._event.wait(seconds)
+        self._event.clear()
+        return kicked
+
+
+def announce_start(store: "Store", interval: int) -> int:
+    """Сказать в каждый настроенный чат, что демон поднялся. Вернуть число сообщений.
+
+    Один чат может быть у нескольких контуров — шлём в него один раз. Ошибки Telegram
+    не мешают старту: демон нужен ради синка, а не ради приветствия.
+    """
+    from . import notify
+    from .workspaces import config_for_workspace
+
+    todo, _ = syncable(store.list_workspaces())
+    seen_chats: set[str] = set()
+    sent = 0
+    for ws in todo:
+        try:
+            sender = notify.notifier_from_config(config_for_workspace(store, ws))
+        except Exception:  # noqa: BLE001
+            sender = None
+        if sender is None or sender.chat_id in seen_chats:
+            continue
+        seen_chats.add(sender.chat_id)
+        text = (f"🟢 <b>jwu-демон запущен</b> на {socket.gethostname()}\n"
+                f"интервал {interval // 60} мин · контуры: {', '.join(w.slug for w in todo)}\n"
+                f"первый проход — сейчас; внеплановый — <code>jwu daemon kick</code>")
+        try:
+            sender.send(text)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{ws.slug}] стартовое сообщение не ушло: {exc}")
+        finally:
+            sender.close()
+    return sent
+
+
 def run_loop(
     open_store: Callable[[], "Store"],
     *,
@@ -245,16 +297,32 @@ def run_loop(
     once: bool = False,
     factory: ServiceFactory | None = None,
     after_sync: Callable[["Service", "SyncResult"], None] | None = None,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] | None = None,
+    announce: bool = True,
 ) -> None:
     """Главный цикл демона: проход → пауза ``interval`` → проход… (``once`` — один проход).
 
     Пауза считается от конца прохода, а не от начала: медленная сеть не должна
-    приводить к тому, что следующий проход стартует сразу за предыдущим.
+    приводить к тому, что следующий проход стартует сразу за предыдущим. Сигнал SIGUSR1
+    (`jwu daemon kick`) прерывает паузу и запускает проход немедленно.
     """
     interval = max(MIN_INTERVAL, int(interval))
+    waiter = Waiter()
+    if sleep is None:
+        try:
+            signal.signal(signal.SIGUSR1, waiter.kick)
+        except (ValueError, OSError):
+            pass  # не главный поток (тесты) — без сигналов
     with SingleInstance():
         log(f"демон запущен (pid {os.getpid()}, интервал {interval}с)")
+        if announce and not once:
+            store = open_store()
+            try:
+                n = announce_start(store, interval)
+            finally:
+                store.close()
+            if n:
+                log(f"стартовое сообщение отправлено в {n} чат(а)")
         while True:
             store = open_store()
             try:
@@ -264,7 +332,22 @@ def run_loop(
             log(f"проход завершён: {report.summary()}")
             if once:
                 return
-            sleep(interval)
+            if sleep is not None:
+                sleep(interval)
+            elif waiter.wait(interval):
+                log("внеплановый проход по kick")
+
+
+def kick() -> int | None:
+    """Разбудить работающий демон (SIGUSR1). Вернуть его pid либо None, если не запущен."""
+    pid = SingleInstance().holder_pid()
+    if pid is None:
+        return None
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError as exc:
+        raise DaemonError(f"Не удалось послать сигнал демону (pid {pid}): {exc}") from exc
+    return pid
 
 
 # --------------------------------------------------------------------------- #
