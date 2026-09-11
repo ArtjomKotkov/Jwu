@@ -108,6 +108,9 @@ description: Use when the user wants to run a code review of current changes ins
      `title`, `description`, `source_branch`, `target_branch`, `state`,
      `conflicted`/`can_merge`, и **`comments`** (комменты ревью с `file:line`),
      чтобы ревьювер видел уже сделанные внешние замечания и не дублировал их.
+     Там же `open_tasks` — открытые задачи на комментах (чек-лист правок): что ещё
+     не сделано по PR. Замечания субагента в задачи PR превращает только скилл
+     **jwu-pr-task**, с текстом от пользователя.
    - Если PR нет — пропусти этот шаг, target_branch определи отдельно (см. шаг 5).
 
 5. **Собери ЛОКАЛЬНЫЙ дифф изменений vs целевой ветки.**

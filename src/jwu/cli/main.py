@@ -1585,6 +1585,12 @@ def pr(
         indent = "  " + "    " * c.depth
         ts = f"[dim]{fmt_dt(c.created)}[/dim] " if c.created else ""
         console.print(f"{indent}{ts}{loc}[bold]{c.author}[/bold]: {(c.text or '').strip()}")
+        for t in c.tasks:
+            mark = "[green]☑[/green]" if t.resolved else "[yellow]☐[/yellow]"
+            console.print(f"{indent}    {mark} [dim]#{t.id}[/dim] {t.text}")
+    if pull.tasks_open or pull.tasks_resolved:
+        console.print(f"[bold]Задачи в PR:[/bold] открытых {pull.tasks_open}, закрытых {pull.tasks_resolved}"
+                      f"  [dim](jwu pr-task list {pull.id})[/dim]")
     if jobs_list:
         console.print(f"[bold]Работы ({len(jobs_list)})[/bold]")
         for j in jobs_list:
@@ -1733,6 +1739,129 @@ def _prompt_telegram(cfg, chat_opt: Optional[str], token_opt: Optional[str]) -> 
     if token_opt is not None:
         return token_opt
     return _prompt_default("Токен Telegram-бота (Enter — оставить прежний)", "", secret=True)
+
+
+# --------------------------------------------------------------------------- #
+# pr-task: задачи на комментах PR (Bitbucket tasks) — чек-лист правок
+# --------------------------------------------------------------------------- #
+
+pr_task_app = typer.Typer(
+    help="Задачи на комментах PR (ВНЕШНЯЯ запись в Bitbucket): чек-лист «что поправить»."
+)
+app.add_typer(pr_task_app, name="pr-task")
+
+
+def _render_pr_tasks(tasks: list) -> None:
+    if not tasks:
+        console.print("[dim]Задач в PR нет.[/dim]")
+        return
+    for t in tasks:
+        mark = "[green]☑[/green]" if t.resolved else "[yellow]☐[/yellow]"
+        anchor = f" [dim]коммент #{t.comment_id}[/dim]" if t.comment_id else ""
+        console.print(f"  {mark} [dim]#{t.id}[/dim] {t.text}{anchor}  [dim]{t.author}[/dim]")
+    open_n = sum(1 for t in tasks if not t.resolved)
+    console.print(f"[dim]открытых {open_n}, закрытых {len(tasks) - open_n}[/dim]")
+
+
+@pr_task_app.command("list")
+def pr_task_list(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта Bitbucket."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug репозитория."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Все задачи PR: открытые и закрытые, с комментом-якорем."""
+    with _service_with_prs() as svc:
+        try:
+            tasks = svc.pr_tasks(project, repo, pr_id)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json([t.model_dump() for t in tasks])
+    else:
+        _render_pr_tasks(tasks)
+
+
+@pr_task_app.command("add")
+def pr_task_add(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    text: str = typer.Argument(..., help=f"Текст задачи — до {models.PR_TASK_MAX_WORDS} слов, формулирует пользователь."),
+    comment: Optional[int] = typer.Option(None, "--comment", "-c",
+        help="id комментария-якоря (любого, включая свой). Без него jwu оставит свой коммент."),
+    comment_text: Optional[str] = typer.Option(None, "--comment-text",
+        help="Текст своего коммента-якоря (по умолчанию — текст задачи)."),
+    path: Optional[str] = typer.Option(None, "--file", help="Файл для inline-коммента (без --comment)."),
+    line: Optional[int] = typer.Option(None, "--line", help="Строка файла для inline-коммента."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта Bitbucket."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug репозитория."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Создать. Без флага — только показать, что будет создано."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Повесить задачу на коммент PR (ВНЕШНЯЯ запись — только с --yes)."""
+    try:
+        text = models.check_task_text(text)
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    where = (f"коммент #{comment}" if comment is not None
+             else f"свой inline-коммент {path}:{line}" if path
+             else "свой общий коммент")
+    if not yes:
+        console.print(f"[yellow]Превью[/yellow] (ничего не создано, добавь --yes):")
+        console.print(f"  PR #{pr_id} · {where} · задача: «{text}»")
+        raise typer.Exit(code=1)
+    with _service_with_prs() as svc:
+        try:
+            task = svc.pr_task_add(project, repo, pr_id, text, comment_id=comment,
+                                   comment_text=comment_text, path=path, line=line)
+        except (ValueError, BitbucketError) as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(task.model_dump())
+    else:
+        console.print(f"[green]Задача #{task.id} создана[/green] на комменте #{task.comment_id}: {task.text}")
+
+
+def _pr_task_state(task_ids: list[int], state: str, yes: bool, json_out: bool) -> None:
+    verb = "закрыть" if state == "RESOLVED" else "снова открыть"
+    if not yes:
+        console.print(f"[yellow]Превью[/yellow] (ничего не изменено, добавь --yes): "
+                      f"{verb} задачи {', '.join(f'#{t}' for t in task_ids)}")
+        raise typer.Exit(code=1)
+    with _service_with_prs() as svc:
+        try:
+            tasks = svc.pr_task_set_state(task_ids, state)
+        except (ValueError, BitbucketError) as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json([t.model_dump() for t in tasks])
+    else:
+        for t in tasks:
+            mark = "[green]☑[/green]" if t.resolved else "[yellow]☐[/yellow]"
+            console.print(f"  {mark} #{t.id} {t.text}")
+
+
+@pr_task_app.command("done")
+def pr_task_done(
+    task_ids: list[int] = typer.Argument(..., help="id задач (одна или несколько)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Закрыть. Без флага — превью."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Пометить задачи сделанными (RESOLVED). Одно подтверждение на всю пачку."""
+    _pr_task_state(task_ids, "RESOLVED", yes, json_out)
+
+
+@pr_task_app.command("reopen")
+def pr_task_reopen(
+    task_ids: list[int] = typer.Argument(..., help="id задач."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Открыть заново. Без флага — превью."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Снова открыть закрытые задачи."""
+    _pr_task_state(task_ids, "OPEN", yes, json_out)
 
 
 # --------------------------------------------------------------------------- #
@@ -2189,6 +2318,7 @@ _DAY_PROMPT = """## Что нужно сделать
 - PR `состояние: конфликт` → поправить merge-конфликт (приоритет, если апрувы собраны).
 - PR `состояние: красный билд` (или дельта `build_failed`) → разобрать падение сборки (`jwu build <PR>`), починить; `build_fixed` — сборка снова зелёная.
 - PR `апрувы собраны`, без NEEDS_WORK/конфликта/красного билда, а задача не на тестах → перевести задачу на тесты.
+- PR `открытые задачи: N` (задачи на комментах = чек-лист правок) → закрыть их: `jwu pr <PR>` показывает задачи под комментами.
 - PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
 - PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
 - Упоминание с пометкой `· новое` → прочитать, понять, что от меня хотят, и ответить.
@@ -2202,6 +2332,8 @@ def _pr_state(pr: PR) -> str:
         return "конфликт"
     if pr.build_state == "FAILED":
         return "красный билд"
+    if pr.tasks_open:
+        return f"открытые задачи: {pr.tasks_open}"
     if any((r.status or "") == "NEEDS_WORK" for r in pr.reviewers):
         return "есть NEEDS_WORK"
     if not pr.reviewers:
@@ -2219,6 +2351,7 @@ def _pr_line(pr: PR) -> str:
     conflict = "КОНФЛИКТ" if pr.conflicted else ("ok" if pr.conflicted is False else "?")
     return (f'- {pr.project}/{pr.repository}#{pr.id} "{pr.title}" — {conflict}; '
             f"состояние: {_pr_state(pr)}; сборка: {_BUILD_RU.get(pr.build_state, 'нет')}; "
+            f"задач: {pr.tasks_open} открытых / {pr.tasks_resolved} закрытых; "
             f"ревью: {revs}; комментов: {pr.comment_count}; "
             f"обновлён: {fmt_ago(pr.updated)}")
 

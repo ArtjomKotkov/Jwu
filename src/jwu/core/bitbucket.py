@@ -10,7 +10,7 @@ from typing import Optional
 
 import httpx
 
-from .models import PR, BuildStatus, PRComment, _get
+from .models import PR, BuildStatus, PRComment, PRTask, _get
 
 # роль в dashboard/pull-requests
 ROLE_BY_VIEW = {"mine": "AUTHOR", "review": "REVIEWER"}
@@ -65,6 +65,7 @@ def _flatten_comment(
             depth=depth,
             context=context if depth == 0 else [],
             anchor_idx=anchor_idx if depth == 0 else -1,
+            tasks=[PRTask.from_bitbucket(t) for t in c.get("tasks", []) or []],
         )
     )
     for reply in c.get("comments", []) or []:
@@ -122,6 +123,20 @@ class BitbucketClient:
         if resp.status_code >= 400:
             raise BitbucketError(f"{resp.status_code}: {resp.text[:200]}", resp.status_code)
         return resp.json()
+
+    def _send(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """Запись (POST/PUT/DELETE) с той же обработкой ошибок, что у ``_get``."""
+        try:
+            resp = self._client.request(method, path, json=payload)
+        except httpx.HTTPError as exc:
+            raise BitbucketError(f"Сеть/Bitbucket недоступен: {exc}") from exc
+        if resp.status_code == 401:
+            raise BitbucketError("401: токен Bitbucket невалиден", 401)
+        if resp.status_code == 403:
+            raise BitbucketError("403: нет прав в Bitbucket", 403)
+        if resp.status_code >= 400:
+            raise BitbucketError(f"{resp.status_code}: {resp.text[:200]}", resp.status_code)
+        return resp.json() if resp.content else {}
 
     def _paged(self, path: str, params: dict | None = None) -> list[dict]:
         """Собрать все страницы Bitbucket (values / isLastPage / nextPageStart)."""
@@ -250,6 +265,53 @@ class BitbucketClient:
             if best is None or ts > best:
                 best = ts
         return best
+
+    # --- задачи на комментах (Bitbucket Server tasks API) ------------------ #
+
+    def pr_tasks(self, project: str, repo: str, pr_id: int) -> list[PRTask]:
+        """Все задачи PR (открытые и закрытые), с привязкой к комменту-якорю."""
+        raw = self._paged(f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/tasks")
+        return [PRTask.from_bitbucket(t) for t in raw]
+
+    def pr_task_count(self, project: str, repo: str, pr_id: int) -> tuple[int, int]:
+        """(открытых, закрытых) — один дешёвый запрос, для синка."""
+        data = self._get(f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/tasks/count")
+        return int(data.get("open", 0) or 0), int(data.get("resolved", 0) or 0)
+
+    def task_create(self, comment_id: int | str, text: str) -> PRTask:
+        """Повесить задачу на коммент. Текст — как есть: проверка длины лежит выше."""
+        raw = self._send("POST", "/tasks", {
+            "anchor": {"id": int(comment_id), "type": "COMMENT"},
+            "text": text,
+        })
+        return PRTask.from_bitbucket(raw)
+
+    def task_set_state(self, task_id: int, state: str) -> PRTask:
+        """Закрыть (RESOLVED) или снова открыть (OPEN) задачу."""
+        raw = self._send("PUT", f"/tasks/{int(task_id)}", {"id": int(task_id), "state": state})
+        return PRTask.from_bitbucket(raw)
+
+    def pr_comment_add(
+        self, project: str, repo: str, pr_id: int, text: str, *,
+        parent_id: int | str | None = None, path: str | None = None,
+        line: int | None = None, line_type: str = "CONTEXT", file_type: str = "TO",
+    ) -> dict:
+        """Оставить коммент: общий, ответ в тред (``parent_id``) или на строку файла.
+
+        У inline-коммента ``line_type`` — ADDED | REMOVED | CONTEXT, ``file_type`` — TO
+        (правая сторона диффа, новая версия) | FROM. Возвращает сырой коммент Bitbucket
+        (нужен его ``id`` — на него вешаются задачи).
+        """
+        payload: dict = {"text": text}
+        if parent_id is not None:
+            payload["parent"] = {"id": int(parent_id)}
+        elif path:
+            payload["anchor"] = {"path": path, "lineType": line_type, "fileType": file_type}
+            if line is not None:
+                payload["anchor"]["line"] = int(line)
+        return self._send(
+            "POST", f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments", payload
+        )
 
     def pr_comments(self, project: str, repo: str, pr_id: int) -> list[PRComment]:
         """Комментарии PR из activities: общие + inline (с file:line и куском диффа)."""

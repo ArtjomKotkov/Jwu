@@ -12,7 +12,8 @@ workspace_tag, workspace_use, rule_add, rule_edit, rule_rm, note, worklog, comme
 issue_link, issue_transition, issue_attach, job_start, job_add,
 job_link, job_status, feature_add, feature_status, feature_edit, feature_rm. Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
 у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в SDESK его читает КЛИЕНТ),
-`jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition` и `jwu_issue_attach` —
+`jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition`, `jwu_issue_attach`,
+`jwu_pr_task_add` и `jwu_pr_task_done` (задачи на комментах PR в Bitbucket) —
 вызывать только по явному подтверждению пользователя. У пишущих инструментов с
 `dry_run` порядок обязателен: сначала превью, показать его пользователю, потом запись.
 
@@ -348,7 +349,75 @@ async def jwu_pr(
     payload["comments"] = [c.model_dump() for c in detail.comments]
     payload["commits"] = detail.commits
     payload["jobs"] = [j.model_dump() for j in jobs]
+    # Открытые задачи на комментах — чек-лист правок по PR, отдельным списком.
+    payload["open_tasks"] = [
+        t.model_dump() for c in detail.comments for t in c.tasks if not t.resolved
+    ]
     return payload
+
+
+@mcp.tool()
+async def jwu_pr_tasks(
+    pr_id: int,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> list[dict]:
+    """Задачи на комментах PR (Bitbucket tasks) — чек-лист «что поправить»: id, текст,
+    state OPEN|RESOLVED, автор, comment_id якоря. Открытые задачи = что ещё не сделано
+    по этому PR; закрывай их по мере правок через jwu_pr_task_done. Только Bitbucket.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    return [t.model_dump() for t in svc.pr_tasks(project, repo, pr_id)]
+
+
+@mcp.tool()
+async def jwu_pr_task_add(
+    pr_id: int,
+    text: str,
+    comment_id: Optional[int] = None,
+    comment_text: Optional[str] = None,
+    path: Optional[str] = None,
+    line: Optional[int] = None,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ в Bitbucket: повесить задачу на коммент PR. Звать только после
+    явного подтверждения пользователя (скилл jwu-pr-task).
+
+    text — ТЕКСТ ЗАДАЧИ ФОРМУЛИРУЕТ ПОЛЬЗОВАТЕЛЬ, не придумывай его сам; до 10 слов,
+    длиннее инструмент отказывает. comment_id — коммент-якорь (любой, включая свой);
+    без него jwu оставляет СВОЙ коммент (общий, либо на строку path:line) с текстом
+    comment_text (по умолчанию — текст задачи) и вешает задачу на него.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    task = svc.pr_task_add(project, repo, pr_id, text, comment_id=comment_id,
+                           comment_text=comment_text, path=path, line=line)
+    return _stamp(task.model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_task_done(
+    task_ids: list[int],
+    reopen: bool = False,
+    workspace: Optional[str] = None,
+) -> list[dict]:
+    """ВНЕШНЯЯ ЗАПИСЬ в Bitbucket: закрыть задачи PR (RESOLVED) — сделано. reopen=True
+    открывает их заново. Одно подтверждение пользователя на всю пачку task_ids.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    tasks = svc.pr_task_set_state(list(task_ids), "OPEN" if reopen else "RESOLVED")
+    return [_stamp(t.model_dump(), _resolve(workspace)) for t in tasks]
 
 
 @mcp.tool()

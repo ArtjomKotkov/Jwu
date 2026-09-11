@@ -33,6 +33,7 @@ EXPECTED_SKILLS = {
     "jwu-update",
     "jwu-prompt-refine",
     "duty-support",
+    "jwu-pr-task",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
