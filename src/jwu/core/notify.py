@@ -43,10 +43,11 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Последний проход и что накопилось"},
     {"command": "stuck", "description": "Что застряло по порогам"},
     {"command": "mentions", "description": "Непрочитанные упоминания"},
+    {"command": "seen", "description": "Пометить упоминания прочитанными"},
     {"command": "help", "description": "Как пользоваться"},
 ]
 KEYBOARD = {
-    "keyboard": [["/sync", "/status"], ["/stuck", "/mentions"]],
+    "keyboard": [["/sync", "/status"], ["/stuck", "/mentions", "/seen"]],
     "resize_keyboard": True, "is_persistent": True,
     "input_field_placeholder": "PROJ-1 текст → заметка; ответ на уведомление → заметка",
 }
