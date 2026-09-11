@@ -47,7 +47,7 @@ from . import notify
 from . import thresholds as thresholds_mod
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
-    PR_TASK_STATES, PRAttachment, PRTask, check_task_text, pr_note_key,
+    PR_TASK_STATES, PRAttachment, PRTask, check_task_text, job_description_text, pr_note_key,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
     GITHUB_SHORT_REF_RE,
@@ -287,6 +287,8 @@ class DashboardData:
     # для колонок «Назначен» / «Статус» в PR-таблицах.
     task_status: dict[str, str] = field(default_factory=dict)
     task_assignee: dict[str, str] = field(default_factory=dict)
+    # Закреплённые status-заметки по ключам задач и PR — колонка «почему висит».
+    status_notes: dict[str, str] = field(default_factory=dict)
 
     @property
     def tasks_enabled(self) -> bool:
@@ -411,6 +413,12 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
             task_status[branch_key] = task_status[canonical_key]
         if canonical_key in task_assignee and branch_key not in task_assignee:
             task_assignee[branch_key] = task_assignee[canonical_key]
+    mine = store.latest_issues("mine")
+    prs_mine = store.latest_prs("mine")
+    prs_review = store.latest_prs("review")
+    note_keys = [i.key for i in mine] + [pr_note_key(p.project, p.repository, p.id)
+                                         for p in prs_mine + prs_review]
+    status_notes = {k: v for k, v in store.status_notes(note_keys).items() if v}
     return DashboardData(
         user=user or ident.get("user", ""),
         display_name=ident.get("display_name", ""),
@@ -419,10 +427,11 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
             section: store.last_sync_at(token) for section, token in SECTION_TOKEN.items()
         },
         deltas=store.pending_changes(),  # накопленные изменения (до явного закрытия)
-        mine=store.latest_issues("mine"),
+        mine=mine,
         mentions=store.list_mentions(),
-        prs_mine=store.latest_prs("mine"),
-        prs_review=store.latest_prs("review"),
+        prs_mine=prs_mine,
+        prs_review=prs_review,
+        status_notes=status_notes,
         jobs=store.list_jobs(),  # все работы (включая закрытые/завершённые)
         workspace=ws,
         workspaces=all_workspaces,
@@ -1326,6 +1335,26 @@ class Service:
             raise ValueError("Не знаю свой логин Bitbucket — задай jira.username в конфиге")
         return client.pr_review(project or default_project, repo or default_repo, pr_id, login, status)
 
+    def pr_draft_from_job(self, job_id: int) -> tuple[str, str]:
+        """(заголовок, описание) PR из работы: ключ задачи + название, описание из журнала."""
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Работа #{job_id} не найдена в этом воркспейсе")
+        anchor = job.task_key or job.feature_key
+        title = f"{anchor}: {job.title}" if anchor and job.title else (job.title or anchor)
+        return title, job_description_text(job)
+
+    def pr_create(self, project: str | None, repo: str | None, *, source: str, target: str,
+                  title: str, description: str = "", reviewers: list[str] | None = None) -> PR:
+        """Создать PR. ВНЕШНЯЯ запись — только после подтверждения пользователя."""
+        if not (source and target and title.strip()):
+            raise ValueError("Нужны ветка-источник, целевая ветка и заголовок")
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        return client.pr_create(project or default_project, repo or default_repo,
+                                source=source, target=target, title=title.strip(),
+                                description=description, reviewers=reviewers)
+
     # --- задачи на комментах PR (Bitbucket tasks) ------------------------- #
 
     def _require_bitbucket(self) -> BitbucketClient:
@@ -1599,6 +1628,34 @@ class Service:
             pass
         names.append(self._configured_username())
         return tuple(n for n in names if n)
+
+    # --- Telegram: ответы боту → заметки ----------------------------------- #
+
+    def poll_telegram_replies(self) -> list[dict]:
+        """Забрать новые сообщения боту и превратить их в заметки-контекст.
+
+        Ответ на уведомление (reply) — заметка по первому ключу из текста уведомления;
+        сообщение вида «PROJ-1 текст» — заметка по этому ключу. Сообщения не из
+        настроенного чата игнорируются. Смещение хранится в meta воркспейса.
+        """
+        sender = self.notifier()
+        if sender is None:
+            return []
+        offset = int(self.store.get_workspace_meta(notify.OFFSET_META) or 0)
+        updates = sender.get_updates(offset + 1 if offset else None)
+        written: list[dict] = []
+        last = offset
+        for upd in updates:
+            last = max(last, int(upd.get("update_id", 0) or 0))
+            parsed = notify.parse_incoming(upd, chat_id=sender.chat_id)
+            if parsed is None:
+                continue
+            key, text = parsed
+            note = self.store.add_note(key, text, author="telegram", kind="context")
+            written.append({"key": key, "note_id": note.id, "text": text})
+        if last != offset:
+            self.store.set_workspace_meta(notify.OFFSET_META, str(last))
+        return written
 
     # --- уведомления после синка ------------------------------------------ #
 

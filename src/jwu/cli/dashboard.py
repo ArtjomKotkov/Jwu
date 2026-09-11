@@ -43,6 +43,7 @@ from .copy_modal import (
 )
 from ..core.models import (
     GITHUB_SHORT_REF_RE,
+    pr_note_key,
     JOB_RECORD_BADGES,
     LOCAL_FEATURE_BADGES,
     WORKSPACE_RULE_BADGES,
@@ -2123,11 +2124,15 @@ class JwuDashboard(App):
         table.clear()
         for it in issues:
             changed = it.key in self._changed_issue_keys
+            summary = Text(it.summary, style="yellow" if changed else "")
+            note = (self.data.status_notes or {}).get(it.key, "")
+            if note:
+                summary.append(f"  📍 {note}", style="green")
             table.add_row(
                 self._key_cell(it.key, changed),
                 Text(it.status, style=status_color(it.status)),
                 Text(it.priority, style=priority_color(it.priority)),
-                Text(it.summary, style="yellow" if changed else ""),
+                summary,
             )
         self._rows[table_id] = list(issues)
         self._restore_cursor(table, cur)
@@ -2179,7 +2184,12 @@ class JwuDashboard(App):
                 conflict.append("⚠", style="dark_orange")
             if pr.build_state == "FAILED":
                 conflict.append("✗", style="red")
+            if pr.tasks_open:
+                conflict.append(f"☐{pr.tasks_open}", style="yellow")
             title_cell = Text(pr.title, style="yellow" if changed else "")
+            note = (self.data.status_notes or {}).get(pr_note_key(pr.project, pr.repository, pr.id), "")
+            if note:
+                title_cell.append(f"  📍 {note}", style="green")
             review_cell = reviewers_cell(pr.reviewers, current_user=self._user)
             if with_task_cols:
                 key = pr_task_key(pr, self.data.owner)

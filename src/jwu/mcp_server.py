@@ -14,8 +14,8 @@ job_link, job_status, feature_add, feature_status, feature_edit, feature_rm. П�
 у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в SDESK его читает КЛИЕНТ),
 `jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition`, `jwu_issue_attach`,
 `jwu_pr_task_add` и `jwu_pr_task_done` (задачи на комментах PR в Bitbucket),
-`jwu_pr_comment` (комментарий/ответ в PR) и `jwu_pr_review` (мой статус ревью) —
-вызывать только по явному подтверждению пользователя. У пишущих инструментов с
+`jwu_pr_comment` (комментарий/ответ в PR), `jwu_pr_review` (мой статус ревью) и
+`jwu_pr_create` (создание PR) — вызывать только по явному подтверждению пользователя. У пишущих инструментов с
 `dry_run` порядок обязателен: сначала превью, показать его пользователю, потом запись.
 
 Всё работает в контексте ВОРКСПЕЙСА. По умолчанию он определяется по рабочей папке
@@ -560,6 +560,40 @@ async def jwu_pr_comment(
     result = svc.pr_comment_add(project, repo, pr_id, text, parent_id=reply_to, path=path, line=line)
     return _stamp({"pr": pr_id, "id": result.get("id", ""), "reply_to": reply_to,
                    "path": path, "line": line}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_create(
+    target: str,
+    title: str,
+    source: Optional[str] = None,
+    description: str = "",
+    from_job: Optional[int] = None,
+    reviewers: Optional[list[str]] = None,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: создать PR (Bitbucket/GitHub) из уже запушенной ветки. Только после
+    того, как пользователь увидел заголовок, описание, ветки и ревьюверов и сказал «да».
+
+    source — ветка-источник (по умолчанию текущая ветка папки процесса); from_job —
+    взять заголовок/описание из журнала работы (title/description перекрывают).
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    branch = source or gitinfo.head_state(Path.cwd())[0]
+    if not branch:
+        raise ValueError("Не понять ветку-источник: передай source")
+    if from_job is not None:
+        job_title, job_body = svc.pr_draft_from_job(from_job)
+        title = title or job_title
+        description = description or job_body
+    pull = svc.pr_create(project, repo, source=branch, target=target, title=title,
+                         description=description, reviewers=list(reviewers or []))
+    return _stamp(pull.model_dump(), _resolve(workspace))
 
 
 @mcp.tool()

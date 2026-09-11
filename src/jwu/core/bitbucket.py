@@ -366,6 +366,21 @@ class BitbucketClient:
             {"user": {"name": user_slug}, "approved": status == "APPROVED", "status": status},
         )
 
+    def pr_create(self, project: str, repo: str, *, source: str, target: str, title: str,
+                  description: str = "", reviewers: list[str] | None = None) -> PR:
+        """Создать PR из ветки ``source`` в ``target`` того же репозитория."""
+        ref = {"repository": {"slug": repo, "project": {"key": project}}}
+        payload = {
+            "title": title, "description": description or "",
+            "fromRef": {"id": f"refs/heads/{source}", **ref},
+            "toRef": {"id": f"refs/heads/{target}", **ref},
+            "reviewers": [{"user": {"name": r}} for r in (reviewers or []) if r],
+        }
+        raw = self._send("POST", f"/projects/{project}/repos/{repo}/pull-requests", payload)
+        pull = PR.from_bitbucket(raw)
+        self._fill_attachment_urls(project, repo, pull.attachments)
+        return pull
+
     # --- задачи на комментах (Bitbucket Server tasks API) ------------------ #
 
     def pr_tasks(self, project: str, repo: str, pr_id: int) -> list[PRTask]:
