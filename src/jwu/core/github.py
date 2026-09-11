@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .http import new_client
+
 from .models import (
     PR,
     BuildReport,
@@ -96,7 +98,7 @@ class GitHubClient:
         web_url: str = "https://github.com",
         views: Optional[dict[str, str]] = None,
         client: Optional[httpx.Client] = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.web_url = web_url.rstrip("/")
@@ -106,7 +108,7 @@ class GitHubClient:
         self._owner_kind: str | None = None  # user | organization (для квалификатора поиска)
         self._me: dict | None = None
         self._owns_client = client is None
-        self._client = client or httpx.Client(
+        self._client = client or new_client(
             base_url=self.api_url,
             headers={
                 "Authorization": f"Bearer {token}",

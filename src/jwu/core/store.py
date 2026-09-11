@@ -263,6 +263,15 @@ def _issue_signature(issue: Issue) -> dict:
     }
 
 
+# Статусы «на тестах»: те же маркеры, что в эвристиках дневного анализа.
+_TESTING_MARKERS = ("TEST", "ТЕСТ", "QA")
+
+
+def is_testing_status(status: str) -> bool:
+    up = (status or "").upper()
+    return any(m in up for m in _TESTING_MARKERS)
+
+
 def _pr_signature(pr: PR) -> dict:
     return {
         "comment_count": pr.comment_count,
@@ -1107,9 +1116,15 @@ class Store:
 
     # --- дельты --------------------------------------------------------- #
 
-    def compute_changes(self, run_id: int | None = None) -> list[Delta]:
-        """Сравнить снапшоты последнего синка с предыдущими и вернуть дельты."""
+    def compute_changes(self, run_id: int | None = None, *, me: tuple[str, ...] = ()) -> list[Delta]:
+        """Сравнить снапшоты последнего синка с предыдущими и вернуть дельты.
+
+        ``me`` — мои логин/имя: по ним комментарий в задаче на тестах отличается от
+        комментария тестировщика (``qa_comment``), а возврат задачи с тестов — от
+        обычной смены статуса (``returned_from_testing``).
+        """
         run_id = run_id or self.latest_run_id()
+        mine = {m.casefold() for m in me if m}
         if run_id is None:
             return []
         deltas: list[Delta] = []
@@ -1129,9 +1144,14 @@ class Store:
                 deltas.append(Delta(key=key, kind="new_issue", summary=summary))
                 continue
             if cur.get("status") != prev.get("status"):
+                # Возврат с тестов — отдельное событие: обычно это «доработать», а не
+                # просто движение по процессу.
+                returned = (is_testing_status(prev.get("status") or "")
+                            and not is_testing_status(cur.get("status") or "")
+                            and not cur.get("resolution"))
                 deltas.append(Delta(
-                    key=key, kind="status_change", summary=summary,
-                    detail=f"{prev.get('status')} → {cur.get('status')}",
+                    key=key, kind="returned_from_testing" if returned else "status_change",
+                    summary=summary, detail=f"{prev.get('status')} → {cur.get('status')}",
                 ))
             if not prev.get("resolution") and cur.get("resolution"):
                 deltas.append(Delta(
@@ -1140,9 +1160,20 @@ class Store:
                 ))
             new_comments = set(cur.get("comment_ids", [])) - set(prev.get("comment_ids", []))
             if new_comments:
+                # Комментарий не от меня в задаче, которая на тестах, — почти наверняка
+                # тестировщик: это сигнал QA, а не просто «+1 комм.».
+                fields = json.loads(row["fields"])
+                authors = [
+                    (c.get("author") or "", c.get("author_key") or "")
+                    for c in fields.get("comments", []) or []
+                    if str(c.get("id")) in {str(i) for i in new_comments}
+                ]
+                foreign = [a for a in authors if not ({a[0].casefold(), a[1].casefold()} & mine)]
+                qa = is_testing_status(cur.get("status") or "") and bool(foreign)
+                who = ", ".join(sorted({a[0] or a[1] for a in foreign})) if foreign else ""
                 deltas.append(Delta(
-                    key=key, kind="new_comment", summary=summary,
-                    detail=f"+{len(new_comments)} комм.",
+                    key=key, kind="qa_comment" if qa else "new_comment", summary=summary,
+                    detail=f"+{len(new_comments)} комм." + (f" от {who}" if qa and who else ""),
                 ))
             # new_pr — только если dev-панель текущего снапшота достоверна, и
             # сравниваем с последним ДОСТОВЕРНЫМ снапшотом (сбойные пустые пропускаем),

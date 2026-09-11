@@ -21,6 +21,7 @@ import logging
 import re
 import tempfile
 from datetime import datetime
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -179,6 +180,51 @@ class PRDetail:
     commits: list[dict] = field(default_factory=list)
 
 
+# Дельты, которые в кратком режиме не требуют действия: исчезновение из выборки —
+# информационное, а апрувы/коммиты/комменты на ЧУЖИХ PR (где я ревьювер) — не моя работа.
+_BRIEF_DROP_KINDS = {"gone", "pr_gone"}
+_BRIEF_DROP_ON_REVIEW_PRS = {"reviewer_approved", "new_pr_commit", "new_pr_comment", "reviewer_needs_work"}
+
+
+def _brief_dashboard(d: "DashboardData", user: str, *, mention_days: int) -> "DashboardData":
+    """Отфильтровать данные дашборда до «требует действия» (см. collect_day_context)."""
+    from datetime import timedelta, timezone
+
+    mine_keys = {f"{p.project}/{p.repository}#{p.id}" for p in d.prs_mine}
+    review_keys = {f"{p.project}/{p.repository}#{p.id}" for p in d.prs_review} - mine_keys
+    deltas = [
+        x for x in d.deltas
+        if x.kind not in _BRIEF_DROP_KINDS
+        and not (x.key in review_keys and x.kind in _BRIEF_DROP_ON_REVIEW_PRS)
+    ]
+    # PR на ревью: только те, где мой отзыв ещё не дан (или я поставил needs work и
+    # жду доработку — это тоже моё)
+    login = (user or "").casefold()
+
+    def waits_for_me(pr: PR) -> bool:
+        for r in pr.reviewers:
+            if (r.name or "").casefold() == login:
+                return (r.status or "UNAPPROVED") != "APPROVED"
+        return True  # меня нет в списке ревьюверов, но PR в моей выборке — покажем
+
+    prs_review = [p for p in d.prs_review if waits_for_me(p)]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=mention_days)
+    mentions = []
+    for m in d.mentions:
+        if m.seen:
+            continue
+        try:
+            created = datetime.fromisoformat((m.created or "").replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except ValueError:
+            created = None
+        if created is not None and created < cutoff:
+            continue
+        mentions.append(m)
+    return dataclasses.replace(d, deltas=deltas, prs_review=prs_review, mentions=mentions)
+
+
 @dataclass
 class DayContext:
     """Расширенный контекст дня для анализа Claude Code (после фулл-синка)."""
@@ -193,6 +239,7 @@ class DayContext:
     mentions: list[Mention] = field(default_factory=list)
     # pr_id -> комменты (только для flagged PR: конфликт / NEEDS_WORK)
     pr_comments: dict[int, list[PRComment]] = field(default_factory=dict)
+    brief: bool = False  # контекст отфильтрован до «требует действия»
 
 
 @dataclass
@@ -1449,7 +1496,7 @@ class Service:
         # опирается на надёжность прогона по counts, а ради «вкладка реально пуста»
         # vs «фетч упал» это должно быть видно уже для текущего прогона.
         self.store.finish_sync_run(run_id, counts)
-        deltas = self.store.compute_changes(run_id)
+        deltas = self.store.compute_changes(run_id, me=self._me_names())
         self.store.add_pending_changes(run_id, deltas)  # копим до явного закрытия
         result = SyncResult(run_id=run_id, counts=counts, deltas=deltas,
                             new_mentions=new_mentions)
@@ -1479,11 +1526,22 @@ class Service:
         else:
             raise ValueError(f"Неизвестная секция: {section!r}")
         self.store.finish_sync_run(run_id, counts)  # counts до compute_changes (см. sync())
-        deltas = self.store.compute_changes(run_id)
+        deltas = self.store.compute_changes(run_id, me=self._me_names())
         self.store.add_pending_changes(run_id, deltas)  # копим до явного закрытия
         result = SyncResult(run_id=run_id, counts=counts, deltas=deltas)
         self._notify_after_sync(result)
         return result
+
+    def _me_names(self) -> tuple[str, ...]:
+        """Мои логин и отображаемое имя — без сети, если личность уже известна."""
+        names: list[str] = []
+        try:
+            login, display, _ = self._identity()
+            names += [login, display]
+        except Exception:  # noqa: BLE001 — личность не обязательна для дельт
+            pass
+        names.append(self._configured_username())
+        return tuple(n for n in names if n)
 
     # --- уведомления после синка ------------------------------------------ #
 
@@ -1658,12 +1716,21 @@ class Service:
             report.note = f"Jenkins недоступен: {exc}"
         return report
 
-    def collect_day_context(self, *, max_pr_comments: int = 8) -> DayContext:
-        """Фулл-синк + расширенный контекст для дневного анализа Claude Code."""
+    def collect_day_context(self, *, max_pr_comments: int = 8, brief: bool = False,
+                            mention_days: int = 14) -> DayContext:
+        """Фулл-синк + расширенный контекст для дневного анализа Claude Code.
+
+        ``brief`` — только то, что требует действия: без дельт об исчезновении и
+        без чужих апрувов/коммитов на PR, где я ревьювер; из PR на ревью — только
+        ждущие именно меня; из упоминаний — непрочитанные не старше ``mention_days``.
+        Полный контекст на 80+ КБ каждый разбор — дорого, а действий из него столько же.
+        """
         self.sync()
         login, display, _ = self._identity()
         user = login or self._configured_username()
         d = dashboard_from_memory(self.store, user)
+        if brief:
+            d = _brief_dashboard(d, user, mention_days=mention_days)
 
         # подтянуть комменты только для проблемных PR (конфликт / есть NEEDS_WORK)
         pr_comments: dict[int, list[PRComment]] = {}
@@ -1693,6 +1760,7 @@ class Service:
             prs_review=d.prs_review,
             mentions=d.mentions,
             pr_comments=pr_comments,
+            brief=brief,
         )
 
     def changes(self) -> list[Delta]:
