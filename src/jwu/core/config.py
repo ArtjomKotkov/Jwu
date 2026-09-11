@@ -140,6 +140,19 @@ class JenkinsConfig:
 
 
 @dataclass
+class TelegramConfig:
+    """Уведомления в Telegram после синка: бот (токен — секрет ``telegram.token``) и чат.
+
+    ``chat_id`` — куда слать: id личного чата с ботом или группы (отрицательный).
+    Пусто — уведомления выключены; ни одного лишнего запроса при синке не будет.
+    """
+
+    chat_id: str = ""
+    token_service: str = "jwu-telegram"
+    token_env: str = "TELEGRAM_BOT_TOKEN"
+
+
+@dataclass
 class StorageConfig:
     db_path: str = ""  # пусто => дефолт data_dir()/state.db; переопределяется env JWU_DB_PATH
 
@@ -151,6 +164,7 @@ class Config:
     bitbucket: BitbucketConfig = field(default_factory=BitbucketConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     # Откуда берутся секреты. По умолчанию — системный keyring (как исторически);
     # для конфига воркспейса подставляется secrets.DbSecrets (см. workspaces.config_for_workspace).
@@ -174,6 +188,8 @@ def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
         pairs = {"token": (cfg.github.token_service, cfg.github.token_account)}
     elif section == "jenkins":
         pairs = {"token": (cfg.jenkins.token_service, cfg.jenkins.username)}
+    elif section == "telegram":
+        pairs = {"token": (cfg.telegram.token_service, "bot")}
     else:
         return None
     ref = pairs.get(kind)
@@ -285,6 +301,10 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     cfg.jenkins.username = k.get("username", cfg.jenkins.username)
     cfg.jenkins.token_service = k.get("token_service", cfg.jenkins.token_service)
     cfg.jenkins.token_env = k.get("token_env", cfg.jenkins.token_env)
+
+    t = raw.get("telegram", {}) or {}
+    cfg.telegram.chat_id = str(t.get("chat_id", cfg.telegram.chat_id) or "")
+    cfg.telegram.token_env = t.get("token_env", cfg.telegram.token_env)
 
     s = raw.get("storage", {}) or {}
     cfg.storage.db_path = s.get("db_path", cfg.storage.db_path)
@@ -406,6 +426,11 @@ def bitbucket_token(cfg: Config) -> str:
     return _require_slot(cfg, "bitbucket.token")
 
 
+def telegram_token(cfg: Config) -> str:
+    """Токен бота Telegram (пусто — не настроен). Не бросает: уведомления опциональны."""
+    return get_slot(cfg, "telegram.token") or ""
+
+
 def jenkins_auth(cfg: Config) -> tuple[str, str] | None:
     """Basic-auth (username, apiToken) для Jenkins или None, если токен/логин не заданы.
 
@@ -479,6 +504,8 @@ def export_bundle(cfg: Config, path: Path) -> int:
         }
     if cfg.jenkins.username:
         raw["jenkins"] = {"base_url": cfg.jenkins.base_url, "username": cfg.jenkins.username}
+    if cfg.telegram.chat_id:
+        raw["telegram"] = {"chat_id": cfg.telegram.chat_id}
 
     sec_list: list[dict] = []
     for slot in secrets.SECRET_SLOTS:

@@ -312,7 +312,8 @@ def test_configure_interactive_writes_to_workspace(monkeypatch, tmp_path):
 
     # порядок промптов: host, user, project, PAT, session-pw, gate-login, gate-pw,
     # sdesk-host (пусто => SDESK пропускается целиком),
-    # bb-host, bb-project, bb-repo, bb-PAT, jenkins-host, jenkins-user, db-path.
+    # bb-host, bb-project, bb-repo, bb-PAT, jenkins-host, jenkins-user, db-path,
+    # telegram-chat (пусто => уведомления выключены, токен не спрашивается).
     # Jenkins username пустой => токен не спрашивается.
     answers = "\n".join([
         "https://jira.x", "alice", "ACME", "", "",
@@ -321,6 +322,7 @@ def test_configure_interactive_writes_to_workspace(monkeypatch, tmp_path):
         "https://git.x", "PROJ", "repo", "",
         "", "",
         str(tmp_path / "x.db"),
+        "",
     ]) + "\n"
     res = runner.invoke(cli.app, ["configure"], input=answers)
     assert res.exit_code == 0, res.output

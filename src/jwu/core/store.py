@@ -267,6 +267,9 @@ def _pr_signature(pr: PR) -> dict:
         "latest_commit": pr.latest_commit,
         "conflicted": pr.conflicted,
         "reviewers": {r.name: r.approved for r in pr.reviewers},
+        # Статус каждого ревьювера целиком (APPROVED | UNAPPROVED | NEEDS_WORK): по нему
+        # считается дельта «попросили доработать», которой одного approved не хватало.
+        "reviewer_status": {r.name: (r.status or "") for r in pr.reviewers},
         # Сводный статус CI по head-коммиту: переход в FAILED/из FAILED — отдельные дельты.
         "build_state": pr.build_state,
     }
@@ -1169,6 +1172,13 @@ class Store:
                     deltas.append(Delta(
                         key=pr_key, kind="reviewer_approved", summary=title,
                         detail=f"{name} проапрувил",
+                    ))
+            prev_status = prev.get("reviewer_status", {}) or {}
+            for name, status in (cur.get("reviewer_status", {}) or {}).items():
+                if status == "NEEDS_WORK" and prev_status.get(name) != "NEEDS_WORK":
+                    deltas.append(Delta(
+                        key=pr_key, kind="reviewer_needs_work", summary=title,
+                        detail=f"{name}: needs work",
                     ))
             if cur.get("conflicted") and not prev.get("conflicted"):
                 deltas.append(Delta(

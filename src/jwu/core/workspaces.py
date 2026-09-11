@@ -249,6 +249,7 @@ _SETTING_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("github.username", "github", "username"),
     ("jenkins.base_url", "jenkins", "base_url"),
     ("jenkins.username", "jenkins", "username"),
+    ("telegram.chat_id", "telegram", "chat_id"),
 )
 
 LEGACY_MIGRATED_META = "workspaces.legacy_migrated"
@@ -262,7 +263,8 @@ def _settings_to_raw(settings: dict[str, str]) -> dict:
     raw: dict = {}
     for key, value in settings.items():
         parts = key.split(".")
-        if len(parts) < 2 or parts[0] not in ("jira", "sdesk", "bitbucket", "github", "jenkins"):
+        if len(parts) < 2 or parts[0] not in ("jira", "sdesk", "bitbucket", "github", "jenkins",
+                                              "telegram"):
             continue  # служебные ключи воркспейса (features.seq и пр.) — не конфиг
         node = raw
         for part in parts[:-1]:

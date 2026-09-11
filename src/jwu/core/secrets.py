@@ -32,6 +32,7 @@ SECRET_SLOTS: tuple[str, ...] = (
     "jira.token", "jira.password", "jira.gate_password",
     "sdesk.token", "sdesk.password", "sdesk.gate_password",
     "bitbucket.token", "github.token", "jenkins.token",
+    "telegram.token",
 )
 
 # Слоты, которые можно перебить переменной окружения (как и раньше).
@@ -43,6 +44,7 @@ SLOT_ENV: dict[str, str] = {
     # он и подхватывается автоматически: чаще всего токен уже есть в окружении.
     "github.token": "GITHUB_TOKEN",
     "jenkins.token": "JENKINS_TOKEN",
+    "telegram.token": "TELEGRAM_BOT_TOKEN",
 }
 
 KeyringRef = Optional[Tuple[str, str]]  # (service, account) в системном keyring
