@@ -509,3 +509,24 @@ def test_auth_refresh_drops_cached_services(fresh_server, monkeypatch):
     assert closed == ["старый"]
     assert srv._full[ws.id].tag == "новый"
     assert result["ok"] is True and result["auth"]["jira"]["user"] == "akotkov"
+
+
+def test_day_context_tool_returns_markdown_and_data(fresh_server, monkeypatch):
+    """jwu_day_context — тот же рендер, что у CLI, без shell (JWU-36)."""
+    from jwu.core.models import PR
+    from jwu.core.service import DayContext
+
+    class _Svc:
+        tasks_client = object()
+
+        def collect_day_context(self, *, brief=False):
+            return DayContext(user="me", brief=brief,
+                              prs_mine=[PR(id=1, project="P", repository="r", title="T")],
+                              status_notes={"P/r#1": "ждём"})
+
+    monkeypatch.setattr(srv, "_full_svc", lambda workspace=None: _Svc())
+    payload = _run(srv.jwu_day_context(brief=True, as_json=True))
+    assert payload["brief"] is True
+    assert "кратко: только требующее действия" in payload["markdown"]
+    assert 'заметка: «ждём»' in payload["markdown"]
+    assert payload["data"]["prs_mine"][0]["id"] == 1 and payload["data"]["status_notes"] == {"P/r#1": "ждём"}
