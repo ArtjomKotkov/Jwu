@@ -1806,6 +1806,43 @@ def _prompt_telegram(cfg, chat_opt: Optional[str], token_opt: Optional[str]) -> 
 
 
 # --------------------------------------------------------------------------- #
+# branches: реестр локальных веток по задаче — где лежит код, без работ
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def branches(
+    key: Optional[str] = typer.Argument(None, help="Ключ задачи (PROJ-1) или кусок имени ветки."),
+    all_branches: bool = typer.Option(False, "--all", "-a", help="Все ветки, а не только «задачные»."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Локальные ветки по задаче во всех репозиториях воркспейса: коммит, апстрим, ahead/behind,
+    где checkout'нута (клон / worktree), незакоммиченные файлы. Только чтение git."""
+    from ..core import branches as br
+
+    with _store() as store:
+        roots = br.workspace_roots(store)
+        items = br.collect(roots, key=key, all_branches=all_branches)
+        status = store.status_notes([b.branch for b in items])
+    if json_out:
+        _emit_json([{**b.as_dict(), "note": status.get(b.branch, "")} for b in items])
+        return
+    if not roots:
+        console.print("[dim]В папках воркспейса нет git-репозиториев.[/dim]")
+        return
+    if not items:
+        console.print(f"[dim]Веток {'по ' + key if key else 'с ключом задачи'} не найдено "
+                      f"(репозиториев: {len(roots)}; все ветки — --all).[/dim]")
+        return
+    for b in items:
+        mark = "[green]●[/green]" if b.current or b.worktree else "[dim]○[/dim]"
+        console.print(f"{mark} {br.summary_line(b)}")
+        if status.get(b.branch):
+            console.print(f"    [green]📍 {status[b.branch]}[/green]")
+    console.print(f"[dim]веток: {len(items)}, репозиториев: {len(roots)}[/dim]")
+
+
+# --------------------------------------------------------------------------- #
 # pr-comment / pr-review: ответить в PR и поставить статус ревью (ВНЕШНЯЯ запись)
 # --------------------------------------------------------------------------- #
 

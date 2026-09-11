@@ -1118,6 +1118,13 @@ async def jwu_context(key: str, workspace: Optional[str] = None) -> dict:
         if snap_issue is not None:
             payload["task"] = {"summary": snap_issue.summary, "status": snap_issue.status,
                                "assignee": snap_issue.assignee, "updated": snap_issue.updated}
+        try:
+            from .core import branches as br
+
+            found = br.collect(br.workspace_roots(store), key=key)
+            payload["branches"] = [{**b.as_dict(), "summary": br.summary_line(b)} for b in found[:10]]
+        except Exception:  # noqa: BLE001 — git недоступен: контекст всё равно полезен
+            payload["branches"] = []
     if jobs:
         last = jobs[0]
         rec = last.records[-1] if last.records else None
@@ -1406,6 +1413,28 @@ async def jwu_comment(
                          "Показать текст пользователю и получить подтверждение")}
     result = svc.add_comment(key, text, client_facing=client_facing)
     return {"ok": True, "key": key, "id": result.get("id", ""), "client_facing": to_client}
+
+
+@mcp.tool()
+async def jwu_branches(key: Optional[str] = None, all_branches: bool = False,
+                       workspace: Optional[str] = None) -> list[dict]:
+    """Где лежит код по задаче: локальные ветки во всех репозиториях воркспейса, свежие
+    первыми — репозиторий, ветка, коммит, дата, апстрим, ahead/behind, `current`
+    (checkout'нута в клоне), `worktree` (путь, если checkout'нута там), `dirty`
+    (незакоммиченных файлов там, где checkout'нута), `task_key` из имени, `note` —
+    закреплённый статус ветки. key — ключ задачи или кусок имени; без key — все
+    ветки с ключом задачи в имени; all_branches — вообще все. Только чтение git, без сети.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    from .core import branches as br
+
+    store = _store_only(workspace)
+    items = br.collect(br.workspace_roots(store), key=key, all_branches=all_branches)
+    status = store.status_notes([b.branch for b in items])
+    return [{**b.as_dict(), "note": status.get(b.branch, ""), "summary": br.summary_line(b)}
+            for b in items]
 
 
 @mcp.tool()
