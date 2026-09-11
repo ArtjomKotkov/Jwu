@@ -312,6 +312,29 @@ async def jwu_changes(workspace: Optional[str] = None) -> list[dict]:
 
 
 @mcp.tool()
+async def jwu_day_context(brief: bool = True, as_json: bool = False,
+                          workspace: Optional[str] = None) -> dict:
+    """Контекст дневного анализа — то же, что `jwu action day-analyze`, но без shell:
+    фулл-синк, затем markdown с промптом, дельтами, разделом «Застряло», задачами, PR
+    (с состоянием, сборкой, задачами на комментах, status-заметками) и упоминаниями.
+
+    brief=True — только требующее действия (рекомендуется). as_json=True — вдобавок
+    структурированный `data`. Требует трекер задач в контуре. Синк занимает до минуты.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    from .core import daycontext
+
+    svc = _require_jira(_full_svc(workspace))
+    ctx = svc.collect_day_context(brief=brief)
+    payload: dict = {"brief": brief, "markdown": daycontext.render_day_context_md(ctx)}
+    if as_json:
+        payload["data"] = daycontext.day_context_json(ctx)
+    return payload
+
+
+@mcp.tool()
 async def jwu_mentions(unseen: bool = False, limit: int = 50, workspace: Optional[str] = None) -> list[dict]:
     """Упоминания меня в комментариях (из памяти последнего синка, без сети): задача,
     автор, текст, дата, seen. unseen=True — только непрочитанные.

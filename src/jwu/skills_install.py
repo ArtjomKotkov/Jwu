@@ -36,6 +36,10 @@ EXPECTED_SKILLS = {
     "jwu-pr-task",
     "jwu-pr-comment",
     "jwu-context",
+    "jwu-review-pr",
+    "jwu-qa-triage",
+    "jwu-wrap-up",
+    "jwu-setup-remote",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
@@ -52,6 +56,7 @@ EXPECTED_AGENTS = {
     "reviewer-jwu-sample",
     "jenkins-build-analyst",
     "duty-support-sample",
+    "qa-triage-sample",
 }
 
 
