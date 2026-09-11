@@ -19,6 +19,7 @@ from ..core.github import GitHubError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config
 from ..core.dates import fmt_ago, fmt_dt
+from ..core import daemon
 from ..core.maintenance import (
     AUTO_PRUNE_DAYS, ensure_db_available, run_daily_maintenance, run_daily_prune,
     warn_if_cloud_path,
@@ -1710,6 +1711,82 @@ def changes(
         _emit_json([d.model_dump() for d in deltas])
     else:
         _render_deltas(deltas)
+
+
+# --------------------------------------------------------------------------- #
+# daemon: фоновый синк без дашборда
+# --------------------------------------------------------------------------- #
+
+daemon_app = typer.Typer(
+    help="Фоновый синк всех контуров без открытого дашборда: цикл и установка службой."
+)
+app.add_typer(daemon_app, name="daemon")
+
+
+def _daemon_open_store() -> Store:
+    _prepare_db()
+    return Store(str(db_path()))
+
+
+@daemon_app.command("run")
+def daemon_run(
+    interval: int = typer.Option(
+        daemon.DEFAULT_INTERVAL, "--interval", "-i",
+        help=f"Пауза между проходами, сек (минимум {daemon.MIN_INTERVAL}); отсчёт от конца прохода.",
+    ),
+    once: bool = typer.Option(False, "--once", help="Один проход и выход (для cron/проверки)."),
+) -> None:
+    """Цикл: синк каждого контура с внешним провайдером → хуки после синка → пауза.
+
+    Один экземпляр на машину (файловый лок). Обычно запускается службой
+    (`jwu daemon install`), руками — для проверки: `jwu daemon run --once`.
+    """
+    try:
+        daemon.run_loop(_daemon_open_store, interval=interval, once=once)
+    except daemon.DaemonError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    except KeyboardInterrupt:
+        daemon.log("остановлен пользователем")
+
+
+@daemon_app.command("install")
+def daemon_install(
+    interval: int = typer.Option(daemon.DEFAULT_INTERVAL, "--interval", "-i",
+                                 help="Пауза между проходами, сек."),
+    jwu_bin: Optional[str] = typer.Option(None, "--jwu-bin", help="Путь до исполняемого jwu (по умолчанию — текущий)."),
+) -> None:
+    """Поставить демон службой: launchd (macOS) или systemd --user (Linux), автозапуск при входе."""
+    try:
+        for msg in daemon.install(interval, jwu_bin=jwu_bin):
+            console.print(msg)
+    except daemon.DaemonError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+@daemon_app.command("uninstall")
+def daemon_uninstall() -> None:
+    """Снять службу и удалить её файл."""
+    for msg in daemon.uninstall():
+        console.print(msg)
+
+
+@daemon_app.command("status")
+def daemon_status(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Установлена ли служба, жив ли процесс, когда был последний проход."""
+    with _open_store() as store:
+        info = daemon.status(store)
+    if json_out:
+        _emit_json(info)
+        return
+    yes = lambda v: "[green]да[/green]" if v else "[dim]нет[/dim]"  # noqa: E731
+    console.print(f"служба установлена: {yes(info['installed'])}  ({info['service_file']})")
+    console.print(f"служба загружена:   {yes(info['service_loaded'])}")
+    pid = f" (pid {info['pid']})" if info["pid"] else ""
+    console.print(f"процесс работает:   {yes(info['running'])}{pid}")
+    console.print(f"последний проход:   {info['last_pass'] or '—'}  {info['last_summary'] or ''}")
+    console.print(f"лог: [dim]{info['log']}[/dim]")
 
 
 # --------------------------------------------------------------------------- #
