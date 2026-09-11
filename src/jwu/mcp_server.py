@@ -152,6 +152,17 @@ def _with_version(payload: dict) -> dict:
     return payload
 
 
+def _job_summary(job) -> dict:
+    """Работа без журнала: id, статус, заголовок, когда обновлена, последняя запись."""
+    last = job.records[-1] if job.records else None
+    return {
+        "id": job.id, "status": job.status, "title": job.title, "task_key": job.task_key,
+        "updated_at": job.updated_at, "records": len(job.records),
+        "last_record": ({"kind": last.kind, "text": last.text[:300], "ts": last.ts,
+                         "branch": last.branch, "commit": last.commit} if last else None),
+    }
+
+
 def _stamp(payload: dict, workspace: Workspace) -> dict:
     """Пометить ответ воркспейсом: запись не должна молча уехать не в тот контур."""
     payload["workspace"] = workspace.slug
@@ -459,7 +470,9 @@ async def jwu_pr(
     payload = detail.pr.model_dump()
     payload["comments"] = [c.model_dump() for c in detail.comments]
     payload["commits"] = detail.commits
-    payload["jobs"] = [j.model_dump() for j in jobs]
+    # Работы — сводкой: полный журнал (сотни записей) раздувал ответ до 100 КБ.
+    # Детали — jwu_jobs(pr=…) / jwu_job_handoff(job_id).
+    payload["jobs"] = [_job_summary(j) for j in jobs]
     # Открытые задачи на комментах — чек-лист правок по PR, отдельным списком.
     payload["open_tasks"] = [
         t.model_dump() for c in detail.comments for t in c.tasks if not t.resolved
@@ -1474,13 +1487,15 @@ async def jwu_comment(
 
 @mcp.tool()
 async def jwu_branches(key: Optional[str] = None, all_branches: bool = False,
-                       workspace: Optional[str] = None) -> list[dict]:
+                       limit: int = 40, workspace: Optional[str] = None) -> list[dict]:
     """Где лежит код по задаче: локальные ветки во всех репозиториях воркспейса, свежие
     первыми — репозиторий, ветка, коммит, дата, апстрим, ahead/behind, `current`
     (checkout'нута в клоне), `worktree` (путь, если checkout'нута там), `dirty`
     (незакоммиченных файлов там, где checkout'нута), `task_key` из имени, `note` —
     закреплённый статус ветки. key — ключ задачи или кусок имени; без key — все
-    ветки с ключом задачи в имени; all_branches — вообще все. Только чтение git, без сети.
+    ветки с ключом задачи в имени; all_branches — вообще все. limit — сколько самых
+    свежих вернуть (в больших контурах веток сотни; без key бери по ключу, а не всё).
+    Только чтение git, без сети.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
@@ -1489,6 +1504,7 @@ async def jwu_branches(key: Optional[str] = None, all_branches: bool = False,
 
     store = _store_only(workspace)
     items = br.collect(br.workspace_roots(store), key=key, all_branches=all_branches)
+    items = items[: max(1, int(limit))]
     status = store.status_notes([b.branch for b in items])
     return [{**b.as_dict(), "note": status.get(b.branch, ""), "summary": br.summary_line(b)}
             for b in items]

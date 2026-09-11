@@ -1814,6 +1814,7 @@ def _prompt_telegram(cfg, chat_opt: Optional[str], token_opt: Optional[str]) -> 
 def branches(
     key: Optional[str] = typer.Argument(None, help="Ключ задачи (PROJ-1) или кусок имени ветки."),
     all_branches: bool = typer.Option(False, "--all", "-a", help="Все ветки, а не только «задачные»."),
+    limit: int = typer.Option(60, "--limit", "-n", help="Сколько самых свежих показать."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Локальные ветки по задаче во всех репозиториях воркспейса: коммит, апстрим, ahead/behind,
@@ -1823,6 +1824,8 @@ def branches(
     with _store() as store:
         roots = br.workspace_roots(store)
         items = br.collect(roots, key=key, all_branches=all_branches)
+        total = len(items)
+        items = items[: max(1, limit)]
         status = store.status_notes([b.branch for b in items])
     if json_out:
         _emit_json([{**b.as_dict(), "note": status.get(b.branch, "")} for b in items])
@@ -1839,7 +1842,8 @@ def branches(
         console.print(f"{mark} {br.summary_line(b)}")
         if status.get(b.branch):
             console.print(f"    [green]📍 {status[b.branch]}[/green]")
-    console.print(f"[dim]веток: {len(items)}, репозиториев: {len(roots)}[/dim]")
+    more = f" (показано {len(items)} из {total}, --limit)" if total > len(items) else ""
+    console.print(f"[dim]веток: {total}, репозиториев: {len(roots)}{more}[/dim]")
 
 
 # --------------------------------------------------------------------------- #
