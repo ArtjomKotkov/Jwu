@@ -901,6 +901,10 @@ class JobRecord(BaseModel):
     text: str = ""
     status: Optional[str] = None  # опц.: для phase напр. pending | done
     ts: str = ""
+    # Где стоял HEAD, когда запись делалась (читается из .git, в git не пишется ничего):
+    # по последней записи другая сессия знает, с какой ветки и коммита продолжать.
+    branch: str = ""
+    commit: str = ""
 
 
 class JobPRLink(BaseModel):

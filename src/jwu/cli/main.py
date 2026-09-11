@@ -20,7 +20,7 @@ from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config, telegram_token
 from ..core import notify
 from ..core.dates import fmt_ago, fmt_dt
-from ..core import daemon
+from ..core import daemon, gitinfo, handoff
 from ..core.maintenance import (
     AUTO_PRUNE_DAYS, ensure_db_available, run_daily_maintenance, run_daily_prune,
     warn_if_cloud_path,
@@ -3180,18 +3180,23 @@ def job_add(
     text: str = typer.Argument(..., help="Текст записи."),
     kind: str = typer.Option("note", "--kind", "-k", help=" | ".join(JOB_RECORD_KINDS) + " (decision — решение с обоснованием, constraint — запрет, bug/bug-resolved — баг/исправлен, test-pass/test-fail — прогон тестов, todo — отложенное).", click_type=click.Choice(JOB_RECORD_KINDS)),
     status: Optional[str] = typer.Option(None, "--status", help="Опц. статус записи (напр. done)."),
+    git_state: bool = typer.Option(True, "--git/--no-git",
+        help="Запомнить ветку и коммит HEAD текущей папки (читается из .git, в git не пишется)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Добавить запись в работу (фаза/пункт/замечание)."""
+    branch, commit = gitinfo.head_state(Path.cwd()) if git_state else ("", "")
     with _store() as store:
         if store.get_job(job_id) is None:
             err.print(f"[red]Работа #{job_id} не найдена.[/red]")
             raise typer.Exit(code=1)
-        rec = store.add_job_record(job_id, text, kind=kind, status=status)
+        rec = store.add_job_record(job_id, text, kind=kind, status=status,
+                                   branch=branch, commit=commit)
     if json_out:
         _emit_json(rec.model_dump())
     else:
-        console.print(f"[green]Запись добавлена[/green] в работу #{job_id} (kind={kind})")
+        where = f" · {branch}@{commit}" if branch or commit else ""
+        console.print(f"[green]Запись добавлена[/green] в работу #{job_id} (kind={kind}){where}")
 
 
 @job_app.command("link")
@@ -3289,14 +3294,55 @@ def job_show(
         console.print("\n[bold]Записи[/bold]")
         for r in job.records:
             st = f" [{r.status}]" if r.status else ""
+            git = f" [dim]{r.branch}@{r.commit}[/dim]" if (r.branch or r.commit) else ""
             badge = JOB_RECORD_BADGES.get((r.kind or "").lower())
             if badge:
                 label, color = badge
                 console.print(
                     f"[dim]{fmt_dt(r.ts)}[/dim] [bold {color}]{label}[/bold {color}]{st} "
-                    f"[{color}]{r.text}[/{color}]")
+                    f"[{color}]{r.text}[/{color}]{git}")
             else:
-                console.print(f"[dim]{fmt_dt(r.ts)} · {r.kind}{st}[/dim] {r.text}")
+                console.print(f"[dim]{fmt_dt(r.ts)} · {r.kind}{st}[/dim] {r.text}{git}")
+
+
+@job_app.command("handoff")
+def job_handoff(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    offline: bool = typer.Option(False, "--offline",
+        help="Не ходить в сеть: задача и PR — из снапшотов последнего синка."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON вместо markdown."),
+) -> None:
+    """Самодостаточный промпт для следующей сессии: задача, git, сделано/осталось, PR, правила."""
+    with _store() as store:
+        job = store.get_job(job_id)
+        if job is None:
+            err.print(f"[red]Работа #{job_id} не найдена.[/red]")
+            raise typer.Exit(code=1)
+        svc = None
+        if not offline:
+            try:
+                svc = _service()
+            except typer.Exit:
+                svc = None  # нет доступов — соберём из памяти
+        try:
+            data = handoff.collect(store, job, svc=svc, offline=offline or svc is None)
+        finally:
+            if svc is not None:
+                svc.close()
+    if json_out:
+        _emit_json({
+            "job": job.model_dump(), "branch": data.branch, "commit": data.commit,
+            "issue": data.issue.model_dump() if data.issue else None,
+            "issue_source": data.issue_source,
+            "prs": [{"ref": p.ref, "source": p.source,
+                     "pr": p.pr.model_dump() if p.pr else None,
+                     "open_tasks": [t.model_dump() for t in p.open_tasks],
+                     "unresolved_remarks": [c.model_dump() for c in p.unresolved_remarks]}
+                    for p in data.prs],
+            "markdown": handoff.render(data),
+        })
+    else:
+        typer.echo(handoff.render(data))
 
 
 @app.command()

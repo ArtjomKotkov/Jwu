@@ -42,6 +42,7 @@ from mcp.server.fastmcp import FastMCP
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from . import __version__
+from .core import gitinfo, handoff
 from .core import workspaces as ws_mod
 from .core.config import db_path
 from .core.maintenance import ensure_db_available
@@ -935,12 +936,16 @@ async def jwu_job_add(
     text: str,
     kind: str = "note",
     status: Optional[str] = None,
+    cwd: Optional[str] = None,
     workspace: Optional[str] = None,
 ) -> dict:
     """Добавить запись в работу (фаза/пункт/замечание/баг/прогон тестов и т.п.).
 
     kind — один из: phase, note, decision, remark, constraint, warning, bug,
     bug-resolved, test-pass, test-fail, todo, review. status — опц. (напр. "done" у фаз).
+    К записи прикладываются ветка и коммит HEAD репозитория в cwd (по умолчанию —
+    папка процесса; передай cwd, если правишь в другой папке воркспейса). Читается из
+    .git, в git ничего не пишется.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
@@ -950,8 +955,44 @@ async def jwu_job_add(
     store = _store_only(workspace)
     if store.get_job(job_id) is None:
         raise ValueError(f"Работа #{job_id} не найдена")
-    return _stamp(store.add_job_record(job_id, text, kind=kind, status=status).model_dump(),
-                  _resolve(workspace))
+    branch, commit = gitinfo.head_state(cwd or Path.cwd())
+    rec = store.add_job_record(job_id, text, kind=kind, status=status, branch=branch, commit=commit)
+    return _stamp(rec.model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_handoff(
+    job_id: int,
+    offline: bool = False,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Передача работы другой сессии: самодостаточный markdown-промпт (поле `markdown`)
+    по логу работы — задача, ветка и коммит по последней записи, что сделано / что
+    осталось, запреты и решения, состояние PR (блокеры, открытые задачи на комментах,
+    замечания без ответа), правила воркспейса и шаги «как продолжить».
+
+    offline=True — без сети (задача и PR из снапшотов последнего синка). Это read-only.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    store = _store_only(workspace)
+    job = store.get_job(job_id)
+    if job is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    svc = None
+    if not offline:
+        try:
+            svc = _full_svc(workspace)
+        except Exception:  # noqa: BLE001 — нет доступов: соберём из памяти
+            svc = None
+    data = handoff.collect(store, job, svc=svc, offline=offline or svc is None)
+    return _stamp({
+        "job_id": job.id, "anchor": job.anchor, "branch": data.branch, "commit": data.commit,
+        "issue_source": data.issue_source,
+        "open_tasks": [t.model_dump() for p in data.prs for t in p.open_tasks],
+        "markdown": handoff.render(data),
+    }, _resolve(workspace))
 
 
 @mcp.tool()

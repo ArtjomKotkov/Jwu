@@ -190,7 +190,9 @@ CREATE TABLE IF NOT EXISTS job_records (
     kind   TEXT NOT NULL DEFAULT 'note',
     text   TEXT NOT NULL,
     status TEXT,
-    ts     TEXT NOT NULL
+    ts     TEXT NOT NULL,
+    branch     TEXT NOT NULL DEFAULT '',
+    commit_sha TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_job_records_job ON job_records(job_id);
 CREATE TABLE IF NOT EXISTS job_prs (
@@ -283,7 +285,7 @@ def _pr_signature(pr: PR) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -423,6 +425,17 @@ def _m007_provider(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m008_job_git_state(conn: sqlite3.Connection) -> None:
+    """v7 → v8: у записи работы — ветка и коммит на момент записи.
+
+    Подхват работы другой сессией упирался в вопрос «а где вообще стоять»: ветка
+    угадывалась по ключу задачи, коммит — никак. Теперь оба читаются из ``.git`` при
+    ``job add`` (без запуска git и без записи в репозиторий) и лежат рядом с текстом.
+    """
+    _add_column(conn, "job_records", "branch", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "job_records", "commit_sha", "TEXT NOT NULL DEFAULT ''")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
@@ -430,6 +443,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (5, _m005_path_tags),
     (6, _m006_drop_analyses),
     (7, _m007_provider),
+    (8, _m008_job_git_state),
 ]
 
 
@@ -1934,17 +1948,20 @@ class Store:
             raise ValueError(f"Работа #{job_id} не найдена в текущем воркспейсе{hint}.")
 
     def add_job_record(self, job_id: int, text: str, kind: str = "note",
-                       status: str | None = None) -> JobRecord:
+                       status: str | None = None, *, branch: str = "",
+                       commit: str = "") -> JobRecord:
         self._require_own_job(job_id)
         ts = _now()
         cur = self.conn.execute(
-            "INSERT INTO job_records (job_id, kind, text, status, ts) VALUES (?, ?, ?, ?, ?)",
-            (job_id, kind, text, status, ts),
+            "INSERT INTO job_records (job_id, kind, text, status, ts, branch, commit_sha)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (job_id, kind, text, status, ts, branch or "", commit or ""),
         )
         self._touch_job(job_id)
         self.conn.commit()
         return JobRecord(id=int(cur.lastrowid), job_id=job_id, kind=kind,
-                         text=text, status=status, ts=ts)
+                         text=text, status=status, ts=ts, branch=branch or "",
+                         commit=commit or "")
 
     def link_job_pr(self, job_id: int, pr_id: int, project: str = "", repo: str = "") -> None:
         self._require_own_job(job_id)
@@ -1985,11 +2002,13 @@ class Store:
 
     def _job_records(self, job_id: int) -> list[JobRecord]:
         rows = self.conn.execute(
-            "SELECT id, job_id, kind, text, status, ts FROM job_records WHERE job_id = ? ORDER BY id",
+            "SELECT id, job_id, kind, text, status, ts, branch, commit_sha"
+            " FROM job_records WHERE job_id = ? ORDER BY id",
             (job_id,),
         ).fetchall()
         return [JobRecord(id=r["id"], job_id=r["job_id"], kind=r["kind"], text=r["text"],
-                          status=r["status"], ts=r["ts"]) for r in rows]
+                          status=r["status"], ts=r["ts"], branch=r["branch"] or "",
+                          commit=r["commit_sha"] or "") for r in rows]
 
     def _job_prs(self, job_id: int) -> list[JobPRLink]:
         rows = self.conn.execute(

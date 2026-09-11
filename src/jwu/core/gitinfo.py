@@ -146,3 +146,72 @@ def _walk(folder: Path, *, depth: int, out: list[GitInfo]) -> None:
 def index(paths: list[str]) -> dict[str, list[GitInfo]]:
     """Проиндексировать папки воркспейса: путь → найденные в нём репозитории."""
     return {p: find_repos(p) for p in paths}
+
+
+# --------------------------------------------------------------------------- #
+# Состояние HEAD для записей работы (ветка + коммит), тоже без запуска git
+# --------------------------------------------------------------------------- #
+
+# Сколько уровней вверх подниматься от текущей папки в поисках корня репозитория:
+# запись в работу делают из подкаталога проекта, а не обязательно из корня.
+MAX_UP = 8
+
+
+def find_repo_root(path: str | Path) -> Path | None:
+    """Ближайший вверх по дереву каталог с ``.git`` (или None)."""
+    folder = Path(path).resolve()
+    for _ in range(MAX_UP + 1):
+        if _git_dir(folder) is not None:
+            return folder
+        if folder.parent == folder:
+            break
+        folder = folder.parent
+    return None
+
+
+def _read_ref_sha(git_dir: Path, branch: str) -> str:
+    """sha ветки: файл ``refs/heads/<branch>``, иначе ``packed-refs``. Пусто — не нашли."""
+    try:
+        ref_file = git_dir / "refs" / "heads" / branch
+        if ref_file.is_file():
+            return ref_file.read_text(encoding="utf-8", errors="replace").strip()
+        packed = git_dir / "packed-refs"
+        if packed.is_file():
+            needle = f" refs/heads/{branch}"
+            for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.endswith(needle):
+                    return line.split(" ", 1)[0].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def head_state(path: str | Path) -> tuple[str, str]:
+    """(ветка, короткий sha HEAD) для папки внутри репозитория; ("", "") — не репозиторий.
+
+    Используется записями работы: другая сессия по ним узнаёт, откуда продолжать. Читаем
+    файлы, ничего в git не пишем — jwu не оставляет в репозитории следов.
+    """
+    root = find_repo_root(path)
+    if root is None:
+        return "", ""
+    git_dir = _git_dir(root)
+    if git_dir is None:
+        return "", ""
+    branch, detached = _read_branch(git_dir)
+    if branch:
+        sha = _read_ref_sha(git_dir, branch)
+        # worktree: refs лежат в общем каталоге (commondir), а не в своём gitdir
+        if not sha:
+            try:
+                common = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+                sha = _read_ref_sha((git_dir / common).resolve(), branch)
+            except OSError:
+                pass
+        return branch, sha[:12]
+    # detached HEAD: в файле лежит полный sha (``_read_branch`` режет до 7 — для подписи)
+    try:
+        raw = (git_dir / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        raw = detached
+    return "", raw[:12]
