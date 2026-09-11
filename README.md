@@ -531,6 +531,7 @@ jwu install-claude-skills                   # каталог скиллов — 
 | `jwu issue transitions KEY` / `jwu issue transition KEY "In Progress"` | доступные сейчас переходы по процессу и перевод по выбранному |
 | `jwu issue attach KEY ./log.har` | приложить файлы к задаче (обратное к `jwu attachments --download`) |
 | `jwu comment KEY -F ./answer.md` | комментарий в задачу; для SDESK (его читает клиент) обязателен `--to-client` |
+| `jwu branches [KEY] [--all]` | локальные ветки по задаче во всех репозиториях воркспейса: коммит, апстрим, ahead/behind, где checkout'нута (клон/worktree), незакоммиченное; только чтение git |
 | `jwu task KEY --branches` | в какие релизные ветки доехал фикс задачи, а в какие нет (по локальным клонам) |
 | `jwu worklogs --on 2026-08-31` | что затрекано за день; без ключей задачи находятся сами |
 | `jwu job …` | работы: `start`/`add`/`show`/`done` и т.д.; якорь — задача Jira, локальная фича (`--feature`) либо ничего. `add` запоминает ветку и коммит HEAD текущей папки (читает `.git`, в git не пишет) |
