@@ -2355,6 +2355,7 @@ _DAY_PROMPT = """## Что нужно сделать
 - PR `открытые задачи: N` (задачи на комментах = чек-лист правок) → закрыть их: `jwu pr <PR>` показывает задачи под комментами.
 - PR `есть NEEDS_WORK` / новые комменты → ответить/поправить по замечаниям.
 - PR `нет ревьюверов` → назначить ревьюверов; `ждёт апрувов` давно → пнуть.
+- Дельта `returned_from_testing` (задачу вернули с тестов) и `qa_comment` (комментарий тестировщика в задаче на тестах) → это доработка: разобрать, что нашли, и запланировать.
 - Упоминание с пометкой `· новое` → прочитать, понять, что от меня хотят, и ответить.
 - База — дельты: новые комменты, смена статуса, апрувы, новые PR; `resolved` → закрыть работу.
 Пиши сжато, маркерами, без воды; группируй по действиям."""
@@ -2395,9 +2396,10 @@ _BUILD_RU = {"FAILED": "красная", "INPROGRESS": "идёт", "SUCCESSFUL":
 
 
 def _render_day_context_md(ctx: DayContext) -> str:
+    mode = " · кратко: только требующее действия" if ctx.brief else ""
     L: list[str] = [
         "# Контекст дневного анализа (jwu)",
-        f"Пользователь: {ctx.me_display or '—'} ({ctx.user or '—'}). Синк: {ctx.synced_at or '—'}.",
+        f"Пользователь: {ctx.me_display or '—'} ({ctx.user or '—'}). Синк: {ctx.synced_at or '—'}.{mode}",
         "",
         _DAY_PROMPT,
         "",
@@ -2439,6 +2441,7 @@ def _day_context_json(ctx: DayContext) -> dict:
         "user": ctx.user,
         "me_display": ctx.me_display,
         "synced_at": ctx.synced_at,
+        "brief": ctx.brief,
         "deltas": [d.model_dump() for d in ctx.deltas],
         "mine": [i.model_dump() for i in ctx.mine],
         "prs_mine": [p.model_dump() for p in ctx.prs_mine],
@@ -2451,10 +2454,16 @@ def _day_context_json(ctx: DayContext) -> dict:
 
 
 @action_app.command("day-analyze")
-def day_analyze(json_out: bool = typer.Option(False, "--json", help="Вывести JSON-контекст.")) -> None:
+def day_analyze(
+    brief: bool = typer.Option(False, "--brief", "-b",
+        help="Кратко: только требующее действия — без дельт об исчезновении и чужих "
+             "апрувов на PR, где я ревьювер; PR на ревью — только ждущие меня; упоминания — "
+             "непрочитанные за две недели."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON-контекст."),
+) -> None:
     """Фулл-синк + расширенный контекст и промпт для дневного анализа (для Claude Code)."""
     with _service_with_jira() as svc:
-        ctx = svc.collect_day_context()
+        ctx = svc.collect_day_context(brief=brief)
     if json_out:
         _emit_json(_day_context_json(ctx))
     else:

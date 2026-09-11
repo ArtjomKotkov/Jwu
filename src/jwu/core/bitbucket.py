@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Optional
 
 import httpx
+
+from .http import new_client
 from pathlib import Path
 
 from .models import PR, BuildStatus, PRAttachment, PRComment, PRTask, _get, pr_attachment_refs
@@ -93,11 +95,11 @@ class BitbucketClient:
         token: str,
         *,
         client: Optional[httpx.Client] = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._owns_client = client is None
-        self._client = client or httpx.Client(
+        self._client = client or new_client(
             base_url=f"{self.base_url}/rest/api/1.0",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             timeout=timeout,

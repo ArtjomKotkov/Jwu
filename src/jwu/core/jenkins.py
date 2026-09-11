@@ -16,6 +16,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .http import new_client
+
 # Кейсы JUnit, которые считаем падением (PASSED/SKIPPED/FIXED — нет).
 FAILED_STATUSES = frozenset({"FAILED", "REGRESSION", "ERROR"})
 
@@ -50,12 +52,12 @@ class JenkinsClient:
         auth: tuple[str, str] | None = None,
         *,
         client: Optional[httpx.Client] = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.auth = auth
         self._owns_client = client is None
-        self._client = client or httpx.Client(
+        self._client = client or new_client(
             base_url=self.base_url,
             auth=auth,
             headers={"Accept": "application/json"},

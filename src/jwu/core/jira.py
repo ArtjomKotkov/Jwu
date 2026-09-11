@@ -10,6 +10,8 @@ from typing import Callable, Optional
 
 import httpx
 
+from .http import new_client
+
 from .models import Issue
 
 DEFAULT_FIELDS = "summary,status,assignee,reporter,priority,created,updated,resolution"
@@ -232,7 +234,7 @@ class JiraClient:
         proxy_basic: Optional[tuple[str, str]] = None,
         session_login: Optional[tuple[str, str]] = None,
         client: Optional[httpx.Client] = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         """Три режима авторизации:
 
@@ -254,7 +256,7 @@ class JiraClient:
                     auth = httpx.BasicAuth(*proxy_basic)
             else:
                 headers["Authorization"] = f"Bearer {token}"
-            self._client = httpx.Client(
+            self._client = new_client(
                 base_url=f"{self.base_url}/rest",
                 headers=headers,
                 auth=auth,
