@@ -266,13 +266,17 @@ class TelegramNotifier:
             return False
         return resp.status_code < 400
 
-    def get_updates(self, offset: Optional[int] = None, *, limit: int = 100) -> list[dict]:
-        """Входящие сообщения боту (long polling не используем — демон и так периодический)."""
-        params: dict = {"limit": limit, "timeout": 0, "allowed_updates": '["message"]'}
+    def get_updates(self, offset: Optional[int] = None, *, limit: int = 100,
+                    timeout: int = 0) -> list[dict]:
+        """Входящие сообщения боту. ``timeout`` > 0 — long polling: Telegram держит запрос
+        до появления сообщения (или до истечения секунд), так что реакция мгновенная,
+        а пустых опросов нет."""
+        params: dict = {"limit": limit, "timeout": max(0, int(timeout)), "allowed_updates": '["message"]'}
         if offset is not None:
             params["offset"] = offset
         try:
-            resp = self._client.get(f"{self._api}/bot{self.token}/getUpdates", params=params)
+            resp = self._client.get(f"{self._api}/bot{self.token}/getUpdates", params=params,
+                                    timeout=httpx.Timeout(float(max(10, timeout + 10))))
         except httpx.HTTPError as exc:
             raise NotifyError(f"Telegram недоступен: {exc}") from exc
         if resp.status_code >= 400:

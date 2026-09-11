@@ -109,16 +109,17 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
 
 def process_updates(
     store: "Store", ws: "Workspace", cfg: "Config", sender: notify.TelegramNotifier, *,
-    login: str = "", on_sync: Optional[Callable[[], bool]] = None,
+    login: str = "", on_sync: Optional[Callable[[], bool]] = None, long_poll: int = 0,
 ) -> list[dict]:
     """Забрать новые сообщения боту, выполнить команды, записать заметки, ответить.
 
+    ``long_poll`` — сколько секунд Telegram может держать запрос в ожидании сообщения.
     Возвращает список обработанного: ``{"kind": "note"|"command", ...}``. Смещение
     сдвигается даже для пропущенных сообщений, чтобы чужие или пустые не крутились вечно.
     """
     store.use_workspace(ws.id)
     offset = int(store.get_workspace_meta(notify.OFFSET_META) or 0)
-    updates = sender.get_updates(offset + 1 if offset else None)
+    updates = sender.get_updates(offset + 1 if offset else None, timeout=long_poll)
     links = notify.links_from_config(cfg)
     handled: list[dict] = []
     last = offset

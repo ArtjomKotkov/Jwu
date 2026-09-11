@@ -2496,7 +2496,8 @@ def daemon_run(
     once: bool = typer.Option(False, "--once", help="Один проход и выход (для cron/проверки)."),
     quiet: bool = typer.Option(False, "--quiet", help="Не слать стартовое сообщение в Telegram."),
     poll_interval: int = typer.Option(daemon.DEFAULT_POLL_INTERVAL, "--poll-interval",
-        help="Как часто между проходами опрашивать бота Telegram (команды, ответы), сек."),
+        help="Long polling бота Telegram между проходами: сколько секунд запрос ждёт сообщение "
+             "(реакция мгновенная; 0 — обычный опрос раз в секунду)."),
 ) -> None:
     """Цикл: синк каждого контура с внешним провайдером → хуки после синка → пауза.
 
