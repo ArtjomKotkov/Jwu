@@ -171,7 +171,18 @@ jwu auth check
 (секунды, по умолчанию 30) и `JWU_HTTP_RETRIES` (по умолчанию 2; 0 — без повторов).
 
 **Переменные окружения перекрывают БД** (удобно на серверах и в CI):
-`JIRA_TOKEN`, `SDESK_TOKEN`, `BITBUCKET_TOKEN`, `GITHUB_TOKEN`, `JENKINS_TOKEN`, `TELEGRAM_BOT_TOKEN`.
+секреты — `JIRA_TOKEN`, `JIRA_PASSWORD`, `JIRA_GATE_PASSWORD`, `SDESK_TOKEN`, `SDESK_PASSWORD`,
+`SDESK_GATE_PASSWORD`, `BITBUCKET_TOKEN`, `GITHUB_TOKEN`, `JENKINS_TOKEN`, `TELEGRAM_BOT_TOKEN`;
+настройки — `JWU_JIRA_URL`, `JWU_JIRA_USER`, `JWU_JIRA_PROJECT`, `JWU_JIRA_GATE_USER`,
+`JWU_SDESK_URL/PROJECT/USER/GATE_USER`, `JWU_BITBUCKET_URL/PROJECT/REPO`,
+`JWU_GITHUB_API/WEB/OWNER/REPOS/USER`, `JWU_JENKINS_URL/USER`, `JWU_TELEGRAM_CHAT`.
+Так контур поднимается «безголово» — без визарда и keyring: `jwu init . --provider jira
+--bitbucket --yes` плюс переменные, и `jwu doctor` скажет, чего не хватает.
+
+**`jwu doctor`** — одна команда про всё: БД (путь, облачная папка, права, схема), воркспейс
+и его папки на диске, полнота конфига под провайдера, доступы к каждому сервису (с
+`--offline` — без сети), Telegram, демон, MCP-сервер в `~/.claude.json`, актуальность
+скиллов в `~/.claude/skills`, версия кода против установленной.
 
 Неинтерактивно (CI/серверы):
 
@@ -484,6 +495,7 @@ jwu install-claude-skills                   # каталог скиллов — 
 | `jwu auth check` | проверка доступов контура (Jira/Bitbucket либо GitHub). 401 «ключ протух»: сессию Jira клиент переустанавливает сам, а сменившиеся креды долгоживущий MCP-сервер подхватывает инструментом `jwu_auth_refresh` |
 | `jwu sync` | разовый синк вью + PR, снапшот в память, расчёт дельт |
 | `jwu action day-analyze [--brief]` | контекст + промпт для дневного анализа; `--brief` — только требующее действия (без `gone`/`pr_gone`, без чужих апрувов на PR, где я ревьювер, только ждущие меня PR и свежие непрочитанные упоминания) |
+| `jwu doctor [--offline]` | диагностика окружения и доступов одной командой (`--json` для агентов) |
 | `jwu memory export\|import\|sync` | память (работы, заметки, правила, фичи, воркспейсы) как JSON без секретов и снапшотов; `sync` — через свой приватный git |
 | `jwu daemon run\|install\|status\|uninstall` | фоновый синк всех контуров без дашборда; `install` ставит службу launchd/systemd |
 | `jwu notify status\|test` | уведомления в Telegram после синка: настроены ли, тестовое сообщение |

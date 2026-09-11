@@ -467,10 +467,17 @@ def configure_main(
     telegram_token_opt: Optional[str] = typer.Option(None, "--telegram-token",
         help="Токен бота Telegram (от @BotFather)."),
     db_path_opt: Optional[str] = typer.Option(None, "--db-path"),
+    force: bool = typer.Option(False, "--force",
+        help="Разрешить путь до БД в облачной папке (iCloud/Dropbox) — там токены уедут в облако."),
 ) -> None:
     """Визард настройки (когда вызвано без подкоманды export/import)."""
     if ctx.invoked_subcommand is not None:
         return  # вызвана подкоманда (export/import) — визард не запускаем
+    if db_path_opt and not force:
+        cloud = warn_if_cloud_path(Path(db_path_opt).expanduser())
+        if cloud:
+            err.print(f"[red]Отказ:[/red] {cloud[0]}\nЕсли всё равно надо — добавь --force.")
+            raise typer.Exit(code=1)
 
     # За основу берём УЖЕ СОХРАНЁННЫЙ конфиг воркспейса, а не глобальный config.toml:
     # ниже он целиком перезаписывается, поэтому запуск с одним флагом (скажем, только
@@ -2071,6 +2078,43 @@ def notify_test(
 
 
 # --------------------------------------------------------------------------- #
+# doctor: что не так с окружением и доступами — одной командой
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def doctor(
+    offline: bool = typer.Option(False, "--offline", help="Не ходить в сеть (без проверки доступов и Telegram)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Диагностика: БД, воркспейс и его папки, конфиг, доступы, демон, MCP, скиллы, версия."""
+    from ..core import doctor as doc
+
+    try:
+        _prepare_db()
+    except ConfigError as exc:
+        err.print(f"[red]Ошибка БД:[/red] {exc}")
+        raise typer.Exit(code=1)
+    with Store(str(db_path())) as store:
+        checks = doc.run(store, explicit_workspace=_WORKSPACE_ARG, network=not offline)
+    bad = sum(1 for c in checks if c.status == "fail")
+    if json_out:
+        _emit_json([c.__dict__ for c in checks])
+        if bad:
+            raise typer.Exit(code=1)
+        return
+    icon = {"ok": "[green]✓[/green]", "warn": "[yellow]![/yellow]", "fail": "[red]✗[/red]", "skip": "[dim]·[/dim]"}
+    for c in checks:
+        console.print(f"{icon.get(c.status, '?')} [bold]{c.name}[/bold]: {c.detail}")
+        if c.hint and c.status in ("warn", "fail"):
+            console.print(f"    [dim]→ {c.hint}[/dim]")
+    warn = sum(1 for c in checks if c.status == "warn")
+    console.print(f"\n[dim]проверок {len(checks)}: ошибок {bad}, предупреждений {warn}[/dim]")
+    if bad:
+        raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
 # memory: память отдельно от кэша — экспорт / импорт / синк через git
 # --------------------------------------------------------------------------- #
 
@@ -2169,6 +2213,8 @@ def daemon_run(
     Один экземпляр на машину (файловый лок). Обычно запускается службой
     (`jwu daemon install`), руками — для проверки: `jwu daemon run --once`.
     """
+    for warn in warn_if_cloud_path(db_path()):
+        daemon.log(f"⚠ {warn}")
     try:
         daemon.run_loop(_daemon_open_store, interval=interval, once=once)
     except daemon.DaemonError as exc:

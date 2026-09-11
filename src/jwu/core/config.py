@@ -311,6 +311,46 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     return cfg
 
 
+# Несекретные настройки контура из окружения: JWU_<СЕКЦИЯ>_<ПОЛЕ> → (секция, атрибут).
+# Вместе со слотами секретов (JIRA_TOKEN, BITBUCKET_TOKEN, …, см. secrets.SLOT_ENV) этого
+# хватает, чтобы поднять jwu без БД с настройками, keyring и визарда — «безголовый» старт.
+ENV_SETTINGS: dict[str, tuple[str, str]] = {
+    "JWU_JIRA_URL": ("jira", "base_url"),
+    "JWU_JIRA_USER": ("jira", "username"),
+    "JWU_JIRA_PROJECT": ("jira", "project"),
+    "JWU_JIRA_GATE_USER": ("jira", "proxy_basic_user"),
+    "JWU_SDESK_URL": ("sdesk", "base_url"),
+    "JWU_SDESK_PROJECT": ("sdesk", "project"),
+    "JWU_SDESK_USER": ("sdesk", "username"),
+    "JWU_SDESK_GATE_USER": ("sdesk", "proxy_basic_user"),
+    "JWU_BITBUCKET_URL": ("bitbucket", "base_url"),
+    "JWU_BITBUCKET_PROJECT": ("bitbucket", "project"),
+    "JWU_BITBUCKET_REPO": ("bitbucket", "repo"),
+    "JWU_GITHUB_API": ("github", "api_url"),
+    "JWU_GITHUB_WEB": ("github", "web_url"),
+    "JWU_GITHUB_OWNER": ("github", "owner"),
+    "JWU_GITHUB_REPOS": ("github", "repos"),
+    "JWU_GITHUB_USER": ("github", "username"),
+    "JWU_JENKINS_URL": ("jenkins", "base_url"),
+    "JWU_JENKINS_USER": ("jenkins", "username"),
+    "JWU_TELEGRAM_CHAT": ("telegram", "chat_id"),
+}
+
+
+def apply_env_overrides(cfg: Config) -> list[str]:
+    """Наложить JWU_* из окружения поверх конфига. Возвращает имена применённых переменных."""
+    applied: list[str] = []
+    for env_name, (section, attr) in ENV_SETTINGS.items():
+        value = os.environ.get(env_name)
+        if value is None or value == "":
+            continue
+        if attr in ("base_url", "api_url", "web_url"):
+            value = value.rstrip("/")
+        setattr(getattr(cfg, section), attr, value)
+        applied.append(env_name)
+    return applied
+
+
 def save_config(cfg: Config, path: Path | None = None) -> Path:
     """Записать несекретные поля в config.toml, сохранив прочие ключи и views.
 

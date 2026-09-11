@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import secrets as secrets_mod
-from .config import Config, _apply_raw, load_config
+from .config import Config, _apply_raw, apply_env_overrides, load_config
 from .models import WORKSPACE_PROVIDERS, Workspace
 from .store import DEFAULT_WORKSPACE_SLUG as DEFAULT_SLUG, Store
 
@@ -276,6 +276,9 @@ def _settings_to_raw(settings: dict[str, str]) -> dict:
 def config_for_workspace(store: Store, workspace: Workspace) -> Config:
     """Собрать Config воркспейса: настройки и секреты — из БД, путь до БД — глобальный."""
     cfg = _apply_raw(Config(), _settings_to_raw(store.workspace_settings(workspace.id)))
+    # Переменные окружения JWU_* перекрывают настройки из БД — так контур поднимается
+    # без визарда там, где БД с настройками нет (облачная сессия, CI).
+    apply_env_overrides(cfg)
     # storage остаётся глобальным: БД надо найти ДО того, как известен воркспейс
     cfg.storage.db_path = load_config().storage.db_path
     cfg.secrets = secrets_mod.DbSecrets(store, workspace.id)
