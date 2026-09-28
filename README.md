@@ -252,6 +252,7 @@ jwu ssh rm test | jwu ssh config [--print] | jwu ssh uninstall
 | `/jwu-start-job`, `/jwu-track-job`, `/jwu-resume-job`, `/jwu-wrap-up` | начать работу с планом; вести журнал; подхватить после потери контекста (handoff); закруглить сессию |
 | `/jwu-job-review <reviewer>` | ревью СВОИХ локальных правок до коммита субагентом |
 | `/jwu-review-pr <id>` | ревью ЧУЖОГО PR: дифф через jwu, замечания/задачи/статус только после «да» |
+| `/jwu-review-queue [light\|full] [N]` | очередь ревью: все PR на мне (кроме уже апрувнутых) — ревьюеры пулом, фильтр замечаний (только то, что внёс PR), черновики голосом, сводка md; отправка по одному PR после «да» |
 | `/jwu-pr-comment`, `/jwu-pr-task` | ответить в PR или поставить статус; задача-чекбокс на комменте |
 | `/jwu-qa-triage <KEY>` | задачу вернули с тестов: вердикт по коду и черновик ответа |
 | `/build-failure` | почему упал билд PR (Jenkins / Actions) |
@@ -272,7 +273,7 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 
 | Группа | Команды |
 |---|---|
-| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|feedback`, `configure [export\|import]`, `auth check`, `doctor` |
+| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|feedback`, `review queue\|agents`, `configure [export\|import]`, `auth check`, `doctor` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
 | внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklogs`, `pr-comment`, `pr-comment-delete`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |

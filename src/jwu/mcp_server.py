@@ -401,6 +401,37 @@ async def jwu_thresholds(workspace: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
+async def jwu_review_queue(
+    include_approved: bool = False,
+    prs: Optional[list[int]] = None,
+    repos: Optional[list[str]] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Очередь ревью для скилла jwu-review-queue: PR на моём ревью без тех, где мой статус
+    уже APPROVED (include_approved=True — с ними), с фильтром по номерам `prs` и
+    репозиториям `repos`. Ничего не пишет наружу.
+
+    По каждому PR: project/repo/target, ключ задачи, мой статус, `reviewer_agent`
+    (ревьювер репозитория из настроек, иначе reviewer-jwu-sample), файлы разделов
+    `review_file` (вывод ревьювера) и `facts_file` (вывод фильтра). `dir`/`summary` —
+    каталог сводки в данных jwu (вне репозиториев), `filter_agent` — агент фильтра
+    замечаний, `skipped` — пропущенные PR с причиной.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    from .core import reviewq
+
+    ws = _resolve(workspace)
+    svc = _full_svc(workspace)
+    items = svc.prs("review", with_conflicts=False, with_builds=False)
+    result = reviewq.plan(svc.store, ws.id, ws.slug, items, svc._resolve_username(),
+                          include_approved=include_approved, ids=prs, repos=repos)
+    Path(result["dir"]).mkdir(parents=True, exist_ok=True)
+    return _stamp(result, ws)
+
+
+@mcp.tool()
 async def jwu_voice_profile(workspace: Optional[str] = None) -> dict:
     """Голос пользователя: какой субагент пишет внешние тексты от его имени, профиль стиля
     (markdown, правится пользователем) и сводка корпуса его реальных текстов.
