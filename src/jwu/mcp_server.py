@@ -401,6 +401,28 @@ async def jwu_thresholds(workspace: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
+async def jwu_ssh_servers(workspace: Optional[str] = None) -> dict:
+    """SSH-стенды воркспейса (без секретов) и как до них достучаться через ssh-mcp.
+
+    Сам jwu по SSH не ходит: команды на стенде выполняют инструменты MCP-сервера
+    `mcp_server` (префикс `tools_prefix`, напр. `mcp__ssh-<slug>__execute-command` с
+    `connectionName=<имя стенда>`). Если таких инструментов в сессии нет — стенды не
+    выданы: `jwu ssh install` и перезапуск сессии. `tag` стенда — тег папки воркспейса,
+    к которой он относится; `policy=readonly` — разрешён только просмотр (whitelist/blacklist
+    в ответе). Логи смотри в `allowed_remote_paths` и `description`. Добавлять стенды —
+    `jwu ssh add` (секреты вводит пользователь сам, не проси их в чат).
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    from .core import ssh as ssh_mod
+
+    ws = _resolve(workspace)
+    store = _store_only(workspace)
+    return _stamp(ssh_mod.describe(store, ws.id, ws.slug), ws)
+
+
+@mcp.tool()
 async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
     """Полная карточка задачи Jira/SDESK по ключу (напр. WMCTASKS-123 или SDESK-39336).
 
