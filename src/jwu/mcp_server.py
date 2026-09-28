@@ -401,6 +401,77 @@ async def jwu_thresholds(workspace: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
+async def jwu_voice_profile(workspace: Optional[str] = None) -> dict:
+    """Голос пользователя: какой субагент пишет внешние тексты от его имени, профиль стиля
+    (markdown, правится пользователем) и сводка корпуса его реальных текстов.
+
+    Любой внешний текст от имени пользователя (коммент в PR, ответ ревьюверу, коммент в
+    Jira/SDESK, текст задачи, 4test, коммит) пишет субагент `agent` — вызывающий скилл
+    передаёт ему факты, а не сочиняет сам. Без сети.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    from .core import voice as voice_mod
+
+    ws = _resolve(workspace)
+    store = _store_only(workspace)
+    return _stamp({"agent": voice_mod.agent_name(store, ws.id),
+                   "profile_path": str(voice_mod.ensure_profile(ws.slug)),
+                   "profile_md": voice_mod.read_profile(ws.slug),
+                   "corpus": voice_mod.corpus_stats(ws.slug)}, ws)
+
+
+@mcp.tool()
+async def jwu_voice_examples(channel: str, audience: Optional[str] = None, limit: int = 8,
+                             workspace: Optional[str] = None) -> dict:
+    """Примеры реальных текстов пользователя для канала — few-shot для агента голоса.
+
+    channel — pr_comment | pr_reply | pr_review_body | pr_task | pr_description |
+    jira_comment | sdesk_client | task | 4test | commit | message. audience — colleague |
+    qa | analyst | client. Если в канале мало текстов, добираются соседние по жанру.
+    Без сети; пустой корпус собирает `jwu voice collect` (или jwu_voice_collect).
+    """
+    from .core import voice as voice_mod
+
+    ws = _resolve(workspace)
+    return _stamp({"channel": channel,
+                   "examples": voice_mod.examples(ws.slug, channel, audience=audience, limit=limit)}, ws)
+
+
+@mcp.tool()
+async def jwu_voice_feedback(channel: str, verdict: str, before: str, after: str = "",
+                             reason: str = "", audience: str = "",
+                             workspace: Optional[str] = None) -> dict:
+    """Дописать в профиль голоса пару «было → стало» (verdict=edited), «отклонено, почему»
+    (rejected) или удачный пример (accepted). Локальная запись — но ТОЛЬКО после того, как
+    пользователь согласился записать эту правку в профиль.
+    """
+    from .core import voice as voice_mod
+
+    ws = _resolve(workspace)
+    path = voice_mod.add_feedback(ws.slug, channel=channel, verdict=verdict, before=before,
+                                  after=after, reason=reason, audience=audience)
+    return _stamp({"ok": True, "profile_path": str(path)}, ws)
+
+
+@mcp.tool()
+async def jwu_voice_collect(days: int = 180, workspace: Optional[str] = None) -> dict:
+    """Собрать/обновить корпус голоса: мои комменты и описания в PR, мои комменты в
+    Jira/SDESK, мои коммиты за `days` дней. Внешние системы только ЧИТАЮТСЯ; пишется
+    локальный файл корпуса. Долго (десятки запросов) — звать по просьбе пользователя.
+    Переписку с ассистентом в корпус не класть никогда.
+    """
+    from .core import voice as voice_mod
+
+    ws = _resolve(workspace)
+    svc = _full_svc(workspace)
+    report = voice_mod.collect(svc, ws.slug, [p.path for p in ws.paths], days=days)
+    return _stamp({"added": report.added, "total": report.total, "by_source": report.by_source,
+                   "errors": report.errors[:20]}, ws)
+
+
+@mcp.tool()
 async def jwu_ssh_servers(workspace: Optional[str] = None) -> dict:
     """SSH-стенды воркспейса (без секретов) и как до них достучаться через ssh-mcp.
 

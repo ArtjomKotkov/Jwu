@@ -58,6 +58,7 @@ EXPECTED_AGENTS = {
     "jenkins-build-analyst",
     "duty-support-sample",
     "qa-triage-sample",
+    "voice-writer-sample",
 }
 
 
