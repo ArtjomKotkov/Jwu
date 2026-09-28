@@ -90,6 +90,26 @@ def _cmd_mentions(store: "Store", links: Optional[notify.Links]) -> str:
     return "\n".join(lines).lstrip("\n")
 
 
+SYNC_REQUEST_META = "daemon:sync_requested"   # {slug: когда попросили /sync} — общий meta БД
+
+
+def request_sync(store: "Store", slug: str) -> None:
+    """Запомнить, что из чата контура попросили /sync: итог отправит демон после прохода.
+
+    В БД, а не в памяти цикла: /sync забирают два пути (опрос бота между проходами и хук
+    после синка), и итог должен прийти, каким бы путём команда ни пришла.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    try:
+        pending = json.loads(store.get_meta(SYNC_REQUEST_META) or "{}")
+    except ValueError:
+        pending = {}
+    pending.setdefault(slug, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    store.set_meta(SYNC_REQUEST_META, json.dumps(pending))
+
+
 def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
                    links: Optional[notify.Links], on_sync: Optional[Callable[[], bool]]) -> str:
     """Ответ на команду (HTML). Неизвестная команда → подсказка."""
@@ -97,7 +117,8 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
     if cmd == "/sync":
         if on_sync is None:
             return "Демон не запущен — синк запустить некому. Руками: <code>jwu sync</code>."
-        return "🔄 Синк запущен — по окончании пришлю итог." if on_sync() else "🔄 Синк уже идёт."
+        request_sync(store, ws.slug)
+        return "🔄 Синк запущен — по окончании пришлю итог." if on_sync() else "🔄 Синк уже идёт — итог пришлю."
     if cmd == "/status":
         return _cmd_status(store, ws)
     if cmd == "/stuck":

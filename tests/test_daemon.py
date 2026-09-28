@@ -295,12 +295,15 @@ def test_report_pass_one_message_per_requested_chat(tmp_path, monkeypatch):
 
 
 def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
+    """/sync между проходами (опрос бота) → итог после следующего прохода."""
+    from jwu.core import bot
+
     db = tmp_path / "state.db"
     Store(db).close()
     passes, reported = [], []
 
     def fake_pass(store, **kw):
-        passes.append(1)
+        passes.append(daemon._now())
         return _report(work={"deltas": 0, "mentions": 0, "notified": False})
 
     polls = []
@@ -308,15 +311,53 @@ def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
     def fake_poll(store, **kw):
         polls.append(1)
         if len(polls) == 1:
+            bot.request_sync(store, "work")   # как handle_command("/sync")
             return [{"workspace": "work", "kind": "command", "text": "/sync"}]
         raise KeyboardInterrupt   # после внепланового прохода — выходим из цикла
 
-    monkeypatch.setattr(daemon, "run_pass", fake_pass)
+    monkeypatch.setattr(daemon, "run_pass", lambda store, **kw: _stamped(fake_pass(store)))
     monkeypatch.setattr(daemon, "poll_bots", fake_poll)
-    monkeypatch.setattr(daemon, "report_pass", lambda store, report, requested: reported.append(set(requested)))
+    monkeypatch.setattr(daemon, "report_pass", lambda store, report, requested: reported.append(list(requested)))
     try:
         daemon.run_loop(lambda: Store(db), interval=3600, announce=False, poll_interval=1)
     except KeyboardInterrupt:
         pass
     # первый проход — плановый, без отчёта; второй — по /sync, с отчётом в контур work
-    assert len(passes) == 2 and reported == [{"work"}]
+    assert len(passes) == 2 and reported == [["work"]]
+
+
+def _stamped(report):
+    report.started_at = daemon._now()
+    return report
+
+
+def test_sync_request_during_pass_reported_after_next_pass(tmp_path):
+    """/sync, забранный хуком во время прохода, закрывается только СЛЕДУЮЩИМ проходом."""
+    import time
+
+    from jwu.core import bot
+
+    store = Store(tmp_path / "s.db")
+    try:
+        started = daemon._now()
+        time.sleep(1.1)
+        bot.request_sync(store, "work")                      # пришёл во время прохода
+        assert daemon.take_sync_requests(store, started) == []  # этот проход его не закрывает
+        time.sleep(1.1)
+        assert daemon.take_sync_requests(store, daemon._now()) == ["work"]
+        assert daemon.take_sync_requests(store, daemon._now()) == []   # снят
+    finally:
+        store.close()
+
+
+def test_bot_sync_command_records_request(tmp_path):
+    from jwu.core import bot
+
+    store = Store(tmp_path / "s.db")
+    try:
+        ws = store.get_workspace_by_slug("work")
+        reply = bot.handle_command("/sync", store=store, ws=ws, login="", links=None, on_sync=lambda: True)
+        assert "пришлю итог" in reply
+        assert "work" in json.loads(store.get_meta(bot.SYNC_REQUEST_META))
+    finally:
+        store.close()

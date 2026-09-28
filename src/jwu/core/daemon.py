@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import fcntl
 import html
+import json
 import os
 import platform
 import shutil
@@ -367,6 +368,25 @@ def report_pass(store: "Store", report: PassReport, requested: Iterable[str]) ->
     return sent
 
 
+def take_sync_requests(store: "Store", started_at: str) -> list[str]:
+    """Контуры, чей /sync закрыт этим проходом (запрос раньше старта прохода); снять их.
+
+    Запросы, пришедшие во время прохода (их забрал хук после синка), остаются до
+    следующего — внепланового — прохода: итог должен отражать синк ПОСЛЕ просьбы.
+    """
+    from .bot import SYNC_REQUEST_META
+
+    try:
+        pending: dict[str, str] = json.loads(store.get_meta(SYNC_REQUEST_META) or "{}")
+    except ValueError:
+        pending = {}
+    done = sorted(s for s, at in pending.items() if at <= started_at)
+    if done:
+        rest = {s: at for s, at in pending.items() if s not in done}
+        store.set_meta(SYNC_REQUEST_META, json.dumps(rest))
+    return done
+
+
 def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
               long_poll: int = 0) -> list[dict]:
     """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
@@ -425,7 +445,6 @@ def run_loop(
             signal.signal(signal.SIGUSR1, waiter.kick)
         except (ValueError, OSError):
             pass  # не главный поток (тесты) — без сигналов
-    requested: set[str] = set()  # контуры, из чатов которых попросили /sync
     with SingleInstance():
         log(f"демон запущен (pid {os.getpid()}, интервал {interval}с)")
         if announce and not once:
@@ -440,10 +459,10 @@ def run_loop(
             store = open_store()
             try:
                 report = run_pass(store, factory=factory, after_sync=after_sync)
+                # проход закрыл чей-то /sync из бота — ответить итогом, даже если нового нет
+                requested = take_sync_requests(store, report.started_at)
                 if requested:
-                    # проход по /sync из бота — ответить итогом, даже если нового нет
                     report_pass(store, report, requested)
-                    requested = set()
             finally:
                 store.close()
             log(f"проход завершён: {report.summary()}")
@@ -473,10 +492,7 @@ def run_loop(
                 if handled:
                     log(f"бот: обработано {len(handled)} сообщений "
                         f"({', '.join(sorted({h['kind'] for h in handled}))})")
-                    syncs = {h["workspace"] for h in handled
-                             if h["kind"] == "command" and h["text"].startswith("/sync")}
-                    if syncs:
-                        requested |= syncs
+                    if any(h["kind"] == "command" and h["text"].startswith("/sync") for h in handled):
                         kicked = True
                         break
             if kicked:
