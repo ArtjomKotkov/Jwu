@@ -198,7 +198,7 @@ jwu memory sync --repo ~/jwu-memory          # pull → импорт → экс�
 
 ```bash
 jwu voice show                 # какой агент пишет, где профиль, сколько текстов в корпусе
-jwu voice collect [--days 180] # корпус: твои комменты и описания в PR, комменты в Jira/SDESK, коммиты
+jwu voice collect [--reset]    # корпус: твои комменты и описания в PR, комменты в Jira/SDESK, коммиты (без ИИ-коммитов)
 jwu voice examples pr_reply    # что агент увидит как примеры для канала
 jwu voice agent voice-me       # свой агент голоса для воркспейса («-» — дефолт jwu)
 ```

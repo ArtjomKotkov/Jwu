@@ -131,6 +131,9 @@ def _git_repo(path):
     (path / "f.txt").write_text("x")
     run("add", ".")
     run("commit", "-q", "-m", "PROJ-1: таймаут из настроек\n\nCo-Authored-By: Bot <b@x>")
+    (path / "g.txt").write_text("y")
+    run("add", ".")
+    run("commit", "-q", "-m", "feat: написано ассистентом\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
     return path
 
 
@@ -153,7 +156,33 @@ def test_collect_prs_jira_and_git(tmp_path):
     assert corpus["jira:PROJ-1:2"].text == "Стенд обновил, можно проверять."
     commit = next(s for s in corpus.values() if s.channel == "commit")
     assert commit.text == "PROJ-1: таймаут из настроек"  # трейлер соавторства срезан
-    assert report.by_source == {"bitbucket": 5, "jira": 1, "git": 1}  # #42: описание + 2, #7: 2
+    assert not any("ассистентом" in s.text for s in corpus.values())  # коммит ИИ не голос
+    assert report.by_source == {"bitbucket": 5, "jira": 1, "git": 1, "git_skipped_ai": 1}  # #42: описание + 2, #7: 2
+    assert report.errors == []
+
+
+def test_bitbucket_states_are_explicit(tmp_path):
+    seen = []
+
+    class Client(_PRClient):
+        def dashboard_prs(self, view, *, state="OPEN"):
+            seen.append((view, state))
+            return super().dashboard_prs(view, state=state)
+
+    store = Store(tmp_path / "s.db")
+    try:
+        svc = _fake_svc(store)
+        svc.pr_client = Client()
+        voice_mod.collect(svc, "work", [], days=30)
+    finally:
+        store.close()
+    assert {st for _, st in seen} == {"OPEN", "MERGED", "DECLINED"}  # state=ALL Bitbucket 6.1 не знает
+
+
+def test_reset_corpus():
+    voice_mod.merge_corpus("work", [_s(1, "commit")])
+    voice_mod.reset_corpus("work")
+    assert voice_mod.load_corpus("work") == []
 
 
 # --- MCP и CLI --------------------------------------------------------------- #
