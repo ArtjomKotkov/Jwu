@@ -97,7 +97,7 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
     if cmd == "/sync":
         if on_sync is None:
             return "Демон не запущен — синк запустить некому. Руками: <code>jwu sync</code>."
-        return "🔄 Синк запущен, результат придёт уведомлением." if on_sync() else "🔄 Синк уже идёт."
+        return "🔄 Синк запущен — по окончании пришлю итог." if on_sync() else "🔄 Синк уже идёт."
     if cmd == "/status":
         return _cmd_status(store, ws)
     if cmd == "/stuck":

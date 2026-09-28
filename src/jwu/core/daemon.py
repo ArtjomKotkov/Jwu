@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import fcntl
+import html
 import os
 import platform
 import shutil
@@ -149,6 +150,8 @@ class PassReport:
     skipped: list[str] = field(default_factory=list)         # локальные контуры
     failed: dict[str, str] = field(default_factory=dict)     # slug → текст ошибки
     deltas: int = 0
+    # slug → {"deltas": N, "mentions": N, "notified": bool} — для итога ручного /sync
+    per_ws: dict[str, dict] = field(default_factory=dict)
 
     def summary(self) -> str:
         parts = [f"синк: {len(self.synced)} ок"]
@@ -220,6 +223,9 @@ def run_pass(
             result = svc.sync()
             report.synced.append(ws.slug)
             report.deltas += len(result.deltas)
+            report.per_ws[ws.slug] = {"deltas": len(result.deltas),
+                                      "mentions": len(result.new_mentions),
+                                      "notified": bool(result.notified)}
             log(f"[{ws.slug}] синк #{result.run_id}: дельт {len(result.deltas)}")
             if after_sync is not None:
                 try:
@@ -294,6 +300,73 @@ def announce_start(store: "Store", interval: int) -> int:
     return sent
 
 
+def _elapsed(start: str, end: str) -> str:
+    try:
+        sec = int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds())
+    except (TypeError, ValueError):
+        return ""
+    return f"{sec // 60} мин {sec % 60} с" if sec >= 60 else f"{sec} с"
+
+
+def pass_result_text(report: PassReport, slugs: Iterable[str]) -> str:
+    """Итог прохода для чата: по каждому контуру — нового нет / сколько событий / ошибка."""
+    lines = [f"✅ <b>Синк готов</b> · {_elapsed(report.started_at, report.finished_at)}".rstrip(" ·")]
+    if any(s in report.failed for s in slugs):
+        lines[0] = f"⚠️ <b>Синк прошёл с ошибками</b> · {_elapsed(report.started_at, report.finished_at)}".rstrip(" ·")
+    for slug in slugs:
+        if slug in report.failed:
+            err = " ".join(report.failed[slug].split())
+            lines.append(f"{html.escape(slug)} — ошибка: {html.escape(err[:300])}")
+            continue
+        info = report.per_ws.get(slug)
+        if info is None:
+            lines.append(f"{html.escape(slug)} — не синкался (локальный или архивный контур)")
+        elif info["notified"]:
+            lines.append(f"{html.escape(slug)} — есть новое, уведомление выше")
+        elif info["deltas"] or info["mentions"]:
+            lines.append(f"{html.escape(slug)} — изменений {info['deltas']}, важных для уведомления нет")
+        else:
+            lines.append(f"{html.escape(slug)} — нового нет")
+    return "\n".join(lines)
+
+
+def report_pass(store: "Store", report: PassReport, requested: Iterable[str]) -> int:
+    """Отправить итог ручного /sync в чаты, откуда его просили. Вернуть число сообщений.
+
+    В один чат может смотреть несколько контуров — туда уходит одно сообщение со всеми
+    контурами этого чата. Ошибка Telegram не ломает демон.
+    """
+    from . import notify
+    from .workspaces import config_for_workspace
+
+    wanted = set(requested)
+    todo, _ = syncable(store.list_workspaces())
+    by_chat: dict[str, tuple[object, list[str]]] = {}
+    for ws in todo:
+        try:
+            sender = notify.notifier_from_config(config_for_workspace(store, ws))
+        except Exception:  # noqa: BLE001
+            sender = None
+        if sender is None:
+            continue
+        if sender.chat_id in by_chat:
+            by_chat[sender.chat_id][1].append(ws.slug)
+            sender.close()
+        else:
+            by_chat[sender.chat_id] = (sender, [ws.slug])
+    sent = 0
+    for sender, slugs in by_chat.values():
+        try:
+            if wanted & set(slugs):
+                sender.send(pass_result_text(report, slugs))
+                sent += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"итог /sync не ушёл: {exc}")
+        finally:
+            sender.close()
+    return sent
+
+
 def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
               long_poll: int = 0) -> list[dict]:
     """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
@@ -352,6 +425,7 @@ def run_loop(
             signal.signal(signal.SIGUSR1, waiter.kick)
         except (ValueError, OSError):
             pass  # не главный поток (тесты) — без сигналов
+    requested: set[str] = set()  # контуры, из чатов которых попросили /sync
     with SingleInstance():
         log(f"демон запущен (pid {os.getpid()}, интервал {interval}с)")
         if announce and not once:
@@ -366,6 +440,10 @@ def run_loop(
             store = open_store()
             try:
                 report = run_pass(store, factory=factory, after_sync=after_sync)
+                if requested:
+                    # проход по /sync из бота — ответить итогом, даже если нового нет
+                    report_pass(store, report, requested)
+                    requested = set()
             finally:
                 store.close()
             log(f"проход завершён: {report.summary()}")
@@ -395,7 +473,10 @@ def run_loop(
                 if handled:
                     log(f"бот: обработано {len(handled)} сообщений "
                         f"({', '.join(sorted({h['kind'] for h in handled}))})")
-                    if any(h["kind"] == "command" and h["text"].startswith("/sync") for h in handled):
+                    syncs = {h["workspace"] for h in handled
+                             if h["kind"] == "command" and h["text"].startswith("/sync")}
+                    if syncs:
+                        requested |= syncs
                         kicked = True
                         break
             if kicked:
