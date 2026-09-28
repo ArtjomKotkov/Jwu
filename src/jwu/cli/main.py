@@ -1594,6 +1594,8 @@ def pr(
     dest: Optional[str] = typer.Option(None, "--dest", help="Каталог для скачивания."),
     diff: bool = typer.Option(False, "--diff", help="Напечатать unified diff PR (и ничего больше)."),
     diff_path: Optional[str] = typer.Option(None, "--path", help="Только этот файл в диффе."),
+    numbered: bool = typer.Option(False, "--numbered", "-n",
+        help="С --diff: номера строк слева (правый — строка для inline-коммента)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Детали одного PR + статус merge-конфликта + комментарии ревью."""
@@ -1605,6 +1607,10 @@ def pr(
             except (BitbucketError, GitHubError) as exc:
                 err.print(f"[red]{exc}[/red]")
                 raise typer.Exit(code=1)
+        if numbered:
+            from ..core import diffmap
+
+            text = diffmap.numbered(text)
         if json_out:
             _emit_json({"pr": pr_id, "path": diff_path, "diff": text})
         else:
@@ -1879,7 +1885,13 @@ def pr_comment(
     text_file: Optional[str] = typer.Option(None, "--file", "-F", help="Файл с текстом; «-» — stdin."),
     reply_to: Optional[int] = typer.Option(None, "--reply-to", "-r", help="id комментария, в тред которого отвечаем."),
     path: Optional[str] = typer.Option(None, "--path", help="Файл для нового inline-коммента."),
-    line: Optional[int] = typer.Option(None, "--line", help="Строка файла для inline-коммента."),
+    line: Optional[int] = typer.Option(None, "--line", help="Строка новой версии файла для inline-коммента."),
+    line_type: Optional[str] = typer.Option(
+        None, "--line-type", click_type=click.Choice(["ADDED", "CONTEXT", "REMOVED"], case_sensitive=False),
+        help="Тип строки вручную (по умолчанию — из диффа PR)."),
+    side: Optional[str] = typer.Option(
+        None, "--side", click_type=click.Choice(["TO", "FROM"], case_sensitive=False),
+        help="FROM — удалённая строка (номер старой версии)."),
     project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта / owner."),
     repo: Optional[str] = typer.Option(None, "--repo", help="Slug / имя репозитория."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Показать текст, ничего не отправляя."),
@@ -1912,7 +1924,7 @@ def pr_comment(
     with _service_with_prs() as svc:
         try:
             result = svc.pr_comment_add(project, repo, pr_id, body, parent_id=reply_to,
-                                        path=path, line=line)
+                                        path=path, line=line, line_type=line_type, side=side)
         except (BitbucketError, GitHubError, ValueError) as exc:
             if json_out:
                 _emit_json({"ok": False, "pr": pr_id, "error": str(exc)})
@@ -1920,9 +1932,46 @@ def pr_comment(
                 err.print(f"[red]✗[/red] PR #{pr_id}: комментарий не отправлен — {exc}")
             raise typer.Exit(code=1)
     if json_out:
-        _emit_json({"ok": True, "pr": pr_id, "id": result.get("id", ""), "where": where})
+        _emit_json({"ok": True, "pr": pr_id, "id": result.get("id", ""), "where": where,
+                    **{k: result[k] for k in ("line_type", "file_type", "anchored", "warning") if k in result}})
     else:
-        console.print(f"[green]✓[/green] PR #{pr_id}: комментарий #{result.get('id', '?')} добавлен ({where})")
+        kind = f", {result['line_type']}" if result.get("line_type") else ""
+        console.print(f"[green]✓[/green] PR #{pr_id}: комментарий #{result.get('id', '?')} добавлен ({where}{kind})")
+        if result.get("warning"):
+            err.print(f"[yellow]⚠ {result['warning']}[/yellow]")
+
+
+@app.command("pr-comment-delete")
+def pr_comment_delete(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    comment_id: int = typer.Argument(..., help="id своего комментария."),
+    project: Optional[str] = typer.Option(None, "--project", help="Ключ проекта / owner."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Slug / имя репозитория."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Удалить СВОЙ комментарий в PR (чужие — отказ). ВНЕШНЯЯ запись — после подтверждения."""
+    if not yes:
+        if json_out:
+            _emit_json({"ok": False, "reason": "confirm_required", "pr": pr_id, "id": comment_id,
+                        "hint": "Показать пользователю, какой коммент удаляем, и повторить с --yes"})
+            raise typer.Exit(code=0)
+        if not typer.confirm(f"Удалить комментарий #{comment_id} в PR #{pr_id}?", default=False):
+            console.print("[dim]Отменено.[/dim]")
+            raise typer.Exit(code=1)
+    with _service_with_prs() as svc:
+        try:
+            result = svc.pr_comment_delete(project, repo, pr_id, comment_id)
+        except (BitbucketError, GitHubError, ValueError) as exc:
+            if json_out:
+                _emit_json({"ok": False, "pr": pr_id, "error": str(exc)})
+            else:
+                err.print(f"[red]✗[/red] PR #{pr_id}: не удалено — {exc}")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json({"ok": True, "pr": pr_id, **result})
+    else:
+        console.print(f"[green]✓[/green] PR #{pr_id}: комментарий #{comment_id} удалён")
 
 
 @app.command("pr-create")

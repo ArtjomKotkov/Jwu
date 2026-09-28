@@ -662,6 +662,37 @@ class GitHubClient:
             return self._post(f"/repos/{owner}/{name}/pulls/{pr_id}/comments", body)
         return self._post(f"/repos/{owner}/{name}/issues/{pr_id}/comments", {"body": text})
 
+    def _delete(self, path: str) -> None:
+        try:
+            resp = self._client.delete(path)
+        except httpx.HTTPError as exc:
+            raise GitHubError(f"Сеть/GitHub недоступен: {exc}") from exc
+        self._raise_for(resp)
+
+    def pr_comment_get(self, project: str, repo: str, pr_id: int, comment_id: int | str) -> dict:
+        """Коммент по id: сначала inline (pulls/comments), затем общий (issues/comments).
+
+        В ответ добавляется ``_kind`` — pull | issue: от него зависит адрес удаления.
+        """
+        owner, name = self._split_repo(project, repo)
+        for kind, url in (("pull", f"/repos/{owner}/{name}/pulls/comments/{int(comment_id)}"),
+                          ("issue", f"/repos/{owner}/{name}/issues/comments/{int(comment_id)}")):
+            try:
+                raw = self._get(url)
+            except GitHubError as exc:
+                if exc.status_code == 404:
+                    continue
+                raise
+            raw["_kind"] = kind
+            return raw
+        raise GitHubError(f"Комментарий {comment_id} не найден в PR #{pr_id}", 404)
+
+    def pr_comment_delete(self, project: str, repo: str, pr_id: int, comment_id: int | str,
+                          kind: str = "pull") -> None:
+        owner, name = self._split_repo(project, repo)
+        section = "pulls" if kind == "pull" else "issues"
+        self._delete(f"/repos/{owner}/{name}/{section}/comments/{int(comment_id)}")
+
     def pr_review(self, project: str, repo: str, pr_id: int, user_slug: str, status: str,
                   body: str = "") -> dict:
         """Отзыв на PR: APPROVED → APPROVE, NEEDS_WORK → REQUEST_CHANGES (нужен текст)."""

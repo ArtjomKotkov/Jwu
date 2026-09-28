@@ -551,6 +551,7 @@ async def jwu_pr_diff(
     pr_id: int,
     path: Optional[str] = None,
     max_chars: int = 60000,
+    numbered: bool = False,
     project: Optional[str] = None,
     repo: Optional[str] = None,
     workspace: Optional[str] = None,
@@ -559,7 +560,8 @@ async def jwu_pr_diff(
 
     path — только один файл (так и бери большие PR: сначала список файлов из общего
     диффа по строкам `diff --git`, потом по файлам). max_chars — обрезать с пометкой.
-    Работает у Bitbucket и GitHub.
+    numbered=True — дифф с номерами строк слева («старая новая │ ±текст»): правый номер
+    и есть `line` для inline-коммента в jwu_pr_comment. Работает у Bitbucket и GitHub.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
@@ -567,6 +569,10 @@ async def jwu_pr_diff(
     svc = _full_svc(workspace)
     text = svc.pr_diff(project, repo, pr_id, path=path, max_chars=max_chars)
     files = [ln.split(" b/", 1)[-1] for ln in text.splitlines() if ln.startswith("diff --git ")]
+    if numbered:
+        from .core import diffmap
+
+        text = diffmap.numbered(text)
     return {"pr": pr_id, "path": path, "files": files, "diff": text}
 
 
@@ -577,6 +583,8 @@ async def jwu_pr_comment(
     reply_to: Optional[int] = None,
     path: Optional[str] = None,
     line: Optional[int] = None,
+    line_type: Optional[str] = None,
+    side: Optional[str] = None,
     project: Optional[str] = None,
     repo: Optional[str] = None,
     workspace: Optional[str] = None,
@@ -588,13 +596,44 @@ async def jwu_pr_comment(
     согласен, потому что…»); path+line — новый inline-коммент на строку файла; без
     обоих — общий комментарий к PR.
 
+    line — номер строки НОВОЙ версии файла (правый номер в jwu_pr_diff(numbered=True)).
+    Тип строки (ADDED/CONTEXT/REMOVED) jwu берёт из диффа PR сам; строки нет в диффе —
+    ошибка до отправки. Удалённую строку («-») адресуй side="FROM" и номером старой
+    версии. line_type — ручное переопределение, сверяется с диффом. В ответе
+    `anchored`: false — коммент не привязался к диффу (см. `warning`).
+
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
     """
     svc = _full_svc(workspace)
-    result = svc.pr_comment_add(project, repo, pr_id, text, parent_id=reply_to, path=path, line=line)
-    return _stamp({"pr": pr_id, "id": result.get("id", ""), "reply_to": reply_to,
-                   "path": path, "line": line}, _resolve(workspace))
+    result = svc.pr_comment_add(project, repo, pr_id, text, parent_id=reply_to, path=path,
+                                line=line, line_type=line_type, side=side)
+    payload = {"pr": pr_id, "id": result.get("id", ""), "reply_to": reply_to,
+               "path": path, "line": line}
+    for key in ("line_type", "file_type", "anchored", "warning"):
+        if key in result:
+            payload[key] = result[key]
+    return _stamp(payload, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_comment_delete(
+    pr_id: int,
+    comment_id: int,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: удалить СВОЙ комментарий в PR — только после явного «да»
+    пользователя (показать, какой коммент удаляем). Чужие комменты jwu не удаляет.
+    Bitbucket не даёт удалить коммент, на который уже ответили.
+
+    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
+    можно узнать через jwu_workspace_current).
+    """
+    svc = _full_svc(workspace)
+    return _stamp({"pr": pr_id, **svc.pr_comment_delete(project, repo, pr_id, comment_id)},
+                  _resolve(workspace))
 
 
 @mcp.tool()

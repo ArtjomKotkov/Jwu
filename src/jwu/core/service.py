@@ -43,7 +43,7 @@ from .config import (
 )
 from .github import GitHubClient
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
-from . import notify
+from . import diffmap, notify
 from . import thresholds as thresholds_mod
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
@@ -1316,8 +1316,14 @@ class Service:
     def pr_comment_add(
         self, project: str | None, repo: str | None, pr_id: int, text: str, *,
         parent_id: int | str | None = None, path: str | None = None, line: int | None = None,
+        line_type: str | None = None, side: str | None = None,
     ) -> dict:
         """Коммент к PR: общий, ответ в тред (``parent_id``) или на строку файла.
+
+        У inline-коммента тип строки (ADDED/CONTEXT/REMOVED) и сторона берутся из диффа
+        PR: иначе Bitbucket создаёт коммент без привязки к диффу. Строки нет в диффе —
+        ``DiffLineError`` ДО отправки. После отправки коммент перечитывается, и в ответ
+        добавляются ``anchored`` (привязался ли) и ``line_type``/``file_type``.
 
         ВНЕШНЯЯ запись — звать после подтверждения пользователя.
         """
@@ -1326,8 +1332,62 @@ class Service:
             raise ValueError("Пустой комментарий")
         client = self._require_prs()
         default_project, default_repo = self.default_pr_ref()
-        return client.pr_comment_add(project or default_project, repo or default_repo, pr_id,
-                                     text, parent_id=parent_id, path=path, line=line)
+        project, repo = project or default_project, repo or default_repo
+        if parent_id is not None or not path or line is None:
+            return client.pr_comment_add(project, repo, pr_id, text, parent_id=parent_id,
+                                         path=path, line=line)
+        # Контекст 10 строк — как в веб-интерфейсе Bitbucket: коммент на строку контекста
+        # чуть дальше от правки там тоже цепляется.
+        diff = client.pr_diff(project, repo, pr_id, path=path, context=10)
+        kind, file_type = diffmap.locate(diff, path, int(line), side=side, line_type=line_type)
+        raw = client.pr_comment_add(project, repo, pr_id, text, path=path, line=int(line),
+                                    line_type=kind, file_type=file_type)
+        raw = dict(raw)
+        raw.update({"line_type": kind, "file_type": file_type,
+                    "anchored": self._comment_anchored(client, project, repo, pr_id, raw)})
+        if raw["anchored"] is False:
+            raw["warning"] = (f"Коммент #{raw.get('id')} создан, но к строке {path}:{line} в диффе "
+                              f"не привязался — виден только в общей ленте. Удали его "
+                              f"(jwu_pr_comment_delete) и проверь строку по jwu_pr_diff(numbered=True).")
+        return raw
+
+    @staticmethod
+    def _comment_anchored(client, project: str, repo: str, pr_id: int, raw: dict) -> bool | None:
+        """Привязан ли свежий inline-коммент к диффу. None — проверить не удалось."""
+        if isinstance(client, GitHubClient):
+            # GitHub отвечает 422 на строку вне диффа; созданный коммент без line/position — устарел
+            return raw.get("line") is not None or raw.get("position") is not None
+        cid = str(raw.get("id", ""))
+        try:
+            comments = client.pr_comments(project, repo, pr_id)
+        except Exception:  # noqa: BLE001 — коммент уже отправлен, проверка вторична
+            return None
+        for c in comments:
+            if c.id == cid:
+                return c.anchor_idx >= 0 and bool(c.context)
+        return None
+
+    def pr_comment_delete(self, project: str | None, repo: str | None, pr_id: int,
+                          comment_id: int | str) -> dict:
+        """Удалить СВОЙ коммент в PR. Чужой — отказ. ВНЕШНЯЯ запись — после подтверждения."""
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        project, repo = project or default_project, repo or default_repo
+        login = (self._resolve_username() or "").casefold()
+        raw = client.pr_comment_get(project, repo, pr_id, comment_id)
+        if isinstance(client, GitHubClient):
+            author = ((raw.get("user") or {}).get("login", "") or "")
+        else:
+            author = ((raw.get("author") or {}).get("name", "") or "")
+        if not login or author.casefold() != login:
+            raise ValueError(f"Комментарий #{comment_id} — не твой (автор {author or '?'}), "
+                             f"jwu удаляет только свои.")
+        text = raw.get("body") if isinstance(client, GitHubClient) else raw.get("text")
+        if isinstance(client, GitHubClient):
+            client.pr_comment_delete(project, repo, pr_id, comment_id, kind=raw.get("_kind", "pull"))
+        else:
+            client.pr_comment_delete(project, repo, pr_id, comment_id, int(raw.get("version", 0) or 0))
+        return {"id": str(comment_id), "deleted": True, "text": text or ""}
 
     def pr_review(self, project: str | None, repo: str | None, pr_id: int, status: str,
                   body: str = "") -> dict:
@@ -1398,7 +1458,8 @@ class Service:
         project = project or default_project
         repo = repo or default_repo
         if comment_id is None:
-            raw = client.pr_comment_add(
+            # через сервис: у inline-коммента тип строки берётся из диффа (иначе не привяжется)
+            raw = self.pr_comment_add(
                 project, repo, pr_id, comment_text or text, path=path, line=line
             )
             comment_id = raw.get("id")
