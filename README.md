@@ -162,8 +162,13 @@ Claude: `jwu pr-task list|add|done|reopen`. Текст задачи до 10 сл
 
 **Внешняя запись** — только по явному подтверждению (в CLI флаг `--yes`, без него превью):
 `jwu comment`, `jwu issue create|link|transition|attach`, `jwu worklog`, `jwu pr-comment`
-(общий, ответ в тред `--reply-to`, на строку), `jwu pr-review approve|needs-work|unapprove`,
-`jwu pr-create`, `jwu pr-task add|done`.
+(общий, ответ в тред `--reply-to`, на строку), `jwu pr-comment-delete` (только свои),
+`jwu pr-review approve|needs-work|unapprove`, `jwu pr-create`, `jwu pr-task add|done`.
+
+**Коммент на строку** цепляется к диффу: `--line` — номер строки новой версии (правый номер
+в `jwu pr <id> --diff --numbered`), тип строки (ADDED/CONTEXT/REMOVED) jwu берёт из диффа PR.
+Строки нет в диффе — ошибка до отправки; удалённая строка — `--side FROM` и номер старой
+версии. Если коммент всё же не привязался, jwu скажет об этом сразу после отправки.
 
 ## Данные: БД, бэкап, память
 
@@ -249,7 +254,7 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 | проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `configure [export\|import]`, `auth check`, `doctor` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
-| внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklogs`, `pr-comment`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |
+| внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklogs`, `pr-comment`, `pr-comment-delete`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |
 | фон и данные | `daemon run\|install\|uninstall\|status\|kick`, `notify status\|test\|poll`, `backup`, `restore`, `db stats\|prune\|vacuum`, `dashboard`, `install-claude-skills` |
 
 У большинства команд есть `--json`.

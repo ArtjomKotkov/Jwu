@@ -428,6 +428,21 @@ class BitbucketClient:
             "POST", f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments", payload
         )
 
+    def pr_comment_get(self, project: str, repo: str, pr_id: int, comment_id: int | str) -> dict:
+        """Один коммент (сырой): нужен ``version`` для удаления и ``author`` для проверки «мой»."""
+        return self._get(
+            f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{int(comment_id)}"
+        )
+
+    def pr_comment_delete(self, project: str, repo: str, pr_id: int, comment_id: int | str,
+                          version: int) -> None:
+        """Удалить коммент. Bitbucket требует его текущую ``version`` (защита от гонки правок)."""
+        self._send(
+            "DELETE",
+            f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{int(comment_id)}"
+            f"?version={int(version)}",
+        )
+
     def pr_comments(self, project: str, repo: str, pr_id: int) -> list[PRComment]:
         """Комментарии PR из activities: общие + inline (с file:line и куском диффа)."""
         acts = self._paged(

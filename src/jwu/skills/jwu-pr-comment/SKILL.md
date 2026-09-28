@@ -12,10 +12,13 @@ description: Use when the user wants to answer in a pull request through jwu —
 Всё пишущее — **внешняя запись**, которую увидят коллеги: только после явного «да».
 
 > **MCP-first.** `jwu_pr(pr_id, project, repo)` — карточка с `comments[]` (id, автор,
-> `file:line`, текст), `open_tasks`, `attachments`; `jwu_pr_diff(pr_id, path)` — unified
-> diff (большой PR бери по файлам через `path`); `jwu_pr_comment(pr_id, text, reply_to,
-> path, line)` — коммент; `jwu_pr_review(pr_id, status, text)` — мой статус.
-> Bash-фолбэк: `jwu pr <id> --diff [--path f]`, `jwu pr-comment <id> -m … --reply-to CID --yes`,
+> `file:line`, текст), `open_tasks`, `attachments`; `jwu_pr_diff(pr_id, path, numbered)` —
+> unified diff (большой PR бери по файлам через `path`; `numbered=True` — с номерами строк);
+> `jwu_pr_comment(pr_id, text, reply_to, path, line, side)` — коммент;
+> `jwu_pr_comment_delete(pr_id, comment_id)` — удалить СВОЙ коммент;
+> `jwu_pr_review(pr_id, status, text)` — мой статус.
+> Bash-фолбэк: `jwu pr <id> --diff [--path f] [--numbered]`,
+> `jwu pr-comment <id> -m … --reply-to CID --yes`, `jwu pr-comment-delete <id> <CID> --yes`,
 > `jwu pr-review <id> approve|needs-work|unapprove --yes`.
 
 ## Правила
@@ -27,7 +30,16 @@ description: Use when the user wants to answer in a pull request through jwu —
    Апрув чужого PR — ответственность пользователя: не предлагай «апрувнуть заодно».
 3. **Ничего в git.** Ответы и статусы живут в Bitbucket/GitHub; локальный репозиторий
    не трогается, следов jwu там нет.
-4. **Только Bitbucket умеет снять апрув** (`UNAPPROVED`). У GitHub `needs-work`
+4. **Коммент на строку — по номеру из диффа.** `line` — номер строки НОВОЙ версии файла:
+   правый номер в `jwu_pr_diff(pr_id, path, numbered=True)`. Тип строки
+   (ADDED/CONTEXT/REMOVED) jwu берёт из диффа сам; строки нет в диффе — ошибка ДО
+   отправки (в тексте ошибки — какие строки в диффе есть). Удалённую строку («-»)
+   адресуй `side="FROM"` и номером старой версии (левый номер). Ответ содержит
+   `anchored`: если `false` — коммент ушёл, но в диффе не виден; скажи пользователю
+   и предложи удалить его (`jwu_pr_comment_delete`, отдельное «да») и отправить заново.
+5. **Удаление — только своих комментов и только после «да»**: покажи, какой коммент
+   (id и текст) удаляем. На коммент, под которым уже ответили, Bitbucket удалить не даст.
+6. **Только Bitbucket умеет снять апрув** (`UNAPPROVED`). У GitHub `needs-work`
    требует текст (уходит в отзыв); у Bitbucket статус без текста, поэтому текст
    отправляется отдельным общим комментарием — скажи об этом пользователю.
 
