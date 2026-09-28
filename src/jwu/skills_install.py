@@ -41,6 +41,7 @@ EXPECTED_SKILLS = {
     "jwu-wrap-up",
     "jwu-setup-remote",
     "jwu-session-init",
+    "jwu-review-queue",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
@@ -59,6 +60,7 @@ EXPECTED_AGENTS = {
     "duty-support-sample",
     "qa-triage-sample",
     "voice-writer-sample",
+    "review-filter-sample",
 }
 
 

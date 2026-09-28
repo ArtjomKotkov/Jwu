@@ -4561,5 +4561,64 @@ def voice_feedback(
     console.print(f"[green]Записано[/green] в {path}")
 
 
+# --------------------------------------------------------------------------- #
+# review: очередь ревью чужих PR (для скилла jwu-review-queue)
+# --------------------------------------------------------------------------- #
+
+review_app = typer.Typer(help="Очередь ревью: какие PR на мне ревьюить, кем и куда класть сводку.")
+app.add_typer(review_app, name="review")
+
+
+@review_app.command("queue")
+def review_queue(
+    include_approved: bool = typer.Option(False, "--include-approved", help="Включить PR, где я уже APPROVED."),
+    pr_ids: list[int] = typer.Option([], "--pr", help="Только эти PR (можно несколько)."),
+    repos: list[str] = typer.Option([], "--repo", help="Только эти репозитории (можно несколько)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """PR на моём ревью: очередь с ревьюером по репозиторию и пропущенные с причиной."""
+    from ..core import reviewq
+
+    with _service_with_prs() as svc:
+        ws = svc.workspace
+        items = svc.prs("review", with_conflicts=False, with_builds=False)
+        result = reviewq.plan(svc.store, ws.id, ws.slug, items, svc._resolve_username(),
+                              include_approved=include_approved, ids=pr_ids, repos=repos)
+    if json_out:
+        _emit_json(result)
+        return
+    for q in result["queue"]:
+        console.print(f"[cyan]#{q['pr']}[/cyan] {q['repo']}  {escape(q['title'])}  "
+                      f"[dim]{q['task_key'] or '—'} · {q['my_status']} · {q['reviewer_agent']}[/dim]")
+    for sk in result["skipped"]:
+        console.print(f"[dim]пропущен #{sk['pr']} {sk['repo']}: {sk['reason']}[/dim]")
+    console.print(f"[dim]сводка: {result['summary']} · фильтр: {result['filter_agent']}[/dim]")
+
+
+@review_app.command("agents")
+def review_agents(
+    repo: Optional[str] = typer.Option(None, "--repo", help="Репозиторий, которому задать ревьювера."),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="Субагент-ревьювер («-» — дефолт)."),
+    filter_name: Optional[str] = typer.Option(None, "--filter", help="Субагент фильтра замечаний («-» — дефолт)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Ревьюеры по репозиториям и фильтр замечаний: показать или задать (настройки воркспейса)."""
+    from ..core import reviewq
+
+    if reviewer is not None and not repo:
+        err.print("[red]--reviewer задаётся вместе с --repo.[/red]")
+        raise typer.Exit(code=1)
+    store, ws = _store_and_ws()
+    with store:
+        info = reviewq.set_agents(store, ws.id, repo=repo, reviewer=reviewer, filter_name=filter_name)
+    if json_out:
+        _emit_json(info)
+        return
+    console.print(f"Фильтр замечаний: [cyan]{info['filter_agent']}[/cyan]")
+    console.print(f"Ревьювер по умолчанию: [cyan]{info['default_reviewer']}[/cyan]")
+    for name, agent in info["reviewers"].items():
+        console.print(f"  {name}: [cyan]{agent}[/cyan]")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
