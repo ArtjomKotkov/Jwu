@@ -40,6 +40,7 @@ EXPECTED_SKILLS = {
     "jwu-qa-triage",
     "jwu-wrap-up",
     "jwu-setup-remote",
+    "jwu-session-init",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:

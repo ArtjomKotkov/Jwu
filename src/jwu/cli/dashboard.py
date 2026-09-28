@@ -2358,6 +2358,28 @@ class JwuDashboard(App):
                 "[yellow]Папок нет[/yellow][dim] — пока воркспейс не привязан ни к одной "
                 "папке, jwu не сможет выбрать его автоматически. Нажми [/dim][b]a[/b][dim].[/dim]"
             )
+        lines += self._ssh_head_lines()
+        return lines
+
+    def _ssh_head_lines(self) -> list[str]:
+        """Секция «SSH-стенды»: адрес, вход, политика и итоговые whitelist/blacklist."""
+        from ..core import ssh as ssh_mod
+
+        servers = self.data.ssh_servers
+        if not servers:
+            return []
+        lines = ["", f"[b]SSH-стенды[/b] [dim]({len(servers)} · полные списки — jwu workspace show)[/dim]"]
+        for server, has_pw in servers:
+            tag = f"  [magenta]#{escape(server.tag)}[/magenta]" if server.tag else ""
+            desc = f"  [dim]— {escape(server.description)}[/dim]" if server.description else ""
+            lines.append(f"  [cyan]{escape(server.name)}[/cyan]{tag}{desc}")
+            for label, values in ssh_mod.detail_rows(server, has_pw, compact=True):
+                if label in ("whitelist", "blacklist"):
+                    for i, value in enumerate(values):
+                        head = f"{label}:" if i == 0 else ""
+                        lines.append(f"    [dim]{head:<11}[/dim]{escape(value)}")
+                else:
+                    lines.append(f"    [dim]{label + ':':<11}[/dim]{escape(', '.join(values))}")
         return lines
 
     @work(thread=True, exclusive=True, group="reindex")

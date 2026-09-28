@@ -198,6 +198,36 @@ def check_daemon(store: "Store") -> list[Check]:
     return [Check("Демон", "skip", "фоновый синк не установлен", "jwu daemon install")]
 
 
+def check_ssh(store: "Store", ws) -> list[Check]:
+    """Стенды контура выданы Claude Code: ssh-mcp есть, конфиг собран, MCP в папках воркспейса."""
+    from . import ssh as ssh_mod
+
+    servers = ssh_mod.list_servers(store, ws.id)
+    if not servers:
+        return [Check("SSH-стенды", "skip", "стендов нет", "jwu ssh add <имя> --host … --user … --key …")]
+    out: list[Check] = []
+    if not ssh_mod.find_binary():
+        out.append(Check("SSH-стенды", "fail", f"{len(servers)} шт., но ssh-mcp не найден",
+                         "go install github.com/overklassniy/ssh-mcp/cmd/ssh-mcp@latest"))
+        return out
+    if not ssh_mod.config_path(ws.slug).exists():
+        out.append(Check("SSH-стенды", "warn", f"{len(servers)} шт., конфиг ssh-mcp не выдан", "jwu ssh install"))
+        return out
+    try:
+        projects = json.loads(_claude_json().read_text(encoding="utf-8")).get("projects") or {}
+    except (OSError, ValueError):
+        projects = {}
+    name = ssh_mod.mcp_name(ws.slug)
+    missing = [p.path for p in ws.paths
+               if name not in ((projects.get(p.path) or {}).get("mcpServers") or {})]
+    if missing:
+        out.append(Check("SSH-стенды", "warn", f"MCP {name} не зарегистрирован в: {', '.join(missing)}",
+                         "jwu ssh install"))
+    else:
+        out.append(Check("SSH-стенды", "ok", f"{len(servers)} шт. · MCP {name}"))
+    return out
+
+
 def _claude_json() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_PATH") or (Path.home() / ".claude.json"))
 
@@ -284,6 +314,7 @@ def run(store: "Store", *, explicit_workspace: Optional[str] = None, network: bo
             checks += check_access(ws, cfg)
         else:
             checks.append(Check("Доступы", "skip", "--offline: сеть не проверялась"))
+        checks += check_ssh(store, ws)
     checks += check_daemon(store)
     checks += check_mcp()
     checks += check_skills()

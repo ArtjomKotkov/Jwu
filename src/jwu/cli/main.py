@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import click
 import typer
 from rich.console import Console, Group
+from rich.markup import escape
 from rich.table import Table
 
 from ..core.bitbucket import BitbucketError
@@ -1094,6 +1095,7 @@ def workspace_show(
             console.print(f"  📁 {p.path}{tags}{label}{mark}")
     else:
         console.print("\n[dim]Папок нет. Привязать текущую: jwu workspace add-path .[/dim]")
+    _print_ssh_section(store, ws)
 
     # Показываем настройки ТОЛЬКО текущего провайдера: хост Jira в github-контуре
     # ничего не значит (он мог достаться от глобального конфига) и лишь путает.
@@ -1113,6 +1115,25 @@ def workspace_show(
         for slot in sorted(stored):
             value = stored[slot] if show_secrets else "****"
             console.print(f"  [dim]{slot}[/dim] = {value}")
+
+
+def _print_ssh_section(store: Store, ws: Workspace) -> None:
+    """Секция «SSH-стенды» карточки воркспейса: адрес, вход, политика, списки команд."""
+    from ..core import ssh as ssh_mod
+
+    servers = ssh_mod.list_servers(store, ws.id)
+    if not servers:
+        return
+    console.print(f"\n[b]SSH-стенды[/b] [dim](MCP {ssh_mod.mcp_name(ws.slug)})[/dim]")
+    for s in servers:
+        tag = f"  [cyan]#{s.tag}[/cyan]" if s.tag else ""
+        console.print(f"  🖥  [b]{s.name}[/b]{tag}")
+        if s.description:
+            console.print(f"     {escape(s.description)}")
+        for label, values in ssh_mod.detail_rows(s, ssh_mod.has_password(store, ws.id, s.name)):
+            console.print(f"     [dim]{label + ':':<17}[/dim]{escape(values[0])}")
+            for value in values[1:]:
+                console.print(f"     {'':<17}{escape(value)}")
 
 
 @workspace_app.command("add-path")
@@ -4185,6 +4206,199 @@ def rules(
 ) -> None:
     """Правила воркспейса (алиас `jwu rule list`)."""
     rule_list(kind=kind, tag=tag, json_out=json_out)
+
+
+# --------------------------------------------------------------------------- #
+# ssh: стенды воркспейса и их выдача Claude Code через ssh-mcp
+# --------------------------------------------------------------------------- #
+
+ssh_app = typer.Typer(
+    help="SSH-стенды воркспейса: описания, конфиг ssh-mcp и регистрация MCP в Claude Code.")
+app.add_typer(ssh_app, name="ssh")
+
+
+def _ssh_store() -> tuple[Store, Workspace]:
+    store = _open_store()
+    ws = _resolve_workspace(store)
+    store.use_workspace(ws.id)
+    return store, ws
+
+
+def _ssh_refresh_config(store: Store, ws: Workspace) -> None:
+    """Конфиг уже выдан ssh-mcp — переписать, он перечитает его сам."""
+    from ..core import ssh as ssh_mod
+
+    if ssh_mod.config_path(ws.slug).exists():
+        path = ssh_mod.write_config(store, ws.id, ws.slug)
+        console.print(f"[dim]конфиг ssh-mcp обновлён: {path}[/dim]")
+
+
+@ssh_app.command("add")
+def ssh_add(
+    name: str = typer.Argument(..., help="Имя стенда (латиница): так его зовут в инструментах ssh-mcp."),
+    host: str = typer.Option(..., "--host", help="Хост или IP."),
+    user: str = typer.Option(..., "--user", "-u", help="SSH-пользователь."),
+    port: int = typer.Option(22, "--port", "-p"),
+    key: str = typer.Option("", "--key", "-i", help="Путь к приватному ключу."),
+    agent: bool = typer.Option(False, "--agent", help="Входить через ssh-agent ($SSH_AUTH_SOCK)."),
+    password: bool = typer.Option(False, "--password", help="Спросить пароль (ляжет в секреты воркспейса)."),
+    passphrase: bool = typer.Option(False, "--passphrase", help="Спросить passphrase ключа."),
+    policy: str = typer.Option("readonly", "--policy", click_type=click.Choice(["readonly", "none"]),
+                               help="readonly — только просмотр логов и состояния; none — любые команды."),
+    allow: list[str] = typer.Option([], "--allow", help="Regex разрешённой команды сверх пресета (можно несколько)."),
+    deny: list[str] = typer.Option([], "--deny", help="Regex запрещённой команды (можно несколько)."),
+    remote_path: list[str] = typer.Option([], "--remote-path", help="Каталог на сервере, доступный для SFTP."),
+    local_path: list[str] = typer.Option([], "--local-path", help="Локальный каталог для скачанного."),
+    transport: str = typer.Option("exec", "--transport", click_type=click.Choice(["exec", "shell"])),
+    tag: str = typer.Option("", "--tag", "-t", help="Тег папки воркспейса, к которой относится стенд."),
+    desc: str = typer.Option("", "--desc", help="Что за стенд, где там логи."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Добавить стенд воркспейса (или перезаписать одноимённый)."""
+    from ..core import ssh as ssh_mod
+
+    server = ssh_mod.SshServer(
+        name=name, host=host, username=user, port=port,
+        private_key=key, agent="env" if agent else "", policy=policy,
+        whitelist=list(allow), blacklist=list(deny),
+        allowed_remote_paths=list(remote_path), allowed_local_paths=list(local_path),
+        transport=transport, tag=tag, description=desc,
+    )
+    pwd = typer.prompt("Пароль", hide_input=True) if password else None
+    phrase = typer.prompt("Passphrase ключа", hide_input=True) if passphrase else None
+    store, ws = _ssh_store()
+    with store:
+        existed = any(s.name == name for s in ssh_mod.list_servers(store, ws.id))
+        try:
+            ssh_mod.save_server(store, ws.id, server, password=pwd, passphrase=phrase)
+        except ssh_mod.SshError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        _ssh_refresh_config(store, ws)
+    if json_out:
+        _emit_json(server.as_dict())
+        return
+    console.print(f"[green]Стенд {name}[/green] {'обновлён' if existed else 'добавлен'}: "
+                  f"{user}@{host}:{port}, политика {policy}")
+    if policy == "none":
+        console.print("[yellow]⚠ Политика none: модель сможет выполнить на стенде любую команду.[/yellow]")
+    if pwd:
+        console.print("[yellow]Пароль в режиме конфига ssh-mcp пишется в файл (права 600). "
+                      "Надёжнее ключ или --agent.[/yellow]")
+
+
+@ssh_app.command("list")
+def ssh_list(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Стенды воркспейса и состояние интеграции с ssh-mcp."""
+    from ..core import ssh as ssh_mod
+
+    store, ws = _ssh_store()
+    with store:
+        info = ssh_mod.describe(store, ws.id, ws.slug)
+    if json_out:
+        _emit_json(info)
+        return
+    if not info["servers"]:
+        console.print("[dim]Стендов нет. Добавить — jwu ssh add <имя> --host … --user … --key ….[/dim]")
+        return
+    for s in info["servers"]:
+        tag = f" [dim]({s['tag']})[/dim]" if s["tag"] else ""
+        console.print(f"[cyan]{s['name']}[/cyan]{tag}  {s['username']}@{s['host']}:{s['port']}  "
+                      f"[dim]вход: {s['auth']} · политика: {s['policy']}[/dim]")
+        if s["description"]:
+            console.print(f"    {s['description']}")
+        if s["allowed_remote_paths"]:
+            console.print(f"    [dim]SFTP: {', '.join(s['allowed_remote_paths'])}[/dim]")
+    console.print(f"[dim]MCP: {info['mcp_server']} · конфиг: "
+                  f"{info['config'] if info['config_exists'] else 'ещё не выдан (jwu ssh install)'} · "
+                  f"ssh-mcp: {info['binary'] or 'не найден'}[/dim]")
+
+
+@ssh_app.command("rm")
+def ssh_rm(
+    name: str = typer.Argument(..., help="Имя стенда."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Удалить стенд вместе с его паролем/passphrase."""
+    from ..core import ssh as ssh_mod
+
+    store, ws = _ssh_store()
+    with store:
+        try:
+            ssh_mod.get_server(store, ws.id, name)
+        except ssh_mod.SshError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        if not yes and not typer.confirm(f"Удалить стенд «{name}»?", default=False):
+            raise typer.Exit(code=1)
+        ssh_mod.remove_server(store, ws.id, name)
+        _ssh_refresh_config(store, ws)
+    console.print(f"[red]Стенд {name}[/red] удалён")
+
+
+@ssh_app.command("config")
+def ssh_config(
+    show: bool = typer.Option(False, "--print", help="Показать конфиг (пароли скрыты)."),
+) -> None:
+    """Пересобрать конфиг ssh-mcp контура из стендов воркспейса."""
+    from ..core import ssh as ssh_mod
+
+    store, ws = _ssh_store()
+    with store:
+        path = ssh_mod.write_config(store, ws.id, ws.slug)
+        if show:
+            masked = {k: "***" for k, v in store.workspace_secrets(ws.id).items() if k.startswith("ssh.") and v}
+            console.print(ssh_mod.render_config(ssh_mod.list_servers(store, ws.id), masked),
+                          markup=False, highlight=False)
+    console.print(f"[green]Конфиг[/green] {path}")
+
+
+@ssh_app.command("install")
+def ssh_install(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Только показать команды."),
+) -> None:
+    """Выдать стенды Claude Code: конфиг ssh-mcp + MCP-сервер в каждой папке воркспейса.
+
+    Регистрация в скоупе local (per-папка): стенды контура не видны в других проектах.
+    Новые инструменты появятся после перезапуска сессии Claude Code.
+    """
+    from ..core import ssh as ssh_mod
+
+    store, ws = _ssh_store()
+    with store:
+        if not ssh_mod.list_servers(store, ws.id):
+            err.print("[red]Стендов нет — сначала jwu ssh add.[/red]")
+            raise typer.Exit(code=1)
+        path = ssh_mod.config_path(ws.slug) if dry_run else ssh_mod.write_config(store, ws.id, ws.slug)
+    try:
+        results = ssh_mod.install_mcp(ws.slug, [p.path for p in ws.paths], path, dry_run=dry_run)
+    except ssh_mod.SshError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    for r in results:
+        mark = "[green]✓[/green]" if r.ok else "[red]✗[/red]"
+        console.print(f"{mark} {r.path}  [dim]{r.message}[/dim]")
+    if not dry_run and any(r.ok for r in results):
+        console.print(f"MCP [cyan]{ssh_mod.mcp_name(ws.slug)}[/cyan] зарегистрирован — перезапусти сессию Claude Code.")
+    if any(not r.ok for r in results):
+        raise typer.Exit(code=1)
+
+
+@ssh_app.command("uninstall")
+def ssh_uninstall() -> None:
+    """Убрать MCP ssh-mcp контура из папок воркспейса (стенды и конфиг остаются)."""
+    from ..core import ssh as ssh_mod
+
+    store, ws = _ssh_store()
+    store.close()
+    try:
+        results = ssh_mod.uninstall_mcp(ws.slug, [p.path for p in ws.paths])
+    except ssh_mod.SshError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    for r in results:
+        mark = "[green]✓[/green]" if r.ok else "[dim]–[/dim]"
+        console.print(f"{mark} {r.path}  [dim]{r.message}[/dim]")
 
 
 if __name__ == "__main__":  # pragma: no cover

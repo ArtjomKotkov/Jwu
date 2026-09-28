@@ -835,6 +835,13 @@ class Store:
         )
         self.conn.commit()
 
+    def delete_workspace_settings(self, workspace_id: int, keys: list[str]) -> None:
+        self.conn.executemany(
+            "DELETE FROM workspace_settings WHERE workspace_id = ? AND key = ?",
+            [(workspace_id, k) for k in keys],
+        )
+        self.conn.commit()
+
     # --- секреты воркспейса (плайнтекст в БД; см. chmod 600 в __init__) --- #
 
     def get_workspace_secret(self, workspace_id: int, slot: str) -> str | None:
@@ -1924,14 +1931,24 @@ class Store:
         давали агенту ровно один и тот же контекст: расхождения тут — это когда агент
         через один путь видит теги, а через другой нет.
         """
+        from . import ssh as ssh_mod  # локально: ssh знает о Store только для аннотаций
+
         paths = self.workspace_paths(self.workspace_id)
-        return {
+        ctx = {
             # структуру агент фильтрует («папка с тегом фронт») — тут JSON на месте
             "paths": [{"path": p.path, "label": p.label, "tags": p.tags} for p in paths],
             "known_tags": self.all_tags(self.workspace_id),
             # правила агент читает и исполняет — тут текст дешевле и доходчивее
             "rules_md": self.rules_markdown(tag=tag),
         }
+        # Стенды — только кратко и только если есть: whitelist/blacklist длинные, а этот
+        # контекст приезжает в каждый старт работы. Полностью — jwu_ssh_servers.
+        servers = ssh_mod.list_servers(self, self.workspace_id)
+        if servers:
+            ctx["ssh_servers"] = [
+                ssh_mod.brief(s, ssh_mod.has_password(self, self.workspace_id, s.name)) for s in servers
+            ]
+        return ctx
 
     # --- локальные фичи (мини-трекер воркспейса) ------------------------- #
 

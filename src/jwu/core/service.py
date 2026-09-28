@@ -275,6 +275,8 @@ class DashboardData:
     paths: list[WorkspacePath] = field(default_factory=list)
     features: list[LocalFeature] = field(default_factory=list)
     rules: list[WorkspaceRule] = field(default_factory=list)
+    # SSH-стенды контура: (SshServer, есть ли пароль) — секция в шапке «Структуры».
+    ssh_servers: list = field(default_factory=list)
     # Провайдер контура: им TUI решает, какие вкладки показывать (см. tasks_enabled/prs_enabled).
     provider: str = "jira"
     bitbucket_enabled: bool = True
@@ -386,6 +388,13 @@ def _environment(store: Store, ws: Workspace | None) -> dict:
     }
 
 
+def _ssh_servers(store: Store) -> list:
+    from . import ssh as ssh_mod
+
+    wid = store.workspace_id
+    return [(s, ssh_mod.has_password(store, wid, s.name)) for s in ssh_mod.list_servers(store, wid)]
+
+
 def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
     """Собрать дашборд из памяти (свежайшие снапшоты по сущностям). Сеть/токены не нужны.
 
@@ -438,6 +447,7 @@ def dashboard_from_memory(store: Store, user: str = "") -> DashboardData:
         paths=ws.paths if ws else [],
         features=store.list_features(),
         rules=store.list_rules(),
+        ssh_servers=_ssh_servers(store),
         provider=ws.provider if ws else "jira",
         bitbucket_enabled=ws.bitbucket_enabled if ws else True,
         **_environment(store, ws),

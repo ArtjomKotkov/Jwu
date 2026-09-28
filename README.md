@@ -180,6 +180,31 @@ jwu memory sync --repo ~/jwu-memory          # pull → импорт → экс�
 `restore` проверяет контрольные суммы, существующую БД не трогает без `--force`, путь до БД
 переписывает под эту машину. Слить две базы без потерь — `memory import`, не `restore`.
 
+## SSH-стенды (ssh-mcp)
+
+Стенды контура — серверы, где смотрят логи и состояние. jwu хранит их описания в
+воркспейсе, а выполнять команды даёт Claude Code через
+[ssh-mcp](https://github.com/overklassniy/ssh-mcp) (`go install github.com/overklassniy/ssh-mcp/cmd/ssh-mcp@latest`).
+
+```bash
+jwu ssh add test --host test.example.com --user deploy --key ~/.ssh/id_ed25519 \
+    --remote-path /var/log/app --tag бэкенд --desc "логи приложения в /var/log/app"
+jwu ssh list                  # стенды, вход, политика, состояние интеграции
+jwu ssh install [--dry-run]   # конфиг ssh-mcp + MCP ssh-<slug> в каждой папке воркспейса
+jwu ssh rm test | jwu ssh config [--print] | jwu ssh uninstall
+```
+
+- По умолчанию политика `readonly`: whitelist просмотра (`tail`, `grep`, `journalctl`,
+  `systemctl status`, `docker logs` …) и запрет цепочек, перенаправлений, `sudo`, `find -exec`.
+  `--policy none` снимает пресет, `--allow`/`--deny` добавляют свои regex.
+- MCP регистрируется в скоупе `local` папок воркспейса: стенды рабочего контура не видны в личном.
+- Пароль/passphrase (`--password`, `--passphrase`) лежат в секретах воркспейса и в память не
+  синкаются. ssh-mcp в режиме конфига читает пароль только из файла, поэтому конфиг
+  (`~/.local/share/jwu/ssh/<slug>.toml`) пишется с правами 600. Лучше ключ или `--agent`.
+- ssh-mcp не проверяет host key сервера — доверяй только своим стендам.
+- Скиллы разбора (`duty-support`, `jwu-qa-triage`, `build-failure`) смотрят логи стенда, когда
+  его инструменты есть в сессии. Сами стенды видны через MCP `jwu_ssh_servers`.
+
 ## Дашборд
 
 `jwu dashboard [--sync] [-a]` — TUI: вкладки Workspace / Структура / Правила / Мои задачи /
@@ -195,6 +220,7 @@ jwu memory sync --repo ~/jwu-memory          # pull → импорт → экс�
 
 | Скилл | Когда |
 |---|---|
+| `/jwu-session-init` | первый шаг сессии: воркспейс, правила, активные работы и открытые фичи — дальше всё через jwu |
 | `/jwu-workspace-setup`, `/jwu-setup-remote`, `/jwu-update` | подключить проект; настроить демон, Telegram и память; обновить jwu |
 | `/jwu-context` | «что я знаю по задаче / почему висит PR» — контекст без разбора работ, записать статус |
 | `/jwu-start-job`, `/jwu-track-job`, `/jwu-resume-job`, `/jwu-wrap-up` | начать работу с планом; вести журнал; подхватить после потери контекста (handoff); закруглить сессию |
@@ -220,7 +246,7 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 
 | Группа | Команды |
 |---|---|
-| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `configure [export\|import]`, `auth check`, `doctor` |
+| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `configure [export\|import]`, `auth check`, `doctor` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
 | внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklogs`, `pr-comment`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |
