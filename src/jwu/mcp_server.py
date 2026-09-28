@@ -436,6 +436,10 @@ async def jwu_voice_profile(workspace: Optional[str] = None) -> dict:
     """Голос пользователя: какой субагент пишет внешние тексты от его имени, профиль стиля
     (markdown, правится пользователем) и сводка корпуса его реальных текстов.
 
+    `analysis` — раздел «Анализ корпуса» в профиле: есть ли, когда сделан, по каким
+    каналам (`channels`), устарел ли (`stale`). Пишут по профилю; примеры корпуса нужны,
+    только если канала нет в анализе или пользователь сказал «не похоже на меня».
+
     Любой внешний текст от имени пользователя (коммент в PR, ответ ревьюверу, коммент в
     Jira/SDESK, текст задачи, 4test, коммит) пишет субагент `agent` — вызывающий скилл
     передаёт ему факты, а не сочиняет сам. Без сети.
@@ -450,7 +454,23 @@ async def jwu_voice_profile(workspace: Optional[str] = None) -> dict:
     return _stamp({"agent": voice_mod.agent_name(store, ws.id),
                    "profile_path": str(voice_mod.ensure_profile(ws.slug)),
                    "profile_md": voice_mod.read_profile(ws.slug),
-                   "corpus": voice_mod.corpus_stats(ws.slug)}, ws)
+                   "corpus": voice_mod.corpus_stats(ws.slug),
+                   "analysis": voice_mod.analysis_info(ws.slug)}, ws)
+
+
+@mcp.tool()
+async def jwu_voice_analysis_save(markdown: str, channels: list[str],
+                                  workspace: Optional[str] = None) -> dict:
+    """Сохранить раздел «Анализ корпуса» в профиль голоса (заменяет прежний, ручные правки
+    профиля не трогает). Локальная запись — ТОЛЬКО после того, как пользователь увидел
+    анализ и сказал «да» (скилл jwu-voice-profile). channels — каналы, которые анализ
+    покрывает (pr_comment, jira_comment, commit …).
+    """
+    from .core import voice as voice_mod
+
+    ws = _resolve(workspace)
+    path = voice_mod.save_analysis(ws.slug, markdown, channels=channels)
+    return _stamp({"ok": True, "profile_path": str(path), "analysis": voice_mod.analysis_info(ws.slug)}, ws)
 
 
 @mcp.tool()

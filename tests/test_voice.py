@@ -220,3 +220,57 @@ def test_cli_voice_show_agent_examples():
     voice_mod.merge_corpus("work", [_s(1, "commit")])
     r = runner.invoke(cli.app, ["-W", "work", "voice", "examples", "commit"])
     assert "Текст номер 1" in r.output
+
+
+# --- анализ корпуса в профиле (JWU-50) ---------------------------------------- #
+
+def test_analysis_save_replace_and_keep_manual_rules():
+    path = voice_mod.ensure_profile("work")
+    manual = path.read_text().replace("- (как ты пишешь: длина, порядок мыслей, чего избегать)",
+                                      "- Руками: без приветствий.")
+    path.write_text(manual)
+    voice_mod.add_feedback("work", channel="pr_comment", verdict="rejected", before="натянуто")
+    assert voice_mod.analysis_info("work")["present"] is False
+    voice_mod.merge_corpus("work", [_s(i, "pr_comment") for i in range(10)])
+    voice_mod.save_analysis("work", "### pr_comment\n- 3–5 предложений", channels=["pr_comment"])
+    voice_mod.save_analysis("work", "### pr_comment\n- 2–4 предложения\n### commit\n- PROJ-1: тема",
+                            channels=["pr_comment", "commit", "pr_comment"])
+    text = path.read_text()
+    assert text.count("## Анализ корпуса") == 1 and "2–4 предложения" in text and "3–5 предложений" not in text
+    assert "Руками: без приветствий." in text                                # ручное не тронуто
+    assert text.index("## Анализ корпуса") < text.index(voice_mod.FEEDBACK_HEADER) < text.index("натянуто")
+    info = voice_mod.analysis_info("work")
+    assert info["present"] and info["corpus_total"] == 10 and info["channels"] == ["commit", "pr_comment"]
+    assert info["stale"] is False
+    voice_mod.merge_corpus("work", [_s(100 + i, "commit") for i in range(5)])  # +50% корпуса
+    assert voice_mod.analysis_info("work")["stale"] is True
+    with pytest.raises(ValueError):
+        voice_mod.save_analysis("work", "  ", channels=[])
+
+
+def test_mcp_analysis_save_and_profile_reports_it(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    monkeypatch.setenv("JWU_DB_PATH", str(db))
+    monkeypatch.setattr(srv, "_base_store", None)
+    monkeypatch.setattr(srv, "_stores", {})
+    Store(db).close()
+    try:
+        assert asyncio.run(srv.jwu_voice_profile(workspace="work"))["analysis"]["present"] is False
+        out = asyncio.run(srv.jwu_voice_analysis_save("### commit\n- тема по-русски", ["commit"],
+                                                      workspace="work"))
+        assert out["analysis"]["channels"] == ["commit"]
+        prof = asyncio.run(srv.jwu_voice_profile(workspace="work"))
+        assert prof["analysis"]["present"] and "тема по-русски" in prof["profile_md"]
+    finally:
+        for s in list(srv._stores.values()):
+            s.close()
+        if srv._base_store is not None:
+            srv._base_store.close()
+
+
+def test_cli_voice_analysis_save(tmp_path):
+    md = tmp_path / "a.md"
+    md.write_text("### jira_comment\n- по делу")
+    r = runner.invoke(cli.app, ["-W", "work", "voice", "analysis", "-f", str(md), "--channels", "jira_comment"])
+    assert r.exit_code == 0, r.output
+    assert voice_mod.analysis_info("work")["channels"] == ["jira_comment"]

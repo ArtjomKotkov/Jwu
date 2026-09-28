@@ -4474,8 +4474,9 @@ def voice_show(json_out: bool = typer.Option(False, "--json", help="Вывест
         agent = voice_mod.agent_name(store, ws.id)
     path = voice_mod.ensure_profile(ws.slug)
     stats = voice_mod.corpus_stats(ws.slug)
+    analysis = voice_mod.analysis_info(ws.slug)
     if json_out:
-        _emit_json({"agent": agent, "profile": str(path), "corpus": stats})
+        _emit_json({"agent": agent, "profile": str(path), "corpus": stats, "analysis": analysis})
         return
     console.print(f"Агент голоса: [cyan]{agent}[/cyan]"
                   + ("" if agent != voice_mod.DEFAULT_AGENT else " [dim](дефолт jwu)[/dim]"))
@@ -4483,6 +4484,12 @@ def voice_show(json_out: bool = typer.Option(False, "--json", help="Вывест
     by = ", ".join(f"{k} {v}" for k, v in sorted(stats["by_channel"].items())) or "пусто"
     console.print(f"Корпус: {stats['total']} текстов ({by})"
                   + (f" · обновлён {stats['updated']}" if stats["updated"] else " · собрать — jwu voice collect"))
+    if analysis["present"]:
+        mark = " [yellow](устарел — пересобрать скиллом /jwu-voice-profile)[/yellow]" if analysis["stale"] else ""
+        console.print(f"Анализ: {analysis['at']}, по {analysis['corpus_total']} текстам, "
+                      f"каналы: {', '.join(analysis['channels']) or '—'}{mark}")
+    else:
+        console.print("Анализ: нет — сделать скиллом /jwu-voice-profile")
 
 
 @voice_app.command("agent")
@@ -4545,6 +4552,24 @@ def voice_examples(
     for it in items:
         console.print(f"[dim]{it['channel']} · {it['ref']} · {it['created'][:10]}[/dim]")
         console.print(escape(it["text"]) + "\n")
+
+
+@voice_app.command("analysis")
+def voice_analysis(
+    file: Optional[str] = typer.Option(None, "--file", "-f", help="Сохранить анализ из файла (markdown); «-» — stdin."),
+    channels: str = typer.Option("", "--channels", help="Каналы, которые покрывает анализ, через запятую."),
+) -> None:
+    """Раздел «Анализ корпуса» профиля: показать, либо сохранить из файла (заменит прежний)."""
+    from ..core import voice as voice_mod
+
+    slug = _voice_ws().slug
+    if file is None:
+        info = voice_mod.analysis_info(slug)
+        console.print(json.dumps(info, ensure_ascii=False, indent=2))
+        return
+    text = sys.stdin.read() if file == "-" else Path(file).read_text(encoding="utf-8")
+    path = voice_mod.save_analysis(slug, text, channels=[c for c in channels.split(",") if c.strip()])
+    console.print(f"[green]Анализ сохранён[/green] в {path}")
 
 
 @voice_app.command("feedback")
