@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 
 import httpx
 
-from .models import Delta, Mention
+from .models import Delta, Issue, Mention, PR
 
 if TYPE_CHECKING:
     from .config import Config
@@ -76,12 +76,29 @@ class NotifyError(RuntimeError):
 
 
 @dataclass
+class Role:
+    """Моя роль в задаче/PR события: по ней уведомление делится на «МОЁ» и «УЧАСТВУЮ».
+
+    ``assignee`` — на ком задача (по свежим данным); ``actor`` — кто перевёл статус (только
+    у событий смены статуса, из истории изменений Jira).
+    """
+
+    label: str
+    mine: bool
+    assignee: str = ""
+    assignee_is_me: bool = False
+    actor: str = ""
+
+
+@dataclass
 class Notification:
     """Собранное уведомление: заголовок контура + строки событий."""
 
     workspace: str
     deltas: list[Delta] = field(default_factory=list)
     mentions: list[Mention] = field(default_factory=list)
+    # ключ задачи/PR → моя роль; пусто — старый формат без блоков (роли не вычислены)
+    roles: dict[str, Role] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return bool(self.deltas or self.mentions)
@@ -213,6 +230,113 @@ def section(title: str, items: list[list[str]]) -> list[str]:
     return out
 
 
+ROLE_ASSIGNEE = "👤 исполнитель"
+ROLE_MY_PR = "🔧 мой PR"
+ROLE_REPORTER = "✍️ автор задачи"
+ROLE_REVIEWER = "👀 ревьюер"
+ROLE_MENTIONED = "📣 упомянули"
+ROLE_WATCHER = "👁 наблюдаю"
+STATUS_KINDS = ("status_change", "returned_from_testing")
+
+
+def _is_me(name: str, me: set[str]) -> bool:
+    return bool(name) and name.casefold() in me
+
+
+def resolve_roles(keys: Iterable[str], *, me: Iterable[str], issues: dict[str, Issue],
+                  my_prs: Iterable[PR] = (), review_prs: Iterable[PR] = (),
+                  mention_keys: Iterable[str] = (),
+                  status: Optional[dict[str, dict]] = None) -> dict[str, Role]:
+    """Роль по каждому ключу. Порядок проверки — от самого «моего» к самому стороннему.
+
+    Задача: исполнитель → задача моего PR → автор задачи → задача PR на моём ревью →
+    упомянули → наблюдаю. PR: мой → на моём ревью. ``status`` — свежие данные по
+    задачам со сменой статуса: ``{key: {"actor": …, "assignee": …}}`` (из changelog).
+    """
+    from .branches import task_key_of
+
+    me_set = {n.casefold() for n in me if n}
+    status = status or {}
+    mentioned = set(mention_keys)
+    my_pr_keys = {f"{p.project}/{p.repository}#{p.id}" for p in my_prs}
+    review_pr_keys = {f"{p.project}/{p.repository}#{p.id}" for p in review_prs}
+    my_tasks = {task_key_of(p.source_branch) or task_key_of(p.title) for p in my_prs} - {""}
+    review_tasks = {task_key_of(p.source_branch) or task_key_of(p.title) for p in review_prs} - {""}
+    out: dict[str, Role] = {}
+    for key in dict.fromkeys(keys):
+        if PR_KEY_RE.match(key):
+            if key in my_pr_keys:
+                out[key] = Role(ROLE_MY_PR, True)
+            else:
+                out[key] = Role(ROLE_REVIEWER if key in review_pr_keys else ROLE_WATCHER, False)
+            continue
+        issue = issues.get(key)
+        fresh = status.get(key) or {}
+        assignee = fresh.get("assignee", issue.assignee if issue else "") or ""
+        reporter = issue.reporter if issue else ""
+        a_me = _is_me(assignee, me_set)
+        if a_me:
+            label, mine = ROLE_ASSIGNEE, True
+        elif key in my_tasks:
+            label, mine = ROLE_MY_PR, True
+        elif _is_me(reporter, me_set):
+            label, mine = ROLE_REPORTER, False
+        elif key in review_tasks:
+            label, mine = ROLE_REVIEWER, False
+        elif key in mentioned:
+            label, mine = ROLE_MENTIONED, False
+        else:
+            label, mine = ROLE_WATCHER, False
+        out[key] = Role(label, mine, assignee=assignee, assignee_is_me=a_me,
+                        actor=fresh.get("actor", "") or "")
+    return out
+
+
+def _role_line(role: Optional[Role], kind: str) -> str:
+    """Строка роли под ключом: «👁 наблюдаю · исп. Иванов» / «перевёл Петров · на мне»."""
+    if role is None:
+        return ""
+    parts = [role.label]
+    if kind in STATUS_KINDS:
+        if role.actor:
+            parts.append(f"перевёл {role.actor}")
+        parts.append("на мне" if role.assignee_is_me else
+                     f"на {role.assignee}" if role.assignee else "не назначена")
+    elif role.assignee and not role.assignee_is_me:
+        parts.append(f"исп. {role.assignee}")
+    return " · ".join(parts)
+
+
+def _item(key: str, who: str, body: str, role_line: str, *, links: Optional[Links],
+          quote: bool = False, body_limit: int = 110) -> list[str]:
+    block = item_block(key, who, body, links=links, quote=quote, body_limit=body_limit)
+    if role_line:
+        block.insert(1, html.escape(_short(role_line, 90)))
+    return block
+
+
+def _sections(deltas: list[Delta], mentions: list[Mention], roles: dict[str, Role],
+              links: Optional[Links]) -> list[str]:
+    lines: list[str] = []
+    by_kind: dict[str, list[Delta]] = {}
+    for d in deltas:
+        by_kind.setdefault(d.kind, []).append(d)
+    order = [k for k in _GROUP_ORDER if k in by_kind] + [k for k in by_kind if k not in _GROUP_ORDER]
+    for kind in order:
+        title = SECTION_TITLES.get(kind, NOTABLE_KINDS.get(kind, kind).upper())
+        lines += section(title, [
+            _item(d.key, _who(kind, d.detail), d.summary, _role_line(roles.get(d.key), kind), links=links)
+            for d in by_kind[kind]
+        ])
+    if mentions:
+        lines += section("📣 УПОМИНАНИЯ", [
+            _item(m.task_key, m.author or "кто-то", strip_mention_tags(m.text),
+                  _role_line(roles.get(m.task_key), "mention"), links=links, quote=True, body_limit=160)
+            for m in mentions
+        ])
+    return lines
+
+
 def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
     """HTML для Telegram: шапка, секции по виду события, элементы через пустую строку.
 
@@ -222,6 +346,15 @@ def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
     """
     stamp = datetime.now().strftime("%d.%m %H:%M")
     lines = [f"🔔 <b>jwu · {html.escape(note.workspace)}</b>", stamp]
+    if note.roles:
+        # два блока: где я делаю (исполнитель, мой PR) и где лишь участвую
+        mine = lambda key: bool(note.roles.get(key) and note.roles[key].mine)  # noqa: E731
+        for title, pick in (("━━ МОЁ ━━", True), ("━━ УЧАСТВУЮ ━━", False)):
+            deltas = [d for d in note.deltas if mine(d.key) is pick]
+            mentions = [m for m in note.mentions if mine(m.task_key) is pick]
+            if deltas or mentions:
+                lines += ["", f"<b>{title}</b>"] + _sections(deltas, mentions, note.roles, links)
+        return "\n".join(lines)
     by_kind: dict[str, list[Delta]] = {}
     for d in note.deltas:
         by_kind.setdefault(d.kind, []).append(d)
@@ -364,11 +497,13 @@ def notifier_from_config(cfg: "Config") -> Optional[TelegramNotifier]:
 
 
 def build_notification(workspace: str, deltas: Iterable[Delta], mentions: Iterable[Mention] = (),
-                       *, kinds: Iterable[str] = DEFAULT_KINDS) -> Notification:
+                       *, kinds: Iterable[str] = DEFAULT_KINDS,
+                       roles: Optional[dict[str, Role]] = None) -> Notification:
     return Notification(
         workspace=workspace,
         deltas=select_notable(deltas, kinds=kinds),
         mentions=list(mentions),
+        roles=dict(roles or {}),
     )
 
 
