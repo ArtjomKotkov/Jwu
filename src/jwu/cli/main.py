@@ -4504,12 +4504,15 @@ def voice_collect(
     days: int = typer.Option(180, "--days", help="За сколько дней собирать."),
     max_prs: int = typer.Option(80, "--max-prs", help="Сколько PR просмотреть максимум."),
     max_issues: int = typer.Option(150, "--max-issues", help="Сколько задач просмотреть максимум."),
+    reset: bool = typer.Option(False, "--reset", help="Стереть корпус и собрать заново (профиль не трогается)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Собрать корпус: твои комменты в PR и Jira/SDESK, описания PR, коммиты. Только чтение."""
     from ..core import voice as voice_mod
 
     ws = _voice_ws()
+    if reset:
+        voice_mod.reset_corpus(ws.slug)
     with _service() as svc:
         report = voice_mod.collect(svc, ws.slug, [p.path for p in ws.paths], days=days,
                                    max_prs=max_prs, max_issues=max_issues)

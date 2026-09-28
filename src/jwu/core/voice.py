@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -185,6 +186,11 @@ def save_corpus(slug: str, samples: Iterable[VoiceSample]) -> int:
     return len(items)
 
 
+def reset_corpus(slug: str) -> None:
+    """Стереть корпус (профиль не трогаем): следующий collect соберёт его заново."""
+    corpus_path(slug).unlink(missing_ok=True)
+
+
 def merge_corpus(slug: str, fresh: Iterable[VoiceSample]) -> tuple[int, int]:
     """Добавить новые тексты к корпусу (по id). → (добавлено, всего)."""
     current = {s.id: s for s in load_corpus(slug)}
@@ -318,7 +324,8 @@ def _collect_prs(svc: "Service", me: set[str], since_ms: int, max_prs: int,
     if client is None:
         return []
     source = "github" if client.__class__.__name__ == "GitHubClient" else "bitbucket"
-    states = ("OPEN", "CLOSED") if source == "github" else ("ALL",)
+    # Bitbucket Server 6.1 не знает state=ALL: только OPEN | MERGED | DECLINED
+    states = ("OPEN", "CLOSED") if source == "github" else ("OPEN", "MERGED", "DECLINED")
     prs = []
     for view in ("mine", "review"):
         for state in states:
@@ -404,6 +411,12 @@ def _collect_issues(svc: "Service", me: set[str], days: int, max_issues: int,
     return out
 
 
+# Трейлеры, по которым видно, что сообщение коммита писал ассистент, а не человек.
+_AI_TRAILER_RE = re.compile(
+    r"^(Co-Authored-By:.*\b(Claude|anthropic|Copilot|Cursor|ChatGPT|OpenAI|Codex|Gemini|Aider|Devin)\b"
+    r"|Claude-Session:|Generated with \[?Claude)", re.I | re.M)
+
+
 def _collect_commits(paths: list[str], days: int, report: CollectReport) -> list[VoiceSample]:
     out: list[VoiceSample] = []
     since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
@@ -427,9 +440,12 @@ def _collect_commits(paths: list[str], days: int, report: CollectReport) -> list
             if len(parts) < 3:
                 continue
             sha, created, body = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            # трейлеры соавторства — не голос пользователя
+            # коммит, написанный ассистентом (трейлер соавторства ИИ), — не голос пользователя
+            if _AI_TRAILER_RE.search(body):
+                report.bump("git_skipped_ai")
+                continue
             body = "\n".join(ln for ln in body.splitlines()
-                             if not ln.startswith(("Co-Authored-By:", "Claude-Session:", "Signed-off-by:"))).strip()
+                             if not ln.startswith(("Co-Authored-By:", "Signed-off-by:"))).strip()
             if sha and body:
                 out.append(VoiceSample(id=f"git:{sha}", channel="commit", text=body, source="git",
                                        ref=f"{Path(path).name}@{sha[:10]}", created=created))
