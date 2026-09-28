@@ -4266,7 +4266,7 @@ ssh_app = typer.Typer(
 app.add_typer(ssh_app, name="ssh")
 
 
-def _ssh_store() -> tuple[Store, Workspace]:
+def _store_and_ws() -> tuple[Store, Workspace]:
     store = _open_store()
     ws = _resolve_workspace(store)
     store.use_workspace(ws.id)
@@ -4315,7 +4315,7 @@ def ssh_add(
     )
     pwd = typer.prompt("Пароль", hide_input=True) if password else None
     phrase = typer.prompt("Passphrase ключа", hide_input=True) if passphrase else None
-    store, ws = _ssh_store()
+    store, ws = _store_and_ws()
     with store:
         existed = any(s.name == name for s in ssh_mod.list_servers(store, ws.id))
         try:
@@ -4341,7 +4341,7 @@ def ssh_list(json_out: bool = typer.Option(False, "--json", help="Вывести
     """Стенды воркспейса и состояние интеграции с ssh-mcp."""
     from ..core import ssh as ssh_mod
 
-    store, ws = _ssh_store()
+    store, ws = _store_and_ws()
     with store:
         info = ssh_mod.describe(store, ws.id, ws.slug)
     if json_out:
@@ -4371,7 +4371,7 @@ def ssh_rm(
     """Удалить стенд вместе с его паролем/passphrase."""
     from ..core import ssh as ssh_mod
 
-    store, ws = _ssh_store()
+    store, ws = _store_and_ws()
     with store:
         try:
             ssh_mod.get_server(store, ws.id, name)
@@ -4392,7 +4392,7 @@ def ssh_config(
     """Пересобрать конфиг ssh-mcp контура из стендов воркспейса."""
     from ..core import ssh as ssh_mod
 
-    store, ws = _ssh_store()
+    store, ws = _store_and_ws()
     with store:
         path = ssh_mod.write_config(store, ws.id, ws.slug)
         if show:
@@ -4413,7 +4413,7 @@ def ssh_install(
     """
     from ..core import ssh as ssh_mod
 
-    store, ws = _ssh_store()
+    store, ws = _store_and_ws()
     with store:
         if not ssh_mod.list_servers(store, ws.id):
             err.print("[red]Стендов нет — сначала jwu ssh add.[/red]")
@@ -4438,7 +4438,7 @@ def ssh_uninstall() -> None:
     """Убрать MCP ssh-mcp контура из папок воркспейса (стенды и конфиг остаются)."""
     from ..core import ssh as ssh_mod
 
-    store, ws = _ssh_store()
+    store, ws = _store_and_ws()
     store.close()
     try:
         results = ssh_mod.uninstall_mcp(ws.slug, [p.path for p in ws.paths])
@@ -4448,6 +4448,117 @@ def ssh_uninstall() -> None:
     for r in results:
         mark = "[green]✓[/green]" if r.ok else "[dim]–[/dim]"
         console.print(f"{mark} {r.path}  [dim]{r.message}[/dim]")
+
+
+# --------------------------------------------------------------------------- #
+# voice: голос пользователя — профиль стиля и корпус его внешних текстов
+# --------------------------------------------------------------------------- #
+
+voice_app = typer.Typer(
+    help="Голос: профиль стиля и корпус твоих внешних текстов для агента, который пишет от твоего имени.")
+app.add_typer(voice_app, name="voice")
+
+
+def _voice_ws() -> Workspace:
+    with _open_store() as store:
+        return _resolve_workspace(store)
+
+
+@voice_app.command("show")
+def voice_show(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Агент голоса, путь к профилю и сводка корпуса."""
+    from ..core import voice as voice_mod
+
+    store, ws = _store_and_ws()
+    with store:
+        agent = voice_mod.agent_name(store, ws.id)
+    path = voice_mod.ensure_profile(ws.slug)
+    stats = voice_mod.corpus_stats(ws.slug)
+    if json_out:
+        _emit_json({"agent": agent, "profile": str(path), "corpus": stats})
+        return
+    console.print(f"Агент голоса: [cyan]{agent}[/cyan]"
+                  + ("" if agent != voice_mod.DEFAULT_AGENT else " [dim](дефолт jwu)[/dim]"))
+    console.print(f"Профиль: {path}")
+    by = ", ".join(f"{k} {v}" for k, v in sorted(stats["by_channel"].items())) or "пусто"
+    console.print(f"Корпус: {stats['total']} текстов ({by})"
+                  + (f" · обновлён {stats['updated']}" if stats["updated"] else " · собрать — jwu voice collect"))
+
+
+@voice_app.command("agent")
+def voice_agent(
+    name: Optional[str] = typer.Argument(None, help="Имя субагента; «-» — вернуть дефолт jwu."),
+) -> None:
+    """Какой субагент пишет тексты от твоего имени в этом воркспейсе (настройка voice.agent)."""
+    from ..core import voice as voice_mod
+
+    store, ws = _store_and_ws()
+    with store:
+        current = voice_mod.set_agent(store, ws.id, "" if name == "-" else name) if name else \
+            voice_mod.agent_name(store, ws.id)
+    console.print(f"Агент голоса: [cyan]{current}[/cyan]")
+
+
+@voice_app.command("collect")
+def voice_collect(
+    days: int = typer.Option(180, "--days", help="За сколько дней собирать."),
+    max_prs: int = typer.Option(80, "--max-prs", help="Сколько PR просмотреть максимум."),
+    max_issues: int = typer.Option(150, "--max-issues", help="Сколько задач просмотреть максимум."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Собрать корпус: твои комменты в PR и Jira/SDESK, описания PR, коммиты. Только чтение."""
+    from ..core import voice as voice_mod
+
+    ws = _voice_ws()
+    with _service() as svc:
+        report = voice_mod.collect(svc, ws.slug, [p.path for p in ws.paths], days=days,
+                                   max_prs=max_prs, max_issues=max_issues)
+    if json_out:
+        _emit_json({"added": report.added, "total": report.total, "by_source": report.by_source,
+                    "errors": report.errors})
+        return
+    by = ", ".join(f"{k} {v}" for k, v in sorted(report.by_source.items())) or "ничего"
+    console.print(f"[green]Корпус[/green]: +{report.added}, всего {report.total} ({by})")
+    for e in report.errors[:10]:
+        err.print(f"[yellow]⚠ {e}[/yellow]")
+
+
+@voice_app.command("examples")
+def voice_examples(
+    channel: str = typer.Argument(..., help="Канал: " + " | ".join(("pr_comment", "pr_reply", "jira_comment", "sdesk_client", "commit", "…"))),
+    audience: Optional[str] = typer.Option(None, "--audience", help="colleague | qa | analyst | client"),
+    limit: int = typer.Option(8, "--limit"),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Примеры твоих текстов для канала — то, что получит агент голоса."""
+    from ..core import voice as voice_mod
+
+    items = voice_mod.examples(_voice_ws().slug, channel, audience=audience, limit=limit)
+    if json_out:
+        _emit_json(items)
+        return
+    if not items:
+        console.print("[dim]Примеров нет — собери корпус: jwu voice collect[/dim]")
+    for it in items:
+        console.print(f"[dim]{it['channel']} · {it['ref']} · {it['created'][:10]}[/dim]")
+        console.print(escape(it["text"]) + "\n")
+
+
+@voice_app.command("feedback")
+def voice_feedback(
+    channel: str = typer.Option(..., "--channel", help="Канал текста."),
+    verdict: str = typer.Option(..., "--verdict", click_type=click.Choice(["edited", "rejected", "accepted"])),
+    before: str = typer.Option(..., "--before", help="Черновик агента."),
+    after: str = typer.Option("", "--after", help="Как стало после твоей правки."),
+    reason: str = typer.Option("", "--reason", help="Почему."),
+    audience: str = typer.Option("", "--audience"),
+) -> None:
+    """Дописать в профиль пару «было → стало» / «отклонено, почему» (локально)."""
+    from ..core import voice as voice_mod
+
+    path = voice_mod.add_feedback(_voice_ws().slug, channel=channel, verdict=verdict, before=before,
+                                  after=after, reason=reason, audience=audience)
+    console.print(f"[green]Записано[/green] в {path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

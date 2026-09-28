@@ -185,6 +185,27 @@ jwu memory sync --repo ~/jwu-memory          # pull → импорт → экс�
 `restore` проверяет контрольные суммы, существующую БД не трогает без `--force`, путь до БД
 переписывает под эту машину. Слить две базы без потерь — `memory import`, не `restore`.
 
+## Голос: тексты от твоего имени
+
+Любой внешний текст — коммент или ответ в PR, коммент в Jira, ответ клиенту в SDESK, текст
+задачи, 4test, коммит — скиллы jwu не сочиняют сами: они собирают факты и отдают их **агенту
+голоса**, показывают тебе результат и отправляют только после «да».
+
+```bash
+jwu voice show                 # какой агент пишет, где профиль, сколько текстов в корпусе
+jwu voice collect [--days 180] # корпус: твои комменты и описания в PR, комменты в Jira/SDESK, коммиты
+jwu voice examples pr_reply    # что агент увидит как примеры для канала
+jwu voice agent voice-me       # свой агент голоса для воркспейса («-» — дефолт jwu)
+```
+
+- В пакете только безличный агент `voice-writer-sample`. Персональное — локально, в
+  `~/.local/share/jwu/voice/<slug>/`: `profile.md` (правила, регистры, примеры; правь руками)
+  и `corpus.jsonl` (твои реальные тексты). В память и в репозиторий это не уходит.
+- Правишь или отклоняешь черновик — скилл спросит «записать в профиль?» и допишет пару
+  «было → стало» в журнал профиля.
+- Переписка с ассистентом в корпус не попадает: как ты пишешь Claude — это не твой внешний стиль.
+- MCP: `jwu_voice_profile`, `jwu_voice_examples`, `jwu_voice_feedback`, `jwu_voice_collect`.
+
 ## SSH-стенды (ssh-mcp)
 
 Стенды контура — серверы, где смотрят логи и состояние. jwu хранит их описания в
@@ -251,7 +272,7 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 
 | Группа | Команды |
 |---|---|
-| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `configure [export\|import]`, `auth check`, `doctor` |
+| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|feedback`, `configure [export\|import]`, `auth check`, `doctor` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
 | внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklogs`, `pr-comment`, `pr-comment-delete`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |
