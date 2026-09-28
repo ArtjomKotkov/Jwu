@@ -43,6 +43,7 @@ EXPECTED_SKILLS = {
     "jwu-session-init",
     "jwu-review-queue",
     "jwu-voice-profile",
+    "jwu-voice-rewrite",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
