@@ -239,3 +239,84 @@ def test_run_loop_once_skips_announce(tmp_path, monkeypatch):
     Store(db).close()
     daemon.run_loop(lambda: Store(db), once=True, factory=lambda ws: _FakeService(ws), sleep=lambda s: None)
     assert not called
+
+
+# --- итог ручного /sync в Telegram ------------------------------------------ #
+
+def _report(**per_ws):
+    r = daemon.PassReport(started_at="2026-09-28T10:00:00+00:00", finished_at="2026-09-28T10:01:05+00:00")
+    for slug, info in per_ws.items():
+        if isinstance(info, str):
+            r.failed[slug] = info
+        else:
+            r.synced.append(slug)
+            r.per_ws[slug] = info
+    return r
+
+
+def test_pass_result_text_variants():
+    quiet = {"deltas": 0, "mentions": 0, "notified": False}
+    text = daemon.pass_result_text(_report(work=quiet), ["work"])
+    assert text.startswith("✅ <b>Синк готов</b> · 1 мин 5 с") and "work — нового нет" in text
+    text = daemon.pass_result_text(_report(work={"deltas": 3, "mentions": 0, "notified": True},
+                                           gh="RuntimeError: сеть <timeout>"), ["work", "gh", "home"])
+    assert text.startswith("⚠️ <b>Синк прошёл с ошибками</b>")
+    assert "work — есть новое, уведомление выше" in text
+    assert "gh — ошибка: RuntimeError: сеть &lt;timeout&gt;" in text
+    assert "home — не синкался" in text
+    text = daemon.pass_result_text(_report(work={"deltas": 5, "mentions": 0, "notified": False}), ["work"])
+    assert "изменений 5, важных для уведомления нет" in text
+
+
+def test_report_pass_one_message_per_requested_chat(tmp_path, monkeypatch):
+    store = _registry(tmp_path)
+    sent = []
+
+    class Sender:
+        def __init__(self, chat):
+            self.chat_id = chat
+
+        def send(self, text, **kw):
+            sent.append((self.chat_id, text))
+
+        def close(self):
+            pass
+
+    chats = {"work": "42", "gh": "42"}
+    monkeypatch.setattr("jwu.core.notify.notifier_from_config", lambda cfg: None)
+    monkeypatch.setattr("jwu.core.workspaces.config_for_workspace", lambda store, ws: ws.slug)
+    monkeypatch.setattr("jwu.core.notify.notifier_from_config",
+                        lambda slug: Sender(chats[slug]) if slug in chats else None)
+    report = _report(work={"deltas": 0, "mentions": 0, "notified": False}, gh="RuntimeError: сеть")
+    assert daemon.report_pass(store, report, ["gh"]) == 1
+    assert len(sent) == 1 and "work — нового нет" in sent[0][1] and "gh — ошибка" in sent[0][1]
+    assert daemon.report_pass(store, report, []) == 0   # никто не просил — молчим
+    store.close()
+
+
+def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    Store(db).close()
+    passes, reported = [], []
+
+    def fake_pass(store, **kw):
+        passes.append(1)
+        return _report(work={"deltas": 0, "mentions": 0, "notified": False})
+
+    polls = []
+
+    def fake_poll(store, **kw):
+        polls.append(1)
+        if len(polls) == 1:
+            return [{"workspace": "work", "kind": "command", "text": "/sync"}]
+        raise KeyboardInterrupt   # после внепланового прохода — выходим из цикла
+
+    monkeypatch.setattr(daemon, "run_pass", fake_pass)
+    monkeypatch.setattr(daemon, "poll_bots", fake_poll)
+    monkeypatch.setattr(daemon, "report_pass", lambda store, report, requested: reported.append(set(requested)))
+    try:
+        daemon.run_loop(lambda: Store(db), interval=3600, announce=False, poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+    # первый проход — плановый, без отчёта; второй — по /sync, с отчётом в контур work
+    assert len(passes) == 2 and reported == [{"work"}]
