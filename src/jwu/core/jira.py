@@ -522,6 +522,28 @@ class JiraClient:
             issue.dev_ok = False  # dev-панель не запрашивали — pr/branches недостоверны
         return issue
 
+    def status_actor(self, key: str) -> dict:
+        """Кто последним менял статус задачи и на ком она сейчас — для уведомлений.
+
+        Один запрос: карточка с ``expand=changelog`` и только полями status/assignee.
+        → ``{"actor", "from", "to", "at", "assignee"}``; пустые строки, если истории нет.
+        """
+        raw = self._get(f"/api/2/issue/{key}",
+                        params={"fields": "status,assignee", "expand": "changelog"})
+        fields = raw.get("fields") or {}
+        out = {"actor": "", "from": "", "to": "", "at": "",
+               "assignee": ((fields.get("assignee") or {}).get("displayName", "") or "")}
+        for history in reversed((raw.get("changelog") or {}).get("histories") or []):
+            item = next((i for i in history.get("items") or [] if i.get("field") == "status"), None)
+            if item is None:
+                continue
+            author = history.get("author") or {}
+            out.update(actor=author.get("displayName", "") or author.get("name", "") or "",
+                       at=history.get("created", "") or "",
+                       **{"from": item.get("fromString", "") or "", "to": item.get("toString", "") or ""})
+            break
+        return out
+
     def download_attachment(self, url: str, dest: Path) -> Path:
         """Скачать файл вложения по абсолютному content-URL в dest (стримингом).
 

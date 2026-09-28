@@ -1,5 +1,7 @@
 """Уведомления после синка: отбор дельт, формат, отправка в Telegram, хук в Service.sync."""
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -149,6 +151,9 @@ def test_sync_sends_notification_when_configured(tmp_path, monkeypatch):
         assert r2.notified and tg.call_count == 1
         assert "NEEDS WORK" in tg.calls.last.request.content.decode()
         assert "PROJ/repo#42" in tg.calls.last.request.content.decode()
+        # роль вычислена из памяти: PR из вкладки «мои» — блок «МОЁ» с меткой «мой PR»
+        sent = json.loads(tg.calls.last.request.content)["text"]
+        assert "━━ МОЁ ━━" in sent and "🔧 мой PR" in sent
     finally:
         svc.close()
 

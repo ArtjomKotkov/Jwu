@@ -1743,10 +1743,43 @@ class Service:
                 return
             slug = self.workspace.slug if self.workspace else ""
             note = notify.build_notification(slug, result.deltas, result.new_mentions)
+            note.roles = self._notification_roles(note)
             result.notified = notify.send_after_sync(sender, note,
                                                      links=notify.links_from_config(self.cfg))
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning("уведомление после синка не ушло: %s", exc)
+
+    def _notification_roles(self, note: "notify.Notification") -> dict:
+        """Моя роль по каждому ключу уведомления + кто перевёл статус и на ком задача.
+
+        Роль — из памяти (снапшоты задач и PR). Для смен статуса — один запрос истории
+        изменений на задачу (их в уведомлении единицы). Любая ошибка — уведомление уйдёт
+        без ролей, как раньше: синк и доставку это не должно ронять.
+        """
+        try:
+            keys = [d.key for d in note.deltas] + [m.task_key for m in note.mentions]
+            if not keys:
+                return {}
+            issues = {i.key: i for i in self.store.latest_issues(None)}
+            status: dict[str, dict] = {}
+            for d in note.deltas:
+                if d.kind not in notify.STATUS_KINDS or d.key in status:
+                    continue
+                client = self._client_for_key(d.key) if self.tasks_client is not None else None
+                if client is None or not hasattr(client, "status_actor"):
+                    continue
+                try:
+                    status[d.key] = client.status_actor(d.key)
+                except Exception:  # noqa: BLE001 — без «кто перевёл» уведомление всё равно полезно
+                    pass
+            return notify.resolve_roles(
+                keys, me=self._me_names(), issues=issues,
+                my_prs=self.store.latest_prs("mine"), review_prs=self.store.latest_prs("review"),
+                mention_keys=[m.task_key for m in note.mentions], status=status,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("роли для уведомления не вычислены: %s", exc)
+            return {}
 
     def pr_detail(self, project: str | None, repo: str | None, pr_id: int) -> "PRDetail":
         """Лениво: PR + статус конфликта + комменты (с дифф-контекстом) + коммиты."""
