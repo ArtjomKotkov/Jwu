@@ -203,6 +203,63 @@ def merge_corpus(slug: str, fresh: Iterable[VoiceSample]) -> tuple[int, int]:
     return added, total
 
 
+# --------------------------------------------------------------------------- #
+# Анализ корпуса в профиле
+# --------------------------------------------------------------------------- #
+
+# Раздел профиля, который пишет скилл jwu-voice-profile: правила по каналам, выведенные
+# из корпуса. Агент голоса пишет по профилю и в примеры корпуса лезет, только если канала
+# нет в анализе или пользователь сказал «не похоже на меня». Границы — HTML-комментарии,
+# чтобы пересборка заменяла ровно этот раздел и не трогала ручные правки.
+_ANALYSIS_RE = re.compile(
+    r"<!-- jwu:voice-analysis (?P<meta>[^>]*)-->\n(?P<body>.*?)<!-- /jwu:voice-analysis -->\n?", re.S)
+STALE_DAYS = 90
+STALE_GROWTH = 1.25
+
+
+def save_analysis(slug: str, markdown: str, *, channels: Iterable[str]) -> Path:
+    """Записать (или заменить) раздел «Анализ корпуса» в профиле. Локальная запись."""
+    body = markdown.strip()
+    if not body:
+        raise ValueError("Пустой анализ")
+    chans = sorted({c.strip() for c in channels if c and c.strip()})
+    total = corpus_stats(slug)["total"]
+    day = datetime.now(timezone.utc).date().isoformat()
+    meta = f"at={day} total={total} channels={','.join(chans)} "
+    block = (f"<!-- jwu:voice-analysis {meta}-->\n"
+             f"## Анализ корпуса (обновлён {day}, по {total} текстам)\n\n{body}\n"
+             f"<!-- /jwu:voice-analysis -->\n")
+    path = ensure_profile(slug)
+    text = path.read_text(encoding="utf-8")
+    if _ANALYSIS_RE.search(text):
+        text = _ANALYSIS_RE.sub(lambda _m: block, text, count=1)
+    elif FEEDBACK_HEADER in text:
+        i = text.index(FEEDBACK_HEADER)
+        text = text[:i] + block + "\n" + text[i:]
+    else:
+        text = text.rstrip() + "\n\n" + block
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def analysis_info(slug: str) -> dict:
+    """Есть ли анализ, когда сделан, по скольким текстам, какие каналы, не устарел ли."""
+    m = _ANALYSIS_RE.search(read_profile(slug))
+    if not m:
+        return {"present": False, "at": "", "corpus_total": 0, "channels": [], "stale": True}
+    meta = dict(kv.split("=", 1) for kv in m.group("meta").split() if "=" in kv)
+    total_then = int(meta.get("total") or 0)
+    total_now = corpus_stats(slug)["total"]
+    at = meta.get("at", "")
+    try:
+        age = (datetime.now(timezone.utc).date() - datetime.fromisoformat(at).date()).days
+    except ValueError:
+        age = STALE_DAYS + 1
+    return {"present": True, "at": at, "corpus_total": total_then,
+            "channels": [c for c in meta.get("channels", "").split(",") if c],
+            "stale": age > STALE_DAYS or total_now > total_then * STALE_GROWTH}
+
+
 def corpus_stats(slug: str) -> dict:
     samples = load_corpus(slug)
     by_channel: dict[str, int] = {}
