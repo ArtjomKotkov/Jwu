@@ -293,6 +293,34 @@ def _pr_signature(pr: PR) -> dict:
     }
 
 
+def _merge_readiness(sig: dict) -> tuple[bool, bool]:
+    """(все апрувы, готов к мержу) по сигнатуре PR.
+
+    Все апрувы — ревьюеры есть, каждый APPROVED, никто не NEEDS_WORK. Готов к мержу —
+    плюс сборка не красная и не идёт (зелёная либо сборок нет) и нет конфликта.
+    Конфликт «неизвестно» (None — не запрашивался) мерж не блокирует.
+    """
+    revs = sig.get("reviewers") or {}
+    statuses = (sig.get("reviewer_status") or {}).values()
+    approved = bool(revs) and all(revs.values()) and "NEEDS_WORK" not in statuses
+    ready = (approved and sig.get("conflicted") is not True
+             and (sig.get("build_state") or "") in ("SUCCESSFUL", ""))
+    return approved, ready
+
+
+def _readiness_detail(sig: dict) -> str:
+    n = len(sig.get("reviewers") or {})
+    extra = []
+    build = sig.get("build_state") or ""
+    if build == "FAILED":
+        extra.append("сборка красная")
+    elif build == "INPROGRESS":
+        extra.append("сборка ещё идёт")
+    if sig.get("conflicted") is True:
+        extra.append("есть конфликт")
+    return f"апрувов {n}/{n}" + (" · " + ", ".join(extra) if extra else "")
+
+
 # --------------------------------------------------------------------------- #
 # Миграции схемы
 # --------------------------------------------------------------------------- #
@@ -1219,7 +1247,7 @@ class Store:
 
         # PR: новые комменты/коммиты, апрувы, конфликт
         pr_rows = self.conn.execute(
-            "SELECT pr_id, project, repo, signature, fields FROM pr_snapshots"
+            "SELECT pr_id, project, repo, signature, fields, views FROM pr_snapshots"
             " WHERE sync_run_id = ? AND workspace_id = ?",
             (run_id, self.workspace_id),
         ).fetchall()
@@ -1287,6 +1315,21 @@ class Store:
                 deltas.append(Delta(
                     key=pr_key, kind="build_fixed", summary=title, detail="сборка позеленела",
                 ))
+            # Мои PR: собрал все апрувы / готов к мержу — тоже по ПЕРЕХОДУ. Оба разом —
+            # только «готов к мержу»: он включает апрувы, дубль в уведомлении не нужен.
+            if "mine" in json.loads(row["views"] or "[]"):
+                prev_ok, prev_ready = _merge_readiness(prev)
+                cur_ok, cur_ready = _merge_readiness(cur)
+                if cur_ready and not prev_ready:
+                    deltas.append(Delta(
+                        key=pr_key, kind="pr_ready_to_merge", summary=title,
+                        detail=f"апрувов {len(cur.get('reviewers') or {})}/{len(cur.get('reviewers') or {})}"
+                               " · сборка ок · конфликтов нет",
+                    ))
+                elif cur_ok and not prev_ok:
+                    deltas.append(Delta(
+                        key=pr_key, kind="pr_all_approved", summary=title, detail=_readiness_detail(cur),
+                    ))
 
         deltas.extend(self._gone_deltas(run_id))
         return deltas

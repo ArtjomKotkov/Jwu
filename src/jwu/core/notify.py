@@ -63,11 +63,13 @@ NOTABLE_KINDS: dict[str, str] = {
     "status_change": "🔀 статус",
     "returned_from_testing": "↩️ вернули с тестов",
     "qa_comment": "🧪 комментарий QA",
+    "pr_all_approved": "👍 все апрувы",
+    "pr_ready_to_merge": "🚀 готов к мержу",
 }
 # Что слать по умолчанию, если пользователь не настроил свой набор.
 DEFAULT_KINDS: tuple[str, ...] = (
     "new_conflict", "build_failed", "reviewer_needs_work", "new_pr_task",
-    "returned_from_testing", "qa_comment",
+    "returned_from_testing", "qa_comment", "pr_all_approved", "pr_ready_to_merge",
 )
 
 
@@ -171,7 +173,8 @@ def _clean_detail(kind: str, detail: str) -> str:
 
 # Порядок групп в сообщении: сначала блокеры мержа, потом остальное.
 _GROUP_ORDER = ["new_conflict", "build_failed", "reviewer_needs_work", "new_pr_task",
-                "returned_from_testing", "qa_comment", "new_pr_comment", "status_change"]
+                "returned_from_testing", "qa_comment", "pr_ready_to_merge", "pr_all_approved",
+                "new_pr_comment", "status_change"]
 
 
 SECTION_TITLES: dict[str, str] = {
@@ -184,6 +187,8 @@ SECTION_TITLES: dict[str, str] = {
     "returned_from_testing": "↩️ ВЕРНУЛИ С ТЕСТОВ",
     "qa_comment": "🧪 КОММЕНТАРИЙ QA",
     "build_fixed": "✅ СБОРКА ПОЗЕЛЕНЕЛА",
+    "pr_all_approved": "👍 СОБРАЛ ВСЕ АПРУВЫ",
+    "pr_ready_to_merge": "🚀 ГОТОВ К МЕРЖУ",
 }
 MENTION_TAG_RE = re.compile(r"\[~[^\]]+\]\s*[-—:,]?\s*")
 
@@ -203,7 +208,8 @@ def _who(kind: str, detail: str) -> str:
         if m:
             return (f"{m.group(2)} · +{m.group(1)}" if m.group(2) else f"+{m.group(1)}")
         return text
-    if kind in ("new_pr_task", "pr_task_resolved", "status_change", "returned_from_testing"):
+    if kind in ("new_pr_task", "pr_task_resolved", "status_change", "returned_from_testing",
+                "pr_all_approved", "pr_ready_to_merge"):
         return text
     return ""
 
