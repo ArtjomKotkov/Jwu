@@ -55,6 +55,14 @@ description: Use when the user wants to put a short task (checkbox) on a pull-re
 3. После «да» — `jwu_pr_task_done(task_ids=[...])`. Одно подтверждение на всю пачку.
 4. Ошибся — `jwu_pr_task_done(task_ids=[...], reopen=True)`.
 
+## Шаги: поправить или удалить
+
+- **Поправить текст** своей задачи: новый текст снова формулирует пользователь (до 10 слов),
+  превью «было → стало» → «да» → `jwu_pr_task_edit(task_id, text)` (bash:
+  `jwu pr-task edit <ID> "…" --yes`).
+- **Удалить** лишнюю задачу (не «сделано» — для этого закрытие выше): покажи текст → «да» →
+  `jwu_pr_task_delete(task_id)` (bash: `jwu pr-task delete <ID> --yes`). Только свои.
+
 ## Где это всплывает само
 
 - **jwu-resume-job**: при подхвате работы открытые задачи PR — это «что осталось».

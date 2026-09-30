@@ -443,6 +443,42 @@ class BitbucketClient:
             f"?version={int(version)}",
         )
 
+    def pr_comment_update(self, project: str, repo: str, pr_id: int, comment_id: int | str,
+                          text: str, version: int) -> dict:
+        """Заменить текст коммента; ``version`` — текущая версия (защита от гонки правок)."""
+        return self._send(
+            "PUT",
+            f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{int(comment_id)}",
+            {"text": text, "version": int(version)},
+        )
+
+    def pr_raw(self, project: str, repo: str, pr_id: int) -> dict:
+        return self._get(f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}")
+
+    def pr_update(self, project: str, repo: str, pr_id: int, *, title: str | None = None,
+                  description: str | None = None) -> dict:
+        """Поправить заголовок/описание PR. Ревьюеры передаются текущие — иначе Bitbucket
+        Server при PUT без списка их снимает."""
+        raw = self.pr_raw(project, repo, pr_id)
+        payload = {
+            "version": raw.get("version", 0),
+            "title": raw.get("title", "") if title is None else title,
+            "description": raw.get("description", "") if description is None else description,
+            "reviewers": [{"user": {"name": (r.get("user") or {}).get("name", "")}}
+                          for r in raw.get("reviewers", []) or []],
+        }
+        return self._send("PUT", f"/projects/{project}/repos/{repo}/pull-requests/{pr_id}", payload)
+
+    def task_get(self, task_id: int) -> dict:
+        return self._get(f"/tasks/{int(task_id)}")
+
+    def task_update_text(self, task_id: int, text: str) -> PRTask:
+        raw = self._send("PUT", f"/tasks/{int(task_id)}", {"id": int(task_id), "text": text})
+        return PRTask.from_bitbucket(raw)
+
+    def task_delete(self, task_id: int) -> None:
+        self._send("DELETE", f"/tasks/{int(task_id)}")
+
     def pr_comments(self, project: str, repo: str, pr_id: int) -> list[PRComment]:
         """Комментарии PR из activities: общие + inline (с file:line и куском диффа)."""
         acts = self._paged(

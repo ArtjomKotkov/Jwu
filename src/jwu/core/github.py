@@ -369,6 +369,51 @@ class GitHubClient:
         owner, repo, number = self._require_ref(key)
         return self._post(f"/repos/{owner}/{repo}/issues/{number}/comments", {"body": body})
 
+    def _patch(self, path: str, body: dict) -> dict:
+        try:
+            resp = self._client.patch(path, json=body)
+        except httpx.HTTPError as exc:
+            raise GitHubError(f"Сеть/GitHub недоступен: {exc}") from exc
+        self._raise_for(resp)
+        return resp.json() if resp.content else {}
+
+    def _comment_repo(self, key: str) -> tuple[str, str]:
+        owner, repo, _number = self._require_ref(key)
+        return owner, repo
+
+    def get_comment(self, key: str, comment_id: str | int) -> dict:
+        owner, repo = self._comment_repo(key)
+        raw = self._get(f"/repos/{owner}/{repo}/issues/comments/{int(comment_id)}")
+        # в терминах Jira: автор в author.name — так проверка «мой ли» одна на оба трекера
+        raw["author"] = {"name": ((raw.get("user") or {}).get("login", "") or "")}
+        return raw
+
+    def update_comment(self, key: str, comment_id: str | int, body: str) -> dict:
+        owner, repo = self._comment_repo(key)
+        return self._patch(f"/repos/{owner}/{repo}/issues/comments/{int(comment_id)}", {"body": body})
+
+    def delete_comment(self, key: str, comment_id: str | int) -> None:
+        owner, repo = self._comment_repo(key)
+        self._delete(f"/repos/{owner}/{repo}/issues/comments/{int(comment_id)}")
+
+    def update_issue(self, key: str, fields: dict) -> None:
+        raise GitHubError(self._NO_CREATE.replace("Создание", "Правка"))
+
+    def get_worklog(self, key: str, worklog_id: str | int) -> dict:
+        raise GitHubError("В GitHub нет таймтрекера — ворклогов нет.")
+
+    def pr_update(self, project: str, repo: str, pr_id: int, *, title: str | None = None,
+                  description: str | None = None) -> dict:
+        owner, name = self._split_repo(project, repo)
+        body = {k: v for k, v in (("title", title), ("body", description)) if v is not None}
+        return self._patch(f"/repos/{owner}/{name}/pulls/{pr_id}", body)
+
+    def pr_comment_update(self, project: str, repo: str, pr_id: int, comment_id: int | str,
+                          text: str, kind: str = "pull") -> dict:
+        owner, name = self._split_repo(project, repo)
+        section = "pulls" if kind == "pull" else "issues"
+        return self._patch(f"/repos/{owner}/{name}/{section}/comments/{int(comment_id)}", {"body": text})
+
     _NO_CREATE = (
         "Создание задач в jwu сделано для Jira (REST v2 + createmeta) и в контуре GitHub "
         "не поддержано. Заводи Issue в вебе или через gh issue create."

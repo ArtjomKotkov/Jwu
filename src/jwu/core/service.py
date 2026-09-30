@@ -1060,6 +1060,95 @@ class Service:
             )
         return self._client_for_key(key).add_comment(key, text)
 
+    # --- правка и удаление (JWU-53): только своё, ВНЕШНЯЯ запись после «да» ---- #
+
+    def _ensure_mine(self, author: str, what: str) -> None:
+        me = {n.casefold() for n in self._me_names() if n}
+        if not author or author.casefold() not in me:
+            raise ValueError(f"{what} — не твой (автор {author or '?'}): jwu правит и удаляет только своё.")
+
+    def _ensure_client_ok(self, key: str, client_facing: bool) -> None:
+        if self._key_is_sdesk(key) and not client_facing:
+            raise ValueError(f"{key} — задача SDESK, её комментарии видит КЛИЕНТ. Подтверди явно: "
+                             f"CLI — --to-client, MCP — client_facing=True.")
+
+    def issue_comment_update(self, key: str, comment_id: str, text: str, *,
+                             client_facing: bool = False) -> dict:
+        """Поправить СВОЙ комментарий в задаче. Для SDESK — только с client_facing."""
+        self._require_tasks()
+        if not (text or "").strip():
+            raise ValueError("Пустой текст — для удаления есть отдельная команда")
+        self._ensure_client_ok(key, client_facing)
+        client = self._client_for_key(key)
+        old = client.get_comment(key, comment_id)
+        self._ensure_mine(((old.get("author") or {}).get("name", "") or ""), f"Комментарий {comment_id}")
+        client.update_comment(key, comment_id, text)
+        return {"key": key, "id": str(comment_id), "before": old.get("body", "") or "", "after": text}
+
+    def issue_comment_delete(self, key: str, comment_id: str, *, client_facing: bool = False) -> dict:
+        self._require_tasks()
+        self._ensure_client_ok(key, client_facing)
+        client = self._client_for_key(key)
+        old = client.get_comment(key, comment_id)
+        self._ensure_mine(((old.get("author") or {}).get("name", "") or ""), f"Комментарий {comment_id}")
+        client.delete_comment(key, comment_id)
+        return {"key": key, "id": str(comment_id), "deleted": True, "text": old.get("body", "") or ""}
+
+    def issue_update(self, key: str, *, summary: str | None = None, description: str | None = None,
+                     assignee: str | None = None, priority: str | None = None,
+                     labels: list[str] | None = None) -> dict:
+        """Поправить поля задачи Jira. Удаления задач в jwu нет — сознательно."""
+        self._require_tasks()
+        fields: dict = {}
+        if summary is not None:
+            if not summary.strip():
+                raise ValueError("Пустой заголовок")
+            fields["summary"] = summary.strip()
+        if description is not None:
+            fields["description"] = description
+        if assignee is not None:
+            fields["assignee"] = {"name": assignee} if assignee else None
+        if priority is not None:
+            fields["priority"] = {"name": priority}
+        if labels is not None:
+            fields["labels"] = list(labels)
+        if not fields:
+            raise ValueError("Нечего менять: задай хотя бы одно поле")
+        self._client_for_key(key).update_issue(key, fields)
+        return {"key": key, "fields": sorted(fields)}
+
+    def worklog_update(self, key: str, worklog_id: str, *, time: str | None = None,
+                       started: str | None = None, comment: str | None = None) -> dict:
+        """Поправить СВОЙ ворклог. ``started`` — ISO со смещением либо «YYYY-MM-DD HH:MM»
+        (тогда в поясе контура ``worklog.timezone``)."""
+        from . import timechain
+
+        self._require_tasks()
+        if time is None and started is None and comment is None:
+            raise ValueError("Нечего менять: время, начало или описание")
+        if time is not None:
+            time = timechain.fmt_duration(timechain.parse_duration(time))
+        if started is not None:
+            started = timechain.to_jira_started(started, timechain.get_timezone(self.store, self.store.workspace_id))
+        client = self._client_for_key(key)
+        old = client.get_worklog(key, worklog_id)
+        self._ensure_mine(((old.get("author") or {}).get("name", "") or ""), f"Ворклог {worklog_id}")
+        client.update_worklog(key, worklog_id, time_spent=time, started=started, comment=comment)
+        return {"key": key, "id": str(worklog_id),
+                "before": {"time": old.get("timeSpent", ""), "started": old.get("started", ""),
+                           "comment": old.get("comment", "")},
+                "after": {k: v for k, v in (("time", time), ("started", started), ("comment", comment))
+                          if v is not None}}
+
+    def worklog_delete(self, key: str, worklog_id: str) -> dict:
+        self._require_tasks()
+        client = self._client_for_key(key)
+        old = client.get_worklog(key, worklog_id)
+        self._ensure_mine(((old.get("author") or {}).get("name", "") or ""), f"Ворклог {worklog_id}")
+        client.delete_worklog(key, worklog_id)
+        return {"key": key, "id": str(worklog_id), "deleted": True,
+                "time": old.get("timeSpent", ""), "started": old.get("started", "")}
+
     def key_is_client_facing(self, key: str) -> bool:
         """Уедет ли запись по этому ключу клиенту (SDESK), а не только команде."""
         return self._key_is_sdesk(key)
@@ -1228,6 +1317,7 @@ class Service:
                 continue
             mine = [
                 {
+                    "id": str(w.get("id", "") or ""),
                     "time": w.get("timeSpent", "") or "",
                     "seconds": int(w.get("timeSpentSeconds", 0) or 0),
                     "comment": w.get("comment", "") or "",
@@ -1411,6 +1501,64 @@ class Service:
             if c.id == cid:
                 return c.anchor_idx >= 0 and bool(c.context)
         return None
+
+    def pr_comment_update(self, project: str | None, repo: str | None, pr_id: int,
+                          comment_id: int | str, text: str) -> dict:
+        """Поправить СВОЙ коммент в PR. ВНЕШНЯЯ запись — после подтверждения."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Пустой текст — для удаления есть jwu_pr_comment_delete")
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        project, repo = project or default_project, repo or default_repo
+        raw = client.pr_comment_get(project, repo, pr_id, comment_id)
+        if isinstance(client, GitHubClient):
+            author = ((raw.get("user") or {}).get("login", "") or "")
+            before = raw.get("body", "") or ""
+        else:
+            author = ((raw.get("author") or {}).get("name", "") or "")
+            before = raw.get("text", "") or ""
+        self._ensure_mine(author, f"Комментарий #{comment_id}")
+        if isinstance(client, GitHubClient):
+            client.pr_comment_update(project, repo, pr_id, comment_id, text, kind=raw.get("_kind", "pull"))
+        else:
+            client.pr_comment_update(project, repo, pr_id, comment_id, text, int(raw.get("version", 0) or 0))
+        return {"id": str(comment_id), "before": before, "after": text}
+
+    def pr_update(self, project: str | None, repo: str | None, pr_id: int, *,
+                  title: str | None = None, description: str | None = None) -> dict:
+        """Поправить заголовок/описание СВОЕГО PR. ВНЕШНЯЯ запись — после подтверждения."""
+        if title is None and description is None:
+            raise ValueError("Нечего менять: заголовок или описание")
+        if title is not None and not title.strip():
+            raise ValueError("Пустой заголовок")
+        client = self._require_prs()
+        default_project, default_repo = self.default_pr_ref()
+        project, repo = project or default_project, repo or default_repo
+        pull = client.pr(project, repo, pr_id, with_merge=False)
+        if isinstance(client, GitHubClient):
+            author = pull.author
+        else:
+            author = ((client.pr_raw(project, repo, pr_id).get("author") or {}).get("user") or {}).get("name", "")
+        self._ensure_mine(author, f"PR #{pr_id}")
+        client.pr_update(project, repo, pr_id, title=title, description=description)
+        return {"pr": pr_id, "before": {"title": pull.title, "description": pull.description},
+                "after": {k: v for k, v in (("title", title), ("description", description)) if v is not None}}
+
+    def pr_task_update(self, task_id: int, text: str) -> PRTask:
+        """Поправить текст СВОЕЙ задачи на комменте PR (до 10 слов)."""
+        text = check_task_text(text)
+        client = self._require_bitbucket()
+        raw = client.task_get(task_id)
+        self._ensure_mine(((raw.get("author") or {}).get("name", "") or ""), f"Задача #{task_id}")
+        return client.task_update_text(task_id, text)
+
+    def pr_task_delete(self, task_id: int) -> dict:
+        client = self._require_bitbucket()
+        raw = client.task_get(task_id)
+        self._ensure_mine(((raw.get("author") or {}).get("name", "") or ""), f"Задача #{task_id}")
+        client.task_delete(task_id)
+        return {"id": int(task_id), "deleted": True, "text": raw.get("text", "") or ""}
 
     def pr_comment_delete(self, project: str | None, repo: str | None, pr_id: int,
                           comment_id: int | str) -> dict:

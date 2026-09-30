@@ -60,6 +60,15 @@ description: Use when the user wants to answer in a pull request through jwu —
 2. Спроси статус явно: approve / needs-work. Для needs-work собери текст замечаний.
 3. Превью (`PR #… → NEEDS_WORK`, текст) → «да» → `jwu_pr_review(pr_id, status, text)`.
 
+## Правка своего коммента и своего PR
+
+- **Коммент:** найди `id` в `jwu_pr(...).comments[]` (автор — ты). Покажи «было → стало»,
+  после «да» — `jwu_pr_comment_edit(pr_id, comment_id, text)` (bash:
+  `jwu pr-comment-edit <PR> <CID> -m … --yes`). Удаление — `jwu_pr_comment_delete`.
+- **Свой PR:** заголовок и/или описание — `jwu_pr_update(pr_id, title=…, description=…)`
+  (bash: `jwu pr-edit <PR> --title … -F описание.md --yes`); ревьюеры сохраняются.
+  Показать было → стало, «да». Чужой PR jwu править откажется.
+
 ## Текст от имени пользователя (голос)
 
 Итоговую формулировку любого текста, который уйдёт наружу от имени пользователя или

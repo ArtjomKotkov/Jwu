@@ -759,6 +759,97 @@ async def jwu_pr_comment_delete(
 
 
 @mcp.tool()
+async def jwu_pr_comment_edit(pr_id: int, comment_id: int, text: str, project: Optional[str] = None,
+                              repo: Optional[str] = None, workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: заменить текст своего коммента в PR (Bitbucket/GitHub). Ответ —
+    before/after. Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _full_svc(workspace)
+    return _stamp({"pr": pr_id, **svc.pr_comment_update(project, repo, pr_id, comment_id, text)},
+                  _resolve(workspace))
+
+
+
+@mcp.tool()
+async def jwu_pr_update(pr_id: int, title: Optional[str] = None, description: Optional[str] = None,
+                        project: Optional[str] = None, repo: Optional[str] = None,
+                        workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: поправить заголовок и/или описание своего PR (None — не трогать;
+    ревьюеры сохраняются). Ответ — before/after. Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _full_svc(workspace)
+    return _stamp(svc.pr_update(project, repo, pr_id, title=title, description=description),
+                  _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_task_edit(task_id: int, text: str, workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: поправить текст своей задачи на комменте PR (Bitbucket, до 10 слов;
+    текст формулирует пользователь). Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _full_svc(workspace)
+    return _stamp(svc.pr_task_update(task_id, text).model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_task_delete(task_id: int, workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: удалить свою задачу на комменте PR (Bitbucket). Закрыть — это
+    jwu_pr_task_done, удаление — если задача была лишней. Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _full_svc(workspace)
+    return _stamp(svc.pr_task_delete(task_id), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_comment_edit(key: str, comment_id: str, text: str, client_facing: bool = False,
+                           workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: заменить текст своего комментария в задаче Jira/SDESK. Для SDESK
+    (читает КЛИЕНТ) — только с client_facing=True после отдельного подтверждения.
+    id коммента — из jwu_task (comments[].id). Ответ — before/after. Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _require_jira(_full_svc(workspace))
+    return _stamp(svc.issue_comment_update(key, comment_id, text, client_facing=client_facing),
+                  _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_comment_delete(key: str, comment_id: str, client_facing: bool = False,
+                             workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: удалить свой комментарий в задаче Jira/SDESK (для SDESK —
+    client_facing=True). Необратимо: покажи текст удаляемого и дождись «да». Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _require_jira(_full_svc(workspace))
+    return _stamp(svc.issue_comment_delete(key, comment_id, client_facing=client_facing),
+                  _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_issue_update(key: str, summary: Optional[str] = None, description: Optional[str] = None,
+                           assignee: Optional[str] = None, priority: Optional[str] = None,
+                           labels: Optional[list[str]] = None, workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: поправить поля задачи Jira — заголовок, описание (wiki-разметка),
+    исполнитель (логин; "" — снять), приоритет (имя), метки (список целиком). None — не
+    трогать. Удаления задач в jwu НЕТ и не будет. Показать было → стало, дождаться «да»."""
+    svc = _require_jira(_full_svc(workspace))
+    return _stamp(svc.issue_update(key, summary=summary, description=description, assignee=assignee,
+                                   priority=priority, labels=labels), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_worklog_edit(key: str, worklog_id: str, time: Optional[str] = None,
+                           started: Optional[str] = None, comment: Optional[str] = None,
+                           workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: поправить свой ворклог — время («1h 30m»), начало («2026-09-30 10:00»
+    в поясе контура или ISO со смещением), описание. id — из jwu_worklogs. Сдвиг одного
+    ворклога ломает цепочку дня — предложи сдвинуть соседние. Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _require_jira(_full_svc(workspace))
+    return _stamp(svc.worklog_update(key, worklog_id, time=time, started=started, comment=comment),
+                  _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_worklog_delete(key: str, worklog_id: str, workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: удалить свой ворклог (id — из jwu_worklogs). Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
+    svc = _require_jira(_full_svc(workspace))
+    return _stamp(svc.worklog_delete(key, worklog_id), _resolve(workspace))
+
+
+
+@mcp.tool()
 async def jwu_pr_create(
     target: str,
     title: str,
@@ -1671,7 +1762,8 @@ async def jwu_worklogs(
     находятся сами по JQL (worklogAuthor/worklogDate) в Jira и SDESK. Со списком ключей
     смотрит только их. Обязательная проверка перед jwu_worklog, чтобы не задвоить время.
 
-    on — дата YYYY-MM-DD. Ответ: {KEY: [{time, seconds, comment, started}, …]}.
+    on — дата YYYY-MM-DD. Ответ: {KEY: [{id, time, seconds, comment, started}, …]};
+    id — для jwu_worklog_edit / jwu_worklog_delete.
     """
     svc = _require_jira(_full_svc(workspace))
     targets = list(keys or []) or svc.my_worklog_keys_on(on)
@@ -1689,7 +1781,7 @@ async def jwu_comment(
     """ВНЕШНЯЯ ЗАПИСЬ: комментарий в задачу Jira/SDESK. Только по явному подтверждению.
 
     Это НЕ локальная заметка (для неё есть jwu_note) — текст уходит в саму Jira и
-    удалить его через jwu нельзя. Порядок обязателен: сначала dry_run=True (по умолчанию)
+    править и удалять — jwu_comment_edit / jwu_comment_delete. Порядок обязателен: сначала dry_run=True (по умолчанию)
     — вернётся текст и признак `client_facing`; ПОКАЗАТЬ текст пользователю целиком,
     дождаться явного «да» и только потом повторить с dry_run=False.
 

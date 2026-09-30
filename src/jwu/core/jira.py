@@ -338,7 +338,49 @@ class JiraClient:
         self._raise_for(resp)
         return resp.json() if resp.content else {}
 
+    def _put(self, path: str, json_body: dict, params: dict | None = None) -> dict:
+        resp = self._send(lambda: self._client.put(path, json=json_body, params=params))
+        self._raise_for(resp)
+        return resp.json() if resp.content else {}
+
+    def _delete(self, path: str, params: dict | None = None) -> None:
+        resp = self._send(lambda: self._client.delete(path, params=params))
+        self._raise_for(resp)
+
     # --- API ------------------------------------------------------------- #
+
+    def get_comment(self, key: str, comment_id: str | int) -> dict:
+        return self._get(f"/api/2/issue/{key}/comment/{comment_id}")
+
+    def update_comment(self, key: str, comment_id: str | int, body: str) -> dict:
+        """Заменить текст комментария (``PUT /issue/{key}/comment/{id}``)."""
+        return self._put(f"/api/2/issue/{key}/comment/{comment_id}", {"body": body})
+
+    def delete_comment(self, key: str, comment_id: str | int) -> None:
+        self._delete(f"/api/2/issue/{key}/comment/{comment_id}")
+
+    def get_worklog(self, key: str, worklog_id: str | int) -> dict:
+        return self._get(f"/api/2/issue/{key}/worklog/{worklog_id}")
+
+    def update_worklog(self, key: str, worklog_id: str | int, *, time_spent: str | None = None,
+                       started: str | None = None, comment: str | None = None) -> dict:
+        """Поправить ворклог: время, начало, описание (None — не трогать)."""
+        body: dict = {}
+        if time_spent is not None:
+            body["timeSpent"] = time_spent
+        if started is not None:
+            body["started"] = started
+        if comment is not None:
+            body["comment"] = comment
+        return self._put(f"/api/2/issue/{key}/worklog/{worklog_id}", body,
+                         params={"adjustEstimate": "auto"})
+
+    def delete_worklog(self, key: str, worklog_id: str | int) -> None:
+        self._delete(f"/api/2/issue/{key}/worklog/{worklog_id}", params={"adjustEstimate": "auto"})
+
+    def update_issue(self, key: str, fields: dict) -> None:
+        """Поправить поля задачи (``PUT /issue/{key}``). Удаления задач в jwu нет."""
+        self._put(f"/api/2/issue/{key}", {"fields": fields})
 
     def add_worklog(
         self,

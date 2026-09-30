@@ -54,6 +54,16 @@ Bash: `jwu comment KEY -m "…"` либо `jwu comment KEY -F ./answer.md` (фа
    `client_facing=True`).
 5. **Запиши в работу**, если она есть: `jwu_job_add(job_id, "Ответ в <KEY>", kind="note")`.
 
+## Правка и удаление своего комментария
+
+- `id` коммента — из `jwu_task(KEY).comments[]` (автор — ты).
+- **Правка:** превью «было → стало» → «да» → `jwu_comment_edit(key, comment_id, text,
+  client_facing)` (bash: `jwu comment-edit KEY ID -m … --yes`).
+- **Удаление:** покажи удаляемый текст → «да» → `jwu_comment_delete(key, comment_id,
+  client_facing)` (bash: `jwu comment-delete KEY ID --yes`). Необратимо.
+- **SDESK** — и правку, и удаление видит клиент: то же строгое подтверждение, что при
+  создании (`client_facing=True` / `--to-client` только после отдельного «да»).
+
 ## Текст от имени пользователя (голос)
 
 Итоговую формулировку любого текста, который уйдёт наружу от имени пользователя или
