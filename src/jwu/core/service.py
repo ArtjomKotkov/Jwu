@@ -860,6 +860,51 @@ class Service:
             key, time_spent, comment=comment, started=started
         )
 
+    def worklog_chain(self, items: list[dict], *, start: str, day: str, tz: str = "",
+                      dry_run: bool = True) -> dict:
+        """Ворклоги цепочкой: каждый начинается, где закончился предыдущий.
+
+        ``items`` — [{key, time, comment}] по порядку; ``start`` — «10:00»; ``day`` —
+        YYYY-MM-DD; ``tz`` — пояс (пусто — настройка контура ``worklog.timezone``).
+        ``dry_run`` — только план + сверка с уже затреканным за день (без записи).
+        Запись идёт по порядку и останавливается на первой ошибке: цепочка не должна
+        рваться молча. ВНЕШНЯЯ запись — только после подтверждения пользователя.
+        """
+        from datetime import date as _date
+
+        from . import timechain
+
+        self._require_tasks()
+        tz_name = tz or (timechain.get_timezone(self.store, self.store.workspace_id) if self.store else "")
+        if not tz_name:
+            raise timechain.ChainError(
+                "Часовой пояс для трекинга не задан — спроси пользователя и сохрани: "
+                "jwu_worklog_timezone(tz=…) / jwu worklog-tz Europe/Moscow")
+        chain = timechain.plan(items, start=start, day=_date.fromisoformat(day), tz_name=tz_name)
+        keys = list(dict.fromkeys(i.key for i in chain))
+        try:
+            existing = self.my_worklogs_on(list(dict.fromkeys(keys + self.my_worklog_keys_on(day))), day)
+        except Exception:  # noqa: BLE001 — без сверки план всё равно полезен
+            existing = {}
+        result = {
+            "timezone": tz_name, "day": day,
+            "items": [i.as_dict() for i in chain],
+            "total": timechain.fmt_duration(sum(i.seconds for i in chain)),
+            "overlaps": timechain.overlaps(chain, existing),
+            "existing_ends_at": timechain.latest_end(existing, tz_name),
+            "written": [], "failed": None,
+        }
+        if dry_run:
+            return result
+        for item in chain:
+            try:
+                self.add_worklog(item.key, item.time, comment=item.comment or None, started=item.started)
+            except Exception as exc:  # noqa: BLE001
+                result["failed"] = {"key": item.key, "from": item.start_local, "error": str(exc)}
+                break
+            result["written"].append({"key": item.key, "from": item.start_local, "to": item.end_local})
+        return result
+
     def _workspace_repo_roots(self) -> dict[str, str]:
         """Каталоги git-репозиториев воркспейса → имя репозитория (из origin)."""
         from . import gitinfo

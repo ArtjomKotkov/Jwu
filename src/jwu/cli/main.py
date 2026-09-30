@@ -3179,6 +3179,81 @@ def worklog(
         console.print(f"[green]✓[/green] {key}: затрекано {time}")
 
 
+@app.command("worklog-tz")
+def worklog_tz(
+    tz: Optional[str] = typer.Argument(None, help="Пояс: Europe/Moscow или МСК. Без него — показать."),
+) -> None:
+    """Часовой пояс для трекинга времени (настройка воркспейса)."""
+    from ..core import timechain
+
+    store, ws = _store_and_ws()
+    with store:
+        try:
+            value = timechain.set_timezone(store, ws.id, tz) if tz else timechain.get_timezone(store, ws.id)
+        except timechain.ChainError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+    console.print(f"Пояс трекинга: [cyan]{value or 'не задан'}[/cyan]")
+
+
+@app.command("worklog-chain")
+def worklog_chain(
+    start: str = typer.Option(..., "--start", "-s", help="Начало первого ворклога, напр. 10:00."),
+    items: list[str] = typer.Option(..., "--item", "-i",
+        help="«KEY|1h 30m|описание» — по порядку, можно несколько."),
+    on: str = typer.Option("today", "--on", help="Дата (YYYY-MM-DD или 'today')."),
+    tz: Optional[str] = typer.Option(None, "--tz", help="Пояс (по умолчанию — из jwu worklog-tz)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Записать без вопроса."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Затрекать задачи ЦЕПОЧКОЙ: каждая начинается там, где закончилась предыдущая."""
+    from ..core import timechain
+
+    parsed = []
+    for raw in items:
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) < 2:
+            err.print(f"[red]Строка «{raw}»: нужно «KEY|время|описание».[/red]")
+            raise typer.Exit(1)
+        parsed.append({"key": parts[0], "time": parts[1], "comment": "|".join(parts[2:])})
+    day = datetime.now().date().isoformat() if on.lower() == "today" else on
+    with _service_with_jira() as svc:
+        try:
+            plan = svc.worklog_chain(parsed, start=start, day=day, tz=tz or "", dry_run=True)
+        except timechain.ChainError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        if not json_out:
+            table = Table(show_header=True, header_style="bold")
+            for col in ("Задача", "С", "По", "Время", "Описание"):
+                table.add_column(col)
+            for it in plan["items"]:
+                table.add_row(it["key"], it["start_local"], it["end_local"], it["time"],
+                              (it["comment"] or "—")[:60])
+            console.print(f"{day}, пояс {plan['timezone']}")
+            console.print(table)
+            console.print(f"Итого: {plan['total']}")
+            for o in plan["overlaps"]:
+                err.print(f"[yellow]⚠ пересекается с уже затреканным: {o['key']} {o['from']}–{o['to']} ({o['time']})[/yellow]")
+        if not yes:
+            if json_out:
+                _emit_json({"ok": False, "reason": "confirm_required", **plan})
+                raise typer.Exit(0)
+            if not typer.confirm("Трекаем?", default=False):
+                console.print("[dim]Отменено.[/dim]")
+                raise typer.Exit(1)
+        result = svc.worklog_chain(parsed, start=start, day=day, tz=tz or "", dry_run=False)
+    if json_out:
+        _emit_json(result)
+        raise typer.Exit(1 if result["failed"] else 0)
+    for w in result["written"]:
+        console.print(f"[green]✓[/green] {w['key']} {w['from']}–{w['to']}")
+    if result["failed"]:
+        f = result["failed"]
+        err.print(f"[red]✗[/red] {f['key']} с {f['from']}: {f['error']} — дальше не трекал")
+        raise typer.Exit(1)
+
+
 @app.command()
 def worklogs(
     keys: Optional[list[str]] = typer.Argument(
