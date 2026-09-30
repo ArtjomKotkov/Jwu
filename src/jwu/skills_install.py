@@ -44,6 +44,7 @@ EXPECTED_SKILLS = {
     "jwu-review-queue",
     "jwu-voice-profile",
     "jwu-voice-rewrite",
+    "jwu-confluence",
 }
 
 # Скиллы, которые jwu раздавал раньше и больше не раздаёт. Установка их УДАЛЯЕТ:
