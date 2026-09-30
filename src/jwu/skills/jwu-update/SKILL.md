@@ -1,6 +1,6 @@
 ---
 name: jwu-update
-description: Use to install or update jwu itself and everything it deploys — the CLI, the MCP server, the bundled skills and subagents. Triggers like «обнови jwu», «переустанови jwu», «поставь jwu», «я поправил код jwu», «jwu не видит новую команду», «нет инструмента jwu_*», «скилл не подхватился», «/jwu-update». Knows that updating is TWO steps (pipx + install-claude-skills) and that the MCP server keeps running old code until the session restarts.
+description: Use to install or update jwu itself and everything it deploys — the CLI, the MCP server, the bundled skills and subagents. Triggers like «обнови jwu», «переустанови jwu», «поставь jwu», «я поправил код jwu», «jwu не видит новую команду», «нет инструмента jwu_*», «скилл не подхватился», «/jwu-update». Knows that updating is TWO steps (pipx + jwu install, for Claude Code and/or Cursor) and that the MCP server keeps running old code until the session restarts.
 ---
 
 # jwu: установка и обновление
@@ -14,7 +14,7 @@ description: Use to install or update jwu itself and everything it deploys — t
 |---|---|---|---|
 | CLI `jwu` | pipx-venv (копия пакета) | `pipx install --force .` | сразу |
 | MCP-сервер `jwu-mcp` | тот же пакет, но **запущенный процесс** | тем же `pipx install` | **только после перезапуска сессии** |
-| Скиллы и субагенты | `~/.claude/skills`, `~/.claude/agents` | `jwu install-claude-skills` | сразу (список скиллов обновится) |
+| Скиллы, субагенты, MCP | `~/.claude/…` (Claude Code), `~/.cursor/…` (Cursor) | `jwu install [--for cursor\|both]` | скиллы — сразу, MCP — после перезапуска сессии |
 
 Самая частая ошибка — обновить пакет и решить, что всё готово: скиллы в `~/.claude`
 остаются старыми, а MCP-сервер продолжает работать со старым кодом в памяти.
@@ -39,10 +39,12 @@ description: Use to install or update jwu itself and everything it deploys — t
 2. **Разверни скиллы и субагентов** — это ОТДЕЛЬНЫЙ шаг, без него `~/.claude` остаётся старым:
 
    ```bash
-   jwu install-claude-skills
+   jwu install                  # Claude Code; --for cursor — Cursor, --for both — оба
    ```
 
-   Ставит только те скиллы и агентов, что шипуются с jwu. Проектные субагенты
+   Ставит скиллы и субагентов из пакета и регистрирует MCP-сервер `jwu` (Claude Code —
+   `claude mcp add`, Cursor — `~/.cursor/mcp.json`). Какой агент у пользователя — видно по
+   `jwu doctor` («MCP в Claude Code» / «MCP в Cursor»). Ставит только то, что шипуется с jwu. Проектные субагенты
    пользователя (`reviewer-*` и прочие) не трогает.
 
 3. **Проверь, что установилось именно новое** — по факту, а не по надежде:
@@ -115,7 +117,7 @@ jwu auth check             # если в контуре есть Jira/Bitbucket
 
 ## Чего не делать
 
-- Не считай `pipx install` достаточным — без `jwu install-claude-skills` скиллы старые.
+- Не считай `pipx install` достаточным — без `jwu install` скиллы старые.
 - Не редактируй файлы в `~/.claude/skills/jwu-*` руками: они перезаписываются при
   следующей установке. Правь исходники в `src/jwu/skills/` и переустанавливай.
 - Не перезапускай MCP-сервер «убийством процесса» — просто скажи пользователю

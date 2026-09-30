@@ -693,6 +693,39 @@ def configure_import(
     _auth_check_report()
 
 
+@app.command("install")
+def install(
+    target: str = typer.Option("claude", "--for", click_type=click.Choice(["claude", "cursor", "both"]),
+                               help="Куда ставить: Claude Code, Cursor или оба."),
+    skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Не регистрировать MCP-сервер jwu."),
+) -> None:
+    """Поставить jwu в агента: скиллы, субагенты и MCP-сервер (Claude Code и/или Cursor)."""
+    from .. import skills_install as si
+
+    for tgt in (("claude", "cursor") if target == "both" else (target,)):
+        skills_dir = _skills_dest() if tgt == "claude" else si.cursor_skills_dest()
+        agents_dir = _agents_dest() if tgt == "claude" else si.cursor_agents_dest()
+        title = "Claude Code" if tgt == "claude" else "Cursor"
+        try:
+            skills = install_skills(skills_dir)
+            agents = install_agents(agents_dir, cursor=(tgt == "cursor"))
+        except Exception as exc:  # noqa: BLE001
+            err.print(f"[red]{title}: не удалось поставить:[/red] {exc}")
+            raise typer.Exit(code=1)
+        console.print(f"[b]{title}[/b]: скиллов {len(skills)} → {skills_dir}, субагентов {len(agents)} → {agents_dir}")
+        if skip_mcp:
+            continue
+        try:
+            status = si.register_mcp_claude() if tgt == "claude" else si.register_mcp_cursor()
+        except ValueError as exc:
+            err.print(f"[red]{title}: MCP не зарегистрирован:[/red] {exc}")
+            raise typer.Exit(code=1)
+        where = "claude mcp (user)" if tgt == "claude" else str(si.cursor_mcp_path())
+        console.print(f"  MCP jwu: {status} [dim]({where})[/dim]")
+    console.print("[dim]Перезапусти сессию агента, чтобы он увидел новые инструменты. "
+                  "Дальше: jwu init в папке проекта.[/dim]")
+
+
 @app.command("install-claude-skills")
 def install_claude_skills(
     dest: Optional[str] = typer.Option(

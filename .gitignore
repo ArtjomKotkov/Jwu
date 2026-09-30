@@ -7,7 +7,6 @@ build/
 dist/
 .venv/
 venv/
-docs/
 
 # Тесты/кэши
 .pytest_cache/

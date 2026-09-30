@@ -243,12 +243,28 @@ def check_mcp() -> list[Check]:
     entry = (cfg.get("mcpServers") or {}).get("jwu")
     if not entry:
         return [Check("MCP в Claude Code", "fail", "сервер jwu не зарегистрирован",
-                      "claude mcp add --scope user jwu -- ~/.local/bin/jwu-mcp")]
+                      "jwu install")]
     cmd = entry.get("command", "")
     if cmd and not Path(cmd).expanduser().exists():
         return [Check("MCP в Claude Code", "fail", f"команда {cmd} не существует",
                       "pipx install --force … и claude mcp add … заново")]
     return [Check("MCP в Claude Code", "ok", cmd or "зарегистрирован")]
+
+
+def check_cursor() -> list[Check]:
+    """Cursor: есть ли на машине и выдан ли ему jwu (MCP в ~/.cursor/mcp.json)."""
+    from ..skills_install import cursor_mcp_path
+
+    path = cursor_mcp_path()
+    if not path.parent.exists():
+        return []  # Cursor не ставился — молчим
+    try:
+        entry = (json.loads(path.read_text(encoding="utf-8")).get("mcpServers") or {}).get("jwu") if path.exists() else None
+    except (OSError, ValueError) as exc:
+        return [Check("MCP в Cursor", "warn", f"{path} не читается: {exc}")]
+    if not entry:
+        return [Check("MCP в Cursor", "warn", "сервер jwu не зарегистрирован", "jwu install --for cursor")]
+    return [Check("MCP в Cursor", "ok", entry.get("command", "зарегистрирован"))]
 
 
 def check_skills() -> list[Check]:
@@ -317,6 +333,7 @@ def run(store: "Store", *, explicit_workspace: Optional[str] = None, network: bo
         checks += check_ssh(store, ws)
     checks += check_daemon(store)
     checks += check_mcp()
+    checks += check_cursor()
     checks += check_skills()
     checks += check_memory(store)
     return checks
