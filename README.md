@@ -202,6 +202,24 @@ jwu memory sync --repo ~/jwu-memory          # pull → импорт → экс�
 `restore` проверяет контрольные суммы, существующую БД не трогает без `--force`, путь до БД
 переписывает под эту машину. Слить две базы без потерь — `memory import`, не `restore`.
 
+## Confluence
+
+Чтение, создание и правка страниц. **Удаления нет** — ни в CLI, ни в MCP.
+
+```bash
+jwu confluence setup --url https://conf.example.com [--space KEY]   # креды — как у Jira контура
+jwu confluence page 149359387 [--body]        # заголовок, путь, версия, адрес, текст (storage)
+jwu confluence children 149359387             # дочерние страницы
+jwu confluence search 'space = KEY and title ~ "LINE"'
+jwu confluence create --title "LINE" -F page.html --parent 149359387 [--format wiki] [--yes]
+jwu confluence update 149359389 [--title …] [-F page.html] [-m "что поменял"] [--yes]
+```
+
+Без `--yes` — превью: где появится страница или что меняется в версии. Доступ тот же, что у
+Jira (nginx-гейт + вход логином Jira). Текст — storage (XHTML) либо вики-разметка
+(`--format wiki`, конвертирует сам Confluence). Занятый заголовок в пространстве — отказ до
+записи. Скилл `/jwu-confluence`; MCP `jwu_confluence_page|children|search|create|update`.
+
 ## Голос: тексты от твоего имени
 
 Любой внешний текст — коммент или ответ в PR, коммент в Jira, ответ клиенту в SDESK, текст
@@ -296,7 +314,7 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 
 | Группа | Команды |
 |---|---|
-| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|feedback`, `review queue\|agents`, `configure [export\|import]`, `auth check`, `doctor` |
+| проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|feedback`, `confluence setup\|page\|children\|search\|create\|update`, `review queue\|agents`, `configure [export\|import]`, `auth check`, `doctor` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
 | внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklog-chain`, `worklog-tz`, `worklog-edit`, `worklog-delete`, `worklogs`, `comment-edit`, `comment-delete`, `issue edit`, `pr-comment`, `pr-comment-edit`, `pr-comment-delete`, `pr-edit`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen\|edit\|delete` |

@@ -4912,5 +4912,138 @@ def pr_task_delete(
         _run_external(lambda: svc.pr_task_delete(task_id), json_out=json_out, done=f"задача #{task_id} удалена")
 
 
+# --------------------------------------------------------------------------- #
+# confluence: чтение, создание и правка страниц (удаления нет)
+# --------------------------------------------------------------------------- #
+
+confluence_app = typer.Typer(help="Confluence: читать, создавать и править страницы. Удаления нет.")
+app.add_typer(confluence_app, name="confluence")
+
+
+def _conf_run(fn, json_out: bool):
+    from ..core.confluence import ConfluenceError
+
+    with _service() as svc:
+        try:
+            return fn(svc)
+        except (ConfluenceError, ValueError) as exc:
+            if json_out:
+                _emit_json({"ok": False, "error": str(exc)})
+            else:
+                err.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(1)
+
+
+@confluence_app.command("setup")
+def confluence_setup(
+    url: Optional[str] = typer.Option(None, "--url", help="Адрес Confluence, напр. https://conf.example.com"),
+    space: Optional[str] = typer.Option(None, "--space", help="Пространство по умолчанию (ключ)."),
+) -> None:
+    """Адрес Confluence и пространство по умолчанию (креды — как у Jira контура)."""
+    from ..core import confluence as conf_mod
+
+    store, ws = _store_and_ws()
+    with store:
+        updates = {k: v for k, v in ((conf_mod.BASE_URL_SETTING, (url or "").rstrip("/")),
+                                     (conf_mod.SPACE_SETTING, space or "")) if v}
+        if updates:
+            store.set_workspace_settings(ws.id, updates)
+        settings = store.workspace_settings(ws.id)
+    console.print(f"Confluence: [cyan]{settings.get(conf_mod.BASE_URL_SETTING) or 'не задан'}[/cyan] · "
+                  f"пространство: [cyan]{settings.get(conf_mod.SPACE_SETTING) or '—'}[/cyan]")
+
+
+@confluence_app.command("page")
+def confluence_page(
+    page_id: str = typer.Argument(..., help="id страницы (pageId из адреса)."),
+    body: bool = typer.Option(False, "--body", help="Напечатать текст (storage/XHTML)."),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Страница: заголовок, путь, версия, адрес (и текст с --body)."""
+    page = _conf_run(lambda svc: svc.confluence().page(page_id, with_body=body or json_out), json_out)
+    if json_out:
+        _emit_json(page)
+        return
+    console.print(f"[b]{escape(page['title'])}[/b]  [dim]{page['space']} · v{page['version']} · {page['updated_by']}[/dim]")
+    console.print(f"[dim]{' / '.join(page['path'])}[/dim]\n{page['url']}")
+    if body:
+        typer.echo(page.get("body", ""))
+
+
+@confluence_app.command("children")
+def confluence_children(page_id: str = typer.Argument(...), json_out: bool = typer.Option(False, "--json")) -> None:
+    """Дочерние страницы."""
+    items = _conf_run(lambda svc: svc.confluence().children(page_id), json_out)
+    if json_out:
+        _emit_json(items)
+        return
+    for it in items:
+        console.print(f"[cyan]{it['id']}[/cyan]  {escape(it['title'])}  [dim]v{it['version']}[/dim]")
+
+
+@confluence_app.command("search")
+def confluence_search(cql: str = typer.Argument(..., help='CQL, напр. \'space = KEY and title ~ "LINE"\''),
+                      limit: int = typer.Option(25, "--limit"), json_out: bool = typer.Option(False, "--json")) -> None:
+    """Поиск страниц по CQL."""
+    items = _conf_run(lambda svc: svc.confluence().search(cql, limit=limit), json_out)
+    if json_out:
+        _emit_json(items)
+        return
+    for it in items:
+        console.print(f"[cyan]{it['id']}[/cyan]  {it['space']}  {escape(it['title'])}")
+
+
+@confluence_app.command("create")
+def confluence_create(
+    title: str = typer.Option(..., "--title"),
+    body_file: str = typer.Option(..., "--file", "-F", help="Текст страницы из файла; «-» — stdin."),
+    parent: Optional[str] = typer.Option(None, "--parent", help="id родительской страницы."),
+    space: Optional[str] = typer.Option(None, "--space", help="Пространство, если без родителя."),
+    fmt: str = typer.Option("storage", "--format", click_type=click.Choice(["storage", "wiki"])),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Создать страницу (ВНЕШНЯЯ запись; без --yes — только превью)."""
+    body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8")
+    preview = _conf_run(lambda svc: svc.confluence_create(title=title, body=body, parent_id=parent, space=space,
+                                                           fmt=fmt, dry_run=True), json_out)
+    where = f"под «{preview['parent']['title']}»" if preview.get("parent") else f"в корень {preview['space']}"
+    _confirm_external(f"[bold]Создать «{preview['title']}» {where}[/bold] ({preview['body_chars']} символов, {fmt})",
+                      yes=yes, json_out=json_out)
+    res = _conf_run(lambda svc: svc.confluence_create(title=title, body=body, parent_id=parent, space=space,
+                                                       fmt=fmt, dry_run=False), json_out)
+    if json_out:
+        _emit_json({"ok": True, **res})
+    else:
+        console.print(f"[green]✓[/green] создана «{res['title']}» (id {res['id']})\n{res['url']}")
+
+
+@confluence_app.command("update")
+def confluence_update(
+    page_id: str = typer.Argument(...),
+    title: Optional[str] = typer.Option(None, "--title", help="Новый заголовок."),
+    body_file: Optional[str] = typer.Option(None, "--file", "-F", help="Новый текст целиком; «-» — stdin."),
+    fmt: str = typer.Option("storage", "--format", click_type=click.Choice(["storage", "wiki"])),
+    message: str = typer.Option("", "--message", "-m", help="Комментарий к версии."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Новая версия страницы: заголовок и/или текст (ВНЕШНЯЯ запись; без --yes — превью)."""
+    body = None if body_file is None else (sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8"))
+    preview = _conf_run(lambda svc: svc.confluence_update(page_id, title=title, body=body, fmt=fmt,
+                                                           message=message, dry_run=True), json_out)
+    _confirm_external(
+        f"[bold]«{preview['title_before']}» v{preview['version']} → v{preview['version'] + 1}[/bold]"
+        + (f"\nзаголовок → «{preview['title_after']}»" if preview["title_after"] != preview["title_before"] else "")
+        + (f"\nтекст: {preview['body_chars_before']} → {preview['body_chars_after']} символов" if preview["body_changed"] else ""),
+        yes=yes, json_out=json_out)
+    res = _conf_run(lambda svc: svc.confluence_update(page_id, title=title, body=body, fmt=fmt,
+                                                       message=message, dry_run=False), json_out)
+    if json_out:
+        _emit_json({"ok": True, **res})
+    else:
+        console.print(f"[green]✓[/green] «{res['title']}» → v{res['version']}\n{res['url']}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

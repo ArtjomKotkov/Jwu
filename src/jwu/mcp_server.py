@@ -850,6 +850,56 @@ async def jwu_worklog_delete(key: str, worklog_id: str, workspace: Optional[str]
 
 
 @mcp.tool()
+async def jwu_confluence_page(page_id: str, with_body: bool = True, workspace: Optional[str] = None) -> dict:
+    """Страница Confluence: заголовок, пространство, версия, путь (предки), url и текст в
+    формате storage (XHTML). Без записи. Удаления страниц в jwu нет."""
+    svc = _full_svc(workspace)
+    return _stamp(svc.confluence().page(page_id, with_body=with_body), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_confluence_children(page_id: str, workspace: Optional[str] = None) -> dict:
+    """Дочерние страницы Confluence (id, title, version, url). Без записи. «Рядом с
+    страницей X» = дочерняя того же родителя: parent_id из jwu_confluence_page(X)."""
+    svc = _full_svc(workspace)
+    return _stamp({"page_id": page_id, "children": svc.confluence().children(page_id)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_confluence_search(cql: str, limit: int = 25, workspace: Optional[str] = None) -> dict:
+    """Поиск страниц Confluence по CQL, напр. `space = WEBIMTEST and title ~ "LINE"`. Без записи."""
+    svc = _full_svc(workspace)
+    return _stamp({"cql": cql, "results": svc.confluence().search(cql, limit=limit)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_confluence_create(title: str, body: str, parent_id: Optional[str] = None,
+                                space: Optional[str] = None, fmt: str = "storage",
+                                dry_run: bool = True, workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: создать страницу Confluence. parent_id — под какой страницей
+    (пространство берётся у родителя), иначе space или настройка контура. body — storage
+    (XHTML) или вики-разметка при fmt="wiki". dry_run=True (по умолчанию) — превью: где
+    появится, заголовок, объём; занятый заголовок — ошибка. Показать пользователю и только
+    после «да» — dry_run=False. Удаления страниц в jwu НЕТ."""
+    svc = _full_svc(workspace)
+    return _stamp(svc.confluence_create(title=title, body=body, parent_id=parent_id, space=space,
+                                        fmt=fmt, dry_run=dry_run), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_confluence_update(page_id: str, title: Optional[str] = None, body: Optional[str] = None,
+                                fmt: str = "storage", message: str = "", dry_run: bool = True,
+                                workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: новая версия страницы Confluence — заголовок и/или текст целиком
+    (None — оставить). Текст заменяется ПОЛНОСТЬЮ: сначала прочитай jwu_confluence_page и
+    правь его. dry_run=True — превью (версия, было/стало по заголовку и объёму); после «да»
+    — dry_run=False. message — комментарий к версии. Удаления страниц в jwu НЕТ."""
+    svc = _full_svc(workspace)
+    return _stamp(svc.confluence_update(page_id, title=title, body=body, fmt=fmt, message=message,
+                                        dry_run=dry_run), _resolve(workspace))
+
+
+@mcp.tool()
 async def jwu_pr_create(
     target: str,
     title: str,

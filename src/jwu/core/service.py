@@ -642,7 +642,8 @@ class Service:
         if isinstance(self._notifier, notify.TelegramNotifier):
             self._notifier.close()
             self._notifier = _UNSET
-        clients = [self.tasks_client, self.pr_client, self.sdesk, self.jenkins]
+        clients = [self.tasks_client, self.pr_client, self.sdesk, self.jenkins,
+                   getattr(self, "_confluence", None)]
         seen: list[int] = []
         for client in clients:
             # tasks_client и pr_client у GitHub-контура — один и тот же объект
@@ -1148,6 +1149,73 @@ class Service:
         client.delete_worklog(key, worklog_id)
         return {"key": key, "id": str(worklog_id), "deleted": True,
                 "time": old.get("timeSpent", ""), "started": old.get("started", "")}
+
+    # --- Confluence (JWU-54): чтение, создание, правка. Удаления нет. ------------ #
+
+    def confluence(self):
+        """Клиент Confluence контура (лениво). Адрес — настройка confluence.base_url,
+        креды — как у Jira (гейт + логин): учётка общая."""
+        from . import confluence as conf_mod
+
+        if getattr(self, "_confluence", None) is None:
+            settings = self.store.workspace_settings(self.store.workspace_id) if self.store else {}
+            base = (settings.get(conf_mod.BASE_URL_SETTING) or "").strip()
+            if not base:
+                raise ValueError("Confluence не настроен: jwu confluence setup --url https://conf.example.com")
+            self._confluence = conf_mod.ConfluenceClient(
+                base, proxy_basic=jira_proxy_basic(self.cfg), session_login=jira_login(self.cfg))
+        return self._confluence
+
+    def confluence_space(self, space: str | None = None) -> str:
+        from . import confluence as conf_mod
+
+        value = space or (self.store.workspace_settings(self.store.workspace_id).get(conf_mod.SPACE_SETTING) or "")
+        if not value:
+            raise ValueError("Не знаю пространство Confluence: передай space или задай "
+                             "jwu confluence setup --space KEY (или создавай под родительской страницей)")
+        return value
+
+    def confluence_create(self, *, title: str, body: str, parent_id: str | None = None,
+                          space: str | None = None, fmt: str = "storage", dry_run: bool = True) -> dict:
+        """Создать страницу (под ``parent_id`` — пространство берётся у родителя).
+        ``dry_run`` — превью без записи. ВНЕШНЯЯ запись — только после «да»."""
+        if not (title or "").strip() or not (body or "").strip():
+            raise ValueError("Нужны заголовок и текст страницы")
+        client = self.confluence()
+        parent = client.page(parent_id, with_body=False) if parent_id else None
+        space_key = parent["space"] if parent else self.confluence_space(space)
+        clash = client.find_by_title(space_key, title.strip())
+        if clash:
+            raise ValueError(f"В пространстве {space_key} уже есть страница «{title.strip()}» "
+                             f"(id {clash['id']}) — правь её (jwu_confluence_update) или выбери другой заголовок")
+        preview = {"space": space_key, "title": title.strip(), "format": fmt,
+                   "parent": {"id": parent["id"], "title": parent["title"], "path": parent["path"]} if parent else None,
+                   "body_chars": len(body)}
+        if dry_run:
+            return {"dry_run": True, **preview}
+        created = client.create_page(space=space_key, title=title.strip(),
+                                     body=client.to_storage(body, fmt), parent_id=parent_id)
+        return {"dry_run": False, **preview, **created}
+
+    def confluence_update(self, page_id: str, *, title: str | None = None, body: str | None = None,
+                          fmt: str = "storage", message: str = "", dry_run: bool = True) -> dict:
+        """Новая версия страницы: заголовок и/или текст (None — оставить). Удаления нет.
+        ``dry_run`` — текущая версия и что меняется. ВНЕШНЯЯ запись — только после «да»."""
+        if title is None and body is None:
+            raise ValueError("Нечего менять: заголовок или текст")
+        client = self.confluence()
+        current = client.page(page_id, with_body=True)
+        preview = {"id": current["id"], "space": current["space"], "version": current["version"],
+                   "title_before": current["title"], "title_after": (title or current["title"]).strip(),
+                   "body_changed": body is not None, "body_chars_before": len(current["body"]),
+                   "body_chars_after": len(body) if body is not None else len(current["body"]),
+                   "url": current["url"]}
+        if dry_run:
+            return {"dry_run": True, **preview}
+        new_body = client.to_storage(body, fmt) if body is not None else current["body"]
+        updated = client.update_page(page_id, title=preview["title_after"], body=new_body,
+                                     version=current["version"], message=message)
+        return {"dry_run": False, **preview, **updated}
 
     def key_is_client_facing(self, key: str) -> bool:
         """Уедет ли запись по этому ключу клиенту (SDESK), а не только команде."""
