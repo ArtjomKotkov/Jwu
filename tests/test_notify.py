@@ -210,3 +210,14 @@ def test_pr_signature_needs_work_delta_only_on_transition(tmp_path):
         assert "reviewer_needs_work" in [d.kind for d in store.compute_changes(r4)]
     finally:
         store.close()
+
+
+def test_ready_and_approved_are_notable_and_titled():
+    deltas = [Delta(key="P/r#7", kind="pr_ready_to_merge", summary="PROJ-1: фича",
+                    detail="апрувов 2/2 · сборка ок · конфликтов нет"),
+              Delta(key="P/r#8", kind="pr_all_approved", summary="PROJ-2", detail="апрувов 1/1 · сборка красная")]
+    note = notify.build_notification("work", deltas)
+    assert [d.kind for d in note.deltas] == ["pr_ready_to_merge", "pr_all_approved"]
+    text = notify.format_message(note)
+    assert "🚀 ГОТОВ К МЕРЖУ" in text and "👍 СОБРАЛ ВСЕ АПРУВЫ" in text
+    assert "апрувов 2/2 · сборка ок · конфликтов нет" in text and "сборка красная" in text

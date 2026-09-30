@@ -569,3 +569,56 @@ def test_old_snapshot_without_build_state_counts_as_no_builds(store):
     run2 = store.start_sync_run(["prs:mine"])
     store.save_pr_snapshot(run2, _pr_with_build("FAILED"), ["mine"])
     assert "build_failed" in [d.kind for d in store.compute_changes(run2)]
+
+
+# --- мои PR: собрал все апрувы / готов к мержу ---------------------------------- #
+
+def _pr_state(approvals, *, build="SUCCESSFUL", conflicted=False, needs_work=()):
+    from jwu.core.models import BuildStatus, Reviewer
+
+    reviewers = [Reviewer(name=n, approved=ok, status="NEEDS_WORK" if n in needs_work else
+                          ("APPROVED" if ok else "UNAPPROVED")) for n, ok in approvals.items()]
+    builds = [BuildStatus(state=build, key="ci", name="tests", url="https://ci/1")] if build else []
+    return PR(id=7, title="PROJ-1: фича", project="PROJ", repository="repo", latest_commit="abc",
+              reviewers=reviewers, builds=builds, conflicted=conflicted)
+
+
+def _run(store, pr, views=("mine",)):
+    run = store.start_sync_run(["prs:mine", "prs:review"])
+    store.save_pr_snapshot(run, pr, list(views))
+    return [d for d in store.compute_changes(run) if d.kind in ("pr_all_approved", "pr_ready_to_merge")]
+
+
+def test_ready_to_merge_when_last_approval_lands_on_green_build(store):
+    _run(store, _pr_state({"a": True, "b": False}))
+    got = _run(store, _pr_state({"a": True, "b": True}))
+    assert [(d.kind, d.key) for d in got] == [("pr_ready_to_merge", "PROJ/repo#7")]   # без дубля all_approved
+    assert "апрувов 2/2" in got[0].detail
+    assert _run(store, _pr_state({"a": True, "b": True})) == []                        # состояние, не событие
+
+
+def test_all_approved_then_ready_after_build_turns_green(store):
+    _run(store, _pr_state({"a": False}, build="INPROGRESS"))
+    got = _run(store, _pr_state({"a": True}, build="INPROGRESS"))
+    assert [d.kind for d in got] == ["pr_all_approved"] and "сборка ещё идёт" in got[0].detail
+    got = _run(store, _pr_state({"a": True}, build="SUCCESSFUL"))
+    assert [d.kind for d in got] == ["pr_ready_to_merge"]
+
+
+def test_conflict_blocks_ready_and_resolving_it_fires(store):
+    _run(store, _pr_state({"a": False}, conflicted=True))
+    got = _run(store, _pr_state({"a": True}, conflicted=True))
+    assert [d.kind for d in got] == ["pr_all_approved"] and "есть конфликт" in got[0].detail
+    assert [d.kind for d in _run(store, _pr_state({"a": True}, conflicted=False))] == ["pr_ready_to_merge"]
+
+
+def test_needs_work_and_no_reviewers_are_not_approved(store):
+    _run(store, _pr_state({"a": False, "b": False}))
+    assert _run(store, _pr_state({"a": True, "b": False}, needs_work=("b",))) == []
+    _run(store, _pr_state({}))
+    assert _run(store, _pr_state({})) == []                                             # без ревьюеров — не событие
+
+
+def test_review_prs_do_not_fire_readiness(store):
+    _run(store, _pr_state({"a": False}), views=("review",))
+    assert _run(store, _pr_state({"a": True}), views=("review",)) == []                 # чужой PR — не моё событие
