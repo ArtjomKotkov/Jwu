@@ -81,3 +81,53 @@ def test_install_does_not_touch_foreign_skills(tmp_path):
     install_skills(tmp_path)
 
     assert (mine / "SKILL.md").read_text(encoding="utf-8") == "моё"
+
+
+# --- установка в Cursor и регистрация MCP ---------------------------------------- #
+
+import json as _json
+
+from jwu import skills_install as _si
+
+
+def test_cursor_agents_drop_claude_tools(tmp_path):
+    _si.install_agents(tmp_path, cursor=True)
+    text = (tmp_path / "voice-writer-sample.md").read_text()
+    assert text.startswith("---\n") and "\ntools:" not in text and "name: voice-writer-sample" in text
+    _si.install_agents(tmp_path / "claude")
+    assert "\ntools:" in (tmp_path / "claude" / "voice-writer-sample.md").read_text()
+
+
+def test_register_mcp_cursor_merges(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text(_json.dumps({"mcpServers": {"other": {"command": "x"}}, "keep": 1}))
+    assert _si.register_mcp_cursor(path, command="/bin/jwu-mcp") == "добавлен"
+    data = _json.loads(path.read_text())
+    assert data["mcpServers"]["other"] == {"command": "x"} and data["keep"] == 1
+    assert data["mcpServers"]["jwu"] == {"command": "/bin/jwu-mcp", "args": []}
+    assert _si.register_mcp_cursor(path, command="/bin/jwu-mcp") == "без изменений"
+    assert _si.register_mcp_cursor(path, command="/new/jwu-mcp") == "обновлён"
+    path.write_text("{битый")
+    import pytest
+    with pytest.raises(ValueError, match="не JSON"):
+        _si.register_mcp_cursor(path, command="/bin/jwu-mcp")
+
+
+def test_register_mcp_claude_without_cli(monkeypatch):
+    monkeypatch.setattr(_si.shutil, "which", lambda name: None)
+    assert _si.register_mcp_claude(command="/bin/jwu-mcp").startswith("пропущен")
+
+
+def test_cli_install_for_cursor(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from jwu.cli import main as cli
+
+    monkeypatch.setattr(_si, "cursor_skills_dest", lambda: tmp_path / "skills")
+    monkeypatch.setattr(_si, "cursor_agents_dest", lambda: tmp_path / "agents")
+    monkeypatch.setattr(_si, "cursor_mcp_path", lambda: tmp_path / "mcp.json")
+    r = CliRunner().invoke(cli.app, ["install", "--for", "cursor"])
+    assert r.exit_code == 0, r.output
+    assert (tmp_path / "skills" / "jwu-session-init" / "SKILL.md").exists()
+    assert (tmp_path / "agents" / "reviewer-jwu-sample.md").exists()
+    assert "jwu" in _json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
