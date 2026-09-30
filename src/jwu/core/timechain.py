@@ -81,6 +81,24 @@ def jira_started(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000%z")
 
 
+def to_jira_started(value: str, tz_name: str) -> str:
+    """Начало ворклога → формат Jira. ISO со смещением берётся как есть; «YYYY-MM-DD HH:MM»
+    (или с «T») — в поясе ``tz_name`` (пусто — ошибка: без пояса время уедет не туда)."""
+    raw = (value or "").strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S.%f%z")
+        except ValueError as exc:
+            raise ChainError(f"Не понял начало «{value}» — нужно «2026-09-30 10:00»") from exc
+    if dt.tzinfo is None:
+        if not tz_name:
+            raise ChainError("Часовой пояс для трекинга не задан (jwu worklog-tz МСК)")
+        dt = dt.replace(tzinfo=resolve_tz(tz_name))
+    return jira_started(dt)
+
+
 def parse_start(start: str, day: date, tz: ZoneInfo) -> datetime:
     m = re.fullmatch(r"\s*(\d{1,2})(?:[:.](\d{2}))?\s*", start or "")
     if not m or int(m.group(1)) > 23 or int(m.group(2) or 0) > 59:

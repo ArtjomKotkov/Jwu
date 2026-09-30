@@ -4723,5 +4723,194 @@ def review_agents(
         console.print(f"  {name}: [cyan]{agent}[/cyan]")
 
 
+# --------------------------------------------------------------------------- #
+# правка и удаление (JWU-53): только своё, ВНЕШНЯЯ запись — после подтверждения
+# --------------------------------------------------------------------------- #
+
+
+def _confirm_external(summary: str, *, yes: bool, json_out: bool) -> None:
+    """Показать, что уйдёт наружу, и спросить. Без --yes в --json — отказ с подсказкой."""
+    if yes:
+        return
+    if json_out:
+        _emit_json({"ok": False, "reason": "confirm_required", "what": summary,
+                    "hint": "Показать пользователю и повторить с --yes"})
+        raise typer.Exit(0)
+    console.print(summary)
+    if not typer.confirm("Выполнить?", default=False):
+        console.print("[dim]Отменено.[/dim]")
+        raise typer.Exit(1)
+
+
+def _run_external(action, *, json_out: bool, done: str) -> None:
+    try:
+        result = action()
+    except (JiraError, BitbucketError, GitHubError, ValueError) as exc:
+        if json_out:
+            _emit_json({"ok": False, "error": str(exc)})
+        else:
+            err.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(1)
+    if json_out:
+        _emit_json({"ok": True, **(result if isinstance(result, dict) else result.model_dump())})
+    else:
+        console.print(f"[green]✓[/green] {done}")
+
+
+@app.command("comment-edit")
+def comment_edit(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    comment_id: str = typer.Argument(..., help="id своего комментария (jwu task KEY --json → comments[].id)."),
+    text: Optional[str] = typer.Option(None, "--text", "-m", help="Новый текст."),
+    text_file: Optional[str] = typer.Option(None, "--file", "-F", help="Файл с текстом; «-» — stdin."),
+    to_client: bool = typer.Option(False, "--to-client", help="Согласие: SDESK, текст видит КЛИЕНТ."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Заменить текст своего комментария в задаче Jira/SDESK."""
+    body = _read_description(text, text_file) or ""
+    _confirm_external(f"[bold]{key} · коммент {comment_id} → новый текст:[/bold]\n{body}", yes=yes, json_out=json_out)
+    with _service_with_jira() as svc:
+        _run_external(lambda: svc.issue_comment_update(key, comment_id, body, client_facing=to_client),
+                      json_out=json_out, done=f"{key}: комментарий {comment_id} изменён")
+
+
+@app.command("comment-delete")
+def comment_delete(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    comment_id: str = typer.Argument(..., help="id своего комментария."),
+    to_client: bool = typer.Option(False, "--to-client", help="Согласие для SDESK."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Удалить свой комментарий в задаче Jira/SDESK."""
+    _confirm_external(f"[bold]Удалить комментарий {comment_id} в {key}?[/bold]", yes=yes, json_out=json_out)
+    with _service_with_jira() as svc:
+        _run_external(lambda: svc.issue_comment_delete(key, comment_id, client_facing=to_client),
+                      json_out=json_out, done=f"{key}: комментарий {comment_id} удалён")
+
+
+@app.command("worklog-edit")
+def worklog_edit(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    worklog_id: str = typer.Argument(..., help="id своего ворклога (jwu worklogs --json)."),
+    time: Optional[str] = typer.Option(None, "--time", help="Новое время: «1h 30m»."),
+    started: Optional[str] = typer.Option(None, "--started", help="Новое начало: «2026-09-30 10:00» (пояс трекинга) или ISO."),
+    comment: Optional[str] = typer.Option(None, "--comment", "-m", help="Новое описание."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Поправить свой ворклог: время, начало, описание."""
+    parts = ", ".join(f"{k}={v}" for k, v in (("время", time), ("начало", started), ("описание", comment)) if v is not None)
+    _confirm_external(f"[bold]{key} · ворклог {worklog_id}:[/bold] {parts or 'ничего'}", yes=yes, json_out=json_out)
+    with _service_with_jira() as svc:
+        _run_external(lambda: svc.worklog_update(key, worklog_id, time=time, started=started, comment=comment),
+                      json_out=json_out, done=f"{key}: ворклог {worklog_id} изменён")
+
+
+@app.command("worklog-delete")
+def worklog_delete(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    worklog_id: str = typer.Argument(..., help="id своего ворклога."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Удалить свой ворклог."""
+    _confirm_external(f"[bold]Удалить ворклог {worklog_id} в {key}?[/bold]", yes=yes, json_out=json_out)
+    with _service_with_jira() as svc:
+        _run_external(lambda: svc.worklog_delete(key, worklog_id), json_out=json_out,
+                      done=f"{key}: ворклог {worklog_id} удалён")
+
+
+@issue_app.command("edit")
+def issue_edit(
+    key: str = typer.Argument(..., help="Ключ задачи."),
+    summary: Optional[str] = typer.Option(None, "--summary", help="Новый заголовок."),
+    description: Optional[str] = typer.Option(None, "--description", help="Новое описание (wiki)."),
+    description_file: Optional[str] = typer.Option(None, "--description-file", help="Описание из файла; «-» — stdin."),
+    assignee: Optional[str] = typer.Option(None, "--assignee", help="Логин исполнителя; «-» — снять."),
+    priority: Optional[str] = typer.Option(None, "--priority", help="Приоритет (имя)."),
+    labels: Optional[list[str]] = typer.Option(None, "--label", help="Метки — список целиком (можно несколько)."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Поправить поля задачи Jira. Удаления задач в jwu нет."""
+    desc = _read_description(description, description_file) if (description or description_file) else None
+    who = "" if assignee == "-" else assignee
+    parts = ", ".join(n for n, v in (("заголовок", summary), ("описание", desc), ("исполнитель", who),
+                                     ("приоритет", priority), ("метки", labels)) if v is not None)
+    _confirm_external(f"[bold]{key}: меняю {parts or 'ничего'}[/bold]", yes=yes, json_out=json_out)
+    with _service_with_jira() as svc:
+        _run_external(lambda: svc.issue_update(key, summary=summary, description=desc, assignee=who,
+                                               priority=priority, labels=labels),
+                      json_out=json_out, done=f"{key}: изменено ({parts})")
+
+
+@app.command("pr-comment-edit")
+def pr_comment_edit(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    comment_id: int = typer.Argument(..., help="id своего коммента."),
+    text: Optional[str] = typer.Option(None, "--text", "-m"),
+    text_file: Optional[str] = typer.Option(None, "--file", "-F"),
+    project: Optional[str] = typer.Option(None, "--project"),
+    repo: Optional[str] = typer.Option(None, "--repo"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Заменить текст своего коммента в PR."""
+    body = _read_description(text, text_file) or ""
+    _confirm_external(f"[bold]PR #{pr_id} · коммент #{comment_id} → новый текст:[/bold]\n{body}", yes=yes, json_out=json_out)
+    with _service_with_prs() as svc:
+        _run_external(lambda: svc.pr_comment_update(project, repo, pr_id, comment_id, body),
+                      json_out=json_out, done=f"PR #{pr_id}: комментарий #{comment_id} изменён")
+
+
+@app.command("pr-edit")
+def pr_edit(
+    pr_id: int = typer.Argument(..., help="Числовой id своего PR."),
+    title: Optional[str] = typer.Option(None, "--title"),
+    text: Optional[str] = typer.Option(None, "--text", "-m", help="Новое описание."),
+    text_file: Optional[str] = typer.Option(None, "--file", "-F", help="Описание из файла; «-» — stdin."),
+    project: Optional[str] = typer.Option(None, "--project"),
+    repo: Optional[str] = typer.Option(None, "--repo"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Поправить заголовок и/или описание своего PR (ревьюеры сохраняются)."""
+    desc = _read_description(text, text_file) if (text or text_file) else None
+    _confirm_external(f"[bold]PR #{pr_id}:[/bold] " + ", ".join(
+        n for n, v in (("заголовок → " + (title or ""), title), ("описание", desc)) if v is not None),
+        yes=yes, json_out=json_out)
+    with _service_with_prs() as svc:
+        _run_external(lambda: svc.pr_update(project, repo, pr_id, title=title, description=desc),
+                      json_out=json_out, done=f"PR #{pr_id}: изменён")
+
+
+@pr_task_app.command("edit")
+def pr_task_edit(
+    task_id: int = typer.Argument(..., help="id своей задачи."),
+    text: str = typer.Argument(..., help="Новый текст (до 10 слов)."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Поправить текст своей задачи на комменте PR."""
+    _confirm_external(f"[bold]Задача #{task_id} → «{text}»[/bold]", yes=yes, json_out=json_out)
+    with _service_with_prs() as svc:
+        _run_external(lambda: svc.pr_task_update(task_id, text), json_out=json_out,
+                      done=f"задача #{task_id} изменена")
+
+
+@pr_task_app.command("delete")
+def pr_task_delete(
+    task_id: int = typer.Argument(..., help="id своей задачи."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Удалить свою задачу на комменте PR."""
+    _confirm_external(f"[bold]Удалить задачу #{task_id}?[/bold]", yes=yes, json_out=json_out)
+    with _service_with_prs() as svc:
+        _run_external(lambda: svc.pr_task_delete(task_id), json_out=json_out, done=f"задача #{task_id} удалена")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

@@ -170,6 +170,12 @@ Claude: `jwu pr-task list|add|done|reopen`. Текст задачи до 10 сл
 (общий, ответ в тред `--reply-to`, на строку), `jwu pr-comment-delete` (только свои),
 `jwu pr-review approve|needs-work|unapprove`, `jwu pr-create`, `jwu pr-task add|done`.
 
+**Правка и удаление** — только своего и только с подтверждением: `jwu comment-edit|comment-delete`,
+`jwu worklog-edit|worklog-delete`, `jwu issue edit` (поля задачи; **удаления задач нет**),
+`jwu pr-comment-edit|pr-comment-delete`, `jwu pr-edit` (заголовок/описание, ревьюеры
+сохраняются), `jwu pr-task edit|delete`. Чужое jwu править и удалять отказывается; правка и
+удаление комментов SDESK — только с `--to-client`.
+
 **Трекинг времени цепочкой** — `jwu worklog-chain --start 10:00 --item "KEY|1h 30m|описание" …`
 (MCP `jwu_worklog_chain`): каждый ворклог начинается там, где закончился предыдущий, — время
 дня идёт сплошным отрезком. Пояс — настройка воркспейса (`jwu worklog-tz МСК`), в Jira уходит
@@ -293,7 +299,7 @@ MCP-инструменты повторяют CLI (`jwu_task`, `jwu_pr`, `jwu_pr
 | проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|feedback`, `review queue\|agents`, `configure [export\|import]`, `auth check`, `doctor` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff\|--download]`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `mentions read\|archive`, `memory export\|import\|sync` |
-| внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklog-chain`, `worklog-tz`, `worklogs`, `pr-comment`, `pr-comment-delete`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen` |
+| внешняя запись | `comment`, `issue create\|link\|transition\|transitions\|attach\|similar\|link-types`, `worklog`, `worklog-chain`, `worklog-tz`, `worklog-edit`, `worklog-delete`, `worklogs`, `comment-edit`, `comment-delete`, `issue edit`, `pr-comment`, `pr-comment-edit`, `pr-comment-delete`, `pr-edit`, `pr-review`, `pr-create`, `pr-task list\|add\|done\|reopen\|edit\|delete` |
 | фон и данные | `daemon run\|install\|uninstall\|status\|kick`, `notify status\|test\|poll`, `backup`, `restore`, `db stats\|prune\|vacuum`, `dashboard`, `install-claude-skills` |
 
 У большинства команд есть `--json`.
