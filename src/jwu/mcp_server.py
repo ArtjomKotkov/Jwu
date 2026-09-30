@@ -1588,6 +1588,48 @@ async def jwu_worklog(
 
 
 @mcp.tool()
+async def jwu_worklog_timezone(tz: Optional[str] = None, workspace: Optional[str] = None) -> dict:
+    """Часовой пояс для трекинга времени (настройка контура worklog.timezone).
+
+    Без `tz` — прочитать (пусто — не задан: спроси пользователя один раз). С `tz` —
+    сохранить: IANA-имя (Europe/Moscow) или короткое («МСК»). Локальная запись.
+    """
+    from .core import timechain
+
+    ws = _resolve(workspace)
+    store = _store_only(workspace)
+    value = timechain.set_timezone(store, ws.id, tz) if tz else timechain.get_timezone(store, ws.id)
+    return _stamp({"timezone": value}, ws)
+
+
+@mcp.tool()
+async def jwu_worklog_chain(
+    items: list[dict],
+    start: str,
+    on: Optional[str] = None,
+    tz: Optional[str] = None,
+    dry_run: bool = True,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Ворклоги ЦЕПОЧКОЙ: каждый начинается ровно там, где закончился предыдущий.
+
+    items — [{"key": "PROJ-1", "time": "1h 30m", "comment": "…"}, …] по порядку;
+    start — «10:00»; on — YYYY-MM-DD (по умолчанию сегодня); tz — пояс (по умолчанию
+    настройка контура, см. jwu_worklog_timezone). dry_run=True (по умолчанию) — только
+    план: по строке «с · по · длительность», итог, `overlaps` (пересечения с уже
+    затреканным за день) и `existing_ends_at` (где кончается затреканное). Показать план
+    пользователю, и только после «да» — dry_run=False: ВНЕШНЯЯ запись в Jira по
+    порядку, стоп на первой ошибке (`failed`, записанное — в `written`).
+    """
+    from datetime import date as _date
+
+    svc = _require_jira(_full_svc(workspace))
+    day = on or _date.today().isoformat()
+    return _stamp(svc.worklog_chain(items, start=start, day=day, tz=tz or "", dry_run=dry_run),
+                  _resolve(workspace))
+
+
+@mcp.tool()
 async def jwu_auth_refresh(workspace: Optional[str] = None) -> dict:
     """Переподключиться к Jira/SDESK/Bitbucket свежими кредами и проверить доступ.
 
