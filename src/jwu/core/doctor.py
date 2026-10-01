@@ -251,6 +251,16 @@ def check_mcp() -> list[Check]:
     return [Check("MCP в Claude Code", "ok", cmd or "зарегистрирован")]
 
 
+def check_ffmpeg() -> list[Check]:
+    """ffmpeg нужен, чтобы резать видео из вложений на кадры (jwu video-frames)."""
+    import shutil
+
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return [Check("ffmpeg", "ok", shutil.which("ffmpeg") or "")]
+    return [Check("ffmpeg", "skip", "не установлен — видео из вложений не нарезать на кадры",
+                  "brew install ffmpeg")]
+
+
 def check_cursor() -> list[Check]:
     """Cursor: есть ли на машине и выдан ли ему jwu (MCP в ~/.cursor/mcp.json)."""
     from ..skills_install import cursor_mcp_path
@@ -334,6 +344,7 @@ def run(store: "Store", *, explicit_workspace: Optional[str] = None, network: bo
     checks += check_daemon(store)
     checks += check_mcp()
     checks += check_cursor()
+    checks += check_ffmpeg()
     checks += check_skills()
     checks += check_memory(store)
     return checks

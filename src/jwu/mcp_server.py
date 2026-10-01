@@ -900,6 +900,27 @@ async def jwu_confluence_update(page_id: str, title: Optional[str] = None, body:
 
 
 @mcp.tool()
+async def jwu_video_frames(path: str, every: float = 5, start: Optional[str] = None,
+                           end: Optional[str] = None, width: int = 1280, max_frames: int = 60,
+                           sheet: bool = True, out_dir: Optional[str] = None) -> dict:
+    """Нарезать локальное видео (запись экрана из вложений задачи/PR) на кадры для анализа.
+
+    every — шаг в секундах; start/end — отрезок («90», «1:30», «1m30s»; по умолчанию всё
+    видео). На каждом кадре отметка времени. sheet=True — ещё и контактный лист: сетка
+    4×4 миниатюр (`sheets`). Порядок: прочитай лист(ы) через Read, найди интересный момент,
+    открой нужные кадры (`frames[].path`) целиком; детальнее — повтори с мелким шагом на
+    узком отрезке. Видео скачивается так: jwu_attachments(key, download=True,
+    kinds=["video"]). Нужен системный ffmpeg. Ничего не отправляет наружу.
+    """
+    from .core import frames as frames_mod
+
+    res = frames_mod.extract(Path(path), every=every, start=frames_mod.parse_time(start),
+                             end=frames_mod.parse_time(end), width=width, max_frames=max_frames,
+                             sheet=sheet, out_dir=Path(out_dir) if out_dir else None)
+    return res.as_dict()
+
+
+@mcp.tool()
 async def jwu_pr_create(
     target: str,
     title: str,
@@ -1082,9 +1103,10 @@ async def jwu_attachments(
     У каждого вложения `referenced_by` — где оно вставлено в текст: "description" и/или
     id комментариев (у комментария есть `images`). Так понятно, к какой реплике скриншот.
 
-    kinds — какие виды качать (image|log|doc|archive); по умолчанию все, кроме видео
-    (видео никогда не качается). dest — каталог (по умолчанию <tmp>/jwu/<KEY>). При
-    download возвращает локальные пути в `downloaded[].path` — их потом читать через Read.
+    kinds — какие виды качать (image|log|doc|archive|video); по умолчанию все, кроме видео:
+    видео качается только явно (kinds=["video"]) — оно тяжёлое. Смотреть его — через
+    jwu_video_frames(path). dest — каталог (по умолчанию <tmp>/jwu/<KEY>). При download
+    возвращает локальные пути в `downloaded[].path` — их потом читать через Read.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).

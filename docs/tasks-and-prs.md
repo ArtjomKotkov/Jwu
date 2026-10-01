@@ -5,11 +5,20 @@
 ```bash
 jwu tasks --view mine|mentions · jwu task ACME-1 · jwu attachments ACME-1 --download
 jwu prs --view mine|review · jwu pr 1204 --project ACME --repo shop-api [--diff [--numbered]] [--download]
+jwu attachments ACME-1 --download -k video  # видео — только явно, оно тяжёлое
+jwu video-frames <видео> --every 3 [--from 0:30 --to 1:10]   # кадры + контактный лист 4×4
 jwu builds 1204 · jwu build 1204            # статусы CI и разбор падения из Jenkins/Actions
 jwu branches [ACME-1]                       # локальные ветки по задаче во всех репозиториях
 jwu mentions list --unseen · jwu mentions read --all · jwu mentions archive --older-than 30
 jwu action day-analyze --brief              # контекст + промпт для дневной сводки
 ```
+
+**Запись экрана в задаче.** Агент видео не смотрит, а кадры — да: `jwu video-frames` режет
+видео на кадры через заданный шаг на нужном отрезке и собирает **контактный лист** — сетку
+миниатюр на одной картинке. Сначала лист (что происходит и где), потом нужные кадры целиком,
+при необходимости — второй проход с мелким шагом вокруг интересного момента. Нужен системный
+ffmpeg (`brew install ffmpeg`); если он собран с `drawtext`, время подписано прямо на кадре,
+иначе — в `frames.json` рядом с кадрами.
 
 ## Память
 

@@ -1504,7 +1504,7 @@ def attachments(
     download: bool = typer.Option(False, "--download", "-d", help="Скачать вложения в tmp."),
     kind: Optional[list[str]] = typer.Option(
         None, "--kind", "-k",
-        help="Какие виды качать (повторяй -k): image|log|doc|archive. По умолчанию все, кроме видео."),
+        help="Какие виды качать (повторяй -k): image|log|doc|archive|video. По умолчанию все, кроме видео (его — только явно: -k video)."),
     dest: Optional[str] = typer.Option(
         None, "--dest", help="Каталог для скачивания (по умолчанию <tmp>/jwu/<KEY>)."),
     extract: bool = typer.Option(True, "--extract/--no-extract", help="Распаковывать архивы."),
@@ -1512,7 +1512,7 @@ def attachments(
 ) -> None:
     """Вложения задачи: список с видами/счётчиками; с --download — скачать в tmp для анализа.
 
-    Видео всегда только в списке (не качаются). Для Claude: --download качает файлы,
+    Видео качается только явно (-k video); нарезать на кадры — jwu video-frames. Для Claude: --download качает файлы,
     печатает локальные пути — изображения/логи/pdf затем читаются через Read.
     """
     with _service_with_jira() as svc:
@@ -5076,6 +5076,38 @@ def confluence_update(
         _emit_json({"ok": True, **res})
     else:
         console.print(f"[green]✓[/green] «{res['title']}» → v{res['version']}\n{res['url']}")
+
+
+@app.command("video-frames")
+def video_frames(
+    path: str = typer.Argument(..., help="Локальное видео (напр. из jwu attachments KEY -d -k video)."),
+    every: float = typer.Option(5, "--every", "-e", help="Шаг между кадрами, секунды (можно дробный)."),
+    start: Optional[str] = typer.Option(None, "--from", help="С какого момента: 90, 1:30, 1m30s."),
+    end: Optional[str] = typer.Option(None, "--to", help="До какого момента."),
+    width: int = typer.Option(1280, "--width", help="Ширина кадра (меньше — не увеличиваем)."),
+    max_frames: int = typer.Option(60, "--max", help="Предел числа кадров."),
+    sheet: bool = typer.Option(True, "--sheet/--no-sheet", help="Контактный лист: сетка 4×4 миниатюр."),
+    out: Optional[str] = typer.Option(None, "--out", help="Каталог кадров (по умолчанию <видео>.frames/)."),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Нарезать видео на кадры каждые N секунд (с отметкой времени) + контактный лист."""
+    from ..core import frames as frames_mod
+
+    try:
+        res = frames_mod.extract(Path(path), every=every, start=frames_mod.parse_time(start),
+                                 end=frames_mod.parse_time(end), width=width, max_frames=max_frames,
+                                 sheet=sheet, out_dir=Path(out) if out else None)
+    except frames_mod.FramesError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if json_out:
+        _emit_json(res.as_dict())
+        return
+    console.print(f"{len(res.frames)} кадров каждые {every:g} с · видео {frames_mod.fmt_time(res.duration)} → {res.out_dir}")
+    for sh in res.sheets:
+        console.print(f"  лист: {sh}")
+    if not res.stamped:
+        console.print("[yellow]ffmpeg собран без drawtext — время на кадрах не подписано: кадр N ↔ время — в frames.json (и в --json).[/yellow]")
 
 
 if __name__ == "__main__":  # pragma: no cover
