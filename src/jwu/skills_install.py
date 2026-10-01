@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.resources as resources
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -171,13 +172,23 @@ def register_mcp_cursor(path: Path | None = None, command: str | None = None) ->
     return action
 
 
+def _claude_user_mcp_command() -> str:
+    path = Path(os.environ.get("CLAUDE_CONFIG_PATH") or (Path.home() / ".claude.json"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return ((data.get("mcpServers") or {}).get("jwu") or {}).get("command", "") or ""
+
+
 def register_mcp_claude(command: str | None = None) -> str:
     """Зарегистрировать сервер jwu в Claude Code (scope user) через CLI claude."""
     if not shutil.which("claude"):
         return "пропущен: CLI claude не найден (добавь сам: claude mcp add --scope user jwu -- jwu-mcp)"
     cmd = command or mcp_command()
-    listed = subprocess.run(["claude", "mcp", "get", "jwu"], capture_output=True, text=True)
-    if listed.returncode == 0 and cmd in (listed.stdout or ""):
+    # Смотрим именно user-scope в ~/.claude.json: `claude mcp get` отдаёт запись с наивысшим
+    # приоритетом, и проектный .mcp.json (например, в клоне jwu) маскировал бы user-запись.
+    if _claude_user_mcp_command() == cmd:
         return "без изменений"
     subprocess.run(["claude", "mcp", "remove", "--scope", "user", "jwu"], capture_output=True, text=True)
     proc = subprocess.run(["claude", "mcp", "add", "--scope", "user", "jwu", "--", cmd],

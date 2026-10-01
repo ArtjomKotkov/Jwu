@@ -131,3 +131,13 @@ def test_cli_install_for_cursor(tmp_path, monkeypatch):
     assert (tmp_path / "skills" / "jwu-session-init" / "SKILL.md").exists()
     assert (tmp_path / "agents" / "reviewer-jwu-sample.md").exists()
     assert "jwu" in _json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
+
+
+def test_register_mcp_claude_checks_user_scope(tmp_path, monkeypatch):
+    calls = []
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(_json.dumps({"mcpServers": {"jwu": {"command": "/bin/jwu-mcp"}}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(_si.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(_si.subprocess, "run", lambda args, **kw: calls.append(args))
+    assert _si.register_mcp_claude(command="/bin/jwu-mcp") == "без изменений" and calls == []
