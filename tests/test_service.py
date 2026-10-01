@@ -58,7 +58,7 @@ def test_client_for_key_routes_by_prefix(tmp_path):
     try:
         assert svc._client_for_key("SDESK-39336") is svc.sdesk
         assert svc._client_for_key("sdesk-1") is svc.sdesk  # регистр не важен
-        assert svc._client_for_key("WMCTASKS-5") is svc.jira
+        assert svc._client_for_key("TASKS-5") is svc.jira
     finally:
         svc.close()
 
@@ -74,8 +74,8 @@ def test_client_for_key_without_sdesk_always_jira(tmp_path):
 @respx.mock
 def test_issue_and_worklog_route_to_sdesk_instance(tmp_path):
     """SDESK-ключ ходит на хост SDESK, обычный — на основную Jira."""
-    jira_issue = respx.get(f"{JIRA}/rest/api/2/issue/WMCTASKS-1").mock(
-        return_value=httpx.Response(200, json=jira_issue_raw(key="WMCTASKS-1")))
+    jira_issue = respx.get(f"{JIRA}/rest/api/2/issue/TASKS-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(key="TASKS-1")))
     sdesk_issue = respx.get(f"{SDESK}/rest/api/2/issue/SDESK-39336").mock(
         return_value=httpx.Response(200, json=jira_issue_raw(key="SDESK-39336")))
     for host in (JIRA, SDESK):
@@ -87,7 +87,7 @@ def test_issue_and_worklog_route_to_sdesk_instance(tmp_path):
     svc = _service_with_sdesk(tmp_path)
     try:
         assert svc.issue("SDESK-39336").key == "SDESK-39336"
-        assert svc.issue("WMCTASKS-1").key == "WMCTASKS-1"
+        assert svc.issue("TASKS-1").key == "TASKS-1"
         svc.add_worklog("SDESK-39336", "1h")
     finally:
         svc.close()
@@ -122,18 +122,18 @@ def test_broken_sdesk_does_not_break_jira(tmp_path):
         sdesk_factory=_boom,
     )
 
-    respx.get(f"{JIRA}/rest/api/2/issue/WMCTASKS-1").mock(
-        return_value=httpx.Response(200, json=jira_issue_raw(key="WMCTASKS-1")))
+    respx.get(f"{JIRA}/rest/api/2/issue/TASKS-1").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(key="TASKS-1")))
     respx.get(f"{JIRA}/rest/dev-status/1.0/issue/detail").mock(
         return_value=httpx.Response(200, json={"detail": []}))
     respx.get(f"{JIRA}/rest/api/2/myself").mock(
-        return_value=httpx.Response(200, json={"name": "jdoe", "displayName": "AK"}))
+        return_value=httpx.Response(200, json={"name": "alice", "displayName": "AK"}))
     respx.get(f"{BB}/rest/api/1.0/dashboard/pull-requests").mock(
         return_value=httpx.Response(200, json=bitbucket_dashboard_raw([])))
 
     try:
         # Jira-ключ работает как ни в чём не бывало — SDESK-фабрика не дёргается
-        assert svc.issue("WMCTASKS-1").key == "WMCTASKS-1"
+        assert svc.issue("TASKS-1").key == "TASKS-1"
         res = svc.auth_check()
         assert res["jira"]["ok"] is True
         assert res["sdesk"]["ok"] is False and "401" in res["sdesk"]["error"]

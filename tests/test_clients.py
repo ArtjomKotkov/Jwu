@@ -389,10 +389,10 @@ def test_jira_session_relogin_on_expired_session():
     route = respx.get(f"{JIRA}/rest/api/2/myself")
     route.side_effect = [
         httpx.Response(401, text="session expired"),
-        httpx.Response(200, json={"name": "jdoe"}),
+        httpx.Response(200, json={"name": "alice"}),
     ]
-    with JiraClient(JIRA, session_login=("jdoe", "pw")) as jira:
-        assert jira.myself()["name"] == "jdoe"
+    with JiraClient(JIRA, session_login=("alice", "pw")) as jira:
+        assert jira.myself()["name"] == "alice"
     assert login.call_count == 2      # первый — конструктор, второй — после 401
     assert route.call_count == 2
 
@@ -404,7 +404,7 @@ def test_jira_session_relogin_happens_only_once():
         return_value=httpx.Response(200, json={}))
     route = respx.get(f"{JIRA}/rest/api/2/myself").mock(
         return_value=httpx.Response(401, text="nope"))
-    with JiraClient(JIRA, session_login=("jdoe", "pw")) as jira:
+    with JiraClient(JIRA, session_login=("alice", "pw")) as jira:
         with pytest.raises(JiraError) as exc:
             jira.myself()
     assert route.call_count == 2

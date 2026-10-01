@@ -27,3 +27,6 @@ config.toml
 .idea/
 .vscode/
 .DS_Store
+
+# Локальная регистрация MCP (пути машины разработчика)
+.mcp.json

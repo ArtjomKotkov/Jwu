@@ -51,15 +51,15 @@ def test_bitbucket_diff_review_and_reply():
     bb = BitbucketClient(BB, "tok")
     respx.get(f"{PR_BASE}/diff").mock(return_value=httpx.Response(200, json=_bb_diff_json()))
     one = respx.get(f"{PR_BASE}/diff/a.py").mock(return_value=httpx.Response(200, json={"diffs": _bb_diff_json()["diffs"][:1]}))
-    review = respx.put(f"{PR_BASE}/participants/jdoe").mock(return_value=httpx.Response(200, json={"status": "APPROVED"}))
+    review = respx.put(f"{PR_BASE}/participants/alice").mock(return_value=httpx.Response(200, json={"status": "APPROVED"}))
     try:
         assert "+++ b/new.txt" in bb.pr_diff("PROJ", "repo", 42)
         assert "new.txt" not in bb.pr_diff("PROJ", "repo", 42, path="a.py") and one.call_count == 1
-        assert bb.pr_review("PROJ", "repo", 42, "jdoe", "approved")["status"] == "APPROVED"
+        assert bb.pr_review("PROJ", "repo", 42, "alice", "approved")["status"] == "APPROVED"
         assert json.loads(review.calls.last.request.content) == {
-            "user": {"name": "jdoe"}, "approved": True, "status": "APPROVED"}
+            "user": {"name": "alice"}, "approved": True, "status": "APPROVED"}
         with pytest.raises(BitbucketError):
-            bb.pr_review("PROJ", "repo", 42, "jdoe", "DONE")
+            bb.pr_review("PROJ", "repo", 42, "alice", "DONE")
     finally:
         bb.close()
 
@@ -96,7 +96,7 @@ def test_github_diff_comment_and_review():
 def _service(tmp_path):
     cfg = Config()
     cfg.jira.base_url = JIRA
-    cfg.jira.username = "jdoe"
+    cfg.jira.username = "alice"
     cfg.bitbucket.base_url = BB
     cfg.bitbucket.project = "PROJ"
     cfg.bitbucket.repo = "repo"
@@ -105,8 +105,8 @@ def _service(tmp_path):
 
 @respx.mock
 def test_service_review_uses_my_login_and_truncates_diff(tmp_path):
-    respx.get(f"{JIRA}/rest/api/2/myself").mock(return_value=httpx.Response(200, json={"name": "jdoe", "displayName": "A"}))
-    review = respx.put(f"{PR_BASE}/participants/jdoe").mock(return_value=httpx.Response(200, json={"status": "NEEDS_WORK"}))
+    respx.get(f"{JIRA}/rest/api/2/myself").mock(return_value=httpx.Response(200, json={"name": "alice", "displayName": "A"}))
+    review = respx.put(f"{PR_BASE}/participants/alice").mock(return_value=httpx.Response(200, json={"status": "NEEDS_WORK"}))
     respx.get(f"{PR_BASE}/diff").mock(return_value=httpx.Response(200, json=_bb_diff_json()))
     svc = _service(tmp_path)
     try:

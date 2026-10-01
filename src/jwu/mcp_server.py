@@ -546,7 +546,7 @@ async def jwu_ssh_servers(workspace: Optional[str] = None) -> dict:
 
 @mcp.tool()
 async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
-    """Полная карточка задачи Jira/SDESK по ключу (напр. WMCTASKS-123 или SDESK-39336).
+    """Полная карточка задачи Jira/SDESK по ключу (напр. ACME-123 или SDESK-1234).
 
     Инстанс выбирается по префиксу ключа автоматически. Возвращает поля задачи,
     описание, все комментарии, links, dev-панель (ветки/PR), плюс локальные заметки
@@ -867,7 +867,7 @@ async def jwu_confluence_children(page_id: str, workspace: Optional[str] = None)
 
 @mcp.tool()
 async def jwu_confluence_search(cql: str, limit: int = 25, workspace: Optional[str] = None) -> dict:
-    """Поиск страниц Confluence по CQL, напр. `space = ACMETEST and title ~ "LINE"`. Без записи."""
+    """Поиск страниц Confluence по CQL, напр. `space = DOCS and title ~ "LINE"`. Без записи."""
     svc = _full_svc(workspace)
     return _stamp({"cql": cql, "results": svc.confluence().search(cql, limit=limit)}, _resolve(workspace))
 

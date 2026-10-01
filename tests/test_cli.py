@@ -378,7 +378,7 @@ def test_configure_enables_github_provider(monkeypatch, tmp_path):
 
     res = runner.invoke(cli.app, [
         "-W", "dndeck", "configure", "--non-interactive",
-        "--github-owner", "jdoe", "--github-repos", "dndeck",
+        "--github-owner", "alice", "--github-repos", "dndeck",
         "--github-token", "GHTOK",
     ])
     assert res.exit_code == 0, res.output
@@ -388,7 +388,7 @@ def test_configure_enables_github_provider(monkeypatch, tmp_path):
     assert ws.provider == "github" and ws.github_enabled is True
     assert ws.prs_enabled is True          # PR у GitHub приходят из того же места
     settings = store.workspace_settings(ws.id)
-    assert settings["github.owner"] == "jdoe"
+    assert settings["github.owner"] == "alice"
     assert store.workspace_secrets(ws.id)["github.token"] == "GHTOK"
     store.close()
 

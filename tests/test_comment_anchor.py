@@ -99,7 +99,7 @@ def _bb_file_diff(path="a.py"):
 
 def _activity(cid, *, anchored=True):
     act = {"action": "COMMENTED",
-           "comment": {"id": cid, "text": "t", "author": {"name": "jdoe", "displayName": "A"}},
+           "comment": {"id": cid, "text": "t", "author": {"name": "alice", "displayName": "A"}},
            "commentAnchor": {"path": "a.py", "line": 11, "lineType": "ADDED", "fileType": "TO"}}
     if anchored:
         act["diff"] = _bb_file_diff()["diffs"][0]
@@ -109,7 +109,7 @@ def _activity(cid, *, anchored=True):
 def _service(tmp_path):
     cfg = Config()
     cfg.jira.base_url = JIRA
-    cfg.jira.username = "jdoe"
+    cfg.jira.username = "alice"
     cfg.bitbucket.base_url = BB
     cfg.bitbucket.project = "PROJ"
     cfg.bitbucket.repo = "repo"
@@ -193,9 +193,9 @@ def test_pr_task_inline_comment_is_anchored(tmp_path):
 
 @respx.mock
 def test_delete_own_comment_only(tmp_path):
-    respx.get(f"{JIRA}/rest/api/2/myself").mock(return_value=httpx.Response(200, json={"name": "jdoe"}))
+    respx.get(f"{JIRA}/rest/api/2/myself").mock(return_value=httpx.Response(200, json={"name": "alice"}))
     respx.get(f"{PR_BASE}/comments/501").mock(return_value=httpx.Response(200, json={
-        "id": 501, "version": 3, "text": "мой", "author": {"name": "jdoe"}}))
+        "id": 501, "version": 3, "text": "мой", "author": {"name": "alice"}}))
     respx.get(f"{PR_BASE}/comments/600").mock(return_value=httpx.Response(200, json={
         "id": 600, "version": 0, "text": "чужой", "author": {"name": "colleague"}}))
     delete = respx.delete(f"{PR_BASE}/comments/501").mock(return_value=httpx.Response(204))

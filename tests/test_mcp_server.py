@@ -498,7 +498,7 @@ def test_auth_refresh_drops_cached_services(fresh_server, monkeypatch):
             closed.append(self.tag)
 
         def auth_check(self):
-            return {"jira": {"ok": True, "user": "jdoe"}}
+            return {"jira": {"ok": True, "user": "alice"}}
 
     ws = srv._resolve("work")
     srv._full[ws.id] = _Svc("старый")
@@ -508,7 +508,7 @@ def test_auth_refresh_drops_cached_services(fresh_server, monkeypatch):
     result = _run(srv.jwu_auth_refresh(workspace="work"))
     assert closed == ["старый"]
     assert srv._full[ws.id].tag == "новый"
-    assert result["ok"] is True and result["auth"]["jira"]["user"] == "jdoe"
+    assert result["ok"] is True and result["auth"]["jira"]["user"] == "alice"
 
 
 def test_day_context_tool_returns_markdown_and_data(fresh_server, monkeypatch):

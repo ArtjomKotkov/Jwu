@@ -21,9 +21,9 @@ API = f"{CONF}/rest/api"
 runner = CliRunner()
 
 
-def _page(pid="100", title="WhatsApp Gupshup", version=3, body="<p>текст</p>"):
+def _page(pid="100", title="WhatsApp Business", version=3, body="<p>текст</p>"):
     return {"id": pid, "title": title, "type": "page",
-            "space": {"key": "ACMETEST"}, "version": {"number": version, "by": {"displayName": "Artyom"}},
+            "space": {"key": "DOCS"}, "version": {"number": version, "by": {"displayName": "Alice"}},
             "ancestors": [{"id": "1", "title": "Home"}, {"id": "50", "title": "Каналы"}],
             "body": {"storage": {"value": body}}, "_links": {"webui": f"/pages/viewpage.action?pageId={pid}"}}
 
@@ -33,7 +33,7 @@ def _login_ok():
 
 
 def _client():
-    return ConfluenceClient(CONF, proxy_basic=("gate", "gp"), session_login=("jdoe", "pw"))
+    return ConfluenceClient(CONF, proxy_basic=("gate", "gp"), session_login=("alice", "pw"))
 
 
 @respx.mock
@@ -45,11 +45,11 @@ def test_login_with_gate_and_read_page():
         page = c.page("100")
     finally:
         c.close()
-    assert page == {"id": "100", "title": "WhatsApp Gupshup", "space": "ACMETEST", "version": 3,
-                    "updated_by": "Artyom", "parent_id": "50", "path": ["Home", "Каналы"],
+    assert page == {"id": "100", "title": "WhatsApp Business", "space": "DOCS", "version": 3,
+                    "updated_by": "Alice", "parent_id": "50", "path": ["Home", "Каналы"],
                     "url": f"{CONF}/pages/viewpage.action?pageId=100", "body": "<p>текст</p>"}
     form = login.calls.last.request.content.decode()
-    assert "os_username=jdoe" in form and "os_password=pw" in form
+    assert "os_username=alice" in form and "os_password=pw" in form
     assert route.calls.last.request.headers["authorization"].startswith("Basic ")   # гейт nginx
     assert route.calls.last.request.url.params["expand"] == "space,version,ancestors,body.storage"
 
@@ -72,7 +72,7 @@ def test_expired_session_relogin_once():
     respx.get(f"{API}/content/100").mock(side_effect=[httpx.Response(401), httpx.Response(200, json=_page())])
     c = _client()
     try:
-        assert c.page("100")["title"] == "WhatsApp Gupshup"
+        assert c.page("100")["title"] == "WhatsApp Business"
     finally:
         c.close()
     assert login.call_count == 2
@@ -82,13 +82,13 @@ def test_expired_session_relogin_once():
 def test_children_and_search():
     _login_ok()
     respx.get(f"{API}/content/50/child/page").mock(return_value=httpx.Response(200, json={"results": [
-        {"id": "100", "title": "WhatsApp Gupshup", "version": {"number": 3}, "_links": {"webui": "/x"}}]}))
+        {"id": "100", "title": "WhatsApp Business", "version": {"number": 3}, "_links": {"webui": "/x"}}]}))
     respx.get(f"{API}/content/search").mock(return_value=httpx.Response(200, json={"results": [
-        {"id": "100", "title": "WhatsApp Gupshup", "space": {"key": "ACMETEST"}, "_links": {}}]}))
+        {"id": "100", "title": "WhatsApp Business", "space": {"key": "DOCS"}, "_links": {}}]}))
     c = _client()
     try:
-        assert c.children("50") == [{"id": "100", "title": "WhatsApp Gupshup", "version": 3, "url": f"{CONF}/x"}]
-        assert c.search('title ~ "gupshup"')[0]["space"] == "ACMETEST"
+        assert c.children("50") == [{"id": "100", "title": "WhatsApp Business", "version": 3, "url": f"{CONF}/x"}]
+        assert c.search('title ~ "whatsapp"')[0]["space"] == "DOCS"
     finally:
         c.close()
 
@@ -107,7 +107,7 @@ def test_no_delete_anywhere():
 def _svc(tmp_path):
     cfg = Config()
     cfg.jira.base_url = "https://jira.test"
-    cfg.jira.username = "jdoe"
+    cfg.jira.username = "alice"
     store = Store(tmp_path / "s.db")
     store.use_workspace(store.get_workspace_by_slug("work").id)
     store.set_workspace_settings(store.workspace_id, {conf_mod.BASE_URL_SETTING: CONF})
@@ -126,11 +126,11 @@ def test_create_under_parent_dry_run_then_write(tmp_path):
     svc = _svc(tmp_path)
     try:
         preview = svc.confluence_create(title=" LINE ", body="<p>гайд</p>", parent_id="50")
-        assert preview["dry_run"] and preview["space"] == "ACMETEST" and preview["parent"]["title"] == "Каналы"
+        assert preview["dry_run"] and preview["space"] == "DOCS" and preview["parent"]["title"] == "Каналы"
         assert post.call_count == 0
         res = svc.confluence_create(title="LINE", body="<p>гайд</p>", parent_id="50", dry_run=False)
         assert json.loads(post.calls.last.request.content) == {
-            "type": "page", "title": "LINE", "space": {"key": "ACMETEST"},
+            "type": "page", "title": "LINE", "space": {"key": "DOCS"},
             "body": {"storage": {"value": "<p>гайд</p>", "representation": "storage"}},
             "ancestors": [{"id": "50"}]}
         assert res["id"] == "200" and res["url"].endswith("pageId=200")
@@ -142,12 +142,12 @@ def test_create_under_parent_dry_run_then_write(tmp_path):
 def test_create_refuses_taken_title(tmp_path):
     _login_ok()
     respx.get(f"{API}/content/50").mock(return_value=httpx.Response(200, json=_page("50", "Каналы")))
-    respx.get(f"{API}/content").mock(return_value=httpx.Response(200, json={"results": [{"id": "100", "title": "WhatsApp Gupshup"}]}))
+    respx.get(f"{API}/content").mock(return_value=httpx.Response(200, json={"results": [{"id": "100", "title": "WhatsApp Business"}]}))
     post = respx.post(f"{API}/content")
     svc = _svc(tmp_path)
     try:
         with pytest.raises(ValueError, match="уже есть страница"):
-            svc.confluence_create(title="WhatsApp Gupshup", body="<p>x</p>", parent_id="50", dry_run=False)
+            svc.confluence_create(title="WhatsApp Business", body="<p>x</p>", parent_id="50", dry_run=False)
         assert post.call_count == 0
     finally:
         svc.close()
@@ -158,14 +158,14 @@ def test_update_bumps_version_and_keeps_body_when_only_title(tmp_path):
     _login_ok()
     respx.get(f"{API}/content/100").mock(return_value=httpx.Response(200, json=_page(version=3, body="<p>старое</p>")))
     put = respx.put(f"{API}/content/100").mock(return_value=httpx.Response(200, json={
-        "id": "100", "title": "WhatsApp (Gupshup)", "version": {"number": 4}, "_links": {}}))
+        "id": "100", "title": "WhatsApp (Business)", "version": {"number": 4}, "_links": {}}))
     svc = _svc(tmp_path)
     try:
-        preview = svc.confluence_update("100", title="WhatsApp (Gupshup)")
+        preview = svc.confluence_update("100", title="WhatsApp (Business)")
         assert preview["dry_run"] and preview["version"] == 3 and not preview["body_changed"] and put.call_count == 0
-        res = svc.confluence_update("100", title="WhatsApp (Gupshup)", message="уточнил", dry_run=False)
+        res = svc.confluence_update("100", title="WhatsApp (Business)", message="уточнил", dry_run=False)
         assert json.loads(put.calls.last.request.content) == {
-            "id": "100", "type": "page", "title": "WhatsApp (Gupshup)",
+            "id": "100", "type": "page", "title": "WhatsApp (Business)",
             "version": {"number": 4, "message": "уточнил"},
             "body": {"storage": {"value": "<p>старое</p>", "representation": "storage"}}}
         assert res["version"] == 4
@@ -202,8 +202,8 @@ def test_not_configured(tmp_path):
 # --- CLI ---------------------------------------------------------------------- #
 
 def test_cli_setup_and_create_requires_confirmation(tmp_path, monkeypatch):
-    r = runner.invoke(cli.app, ["-W", "work", "confluence", "setup", "--url", "https://conf.test/", "--space", "ACMETEST"])
-    assert r.exit_code == 0 and "https://conf.test" in r.output and "ACMETEST" in r.output
+    r = runner.invoke(cli.app, ["-W", "work", "confluence", "setup", "--url", "https://conf.test/", "--space", "DOCS"])
+    assert r.exit_code == 0 and "https://conf.test" in r.output and "DOCS" in r.output
     calls = []
 
     class Svc:
@@ -215,7 +215,7 @@ def test_cli_setup_and_create_requires_confirmation(tmp_path, monkeypatch):
 
         def confluence_create(self, **kw):
             calls.append(kw["dry_run"])
-            return {"dry_run": True, "space": "ACMETEST", "title": kw["title"], "format": "storage",
+            return {"dry_run": True, "space": "DOCS", "title": kw["title"], "format": "storage",
                     "parent": {"id": "50", "title": "Каналы", "path": []}, "body_chars": 5}
 
     monkeypatch.setattr(cli, "_service", lambda: Svc())

@@ -11,7 +11,7 @@ from jwu.core.service import Service
 from jwu.core.store import Store
 
 GH = "https://api.github.com"
-OWNER = "jdoe"
+OWNER = "alice"
 REPO = "dndeck"
 
 
@@ -21,7 +21,7 @@ REPO = "dndeck"
 
 
 def gh_issue_raw(number=42, title="Колода не сохраняется", state="open",
-                 state_reason=None, labels=("bug",), assignee="jdoe"):
+                 state_reason=None, labels=("bug",), assignee="alice"):
     return {
         "number": number,
         "title": title,
@@ -135,7 +135,7 @@ def test_issue_maps_state_labels_and_comments():
             state="closed", state_reason="not_planned", labels=("bug", "ui"))))
     respx.get(f"{GH}/repos/{OWNER}/{REPO}/issues/42/comments").mock(
         return_value=httpx.Response(200, json=[
-            {"id": 1, "user": {"login": "bob"}, "body": "@jdoe глянь",
+            {"id": 1, "user": {"login": "bob"}, "body": "@alice глянь",
              "created_at": "2026-07-19T10:00:00Z", "updated_at": "2026-07-19T10:00:00Z"},
         ]))
     with _client() as gh:

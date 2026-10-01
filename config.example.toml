@@ -55,7 +55,7 @@
 # [github]
 # api_url = "https://api.github.com"     # GHE: https://ghe.example.com/api/v3
 # web_url = "https://github.com"         # GHE: https://ghe.example.com
-# owner = "jdoe"                      # организация или пользователь
+# owner = "my-org"                      # организация или пользователь
 # repos = "dndeck,dndeck-ui"             # пусто => все репозитории owner'а
 # username = ""                          # мой логин; пусто => берётся из /user
 

@@ -8,14 +8,14 @@ from jwu.core.jira import JiraClient
 from jwu.core.models import Delta, Issue, Mention, PR
 
 JIRA = "https://jira.test"
-ME = ("jdoe", "Иван Петров")
+ME = ("alice", "Алиса Доу")
 
 
 def _issues():
     return {
-        "SHOP-243": Issue(key="SHOP-243", assignee="Иван Петров", reporter="QA"),
+        "SHOP-243": Issue(key="SHOP-243", assignee="Алиса Доу", reporter="QA"),
         "CORE-12728": Issue(key="CORE-12728", assignee="Иван Иванов", reporter="QA"),
-        "PROJ-336": Issue(key="PROJ-336", assignee="Пётр Петров", reporter="Иван Петров"),
+        "CHAT-336": Issue(key="CHAT-336", assignee="Пётр Петров", reporter="Алиса Доу"),
         "PROJ-1": Issue(key="PROJ-1", assignee="Коллега"),
         "PROJ-2": Issue(key="PROJ-2", assignee="Коллега"),
         "PROJ-3": Issue(key="PROJ-3", assignee=""),
@@ -31,14 +31,14 @@ def _prs():
 def test_role_priority():
     mine, review = _prs()
     roles = notify.resolve_roles(
-        ["SHOP-243", "PROJ-1", "PROJ-336", "PROJ-2", "PROJ-3", "CORE-12728",
+        ["SHOP-243", "PROJ-1", "CHAT-336", "PROJ-2", "PROJ-3", "CORE-12728",
          "P/r#10", "P/r#20"],
         me=ME, issues=_issues(), my_prs=mine, review_prs=review, mention_keys=["PROJ-3"])
     got = {k: (r.label, r.mine) for k, r in roles.items()}
     assert got == {
         "SHOP-243": (notify.ROLE_ASSIGNEE, True),
         "PROJ-1": (notify.ROLE_MY_PR, True),            # задача моего PR
-        "PROJ-336": (notify.ROLE_REPORTER, False),
+        "CHAT-336": (notify.ROLE_REPORTER, False),
         "PROJ-2": (notify.ROLE_REVIEWER, False),         # задача PR на моём ревью
         "PROJ-3": (notify.ROLE_MENTIONED, False),
         "CORE-12728": (notify.ROLE_WATCHER, False),
@@ -50,10 +50,10 @@ def test_role_priority():
 
 def test_fresh_assignee_from_status_wins():
     roles = notify.resolve_roles(["CORE-12728"], me=ME, issues=_issues(),
-                                 status={"CORE-12728": {"actor": "Aleksandra Golovko",
-                                                             "assignee": "Иван Петров"}})
+                                 status={"CORE-12728": {"actor": "Kate Brown",
+                                                             "assignee": "Алиса Доу"}})
     role = roles["CORE-12728"]
-    assert role.mine and role.label == notify.ROLE_ASSIGNEE and role.actor == "Aleksandra Golovko"
+    assert role.mine and role.label == notify.ROLE_ASSIGNEE and role.actor == "Kate Brown"
 
 
 def _note():
@@ -61,14 +61,14 @@ def _note():
         Delta(key="SHOP-243", kind="returned_from_testing", summary="Проблема при выгрузке статистики",
               detail="ACME TESTING → DEFECT"),
         Delta(key="CORE-12728", kind="qa_comment", summary="Баг хронологии сообщений",
-              detail="+1 комм. от Aleksandra Golovko"),
+              detail="+1 комм. от Kate Brown"),
     ]
-    mentions = [Mention(task_key="PROJ-336", author="Roman Gomelauri", text="[~jdoe] Стенд готов")]
+    mentions = [Mention(task_key="CHAT-336", author="Tom Hill", text="[~alice] Стенд готов")]
     note = notify.build_notification("work", deltas, mentions)
     note.roles = notify.resolve_roles(
-        ["SHOP-243", "CORE-12728", "PROJ-336"], me=ME, issues=_issues(),
-        mention_keys=["PROJ-336"],
-        status={"SHOP-243": {"actor": "Мария QA", "assignee": "Иван Петров"}})
+        ["SHOP-243", "CORE-12728", "CHAT-336"], me=ME, issues=_issues(),
+        mention_keys=["CHAT-336"],
+        status={"SHOP-243": {"actor": "Мария QA", "assignee": "Алиса Доу"}})
     return note
 
 
@@ -104,14 +104,14 @@ def test_without_roles_old_format():
 @respx.mock
 def test_jira_status_actor():
     respx.get(f"{JIRA}/rest/api/2/issue/SHOP-243").mock(return_value=httpx.Response(200, json={
-        "fields": {"assignee": {"displayName": "Иван Петров"}},
+        "fields": {"assignee": {"displayName": "Алиса Доу"}},
         "changelog": {"histories": [
             {"author": {"displayName": "Старый"}, "created": "2026-09-20",
              "items": [{"field": "status", "fromString": "Open", "toString": "ACME TESTING"}]},
             {"author": {"displayName": "Мария QA"}, "created": "2026-09-25",
              "items": [{"field": "status", "fromString": "ACME TESTING", "toString": "DEFECT"}]},
             {"author": {"displayName": "Кто-то"}, "created": "2026-09-26",
-             "items": [{"field": "assignee", "toString": "Иван Петров"}]},
+             "items": [{"field": "assignee", "toString": "Алиса Доу"}]},
         ]}}))
     client = JiraClient(JIRA, "tok")
     try:
@@ -119,5 +119,5 @@ def test_jira_status_actor():
     finally:
         client.close()
     assert got == {"actor": "Мария QA", "from": "ACME TESTING", "to": "DEFECT", "at": "2026-09-25",
-                   "assignee": "Иван Петров"}
+                   "assignee": "Алиса Доу"}
     assert respx.calls.last.request.url.params["expand"] == "changelog"

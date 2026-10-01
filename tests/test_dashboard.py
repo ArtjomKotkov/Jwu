@@ -3106,7 +3106,7 @@ def test_footer_shows_provider_host_and_login(tmp_path):
     store = Store(tmp_path / "state.db")
     ws = workspaces.create(store, "dndeck", provider="github")
     data = _github_data(store, ws)
-    data.user, data.display_name = "jdoe", "Артём"
+    data.user, data.display_name = "alice", "Алиса"
     data.env_label = "dndeck @ github.com"
     store.close()
 
@@ -3114,7 +3114,7 @@ def test_footer_shows_provider_host_and_login(tmp_path):
     block = app._user_block()
     assert "GitHub" in block                      # провайдер
     assert "dndeck @ github.com" in block         # хост и репозиторий
-    assert "Артём (jdoe)" in block             # под кем
+    assert "Алиса (alice)" in block             # под кем
     assert "dndeck" in block                      # какой контур
 
 
@@ -3160,12 +3160,12 @@ def test_pr_task_key_reads_github_issue_number():
     from jwu.cli.dashboard import pr_task_key
 
     pr = PR(id=7, title="Fix save", source_branch="42-fix-save",
-            project="jdoe", repository="dndeck")
-    assert pr_task_key(pr, "jdoe") == "dndeck#42"
+            project="alice", repository="dndeck")
+    assert pr_task_key(pr, "alice") == "dndeck#42"
     # ключ Jira по-прежнему в приоритете — контуры Jira ничего не замечают
     jira_pr = PR(id=7, title="PROJ-9: fix", source_branch="PROJ-9-fix",
                  project="PROJ", repository="repo")
     assert pr_task_key(jira_pr) == "PROJ-9"
     # связи нет — колонка «Задача» останется пустой, а не покажет мусор
     assert pr_task_key(PR(id=7, title="Fix", source_branch="fix",
-                          project="jdoe", repository="dndeck"), "jdoe") == ""
+                          project="alice", repository="dndeck"), "alice") == ""

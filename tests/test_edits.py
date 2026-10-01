@@ -27,7 +27,7 @@ runner = CliRunner()
 def _svc(tmp_path):
     cfg = Config()
     cfg.jira.base_url = JIRA
-    cfg.jira.username = "jdoe"
+    cfg.jira.username = "alice"
     cfg.bitbucket.base_url = BB
     cfg.bitbucket.project = "PROJ"
     cfg.bitbucket.repo = "repo"
@@ -47,7 +47,7 @@ def _body(route):
 @respx.mock
 def test_issue_comment_edit_and_delete_own(tmp_path):
     respx.get(f"{API}/issue/PROJ-1/comment/10").mock(return_value=httpx.Response(200, json={
-        "id": "10", "body": "старый", "author": {"name": "jdoe"}}))
+        "id": "10", "body": "старый", "author": {"name": "alice"}}))
     put = respx.put(f"{API}/issue/PROJ-1/comment/10").mock(return_value=httpx.Response(200, json={"id": "10"}))
     delete = respx.delete(f"{API}/issue/PROJ-1/comment/10").mock(return_value=httpx.Response(204))
     svc = _svc(tmp_path)
@@ -114,7 +114,7 @@ def test_no_issue_delete_anywhere():
 def test_worklog_edit_converts_started_to_workspace_tz(tmp_path):
     respx.get(f"{API}/issue/PROJ-1/worklog/77").mock(return_value=httpx.Response(200, json={
         "id": "77", "timeSpent": "1h", "started": "2026-09-30T09:00:00.000+0300", "comment": "было",
-        "author": {"name": "jdoe"}}))
+        "author": {"name": "alice"}}))
     put = respx.put(f"{API}/issue/PROJ-1/worklog/77").mock(return_value=httpx.Response(200, json={}))
     svc = _svc(tmp_path)
     try:
@@ -130,7 +130,7 @@ def test_worklog_edit_converts_started_to_workspace_tz(tmp_path):
 @respx.mock
 def test_worklog_delete_own_only(tmp_path):
     respx.get(f"{API}/issue/PROJ-1/worklog/77").mock(return_value=httpx.Response(200, json={
-        "id": "77", "timeSpent": "1h", "author": {"name": "jdoe"}}))
+        "id": "77", "timeSpent": "1h", "author": {"name": "alice"}}))
     respx.get(f"{API}/issue/PROJ-1/worklog/78").mock(return_value=httpx.Response(200, json={
         "id": "78", "timeSpent": "2h", "author": {"name": "boss"}}))
     d77 = respx.delete(f"{API}/issue/PROJ-1/worklog/77").mock(return_value=httpx.Response(204))
@@ -156,7 +156,7 @@ def test_to_jira_started_needs_tz():
 @respx.mock
 def test_bitbucket_pr_comment_edit(tmp_path):
     respx.get(f"{PR_BASE}/comments/5").mock(return_value=httpx.Response(200, json={
-        "id": 5, "version": 2, "text": "было", "author": {"name": "jdoe"}}))
+        "id": 5, "version": 2, "text": "было", "author": {"name": "alice"}}))
     put = respx.put(f"{PR_BASE}/comments/5").mock(return_value=httpx.Response(200, json={"id": 5}))
     svc = _svc(tmp_path)
     try:
@@ -166,7 +166,7 @@ def test_bitbucket_pr_comment_edit(tmp_path):
         svc.close()
 
 
-def _bb_pr(author="jdoe"):
+def _bb_pr(author="alice"):
     return {"id": 42, "version": 7, "title": "PROJ-1: старое", "description": "было",
             "author": {"user": {"name": author, "displayName": author}},
             "reviewers": [{"user": {"name": "bob", "displayName": "Bob"}, "status": "UNAPPROVED"}],
@@ -205,7 +205,7 @@ def test_bitbucket_foreign_pr_refused(tmp_path):
 @respx.mock
 def test_bitbucket_pr_task_edit_and_delete(tmp_path):
     respx.get(f"{BB}/rest/api/1.0/tasks/9").mock(return_value=httpx.Response(200, json={
-        "id": 9, "text": "старое", "state": "OPEN", "author": {"name": "jdoe"}}))
+        "id": 9, "text": "старое", "state": "OPEN", "author": {"name": "alice"}}))
     put = respx.put(f"{BB}/rest/api/1.0/tasks/9").mock(return_value=httpx.Response(200, json={
         "id": 9, "text": "Вынести таймаут в настройки", "state": "OPEN"}))
     delete = respx.delete(f"{BB}/rest/api/1.0/tasks/9").mock(return_value=httpx.Response(204))

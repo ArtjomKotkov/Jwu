@@ -64,7 +64,7 @@ def test_format_message_sections_links_and_escapes():
     assert "•" not in text and "появился" not in text
     assert "<b>P/r#1</b>" in notify.format_message(note)          # без хостов — жирный ключ
     assert notify.key_url("dndeck/ui#5", notify.Links(github="https://github.com")) == "https://github.com/dndeck/ui/pull/5"
-    assert notify.strip_mention_tags("[~jdoe] [~asmirnov] - как дела?") == "как дела?"
+    assert notify.strip_mention_tags("[~alice] [~asmirnov] - как дела?") == "как дела?"
     assert not notify.Notification(workspace="w")
 
 
