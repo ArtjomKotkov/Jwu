@@ -4708,6 +4708,8 @@ app.add_typer(review_app, name="review")
 @review_app.command("queue")
 def review_queue(
     include_approved: bool = typer.Option(False, "--include-approved", help="Включить PR, где я уже APPROVED."),
+    include_needs_work: bool = typer.Option(False, "--include-needs-work",
+                                            help="Сразу включить PR, где я уже NEEDS_WORK (без вопроса)."),
     pr_ids: list[int] = typer.Option([], "--pr", help="Только эти PR (можно несколько)."),
     repos: list[str] = typer.Option([], "--repo", help="Только эти репозитории (можно несколько)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
@@ -4719,13 +4721,19 @@ def review_queue(
         ws = svc.workspace
         items = svc.prs("review", with_conflicts=False, with_builds=False)
         result = reviewq.plan(svc.store, ws.id, ws.slug, items, svc._resolve_username(),
-                              include_approved=include_approved, ids=pr_ids, repos=repos)
+                              include_approved=include_approved, include_needs_work=include_needs_work,
+                              ids=pr_ids, repos=repos, client=svc.pr_client)
     if json_out:
         _emit_json(result)
         return
     for q in result["queue"]:
         console.print(f"[cyan]#{q['pr']}[/cyan] {q['repo']}  {escape(q['title'])}  "
                       f"[dim]{q['task_key'] or '—'} · {q['my_status']} · {q['reviewer_agent']}[/dim]")
+    for nw in result["needs_work"]:
+        moved = ("новых коммитов нет" if nw.get("new_commits") == 0 else
+                 f"новых коммитов: {nw['new_commits']}" if nw.get("new_commits") else "не знаю, были ли правки")
+        console.print(f"[yellow]мой NEEDS_WORK[/yellow] [cyan]#{nw['pr']}[/cyan] {nw['repo']}  "
+                      f"{escape(nw['title'])}  [dim]{moved} — проверять ли?[/dim]")
     for sk in result["skipped"]:
         console.print(f"[dim]пропущен #{sk['pr']} {sk['repo']}: {sk['reason']}[/dim]")
     console.print(f"[dim]сводка: {result['summary']} · фильтр: {result['filter_agent']}[/dim]")

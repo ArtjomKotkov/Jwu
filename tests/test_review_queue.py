@@ -39,15 +39,15 @@ def test_my_status():
 
 def test_select_skips_my_approved_and_filters():
     prs = [_pr(1), _pr(2, status="APPROVED"), _pr(3, repo="docs"), _pr(4, status="NEEDS_WORK")]
-    queue, skipped = reviewq.select(prs, "me")
-    assert [p.id for p in queue] == [1, 3, 4]
+    queue, skipped, ask = reviewq.select(prs, "me")
+    assert [p.id for p in queue] == [1, 3] and [p.id for p in ask] == [4]   # мой NEEDS_WORK — под вопрос
     assert skipped == [{"pr": 2, "repo": "chat", "title": "PR 2", "reason": "мой статус уже APPROVED"}]
-    queue, _ = reviewq.select(prs, "me", include_approved=True)
-    assert [p.id for p in queue] == [1, 2, 3, 4]
-    queue, skipped = reviewq.select(prs, "me", repos=["DOCS"])
+    queue, _, ask = reviewq.select(prs, "me", include_approved=True, include_needs_work=True)
+    assert [p.id for p in queue] == [1, 2, 3, 4] and ask == []
+    queue, skipped, _ = reviewq.select(prs, "me", repos=["DOCS"])
     assert [p.id for p in queue] == [3] and {s["reason"] for s in skipped} == {"не в списке репозиториев"}
-    queue, _ = reviewq.select(prs, "me", ids=[4, 2])
-    assert [p.id for p in queue] == [4]  # #2 — в списке, но уже APPROVED
+    queue, _, ask = reviewq.select(prs, "me", ids=[4, 2])
+    assert [p.id for p in queue] == [4] and ask == []  # явно названный NEEDS_WORK — без вопроса; #2 APPROVED
 
 
 def test_agents_settings(store):
@@ -81,6 +81,8 @@ def test_shipped():
 
 def test_mcp_review_queue(tmp_path, monkeypatch):
     class Svc:
+        pr_client = None
+
         def __init__(self, store):
             self.store = store
 
@@ -115,3 +117,32 @@ def test_cli_review_agents():
     assert json.loads(r.output[r.output.index("{"):])["reviewers"] == {"chat": "rv-chat"}
     r = runner.invoke(cli.app, ["-W", "work", "review", "agents", "--reviewer", "x"])
     assert r.exit_code == 1 and "--repo" in r.output
+
+
+
+def test_plan_needs_work_section_with_activity(store):
+    wid = store.get_workspace_by_slug("work").id
+
+    class Client:
+        def my_review_at(self, project, repo, pr_id, login):
+            return 1000
+
+        def pr_commits(self, project, repo, pr_id, limit=50):
+            return [{"ts": 500}, {"ts": 1500}, {"ts": 2500}] if pr_id == 4 else [{"ts": 500}]
+
+    prs = [_pr(1), _pr(4, status="NEEDS_WORK"), _pr(5, status="NEEDS_WORK")]
+    plan = reviewq.plan(store, wid, "work", prs, "me", client=Client())
+    assert [q["pr"] for q in plan["queue"]] == [1]
+    nw = {x["pr"]: x for x in plan["needs_work"]}
+    assert nw[4]["new_commits"] == 2 and nw[4]["last_commit_at"] == 2500
+    assert nw[5]["new_commits"] == 0                                  # автор ещё не правил
+    assert "url" in nw[4] and nw[4]["reviewer_agent"] == "reviewer-jwu-sample"
+
+
+def test_since_my_review_survives_errors():
+    class Broken:
+        def my_review_at(self, *a):
+            raise RuntimeError("сеть")
+
+    assert reviewq.since_my_review(Broken(), _pr(1), "me") == {
+        "my_review_at": None, "new_commits": None, "last_commit_at": None}

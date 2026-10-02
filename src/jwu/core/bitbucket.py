@@ -315,6 +315,7 @@ class BitbucketClient:
                 "id": c.get("displayId", c.get("id", "")),
                 "message": (c.get("message", "") or "").strip(),
                 "author": _get(c, "author", "name") or _get(c, "author", "displayName") or "",
+                "ts": int(c.get("committerTimestamp") or c.get("authorTimestamp") or 0),
             })
         return out
 

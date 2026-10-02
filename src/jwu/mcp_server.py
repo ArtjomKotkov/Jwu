@@ -403,6 +403,7 @@ async def jwu_thresholds(workspace: Optional[str] = None) -> dict:
 @mcp.tool()
 async def jwu_review_queue(
     include_approved: bool = False,
+    include_needs_work: bool = False,
     prs: Optional[list[int]] = None,
     repos: Optional[list[str]] = None,
     workspace: Optional[str] = None,
@@ -417,6 +418,12 @@ async def jwu_review_queue(
     каталог сводки в данных jwu (вне репозиториев), `filter_agent` — агент фильтра
     замечаний, `skipped` — пропущенные PR с причиной.
 
+    `needs_work` — PR, где мой статус уже NEEDS_WORK: в очередь сами не идут, их надо
+    отдельно спросить у пользователя («проверять ли?»). У каждого — те же поля, что в
+    очереди, плюс `my_review_at`, `new_commits` (коммитов после моего ревью; 0 — автор
+    ещё не правил), `last_commit_at` (epoch ms). Выбранные пользователем добавь в очередь
+    как есть. include_needs_work=True или явные `prs` — сразу в очередь, без вопроса.
+
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).
     """
@@ -426,7 +433,8 @@ async def jwu_review_queue(
     svc = _full_svc(workspace)
     items = svc.prs("review", with_conflicts=False, with_builds=False)
     result = reviewq.plan(svc.store, ws.id, ws.slug, items, svc._resolve_username(),
-                          include_approved=include_approved, ids=prs, repos=repos)
+                          include_approved=include_approved, include_needs_work=include_needs_work,
+                          ids=prs, repos=repos, client=svc.pr_client)
     Path(result["dir"]).mkdir(parents=True, exist_ok=True)
     return _stamp(result, ws)
 

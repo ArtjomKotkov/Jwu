@@ -89,13 +89,20 @@ def my_status(pr: PR, login: str) -> str:
 
 
 def select(prs: Iterable[PR], login: str, *, include_approved: bool = False,
+           include_needs_work: bool = False,
            ids: Iterable[int] | None = None, repos: Iterable[str] | None = None
-           ) -> tuple[list[PR], list[dict]]:
-    """Очередь ревью и пропущенные (с причиной). Порядок — как пришли (свежие сверху)."""
+           ) -> tuple[list[PR], list[dict], list[PR]]:
+    """(очередь, пропущенные с причиной, мои NEEDS_WORK под вопрос). Порядок — как пришли.
+
+    PR, где мой статус уже NEEDS_WORK, в очередь сразу не идут: смотреть их повторно
+    имеет смысл, только если автор что-то поправил, — это решает пользователь. Явно
+    названные номера (``ids``) и ``include_needs_work`` идут в очередь без вопроса.
+    """
     id_set = {int(i) for i in ids} if ids else set()
     repo_set = {r.casefold() for r in repos} if repos else set()
     queue: list[PR] = []
     skipped: list[dict] = []
+    ask: list[PR] = []
     for pr in prs:
         status = my_status(pr, login)
         reason = ""
@@ -107,30 +114,66 @@ def select(prs: Iterable[PR], login: str, *, include_approved: bool = False,
             reason = "мой статус уже APPROVED"
         if reason:
             skipped.append({"pr": pr.id, "repo": pr.repository, "title": pr.title, "reason": reason})
+        elif status == "NEEDS_WORK" and not include_needs_work and not id_set:
+            ask.append(pr)
         else:
             queue.append(pr)
-    return queue, skipped
+    return queue, skipped, ask
+
+
+def since_my_review(client, pr: PR, login: str) -> dict:
+    """Что было в PR после моего последнего ревью-действия: когда оно, сколько коммитов после.
+
+    Нужно, чтобы решить, смотреть ли PR с моим NEEDS_WORK повторно: нет новых коммитов —
+    автор ещё не поправил. Ошибка сети — пустые поля, а не отказ всей очереди.
+    """
+    out: dict = {"my_review_at": None, "new_commits": None, "last_commit_at": None}
+    try:
+        at = client.my_review_at(pr.project, pr.repository, pr.id, login)
+        commits = client.pr_commits(pr.project, pr.repository, pr.id, limit=50)
+    except Exception:  # noqa: BLE001
+        return out
+    stamps = [int(c.get("ts") or 0) for c in commits if c.get("ts")]
+    out["my_review_at"] = at
+    out["last_commit_at"] = max(stamps) if stamps else None
+    if at is not None and stamps:
+        out["new_commits"] = sum(1 for t in stamps if t > at)
+    return out
+
+
+def _item(store: "Store", workspace_id: int, out_dir: Path, pr: PR, login: str) -> dict:
+    return {
+        "pr": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title,
+        "author": pr.author, "source": pr.source_branch, "target": pr.target_branch,
+        "task_key": task_key_of(pr.source_branch) or task_key_of(pr.title),
+        "my_status": my_status(pr, login) or "UNAPPROVED",
+        "reviewer_agent": reviewer_for(store, workspace_id, pr.repository),
+        "review_file": str(out_dir / f"pr-{pr.repository}-{pr.id}.review.md"),
+        "facts_file": str(out_dir / f"pr-{pr.repository}-{pr.id}.facts.md"),
+        "url": pr.url,
+    }
 
 
 def plan(store: "Store", workspace_id: int, slug: str, prs: Iterable[PR], login: str, *,
-         include_approved: bool = False, ids: Iterable[int] | None = None,
-         repos: Iterable[str] | None = None, day: str | None = None) -> dict:
-    """Всё, что нужно скиллу для фазы A: очередь с ревьюером и файлом раздела, пропуски, пути."""
-    queue, skipped = select(prs, login, include_approved=include_approved, ids=ids, repos=repos)
+         include_approved: bool = False, include_needs_work: bool = False,
+         ids: Iterable[int] | None = None, repos: Iterable[str] | None = None,
+         day: str | None = None, client=None) -> dict:
+    """Всё, что нужно скиллу для фазы A: очередь с ревьюером и файлом раздела, пропуски,
+    PR с моим NEEDS_WORK под вопрос (с тем, что было после моего ревью — если дан client)."""
+    queue, skipped, ask = select(prs, login, include_approved=include_approved,
+                                 include_needs_work=include_needs_work, ids=ids, repos=repos)
     out_dir = reviews_dir(slug, day)
+    needs_work = []
+    for pr in ask:
+        item = _item(store, workspace_id, out_dir, pr, login)
+        if client is not None:
+            item.update(since_my_review(client, pr, login))
+        needs_work.append(item)
     return {
         "dir": str(out_dir),
         "summary": str(out_dir / "summary.md"),
         "filter_agent": filter_agent(store, workspace_id),
-        "queue": [{
-            "pr": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title,
-            "author": pr.author, "source": pr.source_branch, "target": pr.target_branch,
-            "task_key": task_key_of(pr.source_branch) or task_key_of(pr.title),
-            "my_status": my_status(pr, login) or "UNAPPROVED",
-            "reviewer_agent": reviewer_for(store, workspace_id, pr.repository),
-            "review_file": str(out_dir / f"pr-{pr.repository}-{pr.id}.review.md"),
-            "facts_file": str(out_dir / f"pr-{pr.repository}-{pr.id}.facts.md"),
-            "url": pr.url,
-        } for pr in queue],
+        "queue": [_item(store, workspace_id, out_dir, pr, login) for pr in queue],
+        "needs_work": needs_work,
         "skipped": skipped,
     }

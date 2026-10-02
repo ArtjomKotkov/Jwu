@@ -590,6 +590,7 @@ class GitHubClient:
                 "message": (commit.get("message", "") or "").strip(),
                 "author": ((c.get("author") or {}).get("login")
                            or (commit.get("author") or {}).get("name", "") or ""),
+                "ts": gh_ms(((commit.get("committer") or {}).get("date")) or ""),
             })
         return out
 
