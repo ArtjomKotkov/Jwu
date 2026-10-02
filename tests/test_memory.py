@@ -158,3 +158,20 @@ def test_cli_export_import_roundtrip(monkeypatch, tmp_path):
     assert res.exit_code == 0, res.output and "добавлено" in res.output
     res = runner.invoke(cli.app, ["memory", "import", str(tmp_path / "nope")])
     assert res.exit_code == 1
+
+
+
+def test_export_is_stable_over_time(tmp_path, monkeypatch):
+    """Повторный экспорт без изменений даёт байт-в-байт те же файлы — даже в другую секунду."""
+    store = _populated(tmp_path)
+    try:
+        monkeypatch.setattr(memory, "_now", lambda: "2026-01-01T00:00:00+00:00")
+        memory.export_memory(store, tmp_path / "a")
+        monkeypatch.setattr(memory, "_now", lambda: "2026-01-01T00:00:07+00:00")
+        memory.export_memory(store, tmp_path / "b")
+    finally:
+        store.close()
+    files = sorted(p.relative_to(tmp_path / "a") for p in (tmp_path / "a").rglob("*.json"))
+    assert files
+    for rel in files:
+        assert (tmp_path / "a" / rel).read_text() == (tmp_path / "b" / rel).read_text(), rel

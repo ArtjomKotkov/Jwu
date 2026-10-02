@@ -131,8 +131,10 @@ def export_memory(store: "Store", dest: Path | None = None) -> ExportReport:
         report.features += len(features)
         report.jobs += len(jobs)
         report.notes += len(notes)
+    # Без отметки времени экспорта: иначе каждый синк давал бы новый коммит в git-каталог
+    # памяти, даже когда ничего не менялось (когда сделан экспорт, видно по коммиту).
     _write_json(dest / "workspaces.json", {
-        "format": FORMAT_VERSION, "exported_at": _now(), "active": active, "workspaces": index,
+        "format": FORMAT_VERSION, "active": active, "workspaces": index,
     })
     return report
 
