@@ -149,3 +149,19 @@ def test_daily_prune_runs_once_a_day(tmp_path):
     # второй вызов в тот же день — молча ничего не делает
     assert run_daily_prune(store, db, backups_dir=bdir, min_bytes=0) == []
     store.close()
+
+
+def test_backups_keep_three_and_prune_even_without_new_backup(tmp_path):
+    from jwu.core import maintenance
+
+    db = tmp_path / "state.db"
+    sqlite3.connect(db).close()
+    bdir = tmp_path / "b"
+    bdir.mkdir()
+    for day in range(1, 8):
+        (bdir / f"state.db.bak-2026-09-0{day}").write_text("x")
+    today = bdir / f"state.db.bak-{maintenance.date.today().isoformat()}"
+    today.write_text("x")                      # сегодняшний уже есть — новый не делается
+    assert maintenance.run_daily_maintenance(db, backups_dir=bdir) == []
+    left = sorted(p.name for p in bdir.iterdir())
+    assert len(left) == maintenance.DAILY_BACKUPS_KEEP == 3 and today.name in left

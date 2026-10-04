@@ -96,8 +96,20 @@ def backup_before_migration(
     return dest
 
 
+# Сколько ежедневных копий БД держать. Каждая — полный размер БД (сотни МБ), поэтому
+# немного: неделя копий однажды съела почти 2 ГБ на забитом диске.
+DAILY_BACKUPS_KEEP = 3
+
+
+def _prune_backups(bdir: Path, name: str, keep: int) -> int:
+    old = sorted(bdir.glob(f"{name}.bak-*"))[:-keep] if keep > 0 else []
+    for path in old:
+        path.unlink(missing_ok=True)
+    return len(old)
+
+
 def run_daily_maintenance(
-    db_file: Path, *, backups_dir: Path | None = None, keep: int = 7
+    db_file: Path, *, backups_dir: Path | None = None, keep: int = DAILY_BACKUPS_KEEP
 ) -> list[str]:
     """Раз в день: quick_check + локальный бэкап БД, чистка старше ``keep`` копий.
 
@@ -115,6 +127,7 @@ def run_daily_maintenance(
     _restrict(bdir, 0o700)
     marker = bdir / f"{db_file.name}.bak-{date.today().isoformat()}"
     if marker.exists():
+        _prune_backups(bdir, db_file.name, keep)  # лимит мог уменьшиться — чистим и тут
         return []  # сегодня уже делали
 
     try:
@@ -130,8 +143,7 @@ def run_daily_maintenance(
 
     shutil.copy2(db_file, marker)
     _restrict(marker, 0o600)
-    for old in sorted(bdir.glob(f"{db_file.name}.bak-*"))[:-keep]:
-        old.unlink()
+    _prune_backups(bdir, db_file.name, keep)
     return [f"бэкап БД: {marker.name}"]
 
 

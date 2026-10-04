@@ -361,3 +361,16 @@ def test_bot_sync_command_records_request(tmp_path):
         assert "work" in json.loads(store.get_meta(bot.SYNC_REQUEST_META))
     finally:
         store.close()
+
+
+def test_trim_log_keeps_tail_from_line_start(tmp_path):
+    log = tmp_path / "daemon.log"
+    log.write_text("".join(f"line {i:05d}\n" for i in range(3000)))   # ~33 КБ
+    assert daemon.trim_log(log, max_bytes=40_000) is False             # меньше порога — не трогаем
+    assert daemon.trim_log(log, max_bytes=10_000, keep_bytes=1_000) is True
+    text = log.read_text()
+    lines = text.splitlines()
+    assert "лог обрезан" in lines[0] and lines[-1] == "line 02999"
+    assert all(ln.startswith("line ") for ln in lines[1:])             # без обрывка строки
+    assert len(text) < 1_200
+    assert daemon.trim_log(tmp_path / "нет.log") is False

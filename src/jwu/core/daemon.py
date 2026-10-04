@@ -456,6 +456,10 @@ def run_loop(
             if n:
                 log(f"стартовое сообщение отправлено в {n} чат(а)")
         while True:
+            try:
+                trim_log()
+            except OSError:
+                pass  # не смогли обрезать лог — не повод останавливать синк
             store = open_store()
             try:
                 report = run_pass(store, factory=factory, after_sync=after_sync)
@@ -529,6 +533,37 @@ def jwu_executable() -> str:
 
 def log_path() -> Path:
     return data_dir() / "daemon.log"
+
+
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_KEEP_BYTES = 1024 * 1024
+
+
+def trim_log(path: Path | None = None, *, max_bytes: int = LOG_MAX_BYTES,
+             keep_bytes: int = LOG_KEEP_BYTES) -> bool:
+    """Обрезать лог демона до последних ``keep_bytes``, если он больше ``max_bytes``.
+
+    На месте (truncate + запись хвоста), а не переименованием: launchd/systemd держат файл
+    открытым в режиме дозаписи и продолжают писать в тот же inode. Без этого при обрыве
+    сети строка «опрос бота не удался» раз в секунду растила лог без предела.
+    """
+    path = path or log_path()
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= max_bytes:
+        return False
+    with path.open("r+b") as fh:
+        fh.seek(-keep_bytes, 2)
+        tail = fh.read()
+        cut = tail.find(b"\n")
+        tail = tail[cut + 1:] if cut >= 0 else tail  # с начала целой строки
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{_now()} … лог обрезан до последних {keep_bytes // 1024} КБ\n".encode())
+        fh.write(tail)
+    return True
 
 
 def is_macos() -> bool:
