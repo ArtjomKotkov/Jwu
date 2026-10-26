@@ -5,7 +5,7 @@
 - **ответ на уведомление** или сообщение вида ``PROJ-1 текст`` → заметка-контекст по ключу
   (см. ``notify.parse_incoming``), в чат уходит подтверждение «записал»;
 - **команда**: ``/sync`` — внеплановый проход демона, ``/status`` — когда был последний
-  проход и что накопилось, ``/stuck`` — что застряло по порогам контура, ``/mentions`` —
+  проход и что накопилось, ``/mentions`` —
   непрочитанные упоминания, ``/duty`` — тумблер дежурства за комнатой Matrix, ``/personal`` —
   тумблер личного (1:1 и упоминания), ``/matrix`` — их настройка кнопками (``core.duty``), ``/help``;
 - **нажатие inline-кнопки** (callback_query) настройки дежурства → меню перерисовывается
@@ -21,7 +21,7 @@ from __future__ import annotations
 import html
 from typing import TYPE_CHECKING, Callable, Optional
 
-from . import duty, notify, thresholds as th_mod
+from . import duty, notify
 from .dates import fmt_ago
 
 if TYPE_CHECKING:
@@ -33,7 +33,6 @@ HELP = (
     "<b>Команды</b>\n"
     "/sync — синк всех контуров прямо сейчас\n"
     "/status — последний проход и что накопилось\n"
-    "/stuck — что застряло по порогам контура\n"
     "/tasks — сводка моих задач по статусам и PR\n"
     "/today — что сделал сегодня: задачи, их статус и итог\n"
     "/mentions — непрочитанные упоминания\n"
@@ -69,37 +68,6 @@ def _cmd_status(store: "Store", ws: "Workspace") -> str:
         lines.append(f"🔔 дежурство: {'вкл' if state.active else 'выкл'} · {html.escape(state.title)}")
     lines.append(f"💬 личное в Matrix: {'вкл' if state.personal else 'выкл'}")
     return "\n".join(lines)
-
-
-def _cmd_stuck(store: "Store", ws: "Workspace", login: str,
-               links: Optional[notify.Links]) -> str:
-    th = th_mod.load(store, ws.id)
-    items = th_mod.collect_stuck(
-        prs_mine=store.latest_prs("mine"), prs_review=store.latest_prs("review"),
-        mine=store.latest_issues("mine"), th=th, login=login,
-    )
-    if not items:
-        return "⏳ Застрявшего нет — по порогам контура всё движется."
-    lines = notify.section(f"⏳ ЗАСТРЯЛО ({len(items)})", [
-        notify.item_block(x["key"], f"{x['days']} дн · {x['reason']}", x.get("title", ""), links=links)
-        for x in items[:15]
-    ])
-    if len(items) > 15:
-        lines += ["", f"… и ещё {len(items) - 15}"]
-    return "\n".join(lines).lstrip("\n")
-
-
-TASKS_LIMIT = 40
-
-
-# Порядок групп статусов: где надо действовать — выше, «у других» (ревью, тесты) — ниже.
-_STATUS_BLOCKS = [
-    ("🔁 Вернули — доделать", lambda s, q, w: s in q),
-    ("🛠 В работе", lambda s, q, w: s in w),
-    ("📋 Не начаты", lambda s, q, w: s in ("open", "to do", "selected for development", "backlog")),
-    ("👀 На ревью", lambda s, q, w: "review" in s),
-    ("🧪 На тестах и дальше", lambda s, q, w: True),
-]
 
 
 def _cmd_tasks(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -> str:
@@ -264,8 +232,6 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
         return "🔄 Синк запущен — по окончании пришлю итог." if on_sync() else "🔄 Синк уже идёт — итог пришлю."
     if cmd == "/status":
         return _cmd_status(store, ws)
-    if cmd == "/stuck":
-        return _cmd_stuck(store, ws, login, links)
     if cmd == "/mentions":
         return _cmd_mentions(store, links)
     if cmd == "/tasks":
@@ -286,8 +252,7 @@ MENU_PREFIX = "menu:"
 MENU_ROWS = [
     [("🗂 Что делать", "board")],
     [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
-    [("📋 Мои задачи", "tasks"), ("⏳ Что застряло", "stuck")],
-    [("🕒 Что сделал сегодня", "today")],
+    [("📋 Мои задачи", "tasks"), ("🕒 Что сделал сегодня", "today")],
     [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
     [("📡 Matrix: дежурство и личное", "matrix")],
     [("⏰ Утренняя сводка", "brief")],
@@ -412,7 +377,7 @@ def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
         return {"kind": "error", "text": data, "reply": text}
 
 
-SLOW_ACTIONS = {"sync", "tasks", "stuck", "today", "mentions", "status", "board"}
+SLOW_ACTIONS = {"sync", "tasks", "today", "mentions", "status", "board"}
 
 
 def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on_sync) -> dict:

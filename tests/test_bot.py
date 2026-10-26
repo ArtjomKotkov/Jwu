@@ -68,7 +68,7 @@ def test_process_updates_commands_notes_and_replies(tmp_path):
     assert "<b>Команды</b>" in texts[0]
     assert "демон не запущен" in texts[1] and "1 ок" in texts[1]
     assert texts[2].startswith("🔄 Синк запущен")
-    assert "ЗАСТРЯЛО (1)" in texts[3] and 'pull-requests/7">P/r#7</a> · ' in texts[3]
+    assert texts[3].startswith("Не знаю команду /stuck")   # кнопку и команду убрали
     assert texts[4].startswith("📝 записал в") and "P/r#7" in texts[4]
     assert texts[5].startswith("Не понял")
     assert "Непрочитанных упоминаний нет" in texts[6]

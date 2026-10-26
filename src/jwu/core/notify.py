@@ -42,7 +42,6 @@ BOT_COMMANDS = [
     {"command": "menu", "description": "Меню кнопками"},
     {"command": "sync", "description": "Синк всех контуров сейчас"},
     {"command": "status", "description": "Последний проход и что накопилось"},
-    {"command": "stuck", "description": "Что застряло по порогам"},
     {"command": "tasks", "description": "Сводка моих задач"},
     {"command": "today", "description": "Что сделал сегодня"},
     {"command": "mentions", "description": "Непрочитанные упоминания"},
