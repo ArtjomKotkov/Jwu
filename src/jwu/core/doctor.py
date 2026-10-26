@@ -148,7 +148,38 @@ def check_config(store: "Store", ws) -> tuple[list[Check], object]:
         out.append(Check("Telegram", "skip", "уведомления не настроены", "jwu configure --telegram-chat <id> --telegram-token …"))
     out.append(_matrix_check(cfg))
     out.append(_disk_check(store, ws))
+    out += _jobflow_checks(store, ws)
     return out, cfg
+
+
+def _jobflow_checks(store, ws) -> list["Check"]:
+    """Флоу работ: папка рабочих копий, удалённые серверы для агента, живые сессии."""
+    from . import jobspace, ssh as ssh_mod, todo
+
+    out: list[Check] = []
+    folder = jobspace.jobs_dir(store, ws.id)
+    if folder:
+        out.append(Check("Рабочие копии", "ok", str(folder)))
+    else:
+        out.append(Check("Рабочие копии", "warn", "папка не задана — работа с правками кода остановится",
+                         "jwu workspace jobs-dir ~/jwu-jobs/<воркспейс>"))
+    servers = ssh_mod.list_servers(store, ws.id)
+    if servers:
+        info = ssh_mod.describe(store, ws.id, ws.slug)
+        if info["binary"] and info["config_exists"]:
+            out.append(Check("Удалённые серверы", "ok", f"{len(servers)} · ssh-mcp подключён"))
+        else:
+            out.append(Check("Удалённые серверы", "warn",
+                             f"{len(servers)} описано, но агенту не выданы (нет ssh-mcp или конфига)",
+                             "jwu ssh install"))
+    seen = todo.sessions(store)
+    if seen:
+        alive = sum(1 for s in seen.values() if s.get("alive"))
+        status = "ok" if alive == len(seen) else "warn"
+        out.append(Check("Сессии Claude Code", status, f"живых {alive} из {len(seen)}"
+                         + ("" if status == "ok" else " — молчащие держат свои работы"),
+                         "" if status == "ok" else "в сессии: «освободи <имя>» или /jwu-todo"))
+    return out
 
 
 def _disk_check(store, ws) -> "Check":

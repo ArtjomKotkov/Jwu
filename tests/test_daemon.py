@@ -313,11 +313,15 @@ def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
     polls = []
 
     def fake_poll(store, **kw):
+        import time
+
         polls.append(1)
         if len(polls) == 1:
+            while not passes:                     # запрос — строго после старта первого прохода
+                time.sleep(0.05)
+            time.sleep(1.1)                       # метки времени — с точностью до секунды
             bot.request_sync(store, "work")       # как кнопка «Синк сейчас»
             os.kill(os.getpid(), signal.SIGUSR1)  # как on_sync → waiter.kick
-        import time
         time.sleep(0.2)
         return []
 
@@ -329,8 +333,6 @@ def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "poll_bots", fake_poll)
     monkeypatch.setattr(daemon, "poll_duty", lambda store: [])
     monkeypatch.setattr(daemon, "report_pass", fake_report)
-    import time
-    time.sleep(1.1)   # started_at первого прохода — строго раньше запроса
     try:
         daemon.run_loop(lambda: Store(db), interval=3600, announce=False, poll_interval=1)
     except KeyboardInterrupt:

@@ -1,6 +1,6 @@
 ---
 name: jwu-track-time
-description: Use when the user wants to actually LOG/track spent time into Jira's time tracker (worklog) across today's jwu jobs — phrases like «затрекай время в жиру», «разнеси часы по задачам», «залогируй время», «занеси ворклог», «разнести время», «/jwu-track-time». Builds the list from the jobs' closing summaries (запись summary; a job active today without one is probably not closed — remind to close it via jwu-close-job when it looks done), PLUS code reviews the user did (PR'ы, которые он апрувнул/поставил needs work — описание «Ревью»), plus any extra tasks the user dictates; asks how much time per task, and logs NOTHING until the user explicitly confirms. For just a text summary without logging, use jwu-post-analyze-day instead.
+description: Use when the user wants to actually LOG/track spent time into Jira's time tracker (worklog) across today's jwu jobs — phrases like «затрекай время в жиру», «разнеси часы по задачам», «залогируй время», «занеси ворклог», «разнести время», «/jwu-track-time». Builds the list from the jobs' closing summaries (запись summary; a job active today without one is probably not closed — remind to close it via jwu-close-job when it looks done), PLUS code reviews the user did (PR'ы, которые он апрувнул/поставил needs work — описание «Ревью»), plus any extra tasks the user dictates («добавь KEY созвон 30m» ADDS a line to the found list, never replaces it); asks how much time per task, and logs NOTHING until the user explicitly confirms. For just a text summary without logging, use jwu-post-analyze-day instead.
 ---
 
 # jwu: трекинг времени в Jira (worklog)
@@ -44,7 +44,8 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 > **Записи `⛔ ЗАПРЕТ` обязательны к исполнению** и важнее твоего удобства: если правило
 > мешает выполнить просьбу — не обходи его молча, скажи об этом пользователю.
 > Пользователь формулирует правило уровня проекта («не пушь в develop», «стенд поднимается
-> так-то») — предложи сохранить: `jwu_rule_add(title, text, kind, tag)`
+> так-то») — **предложи** сохранить и покажи формулировку; ⛔ записывай только после его «да»:
+> `jwu_rule_add(title, text, kind, tag, user_approved=True)`
 > (bash: `jwu rule add "…" --kind constraint`).
 >
 > **Провайдер контура** (`provider` в ответе `jwu_workspace_current()`) говорит, откуда
@@ -108,6 +109,9 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 
    Ключ задачи берётся из заголовка PR (`ABC-123`). Один и тот же ключ из нескольких PR —
    объединяй в одну строку «Ревью».
+   **Не задваивай с шагом 1.** Ревью, взятое с доски (`/jwu-todo`, группа «ревью»), — это уже
+   работа «Ревью PR #…» со своим итогом, и она есть в списке шага 1. Тот же PR из
+   `--mine-reviews` второй строкой не добавляй: одна строка «Ревью» на ключ.
 
    Покажи найденное компактным списком-кандидатом (`KEY — галка/needs work — короткий
    заголовок`) и спроси, сколько времени по каждому ревью (время пользователь укажет сам).
@@ -117,7 +121,14 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
    который сегодня уже замержили, в выдачу не попадёт; такие пользователь может
    продиктовать на шаге 3.
 
-3. **Прими дополнительные задачи.** Спроси пользователя, есть ли что затрекать сверх
+3. **Прими дополнительные задачи — ДОБАВЛЯЯ к найденному, а не вместо него.** ⛔ Фраза вида
+   «добавь CORE-11969 созвон 30m» — это **ещё одна строка** в план из шагов 1–2: задачи
+   дня из итогов работ и ревью остаются в плане как были. Заменять весь список на
+   продиктованное — только если пользователь прямо сказал «только это» / «вместо». Время в
+   такой фразе («30m») — сразу время этой строки, описание («созвон») — её описание.
+   Если фраза пришла ещё ДО того, как ты собрал задачи дня, — всё равно собери их (шаги 1–2)
+   и покажи общий план: найденное + продиктованное.
+   Дальше как раньше: Спроси пользователя, есть ли что затрекать сверх
    найденного (встречи, исследование, разбор инцидента, ревью уже замердженного PR и т.п.).
    Каждая такая запись — это `КЛЮЧ-ЗАДАЧИ` + краткое описание. Worklog пишется только
    в реальную задачу Jira, поэтому ключ обязателен; если пользователь даёт описание

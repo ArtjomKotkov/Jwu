@@ -50,14 +50,18 @@ HELP = (
 def _cmd_status(store: "Store", ws: "Workspace") -> str:
     from .daemon import LAST_PASS_META, LAST_PASS_SUMMARY_META, SingleInstance
 
+    from .daemon import pass_in_progress
+
     pid = SingleInstance().holder_pid()
+    running = pass_in_progress(store)
     last = store.get_meta(LAST_PASS_META)
     summary = (store.get_meta(LAST_PASS_SUMMARY_META) or "").removeprefix("синк: ")
     state = duty.load(store)
     lines = [
         f"ℹ️ <b>{html.escape(ws.slug)}</b>",
         "",
-        f"{'🟢 демон работает' if pid else '🔴 демон не запущен'}",
+        f"{'🟢 демон работает' if pid else '🔴 демон не запущен'}"
+        + (f" · ⏳ синк идёт (начат {fmt_ago(running)})" if running else ""),
         f"🔄 синк: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}"
         + (f" · {html.escape(summary)}" if summary else ""),
     ]
@@ -228,6 +232,12 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
         if on_sync is None:
             return "Демон не запущен — синк запустить некому. Руками: <code>jwu sync</code>."
         request_sync(store, ws.slug)
+        from .daemon import pass_in_progress
+
+        running = pass_in_progress(store)
+        if running:
+            on_sync()
+            return f"⏳ Синк уже идёт (начат {fmt_ago(running)}) — итог пришлю."
         return "🔄 Синк запущен — по окончании пришлю итог." if on_sync() else "🔄 Синк уже идёт — итог пришлю."
     if cmd == "/status":
         return _cmd_status(store, ws)
@@ -251,11 +261,13 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
 MENU_PREFIX = "menu:"
 # (подпись, действие) — inline-меню; действие → команда того же имени
 MENU_ROWS = [
+    [("🗂 Что делать", "board")],
     [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
     [("📋 Мои задачи", "tasks"), ("⏳ Что застряло", "stuck")],
     [("🕒 Что сделал сегодня", "today")],
     [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
     [("📡 Matrix: дежурство и личное", "matrix")],
+    [("⏰ Утренняя сводка", "brief")],
 ]
 
 
@@ -276,6 +288,18 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
     """Кнопка меню → (текст, клавиатура) для того же сообщения. Под ответом — «← меню»."""
     if action == "main":
         return main_menu()
+    if action == "board":
+        from . import brief, todo
+
+        text = brief.render(todo.build(store, ws.id, login, session="telegram"), ws.slug,
+                            notify.links_from_config(cfg))
+        text = text.replace("☀️", "🗂", 1)
+        return text, {"inline_keyboard": [BACK_TO_MENU]}
+    if action == "brief":
+        from . import brief
+
+        text, markup = brief.menu(store, ws.id)
+        return text, {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
     if action == "matrix":
         text, markup = duty.menu(duty.load(store))
         return text, {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
@@ -341,13 +365,18 @@ def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
         return {"kind": "error", "text": data, "reply": text}
 
 
-SLOW_ACTIONS = {"sync", "tasks", "stuck", "today", "mentions", "status"}
+SLOW_ACTIONS = {"sync", "tasks", "stuck", "today", "mentions", "status", "board"}
 
 
 def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on_sync) -> dict:
     if data.startswith(MENU_PREFIX) and ws is not None:
         text, markup = handle_menu(data[len(MENU_PREFIX):], store=store, ws=ws, cfg=cfg,
                                    login=login, on_sync=on_sync)
+    elif data.startswith("brief:") and ws is not None:
+        from . import brief
+
+        text, markup = brief.handle_callback(store, ws.id, data)
+        markup = {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
     elif data.startswith(duty.CALLBACK_PREFIX):
         text, markup = duty.handle_callback(store, _matrix_factory(cfg), data)
         if data in (duty.CALLBACK_PREFIX + duty.CB_MENU, duty.CALLBACK_PREFIX + duty.CB_ON,

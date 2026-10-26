@@ -133,8 +133,12 @@ def export_memory(store: "Store", dest: Path | None = None) -> ExportReport:
         report.notes += len(notes)
     # Без отметки времени экспорта: иначе каждый синк давал бы новый коммит в git-каталог
     # памяти, даже когда ничего не менялось (когда сделан экспорт, видно по коммиту).
+    from . import guides as guides_mod
+
     _write_json(dest / "workspaces.json", {
         "format": FORMAT_VERSION, "active": active, "workspaces": index,
+        # общие для всех воркспейсов инструкции (Playwright и т.п.) — вне настроек контуров
+        "global_guides": dict(sorted(store.meta_items(guides_mod.PREFIX).items())),
     })
     return report
 
@@ -384,6 +388,15 @@ def import_memory(store: "Store", src: Path | None = None, *, dry_run: bool = Fa
         _import_features(store, _read_json(wdir / "features.json", []), report)
         _import_notes(store, _read_json(wdir / "notes.json", []), report)
         _import_jobs(store, _read_json(wdir / "jobs.json", []), report)
+    for key, raw in (index.get("global_guides") or {}).items():
+        if not str(key).startswith("guide."):
+            continue
+        if store.get_meta(key) == raw:
+            report.bump(report.skipped, "guides")
+            continue
+        report.bump(report.updated if store.get_meta(key) else report.added, "guides")
+        if not dry_run:
+            store.set_meta(key, raw)
     return report
 
 

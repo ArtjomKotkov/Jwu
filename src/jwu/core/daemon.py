@@ -200,6 +200,7 @@ def run_pass(
     *,
     factory: ServiceFactory | None = None,
     after_sync: Callable[["Service", "SyncResult"], None] | None = None,
+    silent: bool = False,
 ) -> PassReport:
     """Один проход: синкнуть каждый внешний контур, вызвать ``after_sync`` по каждому.
 
@@ -221,6 +222,8 @@ def run_pass(
             report.failed[ws.slug] = f"{type(exc).__name__}: {exc}"
             log(f"[{ws.slug}] сервис не создан: {exc}")
             continue
+        if silent:
+            svc.defer_notifications = True   # тихий синк: данные обновить, уведомления — со следующим обычным
         try:
             result = svc.sync()
             report.synced.append(ws.slug)
@@ -249,6 +252,25 @@ def run_pass(
 
 
 LAST_PASS_META = "daemon:last_pass"
+SILENT_META = "daemon:silent_requested"   # следующий проход — тихий (без уведомлений в Telegram)
+PASSING_META = "daemon:passing"   # когда начался идущий сейчас проход; пусто — синк не идёт
+PASSING_MAX_AGE = 30 * 60         # старше — считаем, что демон упал посреди прохода
+
+
+def pass_in_progress(store: "Store") -> str | None:
+    """Идёт ли синк прямо сейчас: время начала прохода или None.
+
+    Флаг ставит демон в начале прохода и снимает в конце. Демон не запущен или флаг
+    протух (упал посреди прохода) — синк не идёт, флагу не верим.
+    """
+    started = (store.get_meta(PASSING_META) or "").strip()
+    if not started or SingleInstance().holder_pid() is None:
+        return None
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).total_seconds()
+    except ValueError:
+        return None
+    return started if age < PASSING_MAX_AGE else None
 LAST_PASS_SUMMARY_META = "daemon:last_summary"
 
 
@@ -511,6 +533,22 @@ def report_bot_failure(open_store: Callable[[], "Store"], workspace_id: int, exc
         pass
 
 
+def send_briefs(store: "Store") -> int:
+    """Утренняя сводка «что делать» по контурам, где наступило выбранное время."""
+    from . import brief
+
+    sent = 0
+    for ws, cfg, sender, login in _bot_senders(store):
+        try:
+            if brief.send_if_due(store, ws, cfg, sender, login):
+                sent += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{ws.slug}] утренняя сводка не ушла: {exc}")
+        finally:
+            sender.close()
+    return sent
+
+
 def poll_duty(store: "Store") -> list[dict]:
     """Matrix: дежурство и личное по каждому контуру с Telegram → новое в чат."""
     from . import duty, matrix
@@ -620,6 +658,8 @@ def run_loop(
                         if ticks % 12 == 1:   # место — раз в ~5 минут
                             if disk_alert(store):
                                 log("предупреждение о месте на диске отправлено")
+                        if send_briefs(store):
+                            log("утренняя сводка отправлена")
                     finally:
                         store.close()
                     if handled:
@@ -639,12 +679,21 @@ def run_loop(
                 passing.set()
                 store = open_store()
                 try:
-                    report = run_pass(store, factory=factory, after_sync=after_sync)
+                    store.set_meta(PASSING_META, _now())
+                    silent = bool(store.get_meta(SILENT_META))
+                    if silent:
+                        store.set_meta(SILENT_META, "")
+                        log("тихий проход: данные обновятся, уведомления уйдут со следующим обычным проходом")
+                    report = run_pass(store, factory=factory, after_sync=after_sync, silent=silent)
                     # проход закрыл чей-то /sync из бота — ответить итогом, даже если нового нет
                     requested = take_sync_requests(store, report.started_at)
                     if requested:
                         report_pass(store, report, requested)
                 finally:
+                    try:
+                        store.set_meta(PASSING_META, "")
+                    except Exception:  # noqa: BLE001
+                        pass
                     store.close()
                     passing.clear()
                 log(f"проход завершён: {report.summary()}")
@@ -661,9 +710,15 @@ def run_loop(
             pool.shutdown(wait=False)
 
 
-def kick() -> int | None:
-    """Разбудить работающий демон (SIGUSR1). Вернуть его pid либо None, если не запущен."""
+def kick(store: "Store | None" = None, *, silent: bool = False) -> int | None:
+    """Разбудить работающий демон (SIGUSR1). Вернуть его pid либо None, если не запущен.
+
+    ``silent`` — проход только обновит данные (доска /jwu-todo, «сходи в сеть»), а уведомлений
+    в Telegram не пришлёт. Флаг лежит в meta и снимается проходом, который его взял.
+    """
     pid = SingleInstance().holder_pid()
+    if pid is not None and silent and store is not None:
+        store.set_meta(SILENT_META, _now())
     if pid is None:
         return None
     try:
@@ -890,6 +945,7 @@ def status(store: "Store", *, runner: Callable[[list[str]], tuple[int, str]] | N
         "running": pid is not None,
         "pid": pid,
         "last_pass": store.get_meta(LAST_PASS_META),
+        "pass_in_progress": pass_in_progress(store),
         "last_summary": store.get_meta(LAST_PASS_SUMMARY_META),
         "log": str(log_path()),
         "service_file": str(plist_path() if is_macos() else systemd_unit_path()),

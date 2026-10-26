@@ -1,6 +1,6 @@
 ---
 name: jwu-session-init
-description: Use at the START of a session (and again after /clear or context compaction) in any folder managed by jwu, BEFORE reading or editing code — to switch into «работаем через jwu» mode. Triggers like «начнём», «инициализируй сессию», «подними контекст jwu», «работай через jwu», «где мы», «что тут у нас», «/jwu-session-init», or simply the first coding request in a fresh session when you have not yet called jwu_workspace_current. Resolves the workspace for the current folder, loads its rules, shows active jobs and open features/tasks, and routes to jwu-continue-job / jwu-start-job / jwu-close-job / jwu-workspace-setup. Read-only: nothing is written.
+description: Use at the START of a session, again after /clear or context compaction, AND before every important action (starting/continuing/closing a job, taking tasks from /jwu-todo, edits, commit/push, anything external) when its answer is no longer in the context — in any folder managed by jwu, BEFORE reading or editing code — to switch into «работаем через jwu» mode. Triggers like «начнём», «инициализируй сессию», «подними контекст jwu», «работай через jwu», «где мы», «что тут у нас», «/jwu-session-init», or simply the first coding request in a fresh session when you have not yet called jwu_workspace_current. Resolves the workspace for the current folder, loads its rules, shows active jobs and open features/tasks, and routes to jwu-continue-job / jwu-start-job / jwu-close-job / jwu-workspace-setup. Read-only: nothing is written.
 ---
 
 # jwu: инит сессии в воркспейсе
@@ -15,6 +15,12 @@ description: Use at the START of a session (and again after /clear or context co
 Скилл только читает (локальная БД, без сети) и ничего не пишет.
 
 ## Когда
+
+**Правила воркспейса нельзя терять.** Перед каждым важным действием — начать, продолжить
+или закрыть работу, взять задачи с доски, править код, коммитить и пушить, писать наружу —
+убедись, что ответ `jwu_workspace_current()` с `rules_md` **есть в контексте этой сессии**.
+Нет (новая сессия, `/clear`, компакт, давно не перечитывал) — пройди этот скилл заново.
+Это дёшево: локальная БД, без сети.
 
 - Начало сессии, до первого чтения/правки кода.
 - После `/clear` или компакта контекста — состояние jwu ушло вместе с ним.
@@ -36,6 +42,9 @@ description: Use at the START of a session (and again after /clear or context co
    понятно, в каком репозитории работа, дотяни его правила — `jwu_rules(tag="<тег>")`.
    Если папка одна — дотяни сразу.
 
+   **Инструкции** — список в `guides_md` (полный текст — `jwu_guide(name)`): длинные «как»
+   (поднять стенд, поставить инструмент), на которые коротко ссылаются правила. Открывай,
+   когда правило на неё ссылается или когда дошло до этого шага; заранее не читай.
 3. **Что уже в работе.** `jwu_jobs(status="active")`.
    - Есть активные — покажи списком (`id`, якорь `anchor`, дата обновления, последняя запись).
      Если просьба пользователя про одну из них — дальше **jwu-continue-job**.

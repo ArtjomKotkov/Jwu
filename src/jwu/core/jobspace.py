@@ -32,7 +32,10 @@ JOBS_DIR_SETTING = "jobs.dir"
 DISK_MIN_SETTING = "disk.min_free_gb"
 DEFAULT_MIN_FREE_GB = 20.0
 LABEL = "jwu.job"
-RESOURCE_KINDS = ("worktree", "container", "volume", "network", "image", "compose", "path")
+RESOURCE_KINDS = ("worktree", "container", "volume", "network", "image", "compose", "path", "port")
+PORTS_BASE_SETTING = "ports.base"
+DEFAULT_PORTS_BASE = 20000
+PORTS_SPAN = 10000
 
 Runner = Callable[[list[str]], tuple[int, str]]
 
@@ -227,6 +230,52 @@ def worktree_state(path: str, runner: Runner = _run) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Порты стенда
+# --------------------------------------------------------------------------- #
+
+
+def _port_free(port: int) -> bool:
+    import socket
+
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET, "0.0.0.0")):
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((host, port))
+            except OSError:
+                return False
+    return True
+
+
+def allocate_ports(store: "Store", job_id: int, names: list[str]) -> dict[str, int]:
+    """Свободные порты для стенда работы: по имени («db», «redis», «web») — порт.
+
+    Уже выданные этой работе — те же. Новые берутся из диапазона ``ports.base`` (20000) …
+    +10000: не выданы другим работам и не заняты на машине прямо сейчас. Записываются за
+    работой (kind ``port``) — при закрытии освобождаются, два стенда не столкнутся.
+    """
+    names = [n.strip() for n in names if n.strip()]
+    mine = {r["meta"].get("name"): int(r["ref"]) for r in store.job_resources(job_id) if r["kind"] == "port"}
+    busy = {int(r["ref"]) for r in store.all_open_job_resources() if r["kind"] == "port"}
+    raw = (store.workspace_settings(store.workspace_id).get(PORTS_BASE_SETTING) or "").strip()
+    base = int(raw) if raw.isdigit() else DEFAULT_PORTS_BASE
+    out: dict[str, int] = {}
+    port = base
+    for name in names:
+        if name in mine:
+            out[name] = mine[name]
+            continue
+        while port < base + PORTS_SPAN and (port in busy or not _port_free(port)):
+            port += 1
+        if port >= base + PORTS_SPAN:
+            raise JobSpaceError(f"Нет свободных портов в {base}–{base + PORTS_SPAN}")
+        store.add_job_resource(job_id, "port", str(port), {"name": name})
+        busy.add(port)
+        out[name] = port
+        port += 1
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Уборка
 # --------------------------------------------------------------------------- #
 
@@ -311,6 +360,9 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
                     report.errors.append(f"{kind} {ref}: {out[-200:]}")
     elif any(r["kind"] in ("container", "volume", "network", "image") for r in resources):
         report.errors.append("docker недоступен — docker-ресурсы не убраны")
+
+    for res in [r for r in resources if r["kind"] == "port"]:
+        done(res["id"], f"порт {res['ref']} ({res['meta'].get('name', '')})")
 
     for res in [r for r in resources if r["kind"] == "path"]:
         path = Path(res["ref"])

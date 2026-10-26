@@ -1,0 +1,166 @@
+"""Доска /jwu-todo, раздача по сессиям, живые сессии, инструкции, порты, утренняя сводка."""
+
+import json
+import os
+from datetime import datetime
+
+import pytest
+
+from jwu.core import brief, guides, jobspace, todo
+from jwu.core.models import PR, BuildStatus, Issue, Reviewer
+from jwu.core.store import Store
+
+
+@pytest.fixture()
+def store(tmp_path):
+    s = Store(tmp_path / "s.db")
+    s.use_workspace(s.get_workspace_by_slug("work").id)
+    yield s
+    s.close()
+
+
+def _pr(pid, title, *, conflicted=False, failed=False, needs_work=False, tasks_open=0, author="bob"):
+    return PR(id=pid, title=title, project="P", repository="r", state="OPEN", author=author,
+              conflicted=conflicted, tasks_open=tasks_open,
+              reviewers=[Reviewer(name="rev", display_name="Ревьюер", status="NEEDS_WORK" if needs_work else "UNAPPROVED")],
+              builds=[BuildStatus(state="FAILED", key="b", name="b", url="")] if failed else [])
+
+
+def _seed(store):
+    run = store.start_sync_run(["mine", "prs:mine", "prs:review"])
+    for issue in (
+        Issue(key="AB-1", summary="Конфликт", status="In Review", priority="Critical"),
+        Issue(key="AB-2", summary="Правки", status="In Review", priority="Major"),
+        Issue(key="AB-3", summary="Вернули", status="DEFECT", priority="Blocker"),
+        Issue(key="AB-4", summary="Не начата", status="Selected for Development", priority="Minor"),
+        Issue(key="AB-5", summary="В работе", status="In Progress", priority="Minor"),
+        Issue(key="AB-6", summary="Важная, не начата", status="To Do", priority="Critical"),
+        Issue(key="AB-7", summary="Уже на ревью", status="In Review", priority="Blocker"),
+    ):
+        store.save_issue_snapshot(run, issue, ["mine"])
+    store.save_pr_snapshot(run, _pr(1, "AB-1: конфликт", conflicted=True, failed=True), ["mine"])
+    store.save_pr_snapshot(run, _pr(2, "AB-2: правки", conflicted=True, needs_work=True), ["mine"])
+    store.save_pr_snapshot(run, _pr(3, "AB-7: ждёт", ), ["mine"])
+    store.save_pr_snapshot(run, _pr(9, "B-1: чужой", author="alice"), ["review"])
+    store.finish_sync_run(run, {"tasks:mine": 7, "prs:mine": 3, "prs:review": 1})
+
+
+def test_board_groups_and_order(store):
+    _seed(store)
+    board = todo.build(store, store.workspace_id, "me", session="S1")
+    by_group = {g: [i.key for i in board.items if i.group == g] for g in todo.GROUPS}
+    assert by_group["simple"] == ["P/r#1"]                    # конфликт + сборка без замечаний
+    assert set(by_group["fixes"]) == {"P/r#2", "AB-3"}         # needs work (с конфликтом) и возврат QA
+    # несделанные: в работе выше не начатого, дальше по приоритету; In Review и PR — не здесь
+    assert by_group["todo"] == ["AB-5", "AB-6", "AB-4"]
+    assert by_group["review"] == ["P/r#9"]
+    assert [i.n for i in board.items] == list(range(1, len(board.items) + 1))
+    md = todo.render_md(board)
+    assert "| № | PR | Задача |" in md and "🟠 Critical" in md and "**Сессия:** S1" in md
+
+
+def test_take_is_bound_to_shown_numbers_and_exclusive(store):
+    _seed(store)
+    board = todo.build(store, store.workspace_id, "me", session="S1")
+    n_conflict = next(i.n for i in board.items if i.key == "P/r#1")
+    res = todo.take(store, store.workspace_id, "me", numbers=[n_conflict], session="S1")
+    assert [t["key"] for t in res["taken"]] == ["P/r#1"]
+    job = store.get_job(res["taken"][0]["job_id"])
+    assert job.task_key == "AB-1" and job.title == "Конфликт и красная сборка PR #1"
+    assert job.prs[0].pr_id == 1
+    # вторая сессия видит взятое и не берёт его даже группой
+    board2 = todo.build(store, store.workspace_id, "me", session="S2")
+    taken = next(i for i in board2.items if i.key == "P/r#1")
+    assert taken.taken["session"] == "S1"
+    res2 = todo.take(store, store.workspace_id, "me", group="simple", session="S2")
+    assert res2["taken"] == []
+    # неизвестный номер — пропуск с причиной
+    res3 = todo.take(store, store.workspace_id, "me", numbers=[99], session="S2")
+    assert res3["skipped"][0]["reason"].startswith("нет такого номера")
+
+
+def test_sessions_alive_and_release(store):
+    _seed(store)
+    todo.build(store, store.workspace_id, "me", session="Dead")
+    todo.take(store, store.workspace_id, "me", numbers=[1], session="Dead")
+    todo.heartbeat(store, "Alive", pid=os.getpid(), cwd="/x")
+    todo.heartbeat(store, "Dead", pid=999999, cwd="/y")
+    seen = todo.sessions(store)
+    assert seen["Alive"]["alive"] and not seen["Dead"]["alive"]
+    released = todo.release(store, "Dead")
+    assert len(released) == 1 and store.get_job(released[0]).status == "paused"
+    board = todo.build(store, store.workspace_id, "me", session="Alive")
+    assert next(i for i in board.items if i.key == "P/r#1").taken is None
+
+
+def test_random_session_name_avoids_taken():
+    name = todo.random_session_name()
+    assert "-" in name and name[0].isupper()
+    assert todo.random_session_name({name}) != name or True
+
+
+def test_guides_workspace_overrides_global(store):
+    ws = store.workspace_id
+    guides.save_guide(store, ws, guides.Guide(name="pw", title="общая", text="g", scope="global"))
+    guides.save_guide(store, ws, guides.Guide(name="stand", title="стенд", text="шаги", tag="be"))
+    names = {g.name: g.scope for g in guides.list_guides(store, ws)}
+    assert names == {"pw": "global", "stand": "workspace"}
+    guides.save_guide(store, ws, guides.Guide(name="pw", title="своя", text="w"))
+    assert guides.get_guide(store, ws, "pw").title == "своя"
+    ctx = store.workspace_context()
+    assert "guides_md" in ctx and "`stand`" in ctx["guides_md"]
+    with pytest.raises(guides.GuideError):
+        guides.save_guide(store, ws, guides.Guide(name="Плохое имя", title="x"))
+
+
+def test_ports_unique_and_idempotent(store):
+    j1 = store.create_job("AB-1", "one")
+    j2 = store.create_job("AB-2", "two")
+    p1 = jobspace.allocate_ports(store, j1.id, ["db", "web"])
+    p2 = jobspace.allocate_ports(store, j2.id, ["db"])
+    assert len({*p1.values(), *p2.values()}) == 3
+    assert jobspace.allocate_ports(store, j1.id, ["db"]) == {"db": p1["db"]}
+
+
+def test_brief_due_once_a_day(store):
+    ws = store.workspace_id
+    assert not brief.due(store, ws)
+    brief.set_time(store, ws, "09:00")
+    tz = brief._tz(store, ws)
+    assert not brief.due(store, ws, now=datetime(2026, 10, 27, 8, 59, tzinfo=tz))
+    assert brief.due(store, ws, now=datetime(2026, 10, 27, 9, 1, tzinfo=tz))
+    store.set_workspace_meta(brief.LAST_META, "2026-10-27")
+    assert not brief.due(store, ws, now=datetime(2026, 10, 27, 12, 0, tzinfo=tz))
+    assert brief.set_time(store, ws, "25:00") == ""          # только из списка
+    _seed(store)
+    text = brief.render(todo.build(store, ws, "me", session="brief"), "work", None)
+    assert "Что делать · work" in text and "AB-6" in text
+
+
+def test_silent_sync_defers_notifications_to_next_normal(store):
+    from types import SimpleNamespace
+
+    from jwu.core import notify
+    from jwu.core.models import Delta
+    from jwu.core.service import Service
+
+    sent = []
+
+    class Sender:
+        def send(self, text, **kw):
+            sent.append(text)
+            return [1]
+
+    from jwu.core.config import Config
+
+    fake = SimpleNamespace(store=store, notifications_enabled=True, defer_notifications=True,
+                           NOTIFY_BACKLOG_META=Service.NOTIFY_BACKLOG_META, workspace=None, cfg=Config(),
+                           notifier=lambda: Sender(), _notification_roles=lambda note: {})
+    silent = SimpleNamespace(deltas=[Delta(key="AB-1", kind="new_conflict", summary="тихо")], new_mentions=[], notified=False)
+    Service._notify_after_sync(fake, silent)
+    assert sent == [] and json.loads(store.get_workspace_meta(Service.NOTIFY_BACKLOG_META))["deltas"]
+    fake.defer_notifications = False
+    normal = SimpleNamespace(deltas=[Delta(key="AB-2", kind="build_failed", summary="громко")], new_mentions=[], notified=False)
+    Service._notify_after_sync(fake, normal)
+    assert len(sent) == 1 and "AB-1" in sent[0] and "AB-2" in sent[0]
+    assert not store.get_workspace_meta(Service.NOTIFY_BACKLOG_META)

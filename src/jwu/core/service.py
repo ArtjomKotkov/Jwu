@@ -1994,19 +1994,38 @@ class Service:
                 self._notifier = None
         return self._notifier
 
+    NOTIFY_BACKLOG_META = "notify:backlog"   # отложенное тихим синком — уйдёт со следующим обычным
+
     def _notify_after_sync(self, result: SyncResult) -> None:
-        """Хук после ЛЮБОГО сетевого синка: отобрать важное и отправить. Никогда не бросает."""
+        """Хук после ЛЮБОГО сетевого синка: отобрать важное и отправить. Никогда не бросает.
+
+        ``defer_notifications`` (тихий синк — доска /jwu-todo) — не слать, а отложить: события
+        копятся в meta воркспейса и уходят вместе со следующим обычным синком, а не теряются.
+        """
         if not self.notifications_enabled:
+            return
+        try:
+            backlog = json.loads(self.store.get_workspace_meta(self.NOTIFY_BACKLOG_META) or "{}")
+        except ValueError:
+            backlog = {}
+        if getattr(self, "defer_notifications", False):
+            backlog.setdefault("deltas", []).extend(d.model_dump() for d in result.deltas)
+            backlog.setdefault("mentions", []).extend(m.model_dump() for m in result.new_mentions)
+            self.store.set_workspace_meta(self.NOTIFY_BACKLOG_META, json.dumps(backlog, ensure_ascii=False, default=str))
             return
         try:
             sender = self.notifier()
             if sender is None:
                 return
+            deltas = [Delta(**d) for d in backlog.get("deltas", [])] + list(result.deltas)
+            mentions = [Mention(**m) for m in backlog.get("mentions", [])] + list(result.new_mentions)
             slug = self.workspace.slug if self.workspace else ""
-            note = notify.build_notification(slug, result.deltas, result.new_mentions)
+            note = notify.build_notification(slug, deltas, mentions)
             note.roles = self._notification_roles(note)
             result.notified = notify.send_after_sync(sender, note,
                                                      links=notify.links_from_config(self.cfg))
+            if backlog:
+                self.store.set_workspace_meta(self.NOTIFY_BACKLOG_META, "")
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning("уведомление после синка не ушло: %s", exc)
 

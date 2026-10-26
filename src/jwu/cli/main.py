@@ -69,6 +69,11 @@ statusline_app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(statusline_app, name="statusline")
+guide_app = typer.Typer(
+    help="Инструкции: полные пошаговые тексты (запуск стенда и т.п.), на которые ссылаются правила.",
+    invoke_without_command=True,
+)
+app.add_typer(guide_app, name="guide")
 duty_app = typer.Typer(
     help="Matrix в Telegram-боте: дежурство за комнатой и личное (непрочитанное 1:1 и упоминания).",
     invoke_without_command=True,
@@ -2702,6 +2707,8 @@ def daemon_status(json_out: bool = typer.Option(False, "--json", help="Выве�
     pid = f" (pid {info['pid']})" if info["pid"] else ""
     console.print(f"процесс работает:   {yes(info['running'])}{pid}")
     console.print(f"последний проход:   {info['last_pass'] or '—'}  {info['last_summary'] or ''}")
+    if info.get("pass_in_progress"):
+        console.print(f"[yellow]идёт синк:[/yellow]          начат {info['pass_in_progress']}")
     console.print(f"лог: [dim]{info['log']}[/dim]")
 
 
@@ -4095,6 +4102,31 @@ def job_resources_cmd(
         console.print(f"  {r['kind']:<9} {r['ref']}", markup=False, highlight=False)
     if not items:
         console.print("[dim]Записанных ресурсов нет.[/dim]")
+
+
+@job_app.command("ports")
+def job_ports(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    names: list[str] = typer.Argument(..., help="Роли портов: db redis web …"),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Свободные порты для стенда работы (записываются за ней, освобождаются при закрытии)."""
+    from ..core import jobspace
+
+    with _store() as store:
+        if store.get_job(job_id) is None:
+            err.print(f"[red]Работа #{job_id} не найдена.[/red]")
+            raise typer.Exit(code=1)
+        try:
+            ports = jobspace.allocate_ports(store, job_id, names)
+        except jobspace.JobSpaceError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if as_json:
+        _emit_json(ports)
+        return
+    for name, port in ports.items():
+        console.print(f"{name}: {port}")
 
 
 @job_app.command("cleanup")
@@ -5824,6 +5856,146 @@ def duty_check(as_json: bool = typer.Option(False, "--json", help="Вывест�
         console.print("[dim]Нового нет.[/dim]")
         return
     console.print(_re.sub(r"<[^>]+>", "", duty.format_items(state, items)), markup=False, highlight=False)
+
+
+# --------------------------------------------------------------------------- #
+# todo: доска «что делать» и раздача по сессиям
+# --------------------------------------------------------------------------- #
+
+
+@app.command("todo")
+def todo_cmd(
+    take_numbers: list[int] = typer.Argument(None, help="Номера из показанного списка — взять в работу этой сессией."),
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Взять всю группу: simple | fixes | todo | review.",
+                                        click_type=click.Choice(["simple", "fixes", "todo", "review"])),
+    session: str = typer.Option("", "--session", "-s", help="Имя сессии — видно другим сессиям в «взято»."),
+    refresh_opt: Optional[bool] = typer.Option(None, "--refresh/--no-refresh",
+        help="Обновить данные перед показом (синк через демон). По умолчанию — если синку больше 30 мин."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Что делать: конфликты и сборки, правки ревью/QA, несделанные задачи, чужие PR на ревью.
+
+    Из кеша, без сети. С номерами или --group — взять пункты в работу (заводит работы
+    атомарно: уже взятое другой сессией пропускается).
+    """
+    from ..core import jobspace
+    from ..core import todo as todo_mod
+    from ..core.service import _read_identity
+
+    with _store() as store:
+        ws_id = store.workspace_id
+        login = _read_identity(store).get("user", "")
+        # без -s имя придумывается, но в CLI каждый вызов — новый процесс: для «делай 1 и 3»
+        # после показа доски передай то же -s, что напечатано в шапке
+        session = session or todo_mod.random_session_name(todo_mod.active_session_names(store))
+        if take_numbers or group:
+            result = todo_mod.take(store, ws_id, login, numbers=take_numbers or [], group=group or "", session=session)
+            if as_json:
+                _emit_json(result)
+                return
+            for t_ in result["taken"]:
+                console.print(f"[green]Взято[/green] {t_['n']}. {t_['key']} → работа #{t_['job_id']} «{t_['goal']}»", highlight=False)
+            for s_ in result["skipped"]:
+                err.print(f"[yellow]Пропущено[/yellow] {s_.get('n', '')} {s_.get('key', '')}: {s_['reason']}", highlight=False)
+            return
+        board = todo_mod.build(store, ws_id, login, session=session)
+        if refresh_opt or (refresh_opt is None and board.stale):
+            err.print("[dim]Обновляю данные (синк через демон)…[/dim]")
+            res = todo_mod.refresh(store)
+            if not res.get("ok"):
+                err.print(f"[yellow]Не обновилось:[/yellow] {res.get('error', '')}")
+            board = todo_mod.build(store, ws_id, login, session=session)
+        try:
+            disk = jobspace.check_space(store, ws_id, with_docker=False)
+            disk_line = f"Диск: {disk.summary()}"
+        except OSError:
+            disk_line = ""
+    if as_json:
+        _emit_json({**board.to_dict(), "disk": disk_line})
+        return
+    from rich.markdown import Markdown
+
+    console.print(Markdown(todo_mod.render_md(board, disk=disk_line)))
+
+
+# --------------------------------------------------------------------------- #
+# guide: инструкции, на которые ссылаются правила
+# --------------------------------------------------------------------------- #
+
+
+@guide_app.callback()
+def guide_root(ctx: typer.Context, as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Список инструкций воркспейса и общих (без подкоманды)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from ..core import guides as g
+
+    with _store() as store:
+        items = g.list_guides(store, store.workspace_id)
+    if as_json:
+        _emit_json([i.brief() for i in items])
+        return
+    if not items:
+        console.print("[dim]Инструкций нет.[/dim] jwu guide add <имя> --title … --file <md>")
+    for i in items:
+        scope = " [dim]· общая[/dim]" if i.scope == "global" else ""
+        tag = f" [cyan]#{i.tag}[/cyan]" if i.tag else ""
+        console.print(f"[bold]{i.name}[/bold]{tag}{scope} — {i.title}")
+
+
+@guide_app.command("show")
+def guide_show(name: str = typer.Argument(..., help="Имя инструкции.")) -> None:
+    """Показать инструкцию целиком."""
+    from rich.markdown import Markdown
+
+    from ..core import guides as g
+
+    with _store() as store:
+        try:
+            item = g.get_guide(store, store.workspace_id, name)
+        except g.GuideError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    console.print(Markdown(f"## {item.title}\n\n{item.text}"))
+
+
+@guide_app.command("add")
+def guide_add(
+    name: str = typer.Argument(..., help="Имя (латиница): по нему ссылаются правила."),
+    title: str = typer.Option(..., "--title", help="Заголовок одной строкой."),
+    file: str = typer.Option(..., "--file", "-f", help="Markdown с текстом; «-» — stdin."),
+    tag: str = typer.Option("", "--tag", "-t", help="Тег папки, если инструкция про один репозиторий."),
+    global_: bool = typer.Option(False, "--global", help="Общая для всех воркспейсов."),
+) -> None:
+    """Добавить или заменить инструкцию."""
+    from ..core import guides as g
+
+    text = sys.stdin.read() if file == "-" else Path(file).expanduser().read_text()
+    with _store() as store:
+        try:
+            item = g.save_guide(store, store.workspace_id, g.Guide(
+                name=name, title=title, text=text, tag=tag, scope="global" if global_ else "workspace"))
+        except g.GuideError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    console.print(f"Инструкция [bold]{item.name}[/bold] сохранена ({'общая' if item.scope == 'global' else 'воркспейса'})")
+
+
+@guide_app.command("rm")
+def guide_rm(name: str = typer.Argument(..., help="Имя инструкции."),
+             yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения.")) -> None:
+    """Удалить инструкцию."""
+    from ..core import guides as g
+
+    if not yes and not typer.confirm(f"Удалить инструкцию {name}?"):
+        raise typer.Exit(code=1)
+    with _store() as store:
+        try:
+            g.remove_guide(store, store.workspace_id, name)
+        except g.GuideError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    console.print(f"Инструкция {name} удалена")
 
 
 if __name__ == "__main__":  # pragma: no cover

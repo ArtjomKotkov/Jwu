@@ -151,12 +151,21 @@ def _queue_line(store: "Store") -> str:
     return line
 
 
-def _daemon_part() -> str:
+def _daemon_part(store: "Store | None" = None) -> str:
     try:
         alive = SingleInstance().holder_pid() is not None
     except Exception:  # noqa: BLE001 — лок может быть недоступен; это не повод падать
         alive = False
-    return f"демон {_c('32', '✓') if alive else _c('31', '✗')}"
+    out = f"демон {_c('32', '✓') if alive else _c('31', '✗')}"
+    if alive and store is not None:
+        try:
+            from .daemon import pass_in_progress
+
+            if pass_in_progress(store):
+                out += " " + _c("33", "⏳ синк идёт")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def _disk_part(store: "Store", workspace_id: int) -> str:
@@ -180,7 +189,7 @@ def jwu_lines(store: "Store", cwd: str) -> list[str]:
     ws, _ = match
     store.use_workspace(ws.id)
     head = (_dim("jwu      ") + _c("1;34", ws.name or ws.slug) + _dim(f" ({ws.provider})")
-            + _dim("   ·   ") + _daemon_part() + _disk_part(store, ws.id))
+            + _dim("   ·   ") + _daemon_part(store) + _disk_part(store, ws.id))
     return [head, _job_line(store), _queue_line(store)]
 
 

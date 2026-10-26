@@ -41,7 +41,8 @@ description: Use when the user wants to understand why a CI build failed for a P
 > **Записи `⛔ ЗАПРЕТ` обязательны к исполнению** и важнее твоего удобства: если правило
 > мешает выполнить просьбу — не обходи его молча, скажи об этом пользователю.
 > Пользователь формулирует правило уровня проекта («не пушь в develop», «стенд поднимается
-> так-то») — предложи сохранить: `jwu_rule_add(title, text, kind, tag)`
+> так-то») — **предложи** сохранить и покажи формулировку; ⛔ записывай только после его «да»:
+> `jwu_rule_add(title, text, kind, tag, user_approved=True)`
 > (bash: `jwu rule add "…" --kind constraint`).
 >
 > **Провайдер контура** (`provider` в ответе `jwu_workspace_current()`) говорит, откуда

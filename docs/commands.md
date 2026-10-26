@@ -6,9 +6,9 @@
 | Группа | Команды |
 |---|---|
 | установка | `install [--for claude\|cursor\|both]`, `install-claude-skills`, `doctor`, `configure [export\|import]`, `auth check`, `statusline [install\|uninstall\|preview]`, `duty [rooms\|room\|on\|off\|personal\|check]` |
-| проект | `init`, `workspace jobs-dir`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm` |
-| чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff [--numbered]\|--download]`, `video-frames`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze`, `review queue\|agents` |
-| память | `job start\|add\|link\|status\|done [--summary] [--cleanup]\|reopen\|cancel\|delete\|show\|handoff\|worktree\|resource\|resources\|cleanup`, `disk`, `jobs`, `note`, `notes`, `feature …`, `features`, `queue add\|list\|show\|take\|done\|fail\|cancel\|release\|edit\|move\|clear\|slots`, `mentions read\|archive`, `memory export\|import\|sync` |
+| проект | `init`, `workspace jobs-dir`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `guide [show\|add\|rm]` |
+| чтение | `todo [номера] [-g simple\|fixes\|todo\|review] [-s сессия]`, `tasks`, `task`, `attachments`, `prs`, `pr [--diff [--numbered]\|--download]`, `video-frames`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze`, `review queue\|agents` |
+| память | `job start\|add\|link\|status\|done [--summary] [--cleanup]\|reopen\|cancel\|delete\|show\|handoff\|worktree\|ports\|resource\|resources\|cleanup`, `disk`, `jobs`, `note`, `notes`, `feature …`, `features`, `queue add\|list\|show\|take\|done\|fail\|cancel\|release\|edit\|move\|clear\|slots`, `mentions read\|archive`, `memory export\|import\|sync` |
 | задачи Jira | `issue create\|edit\|link\|transition\|transitions\|attach\|similar\|link-types`, `comment`, `comment-edit`, `comment-delete` |
 | время | `worklog`, `worklog-chain`, `worklog-tz`, `worklog-edit`, `worklog-delete`, `worklogs` |
 | PR | `pr-create`, `pr-edit`, `pr-review`, `pr-comment`, `pr-comment-edit`, `pr-comment-delete`, `pr-task list\|add\|done\|reopen\|edit\|delete` |

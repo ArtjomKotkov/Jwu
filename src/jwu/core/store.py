@@ -1701,6 +1701,16 @@ class Store:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def meta_items(self, prefix: str) -> dict[str, str]:
+        """Общие meta-ключи с префиксом (общие инструкции и т.п.)."""
+        rows = self.conn.execute("SELECT key, value FROM meta WHERE key LIKE ?",
+                                 (prefix.replace("%", "") + "%",)).fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def delete_meta(self, key: str) -> None:
+        self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self.conn.commit()
+
     def set_meta(self, key: str, value: str) -> None:
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?, ?) "
@@ -2075,6 +2085,12 @@ class Store:
             # правила агент читает и исполняет — тут текст дешевле и доходчивее
             "rules_md": self.rules_markdown(tag=tag),
         }
+        from . import guides as guides_mod
+
+        guides = guides_mod.list_guides(self, self.workspace_id)
+        if guides:
+            ctx["guides"] = [g.brief() for g in guides]
+            ctx["guides_md"] = guides_mod.index_md(guides)
         # Стенды — только кратко и только если есть: whitelist/blacklist длинные, а этот
         # контекст приезжает в каждый старт работы. Полностью — jwu_ssh_servers.
         servers = ssh_mod.list_servers(self, self.workspace_id)

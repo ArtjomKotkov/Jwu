@@ -22,6 +22,7 @@ EXPECTED_SKILLS = {
     "jwu-queue",
     "jwu-continue-job",
     "jwu-close-job",
+    "jwu-todo",
     "jwu-job-review",
     "jwu-commit-message",
     "jwu-task-create",

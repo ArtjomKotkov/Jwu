@@ -85,7 +85,10 @@ jwu workspace provider github                  # сменить провайде
 
 ```bash
 jwu rule add "Не пушить в develop напрямую" --kind constraint
-jwu rule add "Стенд работы" --kind testenv --tag backend --file -   # подъём, проверка, снос, порты
+jwu rule add "Стенд — по инструкции backend-stand" --kind testenv --tag backend
+jwu guide add backend-stand --title "Локальный стенд backend" --file stand.md --tag backend
+jwu guide add playwright --title "Playwright" --file pw.md --global   # общая для всех воркспейсов
+jwu ssh add rocky --host … --user root --key ~/.ssh/… --desc "логи, что можно"   # удалённые серверы
 jwu rules --tag backend
 ```
 
@@ -96,10 +99,11 @@ jwu rules --tag backend
 работа стоп, демон предупреждает в Telegram, `doctor` и строка статуса — красным.
 
 ```bash
-jwu workspace jobs-dir ~/work/.jobs          # где лежат рабочие копии работ
+jwu workspace jobs-dir ~/jwu-jobs/work       # где лежат рабочие копии работ
 jwu disk [--min 20]                          # свободно, docker, неубранное у закрытых работ
 jwu job worktree <id> <репозиторий>          # копия для работы (обычно делает скилл)
-jwu job cleanup <id> [--dry-run] [--force]   # убрать стенд, docker, кеш и копии
+jwu job ports <id> db redis web             # свободные порты стенду работы (не пересекутся)
+jwu job cleanup <id> [--dry-run] [--force]   # убрать стенд, docker, кеш, порты и копии
 jwu job done <id> --summary "что сделано" --cleanup
 ```
 

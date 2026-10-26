@@ -35,7 +35,9 @@ Jira/SDESK всё так же выполняется один раз на вор
 
 from __future__ import annotations
 
+import asyncio
 import atexit
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -111,6 +113,10 @@ def _store_only(workspace: Optional[str] = None) -> Store:
     store = _stores.get(ws.id)
     if store is None:
         store = _stores[ws.id] = Store(str(db_path()), ws.id)
+        try:   # сессия видна на доске с первого вызова jwu, а не только после /jwu-todo
+            _session_name(store)
+        except Exception:  # noqa: BLE001
+            pass
     return store
 
 
@@ -1383,9 +1389,15 @@ async def jwu_rule_add(
     text: str = "",
     kind: str = "info",
     tag: str = "",
+    user_approved: bool = False,
     workspace: Optional[str] = None,
 ) -> dict:
     """Записать правило воркспейса — то, что должно пережить эту сессию.
+
+    ⛔ ТОЛЬКО с явного «да» пользователя на эту формулировку. Сначала покажи title и text,
+    спроси «сохранить правило?», дождись «да» — и только тогда user_approved=True. Без
+    него инструмент откажет. Свои выводы, «прецеденты» и разовые находки сессии — НЕ
+    правила: это журнал работы (jwu_job_add) или заметка на задаче (jwu_note).
 
     Зови, когда пользователь формулирует что-то про ПРОЕКТ, а не про текущую задачу:
     «никогда не пушь в develop», «стенд поднимается так-то», «фронт лежит там-то».
@@ -1396,6 +1408,10 @@ async def jwu_rule_add(
     многострочные). kind: constraint | howto | info | convention | gotcha.
     tag — тег папки, если правило только про этот репозиторий; иначе правило общее.
     """
+    if not user_approved:
+        raise ValueError("Правила воркспейса пишутся только с явного «да» пользователя на ЭТУ "
+                         "формулировку. Покажи ему title и text, спроси «сохранить правило?» и "
+                         "вызови снова с user_approved=True. Сам не решай.")
     if kind not in WORKSPACE_RULE_KINDS:
         raise ValueError(f"Недопустимый тип {kind!r}. "
                          f"Допустимо: {', '.join(WORKSPACE_RULE_KINDS)}")
@@ -1410,9 +1426,17 @@ async def jwu_rule_edit(
     text: Optional[str] = None,
     kind: Optional[str] = None,
     tag: Optional[str] = None,
+    user_approved: bool = False,
     workspace: Optional[str] = None,
 ) -> dict:
-    """Изменить правило воркспейса. Передавай только те поля, что меняешь."""
+    """Изменить правило воркспейса. Передавай только те поля, что меняешь.
+
+    ⛔ ТОЛЬКО с явного «да» пользователя на новую формулировку (user_approved=True).
+    """
+    if not user_approved:
+        raise ValueError("Правила воркспейса пишутся только с явного «да» пользователя на ЭТУ "
+                         "формулировку. Покажи ему title и text, спроси «сохранить правило?» и "
+                         "вызови снова с user_approved=True. Сам не решай.")
     if kind is not None and kind not in WORKSPACE_RULE_KINDS:
         raise ValueError(f"Недопустимый тип {kind!r}. "
                          f"Допустимо: {', '.join(WORKSPACE_RULE_KINDS)}")
@@ -1424,8 +1448,16 @@ async def jwu_rule_edit(
 
 
 @mcp.tool()
-async def jwu_rule_rm(rule_id: int, workspace: Optional[str] = None) -> dict:
-    """Удалить правило воркспейса (правило устарело / больше не действует)."""
+async def jwu_rule_rm(rule_id: int, user_approved: bool = False,
+                      workspace: Optional[str] = None) -> dict:
+    """Удалить правило воркспейса (правило устарело / больше не действует).
+
+    ⛔ ТОЛЬКО с явного «да» пользователя (user_approved=True).
+    """
+    if not user_approved:
+        raise ValueError("Правила воркспейса пишутся только с явного «да» пользователя на ЭТУ "
+                         "формулировку. Покажи ему title и text, спроси «сохранить правило?» и "
+                         "вызови снова с user_approved=True. Сам не решай.")
     store = _store_only(workspace)
     rule = store.get_rule(rule_id)
     if rule is None:
@@ -1843,6 +1875,27 @@ async def jwu_job_resources(job_id: int, workspace: Optional[str] = None) -> dic
                    "items": store.job_resources(job_id)}, _resolve(workspace))
 
 
+
+@mcp.tool()
+async def jwu_job_ports(job_id: int, names: list[str], workspace: Optional[str] = None) -> dict:
+    """Свободные порты для стенда работы: names — роли («db», «redis», «web», «kafka») → порт.
+
+    Повторный вызов отдаёт те же порты. Выданное записано за работой и освобождается при
+    закрытии — два стенда параллельных работ не столкнутся. Используй ВМЕСТО портов по
+    умолчанию из compose/инструкции (через переменные окружения или override-файл).
+    """
+    from .core import jobspace
+
+    store = _store_only(workspace)
+    if store.get_job(job_id) is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    try:
+        ports = jobspace.allocate_ports(store, job_id, names)
+    except jobspace.JobSpaceError as exc:
+        raise ValueError(str(exc)) from exc
+    return _stamp({"ports": ports}, _resolve(workspace))
+
+
 @mcp.tool()
 async def jwu_job_cleanup(job_id: int, dry_run: bool = True, force: bool = False,
                           workspace: Optional[str] = None) -> dict:
@@ -1861,6 +1914,184 @@ async def jwu_job_cleanup(job_id: int, dry_run: bool = True, force: bool = False
     if not dry_run and report.removed:
         store.add_job_record(job_id, "Уборка: " + "; ".join(report.removed)[:900], kind="note")
     return _stamp(report.to_dict(), _resolve(workspace))
+
+
+
+# Имя этой сессии Claude Code для доски: у каждой сессии свой процесс MCP-сервера, поэтому
+# имя живёт здесь и одно на всю сессию — агенту не нужно ни спрашивать, ни помнить его.
+_SESSION_NAME = ""
+
+
+def _session_name(store: "Store", explicit: str = "") -> str:
+    global _SESSION_NAME
+    from .core import todo as todo_mod
+
+    if explicit.strip():
+        _SESSION_NAME = explicit.strip()
+    if not _SESSION_NAME:
+        _SESSION_NAME = todo_mod.random_session_name(todo_mod.active_session_names(store))
+    _start_heartbeat(store.path)
+    return _SESSION_NAME
+
+
+_HEARTBEAT_STARTED = False
+
+
+def _start_heartbeat(db_file: str) -> None:
+    """Раз в минуту отмечать сессию в БД — доска видит, жива ли она (свой поток, своё соединение)."""
+    global _HEARTBEAT_STARTED
+    if _HEARTBEAT_STARTED:
+        return
+    _HEARTBEAT_STARTED = True
+    import threading
+    import time as _time
+
+    from .core import todo as todo_mod
+
+    def loop() -> None:
+        while True:
+            try:
+                own = Store(db_file)
+                try:
+                    todo_mod.heartbeat(own, _SESSION_NAME, pid=os.getpid(), cwd=str(Path.cwd()))
+                finally:
+                    own.close()
+            except Exception:  # noqa: BLE001 — отметка не критична
+                pass
+            _time.sleep(60)
+
+    threading.Thread(target=loop, name="jwu-session-heartbeat", daemon=True).start()
+
+
+@mcp.tool()
+async def jwu_todo(session: str = "", refresh: Optional[bool] = None,
+                   workspace: Optional[str] = None) -> dict:
+    """Доска «что делать» из кеша (без сети): нумерованные пункты по группам.
+
+    Группы: simple — мой PR с конфликтом/красной сборкой без замечаний людей; fixes — правки
+    (needs work, открытые задачи PR, возврат с QA; конфликт и сборка там тоже); todo —
+    несделанные задачи на мне (не начата / в работе, без открытого PR); review — чужие PR
+    ждут моего ревью. У пункта taken — уже взят (работа, кем, сколько назад).
+    session — НЕ спрашивай у пользователя: пусто — у сессии уже есть (или придумается) имя
+    вроде «Shiny-Gold», оно вернётся в поле session. Передавай, только если пользователь сам
+    попросил назвать сессию иначе. Номера запоминаются за сессией,
+    так что jwu_todo_take(numbers) берёт ровно то, что показано. markdown — готовый вывод:
+    показывай его КАК ЕСТЬ — с приоритетом и статусом у каждого пункта и в этом порядке
+    (в работе выше не начатого, дальше по приоритету); не переписывай и не сокращай.
+    refresh: None — обновить сам, если синку больше 30 мин; True — обновить сейчас (пользователь
+    попросил «обнови», «свежее», «сходи в сеть»); False — только кеш. Обновление — синк через
+    демон (один на все сессии, до нескольких минут), без демона — синк этого контура.
+    """
+    from .core import jobspace
+    from .core import todo as todo_mod
+    from .core.service import _read_identity
+
+    store = _store_only(workspace)
+    login = _read_identity(store).get("user", "")
+    session = _session_name(store, session)
+    board = todo_mod.build(store, store.workspace_id, login, session=session)
+    refreshed = None
+    if refresh or (refresh is None and board.stale):
+        path, ws_id = store.path, store.workspace_id
+
+        def _refresh() -> dict:   # своё соединение: sqlite не любит чужие потоки
+            own = Store(path, ws_id)
+            try:
+                return todo_mod.refresh(own)
+            finally:
+                own.close()
+
+        refreshed = await asyncio.to_thread(_refresh)
+        board = todo_mod.build(store, store.workspace_id, login, session=session)
+    try:
+        disk = jobspace.check_space(store, store.workspace_id, with_docker=False).summary()
+    except OSError:
+        disk = ""
+    return _stamp({**board.to_dict(), "disk": disk, "refreshed": refreshed,
+                   "markdown": todo_mod.render_md(board, disk=f"Диск: {disk}" if disk else "")},
+                  _resolve(workspace))
+
+
+
+@mcp.tool()
+async def jwu_todo_release(session: str, workspace: Optional[str] = None) -> dict:
+    """Освободить работы другой сессии, которая молчит (💤 на доске): они уходят в паузу, а
+    их задачи снова свободны. Только по просьбе пользователя («освободи Brave-Fox»)."""
+    from .core import todo as todo_mod
+
+    store = _store_only(workspace)
+    alive = todo_mod.sessions(store).get(session, {}).get("alive")
+    if alive:
+        raise ValueError(f"Сессия «{session}» жива — её работы не трогаю. Пусть закроет сама.")
+    return _stamp({"released": todo_mod.release(store, session)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", session: str = "",
+                        workspace: Optional[str] = None) -> dict:
+    """Взять пункты доски в работу этой сессией: по номерам из её последнего jwu_todo или всю группу.
+
+    Заводит работы атомарно (две сессии одно не возьмут): цель в заголовке («Конфликт и
+    красная сборка PR #1092», «Правки по ревью PR #1027», «Сделать задачу», «Ревью PR #…»),
+    PR привязан, запись «Взято сессией «…»». Уже взятое — в skipped с кем и когда.
+    group: simple | fixes | todo | review — свободные пункты группы целиком.
+    Дальше по каждой взятой работе — jwu-continue-job (работа уже есть), по очереди.
+    """
+    from .core import todo as todo_mod
+    from .core.service import _read_identity
+
+    if group and group not in todo_mod.GROUPS:
+        raise ValueError(f"group: {', '.join(todo_mod.GROUPS)}")
+    store = _store_only(workspace)
+    session = _session_name(store, session)
+    result = todo_mod.take(store, store.workspace_id, _read_identity(store).get("user", ""),
+                           numbers=numbers or [], group=group, session=session)
+    return _stamp({**result, "session": session}, _resolve(workspace))
+
+
+
+@mcp.tool()
+async def jwu_guides(workspace: Optional[str] = None) -> dict:
+    """Список инструкций: свои воркспейса и общие для всех (имя, заголовок, тег)."""
+    from .core import guides as g
+
+    store = _store_only(workspace)
+    return _stamp({"guides": [i.brief() for i in g.list_guides(store, store.workspace_id)]}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_guide(name: str, workspace: Optional[str] = None) -> dict:
+    """Инструкция целиком — когда правило ссылается на неё («по инструкции backend-stand»)
+    или когда поднимаешь стенд / ставишь инструмент. Выполняй по шагам, как написано."""
+    from .core import guides as g
+
+    store = _store_only(workspace)
+    try:
+        return _stamp(g.get_guide(store, store.workspace_id, name).to_dict(), _resolve(workspace))
+    except g.GuideError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+@mcp.tool()
+async def jwu_guide_save(name: str, title: str, text: str, tag: str = "", scope: str = "workspace",
+                         user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Сохранить инструкцию (полный пошаговый текст). scope: workspace | global (для всех воркспейсов).
+
+    ⛔ ТОЛЬКО с явного «да» пользователя на этот текст (user_approved=True), как и правила.
+    """
+    from .core import guides as g
+
+    if not user_approved:
+        raise ValueError("Инструкции пишутся только с явного «да» пользователя на этот текст. "
+                         "Покажи его, спроси и вызови снова с user_approved=True.")
+    if scope not in ("workspace", "global"):
+        raise ValueError("scope: workspace | global")
+    store = _store_only(workspace)
+    try:
+        item = g.save_guide(store, store.workspace_id, g.Guide(name=name, title=title, text=text, tag=tag, scope=scope))
+    except g.GuideError as exc:
+        raise ValueError(str(exc)) from exc
+    return _stamp(item.brief(), _resolve(workspace))
 
 
 @mcp.tool()

@@ -360,18 +360,20 @@ def test_workspace_context_is_identical_everywhere(fresh_server, tmp_path, monke
 def test_rule_add_edit_rm_roundtrip(fresh_server, tmp_path, monkeypatch):
     _ws_with_rules(fresh_server, tmp_path, monkeypatch)
 
-    added = _run(srv.jwu_rule_add("Ревью до коммита", text="всегда", kind="constraint"))
+    with pytest.raises(ValueError, match="«да» пользователя"):
+        _run(srv.jwu_rule_add("Ревью до коммита", text="всегда", kind="constraint"))
+    added = _run(srv.jwu_rule_add("Ревью до коммита", text="всегда", kind="constraint", user_approved=True))
     assert added["kind"] == "constraint" and added["tag"] == ""
 
-    edited = _run(srv.jwu_rule_edit(added["id"], tag="фронт"))
+    edited = _run(srv.jwu_rule_edit(added["id"], tag="фронт", user_approved=True))
     assert edited["tag"] == "фронт" and edited["title"] == "Ревью до коммита"
 
-    removed = _run(srv.jwu_rule_rm(added["id"]))
+    removed = _run(srv.jwu_rule_rm(added["id"], user_approved=True))
     assert removed["removed"]["id"] == added["id"]
     with pytest.raises(ValueError, match="не найдено"):
-        _run(srv.jwu_rule_rm(added["id"]))
+        _run(srv.jwu_rule_rm(added["id"], user_approved=True))
     with pytest.raises(ValueError, match="Недопустимый тип"):
-        _run(srv.jwu_rule_add("x", kind="nope"))
+        _run(srv.jwu_rule_add("x", kind="nope", user_approved=True))
 
 
 # --- полнота поверхности MCP ---------------------------------------------- #
