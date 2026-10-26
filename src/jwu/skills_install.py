@@ -34,11 +34,11 @@ EXPECTED_SKILLS = {
     "jwu-post-analyze-day",
     "jwu-track-time",
     "jwu-4test-message",
-    "build-failure",
+    "jwu-build-failure",
     "jwu-workspace-setup",
     "jwu-update",
     "jwu-prompt-refine",
-    "duty-support",
+    "jwu-duty-support",
     "jwu-pr-task",
     "jwu-pr-comment",
     "jwu-context",
@@ -63,6 +63,9 @@ RETIRED_SKILLS = {
     "jwu-track-job",     # журнал → раздел «Журнал работы» в jwu-start-job
     "jwu-resume-job",    # → jwu-continue-job (плюс переоткрытие закрытой)
     "jwu-wrap-up",       # → jwu-close-job (итог, уборка) / jwu-continue-job (пауза)
+    # 2.2.0: у всех скиллов jwu — префикс jwu-
+    "build-failure",     # → jwu-build-failure
+    "duty-support",      # → jwu-duty-support
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

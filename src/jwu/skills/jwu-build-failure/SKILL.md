@@ -1,9 +1,9 @@
 ---
-name: build-failure
+name: jwu-build-failure
 description: Use when the user wants to understand why a CI build failed for a PR/branch (Jenkins or GitHub Actions) — phrases like «почему упал билд», «разбери сборку», «красный билд», «что упало в jenkins», «что упало в actions», «build failure», «упали тесты ветки в CI». Collects facts ONLY via jwu (`jwu builds`/`jwu build`, which reach Bitbucket+Jenkins or GitHub Actions and do NOT need Jira) and dispatches the `jenkins-build-analyst` subagent to produce a structured root-cause verdict (наш баг vs регресс из целевой ветки vs инфра) and a fix.
 ---
 
-# build-failure: разбор падения CI-сборки
+# jwu-build-failure: разбор падения CI-сборки
 
 ## Когда применять
 Пользователь спрашивает, почему красный билд / что упало в CI по PR или ветке

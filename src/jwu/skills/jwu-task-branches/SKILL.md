@@ -52,5 +52,5 @@ description: Use when the duty/support question is whether a fix has reached a g
 
 ## Связанные скиллы
 
-- **build-failure** — почему упал билд по ветке/PR.
+- **jwu-build-failure** — почему упал билд по ветке/PR.
 - **jwu-task-comment** — ответить в задаче тем, что выяснил.
