@@ -2182,6 +2182,19 @@ async def jwu_worklog(
 
 
 @mcp.tool()
+async def jwu_worklog_links(date: str, keys: Optional[list[str]] = None,
+                            workspace: Optional[str] = None) -> dict:
+    """Ссылки на мои ворклоги за день (поиск в Jira; SDESK — если среди keys есть его задачи).
+    Показывай их пользователю ПОСЛЕ трека — чтобы он сам посмотрел, что записалось."""
+    from .core import timechain
+
+    ws = _resolve(workspace)
+    store = _store_only(workspace)
+    cfg = ws_mod.config_for_workspace(store, ws)
+    return _stamp({"links": timechain.worklog_links(cfg, date, keys or [])}, ws)
+
+
+@mcp.tool()
 async def jwu_worklog_timezone(tz: Optional[str] = None, workspace: Optional[str] = None) -> dict:
     """Часовой пояс для трекинга времени (настройка контура worklog.timezone).
 
