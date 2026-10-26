@@ -22,7 +22,7 @@
 | `/jwu-task-create`, `/jwu-task-comment`, `/jwu-task-status`, `/jwu-task-attach`, `/jwu-task-branches` | задачи Jira: создать и править, комменты, статус, вложения; куда доехал фикс |
 | `/jwu-analyze-day`, `/jwu-post-analyze-day`, `/jwu-track-time` | план на день; итоги дня; трекинг времени цепочкой |
 | `/jwu-4test-message`, `/jwu-commit-message`, `/jwu-prompt-refine` | инструкция QA; коммит-месседж; промпт для другой сессии |
-| `/jwu-duty-support` | дежурство: обращения поддержки из мессенджера |
+| `/jwu-duty` | дежурство: обращения поддержки из мессенджера |
 | `/jwu-confluence` | читать, создавать и править страницы Confluence |
 | `/jwu-voice-profile`, `/jwu-voice-rewrite` | собрать профиль голоса; переписать текст «как я пишу» |
 

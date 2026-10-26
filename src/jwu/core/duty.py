@@ -570,3 +570,37 @@ def poll(store: "Store", client_factory, sender) -> int:
         sender.send(format_items(state, items))
     advance(store, state, end)
     return len(items)
+
+
+
+# --------------------------------------------------------------------------- #
+# Вопросы дежурства — локальные работы
+# --------------------------------------------------------------------------- #
+
+QUESTION_PREFIX = "🛟 Дежурство: "
+QUESTIONS_META = "duty:questions"   # {event_id: job_id} — один вопрос = одна работа
+
+
+def question_job(store: "Store", *, summary: str, author: str = "", when: str = "", where: str = "",
+                 event_id: str = "", link: str = "", details: str = "") -> dict:
+    """Вопрос с дежурства → локальная работа «🛟 Дежурство: …». Повтор того же сообщения
+    (event_id) — та же работа. Номер работы и есть номер вопроса («берём #922»)."""
+    known = _json_meta(store, QUESTIONS_META, {})
+    if event_id and event_id in known:
+        job = store.get_job(int(known[event_id]))
+        if job is not None:
+            return {"job_id": job.id, "created": False, "status": job.status}
+    job = store.create_job("", QUESTION_PREFIX + " ".join(summary.split())[:120])
+    source = " · ".join(p for p in (f"от {author}" if author else "", when, where) if p)
+    store.add_job_record(job.id, f"Вопрос дежурства — {source}" + (f"\nСсылка: {link}" if link else "")
+                         + (f"\nevent_id: {event_id}" if event_id else ""), kind="note")
+    if details.strip():
+        store.add_job_record(job.id, details.strip(), kind="note")
+    if event_id:
+        known[event_id] = job.id
+        store.set_workspace_meta(QUESTIONS_META, json.dumps(known))
+    return {"job_id": job.id, "created": True, "status": "active"}
+
+
+def open_questions(store: "Store") -> list:
+    return [j for j in store.list_jobs(status="active") if j.title.startswith(QUESTION_PREFIX)]

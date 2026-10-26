@@ -33,7 +33,8 @@ color: "#8B5CF6"
 <inputs>
 Вызывающий скилл передаёт в user-prompt:
 - `channel` — pr_comment | pr_reply | pr_review_body | pr_task | pr_description |
-  jira_comment | sdesk_client | task | 4test | commit | message;
+  jira_comment | sdesk_client | task | 4test | commit | message | matrix (реплика в чат:
+  комната, тред поддержки, личка — правила в разделе «matrix» анализа корпуса);
 - `audience` — colleague | qa | analyst | client;
 - `language` — по умолчанию ru;
 - `facts` — ЧТО сказать: сценарий, следствие, просьба/вопрос, что сделано (списком);

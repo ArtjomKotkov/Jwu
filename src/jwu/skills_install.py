@@ -38,7 +38,7 @@ EXPECTED_SKILLS = {
     "jwu-workspace-setup",
     "jwu-update",
     "jwu-prompt-refine",
-    "jwu-duty-support",
+    "jwu-duty",
     "jwu-pr-task",
     "jwu-pr-comment",
     "jwu-context",
@@ -65,7 +65,8 @@ RETIRED_SKILLS = {
     "jwu-wrap-up",       # → jwu-close-job (итог, уборка) / jwu-continue-job (пауза)
     # 2.2.0: у всех скиллов jwu — префикс jwu-
     "build-failure",     # → jwu-build-failure
-    "duty-support",      # → jwu-duty-support
+    "duty-support",      # → jwu-duty
+    "jwu-duty-support",  # → jwu-duty (короче и по делу)
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

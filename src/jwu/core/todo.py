@@ -28,8 +28,9 @@ if TYPE_CHECKING:
     from .models import PR, Issue, Job
     from .store import Store
 
-GROUPS = ("simple", "fixes", "todo", "review")
+GROUPS = ("duty", "simple", "fixes", "todo", "review")
 GROUP_TITLES = {
+    "duty": "🛟 Дежурство",
     "simple": "🔧 Конфликты и сборки",
     "fixes": "✍️ Правки по ревью и QA",
     "todo": "📋 Несделанные задачи",
@@ -208,6 +209,16 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                           problems=[f"автор {pr.author}"] if pr.author else [], issue_key=_issue_key(pr),
                           pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title},
                           taken=_taken(by_pr.get((pr.project, pr.repository, pr.id)))))
+
+    # Дежурство: вопросы уже заведены работами («🛟 Дежурство: …»); «взято» — за ней сессия
+    from .duty import QUESTION_PREFIX, open_questions
+
+    for job in open_questions(store):
+        info = _taken(job)
+        source = next((r.text.split("\n")[0] for r in job.records if r.text.startswith("Вопрос дежурства")), "")
+        items.append(Item(n=0, group="duty", key=f"#{job.id}", title=job.title[len(QUESTION_PREFIX):],
+                          problems=[source.replace("Вопрос дежурства — ", "")] if source else [],
+                          taken=info if info and info["session"] else None))
 
     # Группы — в фиксированном порядке; внутри: свободное выше взятого, в работе выше не начатого,
     # дальше от важного приоритета к неважному.
@@ -413,6 +424,18 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
             if item is None:
                 skipped.append({"key": key, "reason": "больше не требует действия (синк обновился)"})
                 continue
+            if item.group == "duty":
+                jid = int(item.key.lstrip("#"))
+                info = _taken(store.get_job(jid))
+                if info and info["session"]:
+                    skipped.append({"key": key, "n": item.n, "reason": f"уже взято сессией «{info['session']}», {info['ago']}",
+                                    "job_id": jid})
+                    continue
+                conn.execute("INSERT INTO job_records (job_id, kind, text, ts) VALUES (?, 'note', ?, ?)",
+                             (jid, f"{SESSION_MARK} «{session or 'без имени'}»: вопрос дежурства", _iso()))
+                taken.append({"n": item.n, "key": key, "group": "duty", "job_id": jid,
+                              "goal": item.title, "issue_key": "", "pr": None})
+                continue
             job = (by_pr.get((item.pr["project"], item.pr["repo"], item.pr["id"])) if item.pr else None) \
                 or (by_key.get(item.issue_key) if item.issue_key else None)
             if item.issue_key and item.issue_key in claimed:
@@ -506,6 +529,7 @@ def _prio_cell(item: Item) -> str:
 
 # Колонки по группе: у «несделанных» проблем нет — там важны статус и приоритет.
 _COLUMNS = {
+    "duty":   ("№", "Вопрос", "Откуда", "Взято"),
     "simple": ("№", "PR", "Задача", "Заголовок", "Приоритет", "Что не так", "Взято"),
     "fixes":  ("№", "PR", "Задача", "Заголовок", "Приоритет", "Статус", "Что не так", "Взято"),
     "todo":   ("№", "Задача", "Заголовок", "Приоритет", "Статус", "Взято"),
@@ -522,6 +546,8 @@ def _title(i: Item) -> str:
 
 
 def _row(group: str, i: Item) -> list[str]:
+    if group == "duty":
+        return [str(i.n), f"**{i.key}** {_cell(i.title, 70)}", _cell(", ".join(i.problems), 50), _taken_cell(i)]
     pr = f"{i.pr['repo']}#{i.pr['id']}" if i.pr else "—"
     key = f"**{_cell(i.issue_key)}**" if i.issue_key else "—"
     problems = _cell(", ".join(p for p in i.problems if not p.startswith("автор ")))

@@ -40,7 +40,7 @@ AGENT_SETTING = "voice.agent"
 
 CHANNELS = (
     "pr_comment", "pr_reply", "pr_review_body", "pr_task", "pr_description",
-    "jira_comment", "sdesk_client", "task", "4test", "commit", "message",
+    "jira_comment", "sdesk_client", "task", "4test", "commit", "message", "matrix",
 )
 AUDIENCES = ("colleague", "qa", "analyst", "client")
 
@@ -57,6 +57,8 @@ _CHANNEL_FALLBACK = {
     "4test": ("jira_comment", "task"),
     "commit": ("pr_description",),
     "message": ("pr_reply", "jira_comment"),
+    # чаты (комнаты, треды, личка): правила — раздел «matrix» анализа корпуса
+    "matrix": ("message", "pr_reply", "jira_comment"),
 }
 
 FEEDBACK_HEADER = "## Журнал правок"

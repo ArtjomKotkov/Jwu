@@ -180,3 +180,21 @@ def test_two_prs_for_one_task_are_flagged_and_linked(store):
     res = todo.take(store, store.workspace_id, "me", numbers=[item.n], session="S")
     job = store.get_job(res["taken"][0]["job_id"])
     assert {(p.repo, p.pr_id) for p in job.prs} == {("r", 1), ("other", 4)}
+
+
+def test_duty_question_job_board_and_take(store):
+    from jwu.core import duty
+
+    q = duty.question_job(store, summary="mtbank — Too many open files", author="ivan", when="26.10 17:17",
+                          where="корень комнаты", event_id="$e1", details="Спрашивает: …")
+    again = duty.question_job(store, summary="другое", event_id="$e1")
+    assert q["created"] and not again["created"] and again["job_id"] == q["job_id"]
+    board = todo.build(store, store.workspace_id, "me", session="S1")
+    item = next(i for i in board.items if i.group == "duty")
+    assert item.key == f"#{q['job_id']}" and "mtbank" in item.title and item.taken is None
+    assert board.items[0].group == "duty"                       # дежурство — первой группой
+    res = todo.take(store, store.workspace_id, "me", numbers=[item.n], session="S1")
+    assert res["taken"][0]["job_id"] == q["job_id"] and len(store.list_jobs()) == 1   # без новой работы
+    res2 = todo.take(store, store.workspace_id, "me", group="duty", session="S2")
+    assert res2["taken"] == []
+    assert "🛟 Дежурство" in todo.render_md(todo.build(store, store.workspace_id, "me", session="S2"))

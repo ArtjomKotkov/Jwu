@@ -389,8 +389,10 @@ def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
     except notify.NotifyError:
         pass  # часики сами пропадут
     mid = msg.get("message_id")
-    if mid and data.removeprefix(MENU_PREFIX) in SLOW_ACTIONS | {"matrix"} or \
-            mid and data.startswith(duty.CALLBACK_PREFIX) and data != duty.CALLBACK_PREFIX + duty.CB_MENU:
+    # «⏳ делаю…» — на любой кнопке, кроме мгновенных (вернуться в меню): аддоны и сеть
+    # бывают небыстрыми, а молчание выглядит как «бот умер».
+    instant = {MENU_PREFIX + "main", duty.CALLBACK_PREFIX + duty.CB_MENU}
+    if mid and data not in instant:
         try:   # долгое — сразу видно, что бот жив и работает
             sender.edit(int(mid), "⏳ делаю…")
         except notify.NotifyError:

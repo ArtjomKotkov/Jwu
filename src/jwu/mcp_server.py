@@ -2094,6 +2094,39 @@ async def jwu_guide_save(name: str, title: str, text: str, tag: str = "", scope:
     return _stamp(item.brief(), _resolve(workspace))
 
 
+
+@mcp.tool()
+async def jwu_duty_question(summary: str, author: str = "", when: str = "", where: str = "",
+                            event_id: str = "", link: str = "", details: str = "",
+                            workspace: Optional[str] = None) -> dict:
+    """Завести вопрос с дежурства как локальную работу «🛟 Дежурство: <summary>» — её номер и
+    есть номер вопроса («берём #922»). То же сообщение (event_id) — та же работа, без дубля.
+
+    summary — суть одной строкой (клиент + симптом); author/when/where — кто, когда, где
+    (комната/тред); details — что спрашивает, что у него есть, срочность (markdown).
+    Это локальная память jwu, наружу ничего не пишется.
+    """
+    from .core import duty
+
+    store = _store_only(workspace)
+    return _stamp(duty.question_job(store, summary=summary, author=author, when=when, where=where,
+                                    event_id=event_id, link=link, details=details), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_duty_questions(workspace: Optional[str] = None) -> dict:
+    """Открытые вопросы дежурства (активные работы «🛟 Дежурство: …»): номер, суть, кто взял."""
+    from .core import duty, todo
+
+    store = _store_only(workspace)
+    out = []
+    for job in duty.open_questions(store):
+        info = todo._taken(job)
+        out.append({"job_id": job.id, "summary": job.title[len(duty.QUESTION_PREFIX):],
+                    "created_at": job.created_at, "taken_by": (info or {}).get("session", "")})
+    return _stamp({"questions": out}, _resolve(workspace))
+
+
 @mcp.tool()
 async def jwu_disk(path: Optional[str] = None, workspace: Optional[str] = None) -> dict:
     """Свободное место (папка рабочих копий или path), docker и неубранное у закрытых работ.

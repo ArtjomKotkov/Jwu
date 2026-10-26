@@ -65,6 +65,9 @@ def render(board: "todo.Board", slug: str, links: Optional[notify.Links]) -> str
         for i in free[:TOP]:
             prio = todo.PRIORITY_ICON.get(todo._prio(i.priority), "") if i.priority else ""
             key = i.issue_key or i.key
+            if group == "duty":
+                lines.append(f"🛟 {html.escape(key)} — {html.escape(notify._short(i.title, 70))}")
+                continue
             what = ", ".join(p for p in i.problems if not p.startswith("автор ")) or i.status
             title = i.title[len(i.issue_key):].lstrip(" :—-") if i.issue_key and i.title.startswith(i.issue_key) else i.title
             lines.append(f"{prio} {notify._key_html(key, links)} — {html.escape(notify._short(title, 60))}"
