@@ -136,6 +136,7 @@ TABS = {
     "tab-workspaces": ("t-workspaces", "workspace", "workspaces"),
     "tab-structure": ("t-structure", "tree", "structure"),
     "tab-rules": ("t-rules", "rule", "rules"),
+    "tab-stands": ("t-stands", "stand", "stands"),
     "tab-mine": ("t-mine", "issue", "mine"),
     "tab-mentions": ("t-mentions", "mention", "mentions"),
     "tab-features": ("t-features", "feature", "features"),
@@ -148,6 +149,7 @@ _TAB_TITLE = {
     "tab-workspaces": "Workspace",
     "tab-structure": "Структура",
     "tab-rules": "Правила",
+    "tab-stands": "Стенды",
     "tab-mine": "Мои задачи",
     "tab-mentions": "Упоминания",
     "tab-features": "Фичи",
@@ -162,7 +164,7 @@ _TAB_TITLE = {
 # для всего, что внизу. «Структура» и «Правила» идут первыми в нижнем ряду — это ответ
 # на вопросы «где код» и «как тут принято», с них начинается работа в незнакомом контуре.
 GLOBAL_TABS = ("tab-workspaces",)
-PROJECT_TABS = ("tab-structure", "tab-rules", "tab-mine", "tab-mentions", "tab-features",
+PROJECT_TABS = ("tab-structure", "tab-rules", "tab-stands", "tab-mine", "tab-mentions", "tab-features",
                 "tab-prs-mine", "tab-prs-review", "tab-jobs")
 TAB_ROWS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tabs-global", GLOBAL_TABS),
@@ -391,6 +393,7 @@ WORKSPACE_COLUMNS = ["", "Workspace", "Название", "Провайдер", 
 PATH_COLUMNS = ["Папка", "Git", "Метка", "Состояние", "Добавлена"]
 FEATURE_COLUMNS = ["Ключ", "Обновлена", "Статус", "Приоритет", "Название"]
 RULE_COLUMNS = ["Тип", "Тег", "Правило", "Обновлено"]
+STAND_COLUMNS = ["Стенд", "Тег", "Адрес", "Вход", "Политика", "Описание"]
 
 
 from ..core.dates import (  # noqa: E402
@@ -1679,6 +1682,10 @@ class JwuDashboard(App):
                     with Vertical(id="tab-rules"):
                         yield Static(id="rules-head")
                         yield DashboardTable(id="t-rules")
+                    # удалённые серверы: адрес, вход, что можно (подробно — enter)
+                    with Vertical(id="tab-stands"):
+                        yield Static(id="stands-head")
+                        yield DashboardTable(id="t-stands")
                     with Vertical(id="tab-mine"):
                         yield DashboardTable(id="t-mine")
                     with Vertical(id="tab-mentions"):
@@ -1720,7 +1727,7 @@ class JwuDashboard(App):
                         "job": JOB_COLUMNS,
                         "workspace": WORKSPACE_COLUMNS,
                         "feature": FEATURE_COLUMNS,
-                        "rule": RULE_COLUMNS}[kind]
+                        "rule": RULE_COLUMNS, "stand": STAND_COLUMNS}[kind]
             for col in cols:
                 table.add_column(col, key=col)
         self._apply_tab_visibility()
@@ -1776,6 +1783,7 @@ class JwuDashboard(App):
             "workspaces": self.data.workspaces,
             "structure": self.data.paths,
             "rules": self.data.rules,
+            "stands": list(self.data.ssh_servers or []),
             "mine": self.data.mine,
             "mentions": self.data.mentions,
             "features": self.data.features,
@@ -1798,6 +1806,8 @@ class JwuDashboard(App):
             hidden |= set(TASK_TABS)
         else:
             hidden.add("tab-features")
+        if not self.data.ssh_servers:
+            hidden.add("tab-stands")   # стендов нет — вкладка пустая и только шумит
         if not self.data.prs_enabled:
             hidden |= set(PR_TABS)
         return tuple(pane for pane in _TAB_ORDER if pane not in hidden)
@@ -1882,6 +1892,8 @@ class JwuDashboard(App):
                 self._fill_tree(table_id, items)
             elif kind == "rule":
                 self._fill_rules(table_id, items)
+            elif kind == "stand":
+                self._fill_stands(table_id, items)
             else:
                 self._fill_features(table_id, items)
             # У упоминаний нет дельт: «новое» для них — непрочитанные записи.
@@ -2083,6 +2095,15 @@ class JwuDashboard(App):
                     title_key,
                     reviewers_approved,
                 ]
+        elif kind == "stand":     # Стенд · Тег · Адрес · Вход · Политика · Описание
+            keyfns = [
+                lambda s: s[0].name,
+                lambda s: (s[0].tag or "").casefold(),
+                lambda s: s[0].host,
+                lambda s: s[0].private_key or s[0].agent,
+                lambda s: s[0].policy,
+                lambda s: (s[0].description or "").casefold(),
+            ]
         elif kind == "rule":      # Тип · Тег · Правило · Обновлено
             keyfns = [
                 lambda r: r.kind,
@@ -2323,6 +2344,10 @@ class JwuDashboard(App):
         """Шапки двух вкладок: управление контурами и структура активного."""
         self._update_head("#ws-head", self._workspaces_head_lines())
         self._update_head("#structure-head", self._structure_head_lines())
+        try:
+            self._update_head("#stands-head", self._stands_head_lines())
+        except Exception:  # noqa: BLE001 — урезанная тестовая сборка
+            pass
         self._update_head("#rules-head", self._rules_head_lines())
 
     def _update_head(self, selector: str, lines: list[str]) -> None:
@@ -2358,7 +2383,8 @@ class JwuDashboard(App):
                 "[yellow]Папок нет[/yellow][dim] — пока воркспейс не привязан ни к одной "
                 "папке, jwu не сможет выбрать его автоматически. Нажми [/dim][b]a[/b][dim].[/dim]"
             )
-        lines += self._ssh_head_lines()
+        if self.data.ssh_servers:
+            lines.append(f"[dim]Удалённые стенды ({len(self.data.ssh_servers)}) — на вкладке «Стенды».[/dim]")
         return lines
 
     def _ssh_head_lines(self) -> list[str]:
@@ -2483,6 +2509,30 @@ class JwuDashboard(App):
         self._rows[table_id] = list(rules)
         self._restore_cursor(table, cur)
 
+    def _fill_stands(self, table_id: str, stands: list) -> None:
+        """Вкладка «Стенды»: по строке на сервер, описание — первой фразой; целиком — enter."""
+        table = self.query_one(f"#{table_id}", DataTable)
+        cur = table.cursor_row
+        table.clear()
+        for server, has_pw in stands:
+            auth = "ключ" if server.private_key else "ssh-agent" if server.agent else "пароль"
+            policy = Text("только чтение", style="green") if server.policy == "readonly" else Text("любые команды", style="yellow")
+            desc = (server.description or "").split(". ")[0]
+            table.add_row(
+                Text(server.name, style="bold cyan"),
+                Text(server.tag, style="magenta") if server.tag else Text("—", style="dim"),
+                Text(f"{server.username}@{server.host}:{server.port}"),
+                Text(auth, style="dim"),
+                policy,
+                Text(desc[:80] + ("…" if len(desc) > 80 else ""), style="dim"),
+            )
+        self._rows[table_id] = list(stands)
+        self._restore_cursor(table, cur)
+
+    def _stands_head_lines(self) -> list[str]:
+        n = len(self.data.ssh_servers or [])
+        return [f"Удалённых стендов: {n}   [dim]·  enter — карточка: вход, разрешённые команды, описание[/dim]"]
+
     def _rules_head_lines(self) -> list[str]:
         rules = self.data.rules
         general = sum(1 for r in rules if not r.tag)
@@ -2566,6 +2616,10 @@ class JwuDashboard(App):
                 refresh_interval=local_iv))
         elif isinstance(obj, Workspace):
             self._switch_workspace(obj.id)
+        elif isinstance(obj, tuple) and len(obj) == 2 and hasattr(obj[0], "host"):
+            from .workspace_screens import StandDetailScreen
+
+            self.push_screen(StandDetailScreen(obj[0], obj[1]))
         elif isinstance(obj, WorkspaceRule):
             self.push_screen(RuleDetailScreen(
                 obj.id, get_fn=self._rule_get_fn, edit_fn=self._apply_rule_edit,
@@ -2764,7 +2818,7 @@ class JwuDashboard(App):
             if kind == "pr":
                 return PR_MINE_COLUMNS if table_id == "t-prs-mine" else PR_REVIEW_COLUMNS
             return {"issue": ISSUE_COLUMNS, "mention": MENTION_COLUMNS,
-                    "job": JOB_COLUMNS, "rule": RULE_COLUMNS}.get(kind, [])
+                    "job": JOB_COLUMNS, "rule": RULE_COLUMNS, "stand": STAND_COLUMNS}.get(kind, [])
         return []
 
     def _task_base(self) -> str:

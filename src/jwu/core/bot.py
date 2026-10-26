@@ -92,31 +92,54 @@ def _cmd_stuck(store: "Store", ws: "Workspace", login: str,
 TASKS_LIMIT = 40
 
 
+# Порядок групп статусов: где надо действовать — выше, «у других» (ревью, тесты) — ниже.
+_STATUS_BLOCKS = [
+    ("🔁 Вернули — доделать", lambda s, q, w: s in q),
+    ("🛠 В работе", lambda s, q, w: s in w),
+    ("📋 Не начаты", lambda s, q, w: s in ("open", "to do", "selected for development", "backlog")),
+    ("👀 На ревью", lambda s, q, w: "review" in s),
+    ("🧪 На тестах и дальше", lambda s, q, w: True),
+]
+
+
 def _cmd_tasks(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -> str:
-    """Сводка из последнего синка: мои задачи по статусам, мои PR и PR на ревью."""
+    """Мои задачи по смыслу статуса (что делать — сверху), внутри — по приоритету."""
+    from . import todo
     from .daemon import LAST_PASS_META
 
+    qa = todo._statuses(store, ws.id, todo.QA_STATUSES_SETTING, todo.DEFAULT_QA_STATUSES)
+    work = set(todo.IN_WORK_STATUSES)
     issues = store.latest_issues("mine")
     prs_mine, prs_review = store.latest_prs("mine"), store.latest_prs("review")
     last = store.get_meta(LAST_PASS_META)
-    lines = [f"📋 <b>Задачи · {html.escape(ws.slug)}</b>",
+    lines = [f"📋 <b>Мои задачи · {html.escape(ws.slug)}</b> · {len(issues)}",
              f"синк: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}"]
     if not issues:
         lines += ["", "Моих задач нет."]
-    by_status: dict[str, list] = {}
+    blocks: dict[str, list] = {title: [] for title, _ in _STATUS_BLOCKS}
     for issue in issues:
-        by_status.setdefault(issue.status or "без статуса", []).append(issue)
+        s = (issue.status or "").casefold()
+        for title, match in _STATUS_BLOCKS:
+            if match(s, qa, work):
+                blocks[title].append(issue)
+                break
     shown = 0
-    for status, group in sorted(by_status.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
-        lines += ["", f"<b>{html.escape(status)}</b> · {len(group)}"]
+    for title, group in blocks.items():
+        if not group:
+            continue
+        group.sort(key=lambda i: (todo._prio(i.priority), i.key))
+        lines += ["", f"<b>{title}</b> · {len(group)}"]
         for issue in group:
             if shown >= TASKS_LIMIT:
                 break
-            lines.append(f"{notify._key_html(issue.key, links)} — {html.escape(notify._short(issue.summary, 70))}")
+            icon = todo.PRIORITY_ICON.get(todo._prio(issue.priority), "⚪") if issue.priority else "⚪"
+            status = f" · <i>{html.escape(issue.status)}</i>" if title in ("🧪 На тестах и дальше", "📋 Не начаты", "🛠 В работе") else ""
+            lines.append(f"{icon} {notify._key_html(issue.key, links)} — {html.escape(notify._short(issue.summary, 60))}{status}")
             shown += 1
     if len(issues) > shown:
         lines += ["", f"… и ещё {len(issues) - shown}"]
-    lines += ["", f"PR: моих {len(prs_mine)}, на ревью {len(prs_review)}"]
+    lines += ["", "🔴 blocker · 🟠 critical · 🟡 major · 🟢 minor",
+              f"PR: моих {len(prs_mine)}, в ревью у меня {len(prs_review)}"]
     return "\n".join(lines)
 
 
@@ -275,9 +298,20 @@ def _menu_btn(text: str, action: str) -> dict:
     return {"text": text, "callback_data": f"{MENU_PREFIX}{action}"}
 
 
+def _addon_buttons() -> list[tuple[str, str]]:
+    from . import addons
+
+    out: list[tuple[str, str]] = []
+    for addon in addons.load():
+        for label, action in addon.call("menu_buttons", default=[]) or []:
+            out.append((label, f"addon:{addon.name}:{action}"))
+    return out
+
+
 def main_menu() -> tuple[str, dict]:
-    return ("📋 <b>Меню jwu</b>", {"inline_keyboard": [
-        [_menu_btn(label, action) for label, action in row] for row in MENU_ROWS]})
+    rows = [[_menu_btn(label, action) for label, action in row] for row in MENU_ROWS]
+    rows += [[_menu_btn(label, action)] for label, action in _addon_buttons()]
+    return ("📋 <b>Меню jwu</b>", {"inline_keyboard": rows})
 
 
 BACK_TO_MENU = [_menu_btn("← меню", "main")]
@@ -288,6 +322,17 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
     """Кнопка меню → (текст, клавиатура) для того же сообщения. Под ответом — «← меню»."""
     if action == "main":
         return main_menu()
+    if action.startswith("addon:"):
+        from . import addons
+
+        _, name, sub = action.split(":", 2)
+        for addon in addons.load():
+            if addon.name == name:
+                res = addon.call("menu_action", {"store": store, "workspace": ws, "cfg": cfg}, sub)
+                if res:
+                    text, markup = res
+                    return text, {"inline_keyboard": list((markup or {}).get("inline_keyboard") or []) + [BACK_TO_MENU]}
+        return "Аддон не ответил.", {"inline_keyboard": [BACK_TO_MENU]}
     if action == "board":
         from . import brief, todo
 
@@ -392,6 +437,17 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
     return {"kind": "button", "text": data, "reply": text}
 
 
+def _addon_text(store: "Store", ws: "Workspace", cfg: "Config", text: str) -> Optional[str]:
+    """Присланный боту текст — сначала аддонам (например, ссылка, которую аддон умеет запомнить)."""
+    from . import addons
+
+    for addon in addons.load():
+        reply = addon.call("bot_text", {"store": store, "workspace": ws, "cfg": cfg}, text)
+        if reply:
+            return reply
+    return None
+
+
 def show_menu(store: "Store", sender: notify.TelegramNotifier, *, pressed: Optional[int],
               text: str = "") -> dict:
     """Одно меню на чат: старое и нажатие «📋 Меню» удаляются, новое — внизу, без цитаты."""
@@ -448,6 +504,10 @@ def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
         reply = handle_command(text, store=store, ws=ws, login=login, links=links, on_sync=on_sync)
         item = {"kind": "command", "text": text, "reply": reply}
     else:
+        addon_reply = _addon_text(store, ws, cfg, text)
+        if addon_reply:
+            sender.send(addon_reply, reply_to=reply_to)
+            return {"kind": "addon", "text": text, "reply": addon_reply}
         parsed = notify.parse_incoming(upd, chat_id=sender.chat_id)
         if parsed is None:
             reply = ("Не понял, к чему это. Ответь на уведомление или начни с ключа: "

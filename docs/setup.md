@@ -88,7 +88,7 @@ jwu rule add "Не пушить в develop напрямую" --kind constraint
 jwu rule add "Стенд — по инструкции backend-stand" --kind testenv --tag backend
 jwu guide add backend-stand --title "Локальный стенд backend" --file stand.md --tag backend
 jwu guide add playwright --title "Playwright" --file pw.md --global   # общая для всех воркспейсов
-jwu ssh add rocky --host … --user root --key ~/.ssh/… --desc "логи, что можно"   # удалённые серверы
+jwu ssh add dev-stand --host … --user root --key ~/.ssh/… --desc "логи, что можно"   # удалённые серверы
 jwu rules --tag backend
 ```
 

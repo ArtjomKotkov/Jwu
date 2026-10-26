@@ -177,6 +177,16 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
 
     open_pr_keys = {_issue_key(pr) for pr in store.latest_prs("mine")
                     if not pr.state or pr.state.upper() == "OPEN"}
+    # одна задача — несколько моих открытых PR: правки в разных ветках, пометить на доске
+    prs_by_key: dict[str, list[str]] = {}
+    for pr in store.latest_prs("mine"):
+        if (not pr.state or pr.state.upper() == "OPEN") and _issue_key(pr):
+            prs_by_key.setdefault(_issue_key(pr), []).append(f"{pr.repository}#{pr.id}")
+    for item in items:
+        others = [ref for ref in prs_by_key.get(item.issue_key, [])
+                  if not item.pr or ref != f"{item.pr['repo']}#{item.pr['id']}"]
+        if others:
+            item.problems.append(f"⚠️ ещё PR по задаче: {', '.join(others)}")
     for key, issue in issues.items():
         status = (issue.status or "").casefold()
         if key in covered:
@@ -422,6 +432,12 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
             if item.pr:
                 conn.execute("INSERT OR IGNORE INTO job_prs (job_id, pr_id, project, repo) VALUES (?, ?, ?, ?)",
                              (job_id, item.pr["id"], item.pr["project"], item.pr["repo"]))
+            if item.group != "review" and item.issue_key:
+                # все мои открытые PR по этой задаче — в работу: правки в нескольких ветках
+                for pr in store.latest_prs("mine"):
+                    if (not pr.state or pr.state.upper() == "OPEN") and _issue_key(pr) == item.issue_key:
+                        conn.execute("INSERT OR IGNORE INTO job_prs (job_id, pr_id, project, repo)"
+                                     " VALUES (?, ?, ?, ?)", (job_id, pr.id, pr.project, pr.repository))
             conn.execute(
                 "INSERT INTO job_records (job_id, kind, text, ts) VALUES (?, 'note', ?, ?)",
                 (job_id, f"{SESSION_MARK} «{session or 'без имени'}»: {item.key} — {', '.join(item.problems)}", _iso()))

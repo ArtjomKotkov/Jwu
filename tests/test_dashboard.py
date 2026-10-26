@@ -1991,8 +1991,8 @@ def test_tabs_split_into_global_and_project_rows():
             bottom = deck.query_one("#tabs-project", Tabs)
             assert [t.id for t in top.query("Tab")] == ["bar-workspaces"]
             # «Структура» и «Правила» открывают нижний ряд: с них начинают в новом контуре
-            assert [t.id for t in bottom.query("Tab")][:3] == [
-                "bar-structure", "bar-rules", "bar-mine"]
+            assert [t.id for t in bottom.query("Tab")][:4] == [
+                "bar-structure", "bar-rules", "bar-stands", "bar-mine"]
             assert "bar-workspaces" not in [t.id for t in bottom.query("Tab")]
             # стартуем на проектной вкладке → верхняя полоса погашена
             assert deck.active == "tab-mine"

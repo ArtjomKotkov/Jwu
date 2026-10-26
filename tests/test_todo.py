@@ -164,3 +164,19 @@ def test_silent_sync_defers_notifications_to_next_normal(store):
     Service._notify_after_sync(fake, normal)
     assert len(sent) == 1 and "AB-1" in sent[0] and "AB-2" in sent[0]
     assert not store.get_workspace_meta(Service.NOTIFY_BACKLOG_META)
+
+
+
+def test_two_prs_for_one_task_are_flagged_and_linked(store):
+    _seed(store)
+    run = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run, _pr(1, "AB-1: конфликт", conflicted=True, failed=True), ["mine"])
+    store.save_pr_snapshot(run, PR(id=4, title="AB-1: бэкпорт", project="P", repository="other", state="OPEN",
+                                   conflicted=True), ["mine"])
+    store.finish_sync_run(run, {"prs:mine": 2})
+    board = todo.build(store, store.workspace_id, "me", session="S")
+    item = next(i for i in board.items if i.key == "P/r#1")
+    assert any("ещё PR по задаче: other#4" in p for p in item.problems)
+    res = todo.take(store, store.workspace_id, "me", numbers=[item.n], session="S")
+    job = store.get_job(res["taken"][0]["job_id"])
+    assert {(p.repo, p.pr_id) for p in job.prs} == {("r", 1), ("other", 4)}

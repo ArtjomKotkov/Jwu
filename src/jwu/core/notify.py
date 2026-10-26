@@ -517,7 +517,7 @@ class TelegramNotifier:
             self._client.close()
 
     def send(self, text: str, *, reply_to: Optional[int] = None,
-             keyboard: bool = False, markup: Optional[dict] = None) -> list[int]:
+             keyboard: bool = False, markup: Optional[dict] = None, silent: bool = False) -> list[int]:
         """Отправить текст (при необходимости — несколькими сообщениями). Вернуть их id.
 
         ``reply_to`` — ответить на конкретное сообщение (подтверждение заметки, ответ на
@@ -532,6 +532,8 @@ class TelegramNotifier:
                 "chat_id": self.chat_id, "text": chunk, "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
+            if silent:
+                payload["disable_notification"] = True
             if reply_to is not None:
                 payload["reply_to_message_id"] = int(reply_to)
                 payload["allow_sending_without_reply"] = True
@@ -592,7 +594,12 @@ class TelegramNotifier:
         payload: dict = {"chat_id": self.chat_id, "message_id": int(message_id), "text": text,
                          "parse_mode": "HTML", "disable_web_page_preview": True,
                          "reply_markup": markup or {"inline_keyboard": []}}
-        self._post("editMessageText", payload)
+        try:
+            self._post("editMessageText", payload)
+        except NotifyError as exc:
+            if "message is not modified" in str(exc):
+                return   # нажали то, что уже на экране — не ошибка
+            raise
 
     def delete(self, message_id: int) -> bool:
         """Удалить сообщение в чате (своё меню или нажатие кнопки меню). Не вышло — не беда."""

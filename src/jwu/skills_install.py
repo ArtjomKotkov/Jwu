@@ -107,8 +107,30 @@ def install_skills(dest: Path) -> list[tuple[str, str]]:
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "SKILL.md").write_text(content, encoding="utf-8")
         results.append((name, action))
+    results.extend(_install_addon_skills(dest))
     results.extend(_remove_retired(dest))
     return sorted(results)
+
+
+def _install_addon_skills(dest: Path) -> list[tuple[str, str]]:
+    """Скиллы установленных аддонов (``skills_dir()`` модуля аддона) — рядом со своими."""
+    from .core import addons
+
+    out: list[tuple[str, str]] = []
+    for addon in addons.load():
+        folder = addon.call("skills_dir")
+        if not folder:
+            continue
+        for entry in Path(folder).iterdir():
+            skill_md = entry / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            target = dest / entry.name
+            action = "обновлён" if (target / "SKILL.md").exists() else "добавлен"
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "SKILL.md").write_text(skill_md.read_text(encoding="utf-8"), encoding="utf-8")
+            out.append((entry.name, action))
+    return out
 
 
 def _remove_retired(dest: Path) -> list[tuple[str, str]]:

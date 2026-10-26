@@ -5998,5 +5998,34 @@ def guide_rm(name: str = typer.Argument(..., help="Имя инструкции."
     console.print(f"Инструкция {name} удалена")
 
 
+
+# --------------------------------------------------------------------------- #
+# Аддоны: подмешиваемые команды из установленных рядом пакетов (core/addons.py)
+# --------------------------------------------------------------------------- #
+
+def _load_addon_cli() -> None:
+    """Команды аддонов. Аддон, чьи команды typer не может собрать, отключается целиком —
+    сломанный аддон не должен ронять весь jwu (ошибка видна в `jwu doctor`)."""
+    from typer.main import get_command
+
+    from ..core import addons
+
+    for addon in addons.load():
+        if not addon.has("register_cli"):
+            continue
+        probe = typer.Typer()
+        if addon.call("register_cli", probe) is None and addon.error:
+            continue
+        try:
+            get_command(probe)   # собрать заранее: тут вылезают кривые аннотации и пр.
+        except Exception as exc:  # noqa: BLE001
+            addon.error = f"команды CLI не собрались: {type(exc).__name__}: {exc}"
+            continue
+        addon.call("register_cli", app)
+
+
+_load_addon_cli()
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

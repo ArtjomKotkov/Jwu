@@ -62,7 +62,7 @@ description: Use when the user wants a retrospective of what was actually DONE t
    ```bash
    today=${1:-$(date +%F)}
    jwu jobs --json | jq --arg d "$today" '
-     map(select(any(.records[]?; .ts[0:10] == $d) or (.updated_at[0:10] == $d)))
+     map(select(any(.records[]?; .ts[0:10] == $d)))
      | map({task_key, status,
             prs: [.prs[]? | "\(.repo)#\(.pr_id)"],
             done: [.records[]? | select(.ts[0:10] == $d) | "[\(.kind)] \(.text)"]})'
@@ -103,6 +103,8 @@ description: Use when the user wants a retrospective of what was actually DONE t
 ## Заметки
 
 - Read-only: только чтение БД jwu, ничего не пишем и не синкаем.
-- `ts`/`updated_at` — UTC ISO; фильтр по `[0:10]` сравнивает дату. Работал за полночь —
+- Работа «за день» — только по записям за день (`ts`), не по `updated_at`: закрытие или
+  смена статуса работы трогает `updated_at`, но работой за день не является.
+- `ts` — UTC ISO; фильтр по `[0:10]` сравнивает дату. Работал за полночь —
   передай нужную дату аргументом.
 - Это итог дня. «Что делать дальше / на ревью / поправить» — это `/jwu-analyze-day`.

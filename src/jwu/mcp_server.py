@@ -2617,6 +2617,28 @@ async def jwu_queue_slots(
     return _stamp(store.queue_counts(), _resolve(workspace))
 
 
+@mcp.tool()
+async def jwu_addons() -> dict:
+    """Установленные аддоны jwu и что они предлагают после шагов jwu (after: {скилл: подсказка}).
+
+    После jwu-track-time и других шагов загляни сюда: если у аддона есть продолжение для
+    этого шага — предложи его пользователю одной строкой (сам не запускай).
+    """
+    from .core import addons
+
+    return {"addons": addons.describe()}
+
+
+def _load_addon_mcp() -> None:
+    from .core import addons
+
+    for addon in addons.load():
+        addon.call("register_mcp", mcp)
+
+
+_load_addon_mcp()
+
+
 def main() -> None:
     """Точка входа: запустить MCP-сервер по stdio.
 

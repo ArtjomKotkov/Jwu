@@ -149,7 +149,22 @@ def check_config(store: "Store", ws) -> tuple[list[Check], object]:
     out.append(_matrix_check(cfg))
     out.append(_disk_check(store, ws))
     out += _jobflow_checks(store, ws)
+    out += _addon_checks(store, ws)
     return out, cfg
+
+
+def _addon_checks(store, ws) -> list["Check"]:
+    from . import addons
+
+    out: list[Check] = []
+    for addon in addons.load():
+        if addon.error:
+            out.append(Check(f"Аддон {addon.name}", "fail", addon.error))
+            continue
+        out.append(Check(f"Аддон {addon.name}", "ok", addon.version or "загружен"))
+        for name, status, detail in addon.call("doctor", store, ws, default=[]) or []:
+            out.append(Check(name, status, detail))
+    return out
 
 
 def _jobflow_checks(store, ws) -> list["Check"]:

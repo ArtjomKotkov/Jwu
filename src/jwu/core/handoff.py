@@ -50,6 +50,8 @@ class Handoff:
     rules_md: str = ""
     paths: list[dict] = field(default_factory=list)
     workspace: str = ""
+    # мои открытые PR по той же задаче, о которых работа не знает (правки в двух ветках)
+    unlinked_prs: list[str] = field(default_factory=list)
 
 
 def _last_git_state(records: list[JobRecord]) -> tuple[str, str]:
@@ -144,6 +146,14 @@ def collect(store: "Store", job: Job, *, svc: "Optional[Service]" = None,
     if out.branch:
         note_keys.append(out.branch)
     out.notes = {k: v for k, v in store.notes_for_keys(note_keys).items() if v}
+    if job.task_key:
+        linked = {(p.project, p.repo, p.pr_id) for p in job.prs}
+        for pr in store.latest_prs("mine"):
+            if pr.state and pr.state.upper() != "OPEN":
+                continue
+            if job.task_key in (pr.title or "") or job.task_key in (pr.source_branch or ""):
+                if (pr.project, pr.repository, pr.id) not in linked:
+                    out.unlinked_prs.append(f"{pr.project}/{pr.repository}#{pr.id} ({pr.source_branch})")
     return out
 
 
@@ -239,6 +249,14 @@ def render(h: Handoff) -> str:
     L.append("Это самодостаточный контекст для продолжения работы в новой сессии Claude Code. "
              "Прочитай целиком, затем подтверди у пользователя следующий шаг и веди лог через "
              "журнал работы (jwu-start-job). Код правь в рабочих копиях работы, иначе — в папках воркспейса.")
+
+    if h.unlinked_prs:
+        L.append("")
+        L.append("## ⚠️ По задаче есть ещё PR, о которых работа не знает")
+        L += [f"- {ref}" for ref in h.unlinked_prs]
+        L.append("Правки по задаче лежат в нескольких ветках. Уточни у пользователя, какие из них "
+                 "часть этой работы, и привяжи их (`jwu_job_link`), иначе изменения в одной ветке "
+                 "потеряются для другой.")
 
     # задача
     L.append("")

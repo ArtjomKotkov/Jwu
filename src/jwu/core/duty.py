@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -375,6 +376,8 @@ def toggle_personal(store: "Store", client_factory) -> tuple[str, dict]:
 
 
 def _short(text: str, limit: int) -> str:
+    # markdown из Matrix (**жирный**, `код`, > цитата) в коротком пересказе только мешает
+    text = re.sub(r"[*_`~]{1,3}|^>\s?", "", text or "", flags=re.M)
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 

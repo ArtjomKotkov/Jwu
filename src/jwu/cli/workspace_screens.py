@@ -608,3 +608,41 @@ class LegendScreen(ModalScreen):
 
     def action_close(self) -> None:
         self.dismiss()
+
+
+
+class StandDetailScreen(ModalScreen):
+    """Карточка удалённого стенда: адрес, вход, политика, описание, команды whitelist/blacklist."""
+
+    CSS = """
+    StandDetailScreen { align: center middle; }
+    #stand-box { width: 100; height: auto; max-height: 90%; border: round $accent;
+                 padding: 1 2; background: $surface; }
+    #stand-body { height: auto; }
+    #stand-hint { height: auto; margin-top: 1; color: $text-muted; }
+    """
+    BINDINGS = [Binding("escape,q,enter", "close", "Закрыть")]
+
+    def __init__(self, server, has_pw: bool = False) -> None:
+        super().__init__()
+        self._server = server
+        self._has_pw = has_pw
+
+    def compose(self) -> ComposeResult:
+        from ..core import ssh as ssh_mod
+
+        s = self._server
+        parts = [Text.from_markup(f"[b cyan]{escape(s.name)}[/b cyan]"
+                                  + (f"  [magenta]#{escape(s.tag)}[/magenta]" if s.tag else ""))]
+        for label, values in ssh_mod.detail_rows(s, self._has_pw, compact=False):
+            parts.append(Rule(label, align="left", style="cyan"))
+            parts += [Text(v) for v in values]
+        if s.description:
+            parts.append(Rule("описание", align="left", style="cyan"))
+            parts.append(Text(s.description))
+        with Vertical(id="stand-box"):
+            yield VerticalScroll(Static(Group(*parts), id="stand-body"))
+            yield Static(Text.from_markup("[dim]Escape — закрыть[/dim]"), id="stand-hint")
+
+    def action_close(self) -> None:
+        self.dismiss()
