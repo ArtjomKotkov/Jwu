@@ -197,8 +197,8 @@ def test_announce_start_sends_once_per_chat(tmp_path, monkeypatch):
     # work и gh настроены на один чат, третий контур локальный — без уведомлений
     monkeypatch.setattr(notify, "notifier_from_config", lambda cfg: _Sender("42"))
     assert daemon.announce_start(store, 3600) == 1
-    assert sent[0][0] == "42" and "jwu-демон запущен" in sent[0][1] and "60 мин" in sent[0][1]
-    assert "work, gh" in sent[0][1]
+    assert sent[0][0] == "42" and "jwu запущен" in sent[0][1] and "60 мин" in sent[0][1]
+    assert "<b>Работа</b> — Jira" in sent[0][1] and "<b>gh</b> — GitHub" in sent[0][1] and "kick" not in sent[0][1]
     # ошибка Telegram не мешает старту
     class _Broken(_Sender):
         def send(self, text, **kw):

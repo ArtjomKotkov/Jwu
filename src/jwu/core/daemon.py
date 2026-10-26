@@ -290,6 +290,34 @@ class Waiter:
         return kicked
 
 
+def next_pass_delay(store: "Store", interval: int) -> float:
+    """Сколько ждать до прохода по расписанию: от ПРОШЛОГО прохода, а не от старта демона —
+    перезапуск не повод синкать всё заново."""
+    last = store.get_meta(LAST_PASS_META) or ""
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
+    except ValueError:
+        return 0.0
+    return max(0.0, interval - age)
+
+
+def start_message(store: "Store", workspaces: list, interval: int) -> str:
+    """Стартовое сообщение: где запущен, когда был синк, за чем следим — остальное в меню."""
+    from .dates import fmt_ago
+
+    host = socket.gethostname().removesuffix(".local")
+    last = store.get_meta(LAST_PASS_META) or ""
+    delay = next_pass_delay(store, interval)
+    labels = {"jira": "Jira", "github": "GitHub", "local": "локальный"}
+    rows = [f"  • <b>{html.escape(w.name or w.slug)}</b> — {labels.get(w.provider, w.provider)}" for w in workspaces]
+    sync = f"последний синк {fmt_ago(last)}" if last else "синка ещё не было"
+    nxt = f"следующий через {max(1, round(delay / 60))} мин" if delay else "следующий — сейчас"
+    return "\n".join([f"🟢 <b>jwu запущен</b> · {html.escape(host)}",
+                      f"{sync} · {nxt} · раз в {interval // 60} мин", "",
+                      "Слежу за контурами:", *rows, "",
+                      "Всё остальное — в меню 📋 ниже."])
+
+
 def announce_start(store: "Store", interval: int) -> int:
     """Сказать в каждый настроенный чат, что демон поднялся. Вернуть число сообщений.
 
@@ -310,9 +338,7 @@ def announce_start(store: "Store", interval: int) -> int:
         if sender is None or sender.chat_id in seen_chats:
             continue
         seen_chats.add(sender.chat_id)
-        text = (f"🟢 <b>jwu-демон запущен</b> на {socket.gethostname()}\n"
-                f"интервал {interval // 60} мин · контуры: {', '.join(w.slug for w in todo)}\n"
-                f"первый проход — сейчас; внеплановый — /sync или <code>jwu daemon kick</code>")
+        text = start_message(store, todo, interval)
         try:
             sender.set_commands()          # меню на «/» в клиенте
             sender.send(text, keyboard=True)  # и постоянная клавиатура с командами
@@ -670,6 +696,14 @@ def run_loop(
         if sleep is None and not once:
             threading.Thread(target=bot_loop, name="jwu-bot", daemon=True).start()
             threading.Thread(target=duty_loop, name="jwu-matrix", daemon=True).start()
+            # Без синка на старте: продолжаем расписание от прошлого прохода (kick и /sync будят раньше).
+            store = open_store()
+            try:
+                delay = next_pass_delay(store, interval)
+            finally:
+                store.close()
+            if delay and waiter.wait(delay):
+                log("внеплановый проход по kick")
         try:
             while True:
                 try:
