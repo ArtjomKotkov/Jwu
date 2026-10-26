@@ -5,6 +5,10 @@ description: Use when the user wants to put a short task (checkbox) on a pull-re
 
 # jwu: задачи на комментах PR (Bitbucket tasks)
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 ## Overview
 
 В Bitbucket Server под комментом PR можно повесить **задачу** — короткую строку с

@@ -5,6 +5,10 @@ description: Use when the user asks to write/generate a commit message inside a 
 
 # jwu: коммит-сообщение из текущих изменений
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 > **Воркспейс = где лежит код.** jwu работает в контексте *воркспейса*: он определяется
 > автоматически по текущей папке, проверить — `jwu_workspace_current()`
 > (bash: `jwu workspace current --json`).

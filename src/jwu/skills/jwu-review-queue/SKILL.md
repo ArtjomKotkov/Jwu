@@ -5,6 +5,10 @@ description: Use when the user wants to review the QUEUE of other people's pull 
 
 # jwu: очередь ревью
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 ## Overview
 
 Пакетное ревью чужих PR в два захода:

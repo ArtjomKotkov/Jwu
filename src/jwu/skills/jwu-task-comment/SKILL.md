@@ -5,6 +5,10 @@ description: Use when the user wants to POST a comment into a Jira/SDESK task th
 
 # jwu: комментарий в задачу Jira/SDESK
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 > **Воркспейс = где лежит код.** Контур определяется по текущей папке, проверить —
 > `jwu_workspace_current()` (bash: `jwu workspace current --json`). Правила контура
 > приходят там же в `rules_md`; **записи `⛔ ЗАПРЕТ` обязательны к исполнению** —

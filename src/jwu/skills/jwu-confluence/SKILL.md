@@ -5,6 +5,10 @@ description: Use when the user (or another agent) needs to read, create or edit 
 
 # jwu: страницы Confluence
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 ## Overview
 
 Чтение, создание и правка страниц Confluence контура. Доступ — тот же, что у Jira

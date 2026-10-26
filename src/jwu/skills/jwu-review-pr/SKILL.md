@@ -5,6 +5,10 @@ description: Use when the user wants to review SOMEONE ELSE's pull request from 
 
 # jwu: ревью чужого PR из сессии
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 ## Overview
 
 jwu-job-review смотрит СВОЙ локальный дифф до коммита. Этот скилл — про PR коллеги: дифф

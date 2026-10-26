@@ -5,6 +5,10 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 
 # jwu: трекинг времени в Jira (worklog)
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 ## Overview
 
 Залогировать в таймтрекер Jira (worklog) время по задачам за день. Список задач берётся

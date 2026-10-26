@@ -5,6 +5,10 @@ description: Use when the user wants to run a code review of current changes ins
 
 # jwu: ревью изменений ДО коммита/пуша
 
+> **Сначала правила воркспейса.** Ответа `jwu_workspace_current()` с `rules_md` нет в контексте
+> этой сессии (новая сессия, `/clear`, компакт) — сначала пройди **jwu-session-init**. Без правил
+> воркспейса не действуй: запреты (⛔) в них обязательны.
+
 ## Overview
 
 **Фаза 4 в `jwu-start-job` — ВСЕГДА до коммита и пуша.** Идея: поймать проблемы пока
