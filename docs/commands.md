@@ -5,7 +5,7 @@
 
 | Группа | Команды |
 |---|---|
-| установка | `install [--for claude\|cursor\|both]`, `install-claude-skills`, `doctor`, `configure [export\|import]`, `auth check` |
+| установка | `install [--for claude\|cursor\|both]`, `install-claude-skills`, `doctor`, `configure [export\|import]`, `auth check`, `statusline [install\|uninstall\|preview]` |
 | проект | `init`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm` |
 | чтение | `tasks`, `task`, `attachments`, `prs`, `pr [--diff [--numbered]\|--download]`, `video-frames`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze`, `review queue\|agents` |
 | память | `job start\|add\|link\|status\|done\|cancel\|delete\|show\|handoff`, `jobs`, `note`, `notes`, `feature …`, `features`, `queue add\|list\|show\|take\|done\|fail\|cancel\|release\|edit\|move\|clear\|slots`, `mentions read\|archive`, `memory export\|import\|sync` |

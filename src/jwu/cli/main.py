@@ -64,6 +64,11 @@ db_app = typer.Typer(help="Файл БД: сколько занимает, чи�
 app.add_typer(db_app, name="db")
 feature_app = typer.Typer(help="Локальные фичи: мини-трекер воркспейса, когда Jira нет.")
 app.add_typer(feature_app, name="feature")
+statusline_app = typer.Typer(
+    help="Строка статуса Claude Code: воркспейс, работа, очередь, демон под строкой ввода.",
+    invoke_without_command=True,
+)
+app.add_typer(statusline_app, name="statusline")
 queue_app = typer.Typer(
     help="Очередь задач сессии: мелкие просьбы из чата встают в конец и выполняются подряд "
          "в основном потоке либо субагентами по свободным слотам.",
@@ -5396,6 +5401,78 @@ def queue_slots(
 # --------------------------------------------------------------------------- #
 # Строка статуса Claude Code
 # --------------------------------------------------------------------------- #
+
+
+@statusline_app.callback()
+def statusline_root(
+    ctx: typer.Context,
+    no_chain: bool = typer.Option(False, "--no-chain", help="Не запускать прежнюю команду, только своё."),
+) -> None:
+    """Напечатать строку статуса по JSON Claude Code со stdin (без подкоманды).
+
+    Это команда для settings.json → statusLine; руками её звать незачем. Любая
+    ошибка глушится: лучше пустая строка, чем сломанная.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    from ..core import statusline as sl
+
+    raw = "" if sys.stdin.isatty() else sys.stdin.read()
+    stdin = sl.parse_stdin(raw)
+    lines: list[str] = []
+    try:
+        with _open_store() as store:
+            prev = "" if no_chain else sl.previous_command(store)
+            if prev:
+                lines.append(sl.run_previous(prev, raw, cwd=sl.session_cwd(stdin)))
+            lines.append(sl.render(stdin, store, with_claude=not prev))
+    except Exception as exc:  # noqa: BLE001 — строка статуса не должна падать
+        lines.append(f"jwu: {exc}")
+    # color=True: иначе click вырежет ANSI-коды — stdout тут не терминал, а труба Claude Code.
+    typer.echo("\n".join(line for line in lines if line), color=True)
+
+
+@statusline_app.command("install")
+def statusline_install(
+    no_chain: bool = typer.Option(False, "--no-chain", help="Не сохранять прежнюю команду: только строка jwu."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Прописать `jwu statusline` в settings.json Claude Code (прежняя команда — в цепочку)."""
+    from ..core import statusline as sl
+
+    path = sl.settings_path()
+    prev = sl.current_command(path)
+    if prev and not sl.is_installed(path) and not yes:
+        what = "сохранить и печатать первой строкой" if not no_chain else "ЗАМЕНИТЬ"
+        if not typer.confirm(f"В {path} уже есть statusLine. Прежнюю команду {what}?", default=True):
+            raise typer.Exit(code=1)
+    with _open_store() as store:
+        note = sl.install(store, path, chain=not no_chain)
+    console.print(f"[green]{note}[/green] · {path}")
+    console.print("[dim]Claude Code перечитает настройки при следующем обновлении строки.[/dim]")
+
+
+@statusline_app.command("uninstall")
+def statusline_uninstall() -> None:
+    """Вернуть прежнюю строку статуса (или убрать statusLine, если её не было)."""
+    from ..core import statusline as sl
+
+    path = sl.settings_path()
+    if not sl.is_installed(path):
+        console.print(f"[dim]jwu statusline не стоит в {path} — нечего убирать.[/dim]")
+        return
+    with _open_store() as store:
+        note = sl.uninstall(store, path)
+    console.print(f"[green]{note}[/green] · {path}")
+
+
+@statusline_app.command("preview")
+def statusline_preview() -> None:
+    """Показать строку jwu для текущей папки без JSON от Claude Code."""
+    from ..core import statusline as sl
+
+    with _open_store() as store:
+        typer.echo(sl.render({"cwd": str(Path.cwd())}, store, with_claude=False), color=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

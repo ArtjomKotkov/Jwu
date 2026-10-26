@@ -42,6 +42,15 @@ MCP-сервер живёт процессом сессии агента: нов
 (`jwu_version` покажет `version_warning`, пока сессия на старом коде). Скилл `/jwu-update`
 делает всё это сам. Демон перезапускается: `jwu daemon install` (или через launchd/systemd).
 
+### Строка статуса Claude Code
+
+`jwu statusline install` прописывает `jwu statusline` в `~/.claude/settings.json` →
+`statusLine`: под строкой ввода появляются воркспейс, активная работа с последней фазой,
+очередь задач и живость демона. Если строка статуса уже была (например, плагин claude-hud),
+прежняя команда запоминается и печатается первой строкой, jwu — второй (`--no-chain` —
+только своя). Только локальная БД, без сети. Вернуть как было — `jwu statusline uninstall`;
+посмотреть без Claude Code — `jwu statusline preview`.
+
 ### Разработка
 
 `poetry install`, тесты — `poetry run pytest -q`. Скрины для README —
