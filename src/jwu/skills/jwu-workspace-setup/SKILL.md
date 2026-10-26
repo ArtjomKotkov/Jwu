@@ -126,8 +126,8 @@ description: Use to connect a project/repository to jwu — creating or joining 
 
 - Личный контур: `jwu feature add "…"` — ключи (`DNDECK-1`) годятся как префикс ветки
   и коммита; работу начинай через **jwu-start-job**.
-- Рабочий: **jwu-start-job** → **jwu-track-job** → **jwu-job-review**.
+- Рабочий: **jwu-start-job** → **jwu-job-review** → **jwu-close-job**.
 
 ## Связанные скиллы
 
-**jwu-start-job** — начать работу в контуре. **jwu-track-job** — вести её лог.
+**jwu-start-job** — начать работу в контуре (журнал ведётся по ходу). **jwu-continue-job** — продолжить или переоткрыть. **jwu-close-job** — закрыть с итогом и уборкой.

@@ -52,6 +52,7 @@ MIN_INTERVAL = 60
 # Long polling бота Telegram: запрос getUpdates висит до N секунд и возвращается сразу,
 # как только пришло сообщение. Реакция мгновенная, пустых опросов нет.
 DEFAULT_POLL_INTERVAL = 25
+DUTY_INTERVAL = 25   # секунд между проверками Matrix (дежурство и личное)
 
 
 class DaemonError(RuntimeError):
@@ -387,18 +388,12 @@ def take_sync_requests(store: "Store", started_at: str) -> list[str]:
     return done
 
 
-def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
-              long_poll: int = 0) -> list[dict]:
-    """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
-
-    Команды (/sync, /status, /stuck, /mentions) и ответы-заметки обрабатывает
-    ``core.bot``; здесь только обход контуров и сбор отправщиков из конфига.
-    """
-    from . import bot, notify
+def _bot_senders(store: "Store"):
+    """(контур, конфиг, отправщик, логин) для каждого контура с настроенным Telegram."""
+    from . import notify
     from .service import _read_identity
     from .workspaces import config_for_workspace
 
-    handled: list[dict] = []
     todo, _ = syncable(store.list_workspaces())
     for ws in todo:
         try:
@@ -409,13 +404,125 @@ def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
         if sender is None:
             continue
         store.use_workspace(ws.id)
-        login = _read_identity(store).get("user", "")
+        yield ws, cfg, sender, _read_identity(store).get("user", "")
+
+
+def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
+              long_poll: int = 0, dispatch: Callable[[int, dict], None] | None = None) -> list[dict]:
+    """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
+
+    Команды, кнопки и ответы-заметки обрабатывает ``core.bot``. ``dispatch(ws_id, update)``
+    — отдать входящее исполнителю (демон: пул потоков), тогда здесь только приём.
+    """
+    from . import bot
+
+    handled: list[dict] = []
+    for ws, cfg, sender, login in _bot_senders(store):
         try:
+            per_ws = (lambda upd, wid=ws.id: dispatch(wid, upd)) if dispatch else None
             for item in bot.process_updates(store, ws, cfg, sender, login=login, on_sync=on_sync,
-                                            long_poll=long_poll):
+                                            long_poll=long_poll, dispatch=per_ws):
                 handled.append({"workspace": ws.slug, **item})
         except Exception as exc:  # noqa: BLE001 — Telegram лежит: попробуем через минуту
             log(f"[{ws.slug}] опрос бота не удался: {exc}")
+        finally:
+            sender.close()
+    return handled
+
+
+def handle_bot_update(open_store: Callable[[], "Store"], workspace_id: int, upd: dict, *,
+                      on_sync: Callable[[], bool] | None = None) -> dict | None:
+    """Обработать одно входящее в своём потоке: своё соединение с БД, свой отправщик."""
+    from . import bot
+
+    store = open_store()
+    try:
+        for ws, cfg, sender, login in _bot_senders(store):
+            if ws.id != workspace_id:
+                sender.close()
+                continue
+            try:
+                return bot.handle_update(upd, store=store, ws=ws, cfg=cfg, sender=sender,
+                                         login=login, on_sync=on_sync)
+            finally:
+                sender.close()
+        return None
+    finally:
+        store.close()
+
+
+DISK_ALERT_META = "daemon:disk_alert"   # когда последний раз предупреждали о месте (meta воркспейса)
+DISK_ALERT_EVERY = 3 * 3600
+
+
+def disk_alert(store: "Store") -> int:
+    """Места меньше порога — предупредить в Telegram (не чаще раза в 3 часа на контур)."""
+    from . import jobspace
+
+    sent = 0
+    for ws, _cfg, sender, _login in _bot_senders(store):
+        try:
+            report = jobspace.check_space(store, ws.id, with_docker=False)
+            if report.ok:
+                store.set_workspace_meta(DISK_ALERT_META, "")
+                continue
+            last = store.get_workspace_meta(DISK_ALERT_META) or ""
+            if last and time.time() - float(last) < DISK_ALERT_EVERY:
+                continue
+            jobs = sorted({r["job_id"] for r in report.leftovers})
+            text = (f"🔴 <b>Мало места</b> · {html.escape(ws.slug)}\n{html.escape(report.summary())}\n"
+                    + (f"Не убрано у закрытых работ: {', '.join(f'#{j}' for j in jobs)} — "
+                       "<code>jwu job cleanup &lt;id&gt;</code>\n" if jobs else "")
+                    + "Docker и агент виснут на полном диске — освободи место.")
+            sender.send(text)
+            store.set_workspace_meta(DISK_ALERT_META, str(time.time()))
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{ws.slug}] проверка места не удалась: {exc}")
+        finally:
+            sender.close()
+    return sent
+
+
+def is_stale_action(upd: dict) -> bool:
+    """Нажатие кнопки или команда (а не заметка) — то, что после рестарта уже не исполняем."""
+    from . import notify
+
+    if upd.get("callback_query"):
+        return True
+    text = " ".join(((upd.get("message") or {}).get("text") or "").split())
+    return text.startswith("/") or text == notify.MENU_BUTTON
+
+
+def report_bot_failure(open_store: Callable[[], "Store"], workspace_id: int, exc: Exception) -> None:
+    """Обработчик упал целиком (БД, конфиг) — хотя бы сказать об этом в чат."""
+    try:
+        store = open_store()
+        try:
+            for ws, _cfg, sender, _login in _bot_senders(store):
+                try:
+                    if ws.id == workspace_id:
+                        sender.send(f"⚠️ jwu: не смог обработать — {html.escape(str(exc) or type(exc).__name__)}")
+                finally:
+                    sender.close()
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def poll_duty(store: "Store") -> list[dict]:
+    """Matrix: дежурство и личное по каждому контуру с Telegram → новое в чат."""
+    from . import duty, matrix
+
+    handled: list[dict] = []
+    for ws, cfg, sender, _login in _bot_senders(store):
+        try:
+            n = duty.poll(store, lambda cfg=cfg: matrix.client_from_config(cfg), sender)
+            if n:
+                handled.append({"workspace": ws.slug, "kind": "duty", "count": n})
+        except Exception as exc:  # noqa: BLE001 — Matrix лежит: позиция не сдвинута, повторим
+            log(f"[{ws.slug}] Matrix: проверка не удалась: {exc}")
         finally:
             sender.close()
     return handled
@@ -455,52 +562,103 @@ def run_loop(
                 store.close()
             if n:
                 log(f"стартовое сообщение отправлено в {n} чат(а)")
-        while True:
+        # Три потока: синк (этот), слушатель бота и Matrix. Слушатель только принимает —
+        # каждое нажатие и команда исполняются в пуле, так кнопки отвечают сразу, даже когда
+        # другая кнопка ждёт сеть, а синк идёт минутами. /sync будит синк через waiter.
+        from concurrent.futures import ThreadPoolExecutor
+
+        passing = threading.Event()
+        stop = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jwu-bot-job")
+
+        def on_sync() -> bool:
+            waiter.kick()
+            return not passing.is_set()
+
+        def run_job(workspace_id: int, upd: dict) -> None:
             try:
-                trim_log()
-            except OSError:
-                pass  # не смогли обрезать лог — не повод останавливать синк
-            store = open_store()
-            try:
-                report = run_pass(store, factory=factory, after_sync=after_sync)
-                # проход закрыл чей-то /sync из бота — ответить итогом, даже если нового нет
-                requested = take_sync_requests(store, report.started_at)
-                if requested:
-                    report_pass(store, report, requested)
-            finally:
-                store.close()
-            log(f"проход завершён: {report.summary()}")
-            if once:
-                return
-            if sleep is not None:
-                sleep(interval)
-                continue
-            # Между проходами — long polling бота: запрос висит до poll_interval секунд и
-            # возвращается сразу по сообщению, поэтому команды и ответы-заметки не ждут
-            # ни часа, ни минуты. /sync и SIGUSR1 будят цикл через waiter.
-            deadline = time.monotonic() + interval
-            kicked = False
+                item = handle_bot_update(open_store, workspace_id, upd, on_sync=on_sync)
+                if item:
+                    log(f"бот: {item.get('kind')} {str(item.get('text', ''))[:40]}"
+                        + (f" → {item.get('reply', '')[:120]}" if item.get("kind") == "error" else ""))
+            except Exception as exc:  # noqa: BLE001 — даже без БД/конфига: сказать в чат
+                log(f"бот: обработка не удалась: {exc}")
+                report_bot_failure(open_store, workspace_id, exc)
+
+        def bot_loop() -> None:
+            # Первый опрос — без ожидания: всё, что накопилось, пока демон лежал. Кнопки и
+            # команды оттуда устарели — не исполняем (иначе после рестарта посыплются ответы
+            # на давние нажатия); заметки («PROJ-1 текст») не теряем.
+            fresh = [False]
+
+            def dispatch(wid: int, upd: dict) -> None:
+                if not fresh[0] and is_stale_action(upd):
+                    return
+                pool.submit(run_job, wid, upd)
+
+            while not stop.is_set():
+                try:
+                    store = open_store()
+                    try:
+                        poll_bots(store, long_poll=max(1, poll_interval) if fresh[0] else 0,
+                                  dispatch=dispatch)
+                        fresh[0] = True
+                    finally:
+                        store.close()
+                except Exception as exc:  # noqa: BLE001 — поток бота не должен умирать
+                    log(f"бот: опрос не удался: {exc}")
+                    stop.wait(5)
+
+        def duty_loop() -> None:
+            ticks = 0
+            while not stop.wait(DUTY_INTERVAL):
+                try:
+                    store = open_store()
+                    try:
+                        handled = poll_duty(store)
+                        ticks += 1
+                        if ticks % 12 == 1:   # место — раз в ~5 минут
+                            if disk_alert(store):
+                                log("предупреждение о месте на диске отправлено")
+                    finally:
+                        store.close()
+                    if handled:
+                        log(f"Matrix: отправлено {sum(h['count'] for h in handled)} сообщений")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"Matrix: проверка не удалась: {exc}")
+
+        if sleep is None and not once:
+            threading.Thread(target=bot_loop, name="jwu-bot", daemon=True).start()
+            threading.Thread(target=duty_loop, name="jwu-matrix", daemon=True).start()
+        try:
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                if waiter.wait(1):
-                    kicked = True
-                    break
+                try:
+                    trim_log()
+                except OSError:
+                    pass  # не смогли обрезать лог — не повод останавливать синк
+                passing.set()
                 store = open_store()
                 try:
-                    handled = poll_bots(store, on_sync=lambda: (waiter.kick() or True),
-                                        long_poll=int(min(max(1, poll_interval), remaining)))
+                    report = run_pass(store, factory=factory, after_sync=after_sync)
+                    # проход закрыл чей-то /sync из бота — ответить итогом, даже если нового нет
+                    requested = take_sync_requests(store, report.started_at)
+                    if requested:
+                        report_pass(store, report, requested)
                 finally:
                     store.close()
-                if handled:
-                    log(f"бот: обработано {len(handled)} сообщений "
-                        f"({', '.join(sorted({h['kind'] for h in handled}))})")
-                    if any(h["kind"] == "command" and h["text"].startswith("/sync") for h in handled):
-                        kicked = True
-                        break
-            if kicked:
-                log("внеплановый проход по kick")
+                    passing.clear()
+                log(f"проход завершён: {report.summary()}")
+                if once:
+                    return
+                if sleep is not None:
+                    sleep(interval)
+                    continue
+                # Пауза до следующего прохода; /sync из бота и SIGUSR1 будят раньше.
+                if waiter.wait(interval):
+                    log("внеплановый проход по kick")
+        finally:
+            stop.set()
+            pool.shutdown(wait=False)
 
 
 def kick() -> int | None:
@@ -662,14 +820,21 @@ def install(interval: int = DEFAULT_INTERVAL, *, jwu_bin: str | None = None,
     if is_macos():
         path = plist_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        # уже стоит — перезагрузим, чтобы подхватить новый интервал/путь
+        target = f"{_launchd_domain()}/{LAUNCHD_LABEL}"
+        # уже стоит — перезагрузим, чтобы подхватить новый интервал/путь. bootout
+        # асинхронный: пока старая служба не выгрузилась, bootstrap молча не срабатывает
+        # (служба остаётся выгруженной) — ждём, пока launchctl перестанет её видеть.
         if path.exists():
-            runner(["launchctl", "bootout", f"{_launchd_domain()}/{LAUNCHD_LABEL}"])
+            runner(["launchctl", "bootout", target])
+            for _ in range(50):
+                if runner(["launchctl", "print", target])[0] != 0:
+                    break
+                time.sleep(0.1)
         path.write_text(render_plist(jwu_bin, interval, env=env), encoding="utf-8")
         code, out = runner(["launchctl", "bootstrap", _launchd_domain(), str(path)])
         if code != 0:
             code, out = runner(["launchctl", "load", "-w", str(path)])
-        if code != 0:
+        if code != 0 or runner(["launchctl", "print", target])[0] != 0:
             raise DaemonError(f"launchctl не смог загрузить службу: {out}")
         messages.append(f"LaunchAgent записан: {path}")
         messages.append(f"служба {LAUNCHD_LABEL} загружена, интервал {interval}с, лог {log_path()}")

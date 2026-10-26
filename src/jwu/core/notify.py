@@ -39,21 +39,31 @@ MAX_MESSAGE = 3800
 
 # Команды бота: меню на «/» (setMyCommands) и постоянная клавиатура под полем ввода.
 BOT_COMMANDS = [
+    {"command": "menu", "description": "Меню кнопками"},
     {"command": "sync", "description": "Синк всех контуров сейчас"},
     {"command": "status", "description": "Последний проход и что накопилось"},
     {"command": "stuck", "description": "Что застряло по порогам"},
+    {"command": "tasks", "description": "Сводка моих задач"},
+    {"command": "today", "description": "Что сделал сегодня"},
     {"command": "mentions", "description": "Непрочитанные упоминания"},
     {"command": "seen", "description": "Пометить упоминания прочитанными"},
+    {"command": "duty", "description": "Дежурство за комнатой: вкл / выкл"},
+    {"command": "personal", "description": "Личное (1:1 и упоминания): вкл / выкл"},
+    {"command": "matrix", "description": "Matrix: настройка кнопками"},
     {"command": "help", "description": "Как пользоваться"},
 ]
+MENU_BUTTON = "📋 Меню"
+MENU_META = "telegram:menu_id"   # id последнего сообщения с меню (meta воркспейса)
+# Постоянная клавиатура — одна кнопка: она шлёт в чат «📋 Меню», бот отвечает сообщением
+# с inline-меню, дальше всё переходит кнопками внутри него (см. core.bot.main_menu).
 KEYBOARD = {
-    "keyboard": [["/sync", "/status"], ["/stuck", "/mentions", "/seen"]],
+    "keyboard": [[MENU_BUTTON]],
     "resize_keyboard": True, "is_persistent": True,
     "input_field_placeholder": "PROJ-1 текст → заметка; ответ на уведомление → заметка",
 }
 
-# Дельты, о которых стоит будить человека. Остальное (апрувы чужих PR, новые задачи в
-# выборке, исчезновение из списка) подождёт дашборда.
+# Подписи дельт для Telegram. Шлётся то, что в DEFAULT_KINDS: все события синка, кроме
+# «готов к мержу» (о нём и так видно по апрувам и зелёной сборке).
 NOTABLE_KINDS: dict[str, str] = {
     "new_conflict": "⚠️ конфликт",
     "build_failed": "❌ сборка упала",
@@ -65,11 +75,24 @@ NOTABLE_KINDS: dict[str, str] = {
     "qa_comment": "🧪 комментарий QA",
     "pr_all_approved": "👍 все апрувы",
     "pr_ready_to_merge": "🚀 готов к мержу",
+    "new_issue": "🆕 новая задача",
+    "new_comment": "💬 комментарий",
+    "resolved": "✔️ решена",
+    "new_pr": "🔗 новый PR по задаче",
+    "new_review_pr": "👀 новый PR на ревью",
+    "new_pr_commit": "📝 коммит в PR",
+    "reviewer_approved": "✅ апрув",
+    "build_fixed": "✅ сборка позеленела",
+    "pr_task_resolved": "☑️ задача в PR закрыта",
+    "gone": "📤 ушла из моих",
+    "pr_gone": "📤 PR пропал",
 }
 # Что слать по умолчанию, если пользователь не настроил свой набор.
 DEFAULT_KINDS: tuple[str, ...] = (
     "new_conflict", "build_failed", "reviewer_needs_work", "new_pr_task",
-    "returned_from_testing", "qa_comment", "pr_all_approved", "pr_ready_to_merge",
+    "returned_from_testing", "qa_comment", "new_issue", "status_change", "new_comment",
+    "resolved", "new_review_pr", "new_pr", "new_pr_comment", "new_pr_commit",
+    "reviewer_approved", "pr_all_approved", "build_fixed", "pr_task_resolved", "gone", "pr_gone",
 )
 
 
@@ -173,8 +196,10 @@ def _clean_detail(kind: str, detail: str) -> str:
 
 # Порядок групп в сообщении: сначала блокеры мержа, потом остальное.
 _GROUP_ORDER = ["new_conflict", "build_failed", "reviewer_needs_work", "new_pr_task",
-                "returned_from_testing", "qa_comment", "pr_ready_to_merge", "pr_all_approved",
-                "new_pr_comment", "status_change"]
+                "returned_from_testing", "qa_comment", "new_issue", "new_review_pr",
+                "status_change", "resolved", "new_comment", "pr_ready_to_merge", "pr_all_approved",
+                "reviewer_approved", "new_pr_comment", "new_pr_commit", "new_pr", "build_fixed",
+                "pr_task_resolved", "gone", "pr_gone"]
 
 
 SECTION_TITLES: dict[str, str] = {
@@ -189,6 +214,16 @@ SECTION_TITLES: dict[str, str] = {
     "build_fixed": "✅ СБОРКА ПОЗЕЛЕНЕЛА",
     "pr_all_approved": "👍 СОБРАЛ ВСЕ АПРУВЫ",
     "pr_ready_to_merge": "🚀 ГОТОВ К МЕРЖУ",
+    "new_issue": "🆕 НОВЫЕ ЗАДАЧИ",
+    "new_comment": "💬 КОММЕНТАРИИ В ЗАДАЧАХ",
+    "resolved": "✔️ РЕШЕНЫ",
+    "new_pr": "🔗 НОВЫЕ PR ПО ЗАДАЧАМ",
+    "new_review_pr": "👀 НОВЫЕ PR НА РЕВЬЮ",
+    "new_pr_commit": "📝 КОММИТЫ В PR",
+    "reviewer_approved": "✅ АПРУВЫ",
+    "pr_task_resolved": "☑️ ЗАДАЧИ В PR ЗАКРЫТЫ",
+    "gone": "📤 УШЛИ ИЗ ВЫБОРКИ",
+    "pr_gone": "📤 PR ПРОПАЛИ (СМЕРЖЕН / ОТКЛОНЁН)",
 }
 MENTION_TAG_RE = re.compile(r"\[~[^\]]+\]\s*[-—:,]?\s*")
 
@@ -208,9 +243,15 @@ def _who(kind: str, detail: str) -> str:
         if m:
             return (f"{m.group(2)} · +{m.group(1)}" if m.group(2) else f"+{m.group(1)}")
         return text
+    if kind == "reviewer_approved":
+        return text.replace(" проапрувил", "")
+    if kind == "gone":
+        return "" if text.startswith("ушла из выборки") else text
     if kind in ("new_pr_task", "pr_task_resolved", "status_change", "returned_from_testing",
-                "pr_all_approved", "pr_ready_to_merge"):
+                "pr_all_approved", "pr_ready_to_merge", "new_review_pr", "resolved"):
         return text
+    if kind == "new_pr":
+        return f"PR {text}" if text else ""
     return ""
 
 
@@ -243,6 +284,31 @@ ROLE_REVIEWER = "👀 ревьюер"
 ROLE_MENTIONED = "📣 упомянули"
 ROLE_WATCHER = "👁 наблюдаю"
 STATUS_KINDS = ("status_change", "returned_from_testing")
+
+
+def explain_gone(info: dict, issue: Optional[Issue], *, me: Iterable[str]) -> str:
+    """Почему задача ушла из моих: «In Review → Ready for demo · перевёл Иванов · теперь на Петрове».
+
+    ``info`` — из ``status_actor`` (последний переход статуса и текущий исполнитель),
+    ``issue`` — последний снапшот, пока задача была моей. Переход старше снапшота (статус
+    тот же) — значит, её не переводили, а переназначили: статус не пишем.
+    """
+    mine = {m.casefold() for m in me if m}
+    parts: list[str] = []
+    to = info.get("to") or ""
+    was = issue.status if issue is not None else ""
+    if to and to != was:
+        parts.append(f"{info.get('from') or was or '?'} → {to}")
+        if info.get("actor"):
+            parts.append(f"перевёл {info['actor']}")
+    assignee = info.get("assignee") or ""
+    if not assignee:
+        parts.append("теперь не назначена")
+    elif _is_me(assignee, mine):
+        parts.append("по-прежнему на мне")
+    else:
+        parts.append(f"теперь на {assignee}")
+    return " · ".join(parts)
 
 
 def _is_me(name: str, me: set[str]) -> bool:
@@ -343,40 +409,76 @@ def _sections(deltas: list[Delta], mentions: list[Mention], roles: dict[str, Rol
     return lines
 
 
-def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
-    """HTML для Telegram: шапка, секции по виду события, элементы через пустую строку.
+def _rank(kind: str) -> int:
+    return _GROUP_ORDER.index(kind) if kind in _GROUP_ORDER else len(_GROUP_ORDER)
 
-    Ключ — ссылкой на PR или задачу, рядом кто/сколько; ниже курсивом заголовок задачи
-    (у упоминаний — цитата без тега [~логин]). Никаких буллетов и отступов: в чате они
-    только шумят.
+
+def _role_extra(role: Optional[Role], kinds: set[str]) -> str:
+    """Хвост роли для шапки карточки: на ком задача, кто перевёл статус."""
+    if role is None:
+        return ""
+    line = _role_line(role, next((k for k in kinds if k in STATUS_KINDS), ""))
+    return line[len(role.label):].lstrip(" ·") if line.startswith(role.label) else ""
+
+
+def _card(key: str, deltas: list[Delta], mentions: list[Mention], role: Optional[Role],
+          links: Optional[Links]) -> list[str]:
+    """Карточка задачи или PR: ссылка и роль, заголовок курсивом, ниже — все её события."""
+    head = _key_html(key, links)
+    if role is not None:
+        head += f" · {html.escape(role.label)}"
+        extra = _role_extra(role, {d.kind for d in deltas})
+        if extra:
+            head += f" · {html.escape(_short(extra, 60))}"
+    lines = [head]
+    summary = next((d.summary for d in deltas if d.summary), "")
+    if summary:
+        lines.append(f"<i>{html.escape(_short(summary, 110))}</i>")
+    for d in sorted(deltas, key=lambda d: _rank(d.kind)):
+        label = NOTABLE_KINDS.get(d.kind, d.kind)
+        who = _who(d.kind, d.detail)
+        lines.append(f"   {html.escape(label)}" + (f" — {html.escape(_short(who, 60))}" if who else ""))
+    for m in mentions:
+        lines.append(f"   📣 {html.escape(m.author or 'кто-то')}: "
+                     f"<i>«{html.escape(_short(strip_mention_tags(m.text), 140))}»</i>")
+    return lines
+
+
+def _cards(deltas: list[Delta], mentions: list[Mention], roles: dict[str, Role],
+           links: Optional[Links]) -> list[str]:
+    """Карточки по ключу: одна задача/PR — одна карточка, самые тревожные — сверху."""
+    by_key: dict[str, list[Delta]] = {}
+    for d in deltas:
+        by_key.setdefault(d.key, []).append(d)
+    by_mention: dict[str, list[Mention]] = {}
+    for m in mentions:
+        by_mention.setdefault(m.task_key, []).append(m)
+    keys = list(dict.fromkeys(list(by_key) + list(by_mention)))
+    keys.sort(key=lambda k: min([_rank(d.kind) for d in by_key.get(k, [])] or [len(_GROUP_ORDER)]))
+    out: list[str] = []
+    for key in keys:
+        out.append("")
+        out += _card(key, by_key.get(key, []), by_mention.get(key, []), roles.get(key), links)
+    return out
+
+
+def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
+    """HTML для Telegram: шапка и карточки — по одной на задачу или PR со всеми её событиями.
+
+    Ключ — ссылкой, рядом моя роль; ниже курсивом заголовок и строки событий («✅ апрув —
+    Иванов», «💬 комментарий в PR — +2»). С ролями карточки делятся на «Моё» и «Участвую».
     """
     stamp = datetime.now().strftime("%d.%m %H:%M")
-    lines = [f"🔔 <b>jwu · {html.escape(note.workspace)}</b>", stamp]
+    lines = [f"🔔 <b>{html.escape(note.workspace)}</b> · {stamp}"]
     if note.roles:
-        # два блока: где я делаю (исполнитель, мой PR) и где лишь участвую
         mine = lambda key: bool(note.roles.get(key) and note.roles[key].mine)  # noqa: E731
-        for title, pick in (("━━ МОЁ ━━", True), ("━━ УЧАСТВУЮ ━━", False)):
+        for title, pick in (("📌 <b>Моё</b>", True), ("👥 <b>Участвую</b>", False)):
             deltas = [d for d in note.deltas if mine(d.key) is pick]
             mentions = [m for m in note.mentions if mine(m.task_key) is pick]
             if deltas or mentions:
-                lines += ["", f"<b>{title}</b>"] + _sections(deltas, mentions, note.roles, links)
+                lines += ["", title] + _cards(deltas, mentions, note.roles, links)
         return "\n".join(lines)
-    by_kind: dict[str, list[Delta]] = {}
-    for d in note.deltas:
-        by_kind.setdefault(d.kind, []).append(d)
-    order = [k for k in _GROUP_ORDER if k in by_kind] + [k for k in by_kind if k not in _GROUP_ORDER]
-    for kind in order:
-        title = SECTION_TITLES.get(kind, NOTABLE_KINDS.get(kind, kind).upper())
-        lines += section(title, [
-            item_block(d.key, _who(kind, d.detail), d.summary, links=links) for d in by_kind[kind]
-        ])
-    if note.mentions:
-        lines += section("📣 УПОМИНАНИЯ", [
-            item_block(m.task_key, m.author or "кто-то", strip_mention_tags(m.text),
-                       links=links, quote=True, body_limit=160)
-            for m in note.mentions
-        ])
-    return "\n".join(lines)
+    return "\n".join(lines + _cards(note.deltas, note.mentions, {}, links))
 
 
 def split_message(text: str, limit: int = MAX_MESSAGE) -> list[str]:
@@ -415,12 +517,13 @@ class TelegramNotifier:
             self._client.close()
 
     def send(self, text: str, *, reply_to: Optional[int] = None,
-             keyboard: bool = False) -> list[int]:
+             keyboard: bool = False, markup: Optional[dict] = None) -> list[int]:
         """Отправить текст (при необходимости — несколькими сообщениями). Вернуть их id.
 
         ``reply_to`` — ответить на конкретное сообщение (подтверждение заметки, ответ на
         команду), чтобы в чате было видно, к чему это. ``keyboard`` — приложить постоянную
-        клавиатуру с командами (к последнему куску).
+        клавиатуру с командами (к последнему куску). ``markup`` — своя клавиатура (например,
+        inline-кнопки настройки дежурства), тоже к последнему куску; главнее ``keyboard``.
         """
         ids: list[int] = []
         chunks = split_message(text)
@@ -432,8 +535,11 @@ class TelegramNotifier:
             if reply_to is not None:
                 payload["reply_to_message_id"] = int(reply_to)
                 payload["allow_sending_without_reply"] = True
-            if keyboard and i == len(chunks) - 1:
-                payload["reply_markup"] = KEYBOARD
+            if i == len(chunks) - 1:
+                if markup:
+                    payload["reply_markup"] = markup
+                elif keyboard:
+                    payload["reply_markup"] = KEYBOARD
             try:
                 resp = self._client.post(f"{self._api}/bot{self.token}/sendMessage", json=payload)
             except httpx.HTTPError as exc:
@@ -459,7 +565,8 @@ class TelegramNotifier:
         """Входящие сообщения боту. ``timeout`` > 0 — long polling: Telegram держит запрос
         до появления сообщения (или до истечения секунд), так что реакция мгновенная,
         а пустых опросов нет."""
-        params: dict = {"limit": limit, "timeout": max(0, int(timeout)), "allowed_updates": '["message"]'}
+        params: dict = {"limit": limit, "timeout": max(0, int(timeout)),
+                        "allowed_updates": '["message","callback_query"]'}
         if offset is not None:
             params["offset"] = offset
         try:
@@ -470,6 +577,37 @@ class TelegramNotifier:
         if resp.status_code >= 400:
             raise NotifyError(f"Telegram ответил {resp.status_code}: {resp.text[:200]}")
         return list((resp.json() or {}).get("result") or [])
+
+    def _post(self, method: str, payload: dict) -> dict:
+        try:
+            resp = self._client.post(f"{self._api}/bot{self.token}/{method}", json=payload)
+        except httpx.HTTPError as exc:
+            raise NotifyError(f"Telegram недоступен: {exc}") from exc
+        if resp.status_code >= 400:
+            raise NotifyError(f"Telegram ответил {resp.status_code}: {resp.text[:200]}")
+        return resp.json() if resp.content else {}
+
+    def edit(self, message_id: int, text: str, *, markup: Optional[dict] = None) -> None:
+        """Заменить текст и кнопки своего сообщения (меню настройки дежурства)."""
+        payload: dict = {"chat_id": self.chat_id, "message_id": int(message_id), "text": text,
+                         "parse_mode": "HTML", "disable_web_page_preview": True,
+                         "reply_markup": markup or {"inline_keyboard": []}}
+        self._post("editMessageText", payload)
+
+    def delete(self, message_id: int) -> bool:
+        """Удалить сообщение в чате (своё меню или нажатие кнопки меню). Не вышло — не беда."""
+        try:
+            self._post("deleteMessage", {"chat_id": self.chat_id, "message_id": int(message_id)})
+            return True
+        except NotifyError:
+            return False
+
+    def answer_callback(self, callback_id: str, text: str = "") -> None:
+        """Снять «часики» с нажатой кнопки (без этого Telegram крутит их ~15 с)."""
+        payload: dict = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text[:200]
+        self._post("answerCallbackQuery", payload)
 
     def get_me(self) -> dict:
         """Проверка токена: кто мы (`/getMe`)."""

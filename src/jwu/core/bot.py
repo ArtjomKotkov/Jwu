@@ -6,7 +6,10 @@
   (см. ``notify.parse_incoming``), в чат уходит подтверждение «записал»;
 - **команда**: ``/sync`` — внеплановый проход демона, ``/status`` — когда был последний
   проход и что накопилось, ``/stuck`` — что застряло по порогам контура, ``/mentions`` —
-  непрочитанные упоминания, ``/help``.
+  непрочитанные упоминания, ``/duty`` — тумблер дежурства за комнатой Matrix, ``/personal`` —
+  тумблер личного (1:1 и упоминания), ``/matrix`` — их настройка кнопками (``core.duty``), ``/help``;
+- **нажатие inline-кнопки** (callback_query) настройки дежурства → меню перерисовывается
+  на месте.
 
 Всё считается из памяти jwu (без сети и без логина в трекер), поэтому демон может
 опрашивать бота часто — раз в минуту — независимо от интервала синка. Сообщения не из
@@ -18,7 +21,7 @@ from __future__ import annotations
 import html
 from typing import TYPE_CHECKING, Callable, Optional
 
-from . import notify, thresholds as th_mod
+from . import duty, notify, thresholds as th_mod
 from .dates import fmt_ago
 
 if TYPE_CHECKING:
@@ -31,8 +34,13 @@ HELP = (
     "/sync — синк всех контуров прямо сейчас\n"
     "/status — последний проход и что накопилось\n"
     "/stuck — что застряло по порогам контура\n"
+    "/tasks — сводка моих задач по статусам и PR\n"
+    "/today — что сделал сегодня: задачи, их статус и итог\n"
     "/mentions — непрочитанные упоминания\n"
     "/seen — пометить все упоминания прочитанными\n"
+    "/duty — дежурство за комнатой Matrix: вкл / выкл\n"
+    "/personal — личное: непрочитанное 1:1 и упоминания, вкл / выкл\n"
+    "/matrix — настройка Matrix кнопками\n"
     "/help — это сообщение\n\n"
     "Ответ на уведомление → заметка по его ключу. "
     "Сообщение вида <code>PROJ-1 текст</code> → заметка по PROJ-1."
@@ -44,18 +52,19 @@ def _cmd_status(store: "Store", ws: "Workspace") -> str:
 
     pid = SingleInstance().holder_pid()
     last = store.get_meta(LAST_PASS_META)
-    pending = store.pending_changes()
-    notable = notify.select_notable(pending)
-    unseen = len(store.unseen_mentions())
+    summary = (store.get_meta(LAST_PASS_SUMMARY_META) or "").removeprefix("синк: ")
+    state = duty.load(store)
     lines = [
-        f"<b>jwu · {html.escape(ws.slug)}</b>",
-        f"демон: {'работает (pid ' + str(pid) + ')' if pid else 'не запущен'}",
-        f"последний проход: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}",
-        f"  {html.escape(store.get_meta(LAST_PASS_SUMMARY_META) or '')}".rstrip(),
-        f"накоплено дельт: {len(pending)}, из них важных: {len(notable)}; "
-        f"непрочитанных упоминаний: {unseen}",
+        f"ℹ️ <b>{html.escape(ws.slug)}</b>",
+        "",
+        f"{'🟢 демон работает' if pid else '🔴 демон не запущен'}",
+        f"🔄 синк: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}"
+        + (f" · {html.escape(summary)}" if summary else ""),
     ]
-    return "\n".join(line for line in lines if line.strip())
+    if state.configured:
+        lines.append(f"🔔 дежурство: {'вкл' if state.active else 'выкл'} · {html.escape(state.title)}")
+    lines.append(f"💬 личное в Matrix: {'вкл' if state.personal else 'выкл'}")
+    return "\n".join(lines)
 
 
 def _cmd_stuck(store: "Store", ws: "Workspace", login: str,
@@ -74,6 +83,107 @@ def _cmd_stuck(store: "Store", ws: "Workspace", login: str,
     if len(items) > 15:
         lines += ["", f"… и ещё {len(items) - 15}"]
     return "\n".join(lines).lstrip("\n")
+
+
+TASKS_LIMIT = 40
+
+
+def _cmd_tasks(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -> str:
+    """Сводка из последнего синка: мои задачи по статусам, мои PR и PR на ревью."""
+    from .daemon import LAST_PASS_META
+
+    issues = store.latest_issues("mine")
+    prs_mine, prs_review = store.latest_prs("mine"), store.latest_prs("review")
+    last = store.get_meta(LAST_PASS_META)
+    lines = [f"📋 <b>Задачи · {html.escape(ws.slug)}</b>",
+             f"синк: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}"]
+    if not issues:
+        lines += ["", "Моих задач нет."]
+    by_status: dict[str, list] = {}
+    for issue in issues:
+        by_status.setdefault(issue.status or "без статуса", []).append(issue)
+    shown = 0
+    for status, group in sorted(by_status.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
+        lines += ["", f"<b>{html.escape(status)}</b> · {len(group)}"]
+        for issue in group:
+            if shown >= TASKS_LIMIT:
+                break
+            lines.append(f"{notify._key_html(issue.key, links)} — {html.escape(notify._short(issue.summary, 70))}")
+            shown += 1
+    if len(issues) > shown:
+        lines += ["", f"… и ещё {len(issues) - shown}"]
+    lines += ["", f"PR: моих {len(prs_mine)}, на ревью {len(prs_review)}"]
+    return "\n".join(lines)
+
+
+TODAY_TASKS = 20
+SUMMARY_MAX = 160
+
+
+def _cmd_today(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -> str:
+    """Что делал сегодня: задачи с заголовком, текущим статусом и итогом простыми словами.
+
+    Задачи — из работ jwu с записями за сегодня (в поясе ворклогов контура). «Что делалось»
+    — записи ``summary`` за сегодня; их нет — заголовок работы.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from . import timechain
+
+    tz = datetime.now().astimezone().tzinfo or ZoneInfo("UTC")   # пояс не настроен — системный
+    name = timechain.get_timezone(store, ws.id) or ""
+    if name:
+        try:
+            tz = timechain.resolve_tz(name)
+        except Exception:  # noqa: BLE001
+            pass
+    today = datetime.now(tz).date()
+
+    def local(ts: str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(tz)
+        except ValueError:
+            return None
+
+    issues = {i.key: i for i in store.latest_issues()}
+    tasks: dict[str, dict] = {}
+    for job in store.list_jobs():
+        recs = [(local(r.ts), r) for r in job.records]
+        recs = [(dt, r) for dt, r in recs if dt and dt.date() == today]
+        if not recs:
+            continue
+        key = job.task_key or job.feature_key or f"#{job.id}"
+        task = tasks.setdefault(key, {"first": recs[0][0], "summaries": [], "titles": [], "job": job})
+        task["first"] = min(task["first"], min(dt for dt, _ in recs))
+        task["summaries"] += [r.text for _, r in recs if r.kind == "summary" and r.text.strip()]
+        task["titles"].append(job.title)
+    head = f"🕒 <b>Сегодня</b> · {today.strftime('%d.%m')}"
+    if not tasks:
+        return head + "\n\nВ журнале работ за сегодня пусто."
+    lines = [head]
+    for key, task in sorted(tasks.items(), key=lambda kv: kv[1]["first"])[:TODAY_TASKS]:
+        job = task["job"]
+        issue = issues.get(key)
+        if issue is not None:
+            title, status = issue.summary, issue.status
+        elif job.feature_id:
+            feature = store.get_feature(job.feature_id)
+            title = feature.title if feature else job.title
+            status = feature.status if feature else ""
+        else:
+            title, status = job.title, ""
+        lines.append("")
+        lines.append(f"{notify._key_html(key, links) if not key.startswith('#') else ''}"
+                     + (f" · {html.escape(status)}" if status else "")
+                     if not key.startswith("#") else (f"<b>{html.escape(status)}</b>" if status else "—"))
+        lines.append(f"<i>{html.escape(notify._short(title, 110))}</i>")
+        done = task["summaries"][-2:] or [t for t in dict.fromkeys(task["titles"]) if t and t != title][:1]
+        for text in done:
+            lines.append(f"   ✍️ {html.escape(notify._short(text.splitlines()[0], SUMMARY_MAX))}")
+    if len(tasks) > TODAY_TASKS:
+        lines += ["", f"… и ещё {len(tasks) - TODAY_TASKS}"]
+    return "\n".join(lines)
 
 
 def _cmd_mentions(store: "Store", links: Optional[notify.Links]) -> str:
@@ -125,6 +235,10 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
         return _cmd_stuck(store, ws, login, links)
     if cmd == "/mentions":
         return _cmd_mentions(store, links)
+    if cmd == "/tasks":
+        return _cmd_tasks(store, ws, links)
+    if cmd == "/today":
+        return _cmd_today(store, ws, links)
     if cmd == "/seen":
         n = len(store.unseen_mentions())
         store.mark_mentions_seen(None)
@@ -134,47 +248,223 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
     return f"Не знаю команду {html.escape(cmd)}.\n\n{HELP}"
 
 
+MENU_PREFIX = "menu:"
+# (подпись, действие) — inline-меню; действие → команда того же имени
+MENU_ROWS = [
+    [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
+    [("📋 Мои задачи", "tasks"), ("⏳ Что застряло", "stuck")],
+    [("🕒 Что сделал сегодня", "today")],
+    [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
+    [("📡 Matrix: дежурство и личное", "matrix")],
+]
+
+
+def _menu_btn(text: str, action: str) -> dict:
+    return {"text": text, "callback_data": f"{MENU_PREFIX}{action}"}
+
+
+def main_menu() -> tuple[str, dict]:
+    return ("📋 <b>Меню jwu</b>", {"inline_keyboard": [
+        [_menu_btn(label, action) for label, action in row] for row in MENU_ROWS]})
+
+
+BACK_TO_MENU = [_menu_btn("← меню", "main")]
+
+
+def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", login: str,
+                on_sync: Optional[Callable[[], bool]]) -> tuple[str, dict]:
+    """Кнопка меню → (текст, клавиатура) для того же сообщения. Под ответом — «← меню»."""
+    if action == "main":
+        return main_menu()
+    if action == "matrix":
+        text, markup = duty.menu(duty.load(store))
+        return text, {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
+    reply = handle_command(f"/{action}", store=store, ws=ws, login=login,
+                           links=notify.links_from_config(cfg), on_sync=on_sync)
+    if len(reply) > notify.MAX_MESSAGE:
+        reply = reply[:notify.MAX_MESSAGE].rsplit("\n", 1)[0] + "\n…"
+    return reply, {"inline_keyboard": [BACK_TO_MENU]}
+
+
+DUTY_COMMANDS = ("/duty", "/personal", "/matrix", "/duty_settings")
+
+
+def _matrix_factory(cfg: "Config"):
+    """Ленивый конструктор клиента Matrix: сеть нужна не каждой кнопке."""
+    from . import matrix
+
+    return lambda: matrix.client_from_config(cfg)
+
+
+def handle_duty_command(cmd: str, *, store: "Store", cfg: "Config") -> tuple[str, dict]:
+    """/duty, /personal → тумблеры; /matrix → меню настройки кнопками."""
+    factory = _matrix_factory(cfg)
+    if cmd in ("/matrix", "/duty_settings"):
+        return duty.menu(duty.load(store))
+    if cmd == "/personal":
+        return duty.toggle_personal(store, factory)
+    return duty.toggle(store, factory)
+
+
+def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
+                    sender: notify.TelegramNotifier, ws: Optional["Workspace"] = None,
+                    login: str = "", on_sync: Optional[Callable[[], bool]] = None) -> Optional[dict]:
+    """Нажатие inline-кнопки из нашего чата → перерисовать меню на месте."""
+    cq = upd.get("callback_query") or {}
+    msg = cq.get("message") or {}
+    if str((msg.get("chat") or {}).get("id", "")) != str(sender.chat_id):
+        return None
+    data = str(cq.get("data") or "")
+    try:
+        sender.answer_callback(str(cq.get("id", "")), "⏳ принято")
+    except notify.NotifyError:
+        pass  # часики сами пропадут
+    mid = msg.get("message_id")
+    if mid and data.removeprefix(MENU_PREFIX) in SLOW_ACTIONS | {"matrix"} or \
+            mid and data.startswith(duty.CALLBACK_PREFIX) and data != duty.CALLBACK_PREFIX + duty.CB_MENU:
+        try:   # долгое — сразу видно, что бот жив и работает
+            sender.edit(int(mid), "⏳ делаю…")
+        except notify.NotifyError:
+            pass
+    try:
+        return _handle_callback_action(data, mid, store=store, cfg=cfg, sender=sender, ws=ws,
+                                       login=login, on_sync=on_sync)
+    except Exception as exc:  # noqa: BLE001 — ответ должен быть всегда, даже ошибкой
+        text = f"⚠️ Не получилось: {html.escape(str(exc) or type(exc).__name__)}"
+        try:
+            if mid:
+                sender.edit(int(mid), text, markup={"inline_keyboard": [BACK_TO_MENU]})
+            else:
+                sender.send(text)
+        except notify.NotifyError:
+            pass
+        return {"kind": "error", "text": data, "reply": text}
+
+
+SLOW_ACTIONS = {"sync", "tasks", "stuck", "today", "mentions", "status"}
+
+
+def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on_sync) -> dict:
+    if data.startswith(MENU_PREFIX) and ws is not None:
+        text, markup = handle_menu(data[len(MENU_PREFIX):], store=store, ws=ws, cfg=cfg,
+                                   login=login, on_sync=on_sync)
+    elif data.startswith(duty.CALLBACK_PREFIX):
+        text, markup = duty.handle_callback(store, _matrix_factory(cfg), data)
+        if data in (duty.CALLBACK_PREFIX + duty.CB_MENU, duty.CALLBACK_PREFIX + duty.CB_ON,
+                    duty.CALLBACK_PREFIX + duty.CB_OFF, duty.CALLBACK_PREFIX + duty.CB_PERSONAL) \
+                or data.startswith(duty.CALLBACK_PREFIX + duty.CB_ROOM):
+            markup = {"inline_keyboard": list((markup or {}).get("inline_keyboard") or []) + [BACK_TO_MENU]}
+    else:
+        text, markup = "Эта кнопка устарела — открой меню заново.", {"inline_keyboard": [BACK_TO_MENU]}
+    if mid:
+        sender.edit(int(mid), text, markup=markup)
+    else:
+        sender.send(text, markup=markup or None)
+    return {"kind": "button", "text": data, "reply": text}
+
+
+def show_menu(store: "Store", sender: notify.TelegramNotifier, *, pressed: Optional[int],
+              text: str = "") -> dict:
+    """Одно меню на чат: старое и нажатие «📋 Меню» удаляются, новое — внизу, без цитаты."""
+    for mid in (pressed, store.get_workspace_meta(notify.MENU_META)):
+        if mid:
+            sender.delete(int(mid))
+    body, markup = main_menu()
+    ids = sender.send(body, markup=markup)
+    if ids and ids[-1]:
+        store.set_workspace_meta(notify.MENU_META, str(ids[-1]))
+    return {"kind": "command", "text": text, "reply": body}
+
+
+def handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
+                  sender: notify.TelegramNotifier, login: str = "",
+                  on_sync: Optional[Callable[[], bool]] = None) -> Optional[dict]:
+    """Одно входящее: нажатие кнопки, команда или заметка → ответ в чат. None — не наше.
+
+    Ответ есть всегда: упало что-то внутри — в чат уходит «⚠️ Не получилось: …», чтобы
+    по молчанию бота было понятно одно — демон не работает.
+    """
+    try:
+        return _handle_update(upd, store=store, ws=ws, cfg=cfg, sender=sender, login=login,
+                              on_sync=on_sync)
+    except Exception as exc:  # noqa: BLE001
+        text = f"⚠️ Не получилось: {html.escape(str(exc) or type(exc).__name__)}"
+        try:
+            sender.send(text)
+        except notify.NotifyError:
+            pass
+        return {"kind": "error", "text": str((upd.get("message") or {}).get("text") or ""), "reply": text}
+
+
+def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
+                   sender: notify.TelegramNotifier, login: str = "",
+                   on_sync: Optional[Callable[[], bool]] = None) -> Optional[dict]:
+    if upd.get("callback_query"):
+        return handle_callback(upd, store=store, cfg=cfg, sender=sender, ws=ws,
+                               login=login, on_sync=on_sync)
+    msg = upd.get("message") or {}
+    if str((msg.get("chat") or {}).get("id", "")) != str(sender.chat_id):
+        return None
+    links = notify.links_from_config(cfg)
+    text = " ".join((msg.get("text") or "").split())
+    reply_to = msg.get("message_id")
+    markup: dict = {}
+    cmd = text.split()[0].lower().split("@")[0] if text.startswith("/") else ""
+    if text == notify.MENU_BUTTON or cmd in ("/menu", "/start"):
+        return show_menu(store, sender, pressed=reply_to, text=text)
+    if cmd in DUTY_COMMANDS:
+        reply, markup = handle_duty_command(cmd, store=store, cfg=cfg)
+        item = {"kind": "command", "text": text, "reply": reply}
+    elif text.startswith("/"):
+        reply = handle_command(text, store=store, ws=ws, login=login, links=links, on_sync=on_sync)
+        item = {"kind": "command", "text": text, "reply": reply}
+    else:
+        parsed = notify.parse_incoming(upd, chat_id=sender.chat_id)
+        if parsed is None:
+            reply = ("Не понял, к чему это. Ответь на уведомление или начни с ключа: "
+                     "<code>PROJ-1 текст</code>. Меню — кнопка «📋 Меню»")
+            item = {"kind": "ignored", "text": text}
+        else:
+            key, note_text = parsed
+            note = store.add_note(key, note_text, author="telegram", kind="context")
+            reply = f"📝 записал в {notify._key_html(key, links)}: <i>{html.escape(notify._short(note_text, 120))}</i>"
+            item = {"kind": "note", "key": key, "note_id": note.id, "text": note_text}
+    # Ответом (с цитатой) — только к заметкам: видно, к чему «записал». Команды — просто сообщением.
+    if item["kind"] not in ("note", "ignored"):
+        reply_to = None
+    sender.send(reply, reply_to=reply_to, markup=markup or None,
+                keyboard=text.lower().startswith("/help"))
+    return item
+
+
 def process_updates(
     store: "Store", ws: "Workspace", cfg: "Config", sender: notify.TelegramNotifier, *,
     login: str = "", on_sync: Optional[Callable[[], bool]] = None, long_poll: int = 0,
+    dispatch: Optional[Callable[[dict], None]] = None,
 ) -> list[dict]:
-    """Забрать новые сообщения боту, выполнить команды, записать заметки, ответить.
+    """Забрать новые сообщения боту и обработать.
 
     ``long_poll`` — сколько секунд Telegram может держать запрос в ожидании сообщения.
-    Возвращает список обработанного: ``{"kind": "note"|"command", ...}``. Смещение
-    сдвигается даже для пропущенных сообщений, чтобы чужие или пустые не крутились вечно.
+    ``dispatch`` — отдать каждое входящее исполнителю (демон: пул потоков, чтобы слушатель
+    кнопок не ждал синка, Matrix и прочих долгих ответов); тогда смещение сдвигается сразу,
+    а в списке — ``{"kind": "dispatched"}``. Без него — обработать здесь же, по порядку.
+    Смещение сдвигается и для пропущенных сообщений, чтобы чужие не крутились вечно.
     """
     store.use_workspace(ws.id)
     offset = int(store.get_workspace_meta(notify.OFFSET_META) or 0)
     updates = sender.get_updates(offset + 1 if offset else None, timeout=long_poll)
-    links = notify.links_from_config(cfg)
+    last = max([offset] + [int(u.get("update_id", 0) or 0) for u in updates])
+    if dispatch is not None:
+        if last != offset:
+            store.set_workspace_meta(notify.OFFSET_META, str(last))
+        for upd in updates:
+            dispatch(upd)
+        return [{"kind": "dispatched", "text": ""} for _ in updates]
     handled: list[dict] = []
-    last = offset
     for upd in updates:
-        last = max(last, int(upd.get("update_id", 0) or 0))
-        msg = upd.get("message") or {}
-        if str((msg.get("chat") or {}).get("id", "")) != str(sender.chat_id):
-            continue
-        text = " ".join((msg.get("text") or "").split())
-        reply_to = msg.get("message_id")
-        if text.startswith("/"):
-            reply = handle_command(text, store=store, ws=ws, login=login, links=links, on_sync=on_sync)
-            handled.append({"kind": "command", "text": text, "reply": reply})
-        else:
-            parsed = notify.parse_incoming(upd, chat_id=sender.chat_id)
-            if parsed is None:
-                reply = ("Не понял, к чему это. Ответь на уведомление или начни с ключа: "
-                         "<code>PROJ-1 текст</code>. Команды — /help")
-                handled.append({"kind": "ignored", "text": text})
-            else:
-                key, note_text = parsed
-                note = store.add_note(key, note_text, author="telegram", kind="context")
-                reply = f"📝 записал в {notify._key_html(key, links)}: <i>{html.escape(notify._short(note_text, 120))}</i>"
-                handled.append({"kind": "note", "key": key, "note_id": note.id, "text": note_text})
-        try:
-            sender.send(reply, reply_to=reply_to, keyboard=text.lower().startswith(("/help", "/start")))
-        except notify.NotifyError:
-            pass  # ответ не критичен: заметка уже записана / команда выполнена
+        item = handle_update(upd, store=store, ws=ws, cfg=cfg, sender=sender, login=login, on_sync=on_sync)
+        if item:
+            handled.append(item)
     if last != offset:
         store.set_workspace_meta(notify.OFFSET_META, str(last))
     return handled

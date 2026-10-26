@@ -74,13 +74,13 @@ def _note():
 
 def test_format_two_blocks_with_role_lines():
     text = notify.format_message(_note())
-    mine, part = text.index("━━ МОЁ ━━"), text.index("━━ УЧАСТВУЮ ━━")
+    mine, part = text.index("📌 <b>Моё</b>"), text.index("👥 <b>Участвую</b>")
     assert mine < text.index("SHOP-243") < part < text.index("CORE-12728")
     assert "👤 исполнитель · перевёл Мария QA · на мне" in text
     assert "👁 наблюдаю · исп. Иван Иванов" in text
     assert "✍️ автор задачи · исп. Пётр Петров" in text   # упоминание в задаче, которую я завёл
-    # внутри блока — прежние секции по виду события
-    assert text.index("↩️ ВЕРНУЛИ С ТЕСТОВ") < part and text.index("📣 УПОМИНАНИЯ") > part
+    # внутри блока — карточки с событиями
+    assert text.index("↩️ вернули с тестов") < part and text.index("📣 ") > part
 
 
 def test_status_change_unassigned_and_no_block_when_empty():
@@ -91,7 +91,7 @@ def test_status_change_unassigned_and_no_block_when_empty():
                                       status={"PROJ-3": {"actor": "Лид", "assignee": ""}})
     text = notify.format_message(note)
     assert "👁 наблюдаю · перевёл Лид · не назначена" in text
-    assert "━━ МОЁ ━━" not in text and "━━ УЧАСТВУЮ ━━" in text
+    assert "📌 <b>Моё</b>" not in text and "👥 <b>Участвую</b>" in text
 
 
 def test_without_roles_old_format():

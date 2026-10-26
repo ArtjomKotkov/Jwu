@@ -25,12 +25,14 @@ def test_select_notable_filters_and_dedupes():
     deltas = [
         Delta(key="P/r#1", kind="new_conflict"),
         Delta(key="P/r#1", kind="new_conflict"),      # дубль
-        Delta(key="P/r#2", kind="reviewer_approved"),  # не важное
+        Delta(key="P/r#2", kind="reviewer_approved"),
         Delta(key="P/r#3", kind="build_failed"),
+        Delta(key="P/r#4", kind="pr_ready_to_merge"),  # «готов к мержу» не шлём
         Delta(key="X-1", kind="gone"),
     ]
     picked = notify.select_notable(deltas)
-    assert [(d.key, d.kind) for d in picked] == [("P/r#1", "new_conflict"), ("P/r#3", "build_failed")]
+    assert [(d.key, d.kind) for d in picked] == [
+        ("P/r#1", "new_conflict"), ("P/r#2", "reviewer_approved"), ("P/r#3", "build_failed"), ("X-1", "gone")]
     # свой набор видов
     assert [d.kind for d in notify.select_notable(deltas, kinds=["gone"])] == ["gone"]
 
@@ -49,18 +51,16 @@ def test_format_message_sections_links_and_escapes():
     links = notify.Links(jira="https://jira.x", bitbucket="https://git.x")
     text = notify.format_message(note, links=links)
     head, _, rest = text.partition("\n\n")
-    assert head.startswith("🔔 <b>jwu · work</b>\n")            # контур, дата отдельной строкой
-    blocks = rest.split("\n\n")
-    assert blocks[0] == "<b>⚠️ КОНФЛИКТ</b>"                     # секции в порядке блокеров
-    assert blocks[1] == '<a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a>\n<i>second</i>'
-    assert blocks[2] == '<a href="https://git.x/projects/P/repos/r/pull-requests/3">P/r#3</a>\n<i>third</i>'
-    assert blocks[3] == "<b>✍️ NEEDS WORK</b>"
-    assert blocks[4] == ('<a href="https://git.x/projects/P/repos/r/pull-requests/1">P/r#1</a> · bob'
-                         "\n<i>&lt;fix&gt; &amp; go</i>")
-    assert blocks[5] == "<b>🧪 КОММЕНТАРИЙ QA</b>"
-    assert blocks[6].startswith('<a href="https://jira.x/browse/TS-5">TS-5</a> · Anna QA · +2')
-    assert blocks[7] == "<b>📣 УПОМИНАНИЯ</b>"
-    assert blocks[8] == '<a href="https://jira.x/browse/PROJ-9">PROJ-9</a> · Ann\n<i>«глянь &lt;это&gt;»</i>'
+    assert head.startswith("🔔 <b>work</b> · ")                  # контур и время в одной строке
+    cards = rest.split("\n\n")                                   # одна карточка на ключ, тревожные сверху
+    assert cards[0] == ('<a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a>'
+                        "\n<i>second</i>\n   ⚠️ конфликт")
+    assert cards[1].startswith('<a href="https://git.x/projects/P/repos/r/pull-requests/3">P/r#3</a>')
+    assert cards[2] == ('<a href="https://git.x/projects/P/repos/r/pull-requests/1">P/r#1</a>'
+                        "\n<i>&lt;fix&gt; &amp; go</i>\n   ✍️ needs work — bob")
+    assert cards[3].startswith('<a href="https://jira.x/browse/TS-5">TS-5</a>') and "Anna QA · +2" in cards[3]
+    assert cards[4] == ('<a href="https://jira.x/browse/PROJ-9">PROJ-9</a>'
+                        "\n   📣 Ann: <i>«глянь &lt;это&gt;»</i>")
     assert "•" not in text and "появился" not in text
     assert "<b>P/r#1</b>" in notify.format_message(note)          # без хостов — жирный ключ
     assert notify.key_url("dndeck/ui#5", notify.Links(github="https://github.com")) == "https://github.com/dndeck/ui/pull/5"
@@ -149,11 +149,11 @@ def test_sync_sends_notification_when_configured(tmp_path, monkeypatch):
         r2 = svc.sync_section("prs_mine")
         assert [d.kind for d in r2.deltas] == ["reviewer_needs_work"]
         assert r2.notified and tg.call_count == 1
-        assert "NEEDS WORK" in tg.calls.last.request.content.decode()
+        assert "needs work" in tg.calls.last.request.content.decode()
         assert "PROJ/repo#42" in tg.calls.last.request.content.decode()
         # роль вычислена из памяти: PR из вкладки «мои» — блок «МОЁ» с меткой «мой PR»
         sent = json.loads(tg.calls.last.request.content)["text"]
-        assert "━━ МОЁ ━━" in sent and "🔧 мой PR" in sent
+        assert "📌 <b>Моё</b>" in sent and "🔧 мой PR" in sent
     finally:
         svc.close()
 
@@ -217,7 +217,23 @@ def test_ready_and_approved_are_notable_and_titled():
                     detail="апрувов 2/2 · сборка ок · конфликтов нет"),
               Delta(key="P/r#8", kind="pr_all_approved", summary="PROJ-2", detail="апрувов 1/1 · сборка красная")]
     note = notify.build_notification("work", deltas)
-    assert [d.kind for d in note.deltas] == ["pr_ready_to_merge", "pr_all_approved"]
+    assert [d.kind for d in note.deltas] == ["pr_all_approved"]        # «готов к мержу» не шлём
+    note = notify.build_notification("work", deltas, kinds=["pr_ready_to_merge", "pr_all_approved"])
     text = notify.format_message(note)
-    assert "🚀 ГОТОВ К МЕРЖУ" in text and "👍 СОБРАЛ ВСЕ АПРУВЫ" in text
+    assert "🚀 готов к мержу" in text and "👍 все апрувы" in text
     assert "апрувов 2/2 · сборка ок · конфликтов нет" in text and "сборка красная" in text
+
+
+def test_all_sync_events_have_titles_and_default_set():
+    must = {"new_issue", "status_change", "new_review_pr", "new_conflict", "build_failed", "new_comment",
+            "new_pr_comment", "reviewer_needs_work", "gone", "pr_gone"}
+    assert must <= set(notify.DEFAULT_KINDS) and "pr_ready_to_merge" not in notify.DEFAULT_KINDS
+    assert all(k in notify.SECTION_TITLES for k in notify.DEFAULT_KINDS)
+    note = notify.build_notification("work", [
+        Delta(key="PROJ-5", kind="new_issue", summary="Новая"),
+        Delta(key="P/r#9", kind="new_review_pr", summary="feat", detail="автор Иванов"),
+        Delta(key="PROJ-6", kind="status_change", summary="Старая", detail="Open → In Progress"),
+    ])
+    text = notify.format_message(note)
+    assert "🆕 новая задача" in text and "👀 новый PR на ревью — автор Иванов" in text
+    assert text.index("PROJ-5") < text.index("P/r#9") < text.index("PROJ-6")   # по важности

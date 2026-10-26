@@ -232,6 +232,17 @@ CREATE TABLE IF NOT EXISTS queue_items (
     finished_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_queue_items_ws ON queue_items(workspace_id, status, position);
+CREATE TABLE IF NOT EXISTS job_resources (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    job_id       INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    ref          TEXT NOT NULL,
+    meta         TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL,
+    removed_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_job_resources_job ON job_resources(job_id, removed_at);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -254,6 +265,22 @@ CREATE TABLE IF NOT EXISTS queue_items (
     finished_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_queue_items_ws ON queue_items(workspace_id, status, position);
+"""
+
+# Что создала работа (рабочие копии, docker-ресурсы, каталоги кеша) — чтобы при закрытии
+# убрать ровно своё. Docker-ресурсы дополнительно ищутся по метке jwu.job=<id>.
+JOB_RESOURCES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS job_resources (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    job_id       INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    ref          TEXT NOT NULL,
+    meta         TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL,
+    removed_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_job_resources_job ON job_resources(job_id, removed_at);
 """
 
 # Индексы по workspace_id живут ОТДЕЛЬНО от SCHEMA: на старой БД колонки ещё нет в момент
@@ -363,7 +390,7 @@ def _readiness_detail(sig: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -530,6 +557,11 @@ def _m010_mention_archive(conn: sqlite3.Connection) -> None:
     _add_column(conn, "mentions", "archived", "INTEGER NOT NULL DEFAULT 0")
 
 
+def _m012_job_resources(conn: sqlite3.Connection) -> None:
+    """v11 → v12: ресурсы работы (``job_resources``) — рабочие копии, docker, кеш."""
+    conn.executescript(JOB_RESOURCES_SCHEMA)
+
+
 def _m011_queue(conn: sqlite3.Connection) -> None:
     """v10 → v11: очередь задач сессии (``queue_items``).
 
@@ -551,6 +583,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (9, _m009_note_kinds),
     (10, _m010_mention_archive),
     (11, _m011_queue),
+    (12, _m012_job_resources),
 ]
 
 
@@ -558,7 +591,8 @@ class Store:
     def __init__(self, path: str | Path, workspace_id: int | None = None) -> None:
         self.path = str(path)
         self.migration_notes: list[str] = []
-        self.conn = sqlite3.connect(self.path)
+        # timeout: демон пишет из двух потоков (синк и бот) — ждём блокировку, а не падаем
+        self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._restrict_permissions()
@@ -1294,6 +1328,7 @@ class Store:
                         ))
 
         # PR: новые комменты/коммиты, апрувы, конфликт
+        review_seen = self._membership_run("prs:review", "prs:review", before=run_id) is not None
         pr_rows = self.conn.execute(
             "SELECT pr_id, project, repo, signature, fields, views FROM pr_snapshots"
             " WHERE sync_run_id = ? AND workspace_id = ?",
@@ -1304,10 +1339,18 @@ class Store:
             prev = self._prev_pr_signature(
                 (row["project"], row["repo"], row["pr_id"]), run_id
             )
-            if prev is None:
-                continue  # первый раз видим PR — не шумим
             pr_key = f"{row['project']}/{row['repo']}#{row['pr_id']}"
             title = json.loads(row["fields"]).get("title", "")
+            if prev is None:
+                # Первый раз видим PR — шумим только о новом PR на ревью, и только если
+                # вкладка ревью уже синкалась раньше: иначе первый синк завалил бы всем списком.
+                if (review_seen and "review" in json.loads(row["views"] or "[]")):
+                    author = json.loads(row["fields"]).get("author", "")
+                    deltas.append(Delta(
+                        key=pr_key, kind="new_review_pr", summary=title,
+                        detail=f"автор {author}" if author else "",
+                    ))
+                continue
 
             added = (cur.get("comment_count") or 0) - (prev.get("comment_count") or 0)
             if added > 0:
@@ -2232,8 +2275,50 @@ class Store:
             return
         self.conn.execute("DELETE FROM job_records WHERE job_id = ?", (job_id,))
         self.conn.execute("DELETE FROM job_prs WHERE job_id = ?", (job_id,))
+        self.conn.execute("DELETE FROM job_resources WHERE job_id = ?", (job_id,))
         self.conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         self.conn.commit()
+
+    # --- ресурсы работы ------------------------------------------------- #
+
+    def add_job_resource(self, job_id: int, kind: str, ref: str, meta: dict | None = None) -> int:
+        """Запомнить, что создала работа. Повтор того же (kind, ref) — не дублируется."""
+        row = self.conn.execute(
+            "SELECT id FROM job_resources WHERE job_id = ? AND kind = ? AND ref = ? AND removed_at = ''",
+            (job_id, kind, ref),
+        ).fetchone()
+        if row:
+            return int(row["id"])
+        cur = self.conn.execute(
+            "INSERT INTO job_resources (workspace_id, job_id, kind, ref, meta, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (self.workspace_id, job_id, kind, ref, json.dumps(meta or {}, ensure_ascii=False), _now()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def job_resources(self, job_id: int, *, include_removed: bool = False) -> list[dict]:
+        sql = "SELECT * FROM job_resources WHERE job_id = ? AND workspace_id = ?"
+        if not include_removed:
+            sql += " AND removed_at = ''"
+        rows = self.conn.execute(sql + " ORDER BY id", (job_id, self.workspace_id)).fetchall()
+        return [{"id": int(r["id"]), "job_id": int(r["job_id"]), "kind": r["kind"], "ref": r["ref"],
+                 "meta": json.loads(r["meta"] or "{}"), "created_at": r["created_at"],
+                 "removed_at": r["removed_at"]} for r in rows]
+
+    def mark_job_resource_removed(self, resource_id: int) -> None:
+        self.conn.execute("UPDATE job_resources SET removed_at = ? WHERE id = ?", (_now(), resource_id))
+        self.conn.commit()
+
+    def all_open_job_resources(self) -> list[dict]:
+        """Неубранные ресурсы всех работ воркспейса — для подсказки, что чистить при нехватке места."""
+        rows = self.conn.execute(
+            "SELECT r.*, j.status AS job_status FROM job_resources r JOIN jobs j ON j.id = r.job_id"
+            " WHERE r.workspace_id = ? AND r.removed_at = '' ORDER BY r.job_id, r.id",
+            (self.workspace_id,),
+        ).fetchall()
+        return [{"id": int(r["id"]), "job_id": int(r["job_id"]), "kind": r["kind"], "ref": r["ref"],
+                 "job_status": r["job_status"]} for r in rows]
 
     def job_workspace_slug(self, job_id: int) -> str | None:
         """В каком воркспейсе живёт работа (для подсказки «работа #N в воркспейсе X»)."""

@@ -272,7 +272,7 @@ def test_configure_keeps_existing_secret_when_omitted(monkeypatch, tmp_path):
 def test_install_claude_skills_to_custom_dest(tmp_path):
     res = runner.invoke(cli.app, ["install-claude-skills", "--dest", str(tmp_path)])
     assert res.exit_code == 0, res.output
-    assert (tmp_path / "jwu-resume-job" / "SKILL.md").is_file()
+    assert (tmp_path / "jwu-continue-job" / "SKILL.md").is_file()
     assert (tmp_path / "jwu-start-job" / "SKILL.md").is_file()
     assert "Готово" in res.output
 

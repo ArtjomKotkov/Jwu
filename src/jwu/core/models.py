@@ -982,7 +982,7 @@ class Mention(BaseModel):
 # Типы записей работы (jwu job add --kind) — единый источник для CLI-валидации и рендера.
 JOB_RECORD_KINDS = [
     "phase", "note", "decision", "remark", "constraint", "warning",
-    "bug", "bug-resolved", "test-pass", "test-fail", "todo", "review",
+    "bug", "bug-resolved", "test-pass", "test-fail", "todo", "review", "summary",
 ]
 
 # kind -> (бейдж, цвет rich) для выделения в выводе (CLI + TUI).
@@ -997,13 +997,15 @@ JOB_RECORD_BADGES: dict[str, tuple[str, str]] = {
     "test-fail":    ("🧪 ТЕСТЫ УПАЛИ", "red"),
     "todo":         ("📌 TODO", "magenta"),
     "review":       ("🔍 РЕВЬЮ", "blue"),
+    "summary":      ("📝 ИТОГ", "green"),
 }
 
 
 class JobRecord(BaseModel):
     id: int = 0
     job_id: int = 0
-    # phase | note | remark | constraint (запрет) | warning | bug | bug-resolved
+    # phase | note | remark | constraint (запрет) | warning | bug | bug-resolved | …
+    # summary — одна строка простыми словами «что сделал» (для сводки дня и трекинга времени)
     kind: str = "note"
     text: str = ""
     status: Optional[str] = None  # опц.: для phase напр. pending | done
@@ -1114,7 +1116,7 @@ LOCAL_FEATURE_BADGES: dict[str, tuple[str, str]] = {
 
 
 # Типы правил контура — единый источник для CLI-валидации и рендера (как JOB_RECORD_KINDS).
-WORKSPACE_RULE_KINDS = ["constraint", "howto", "info", "convention", "gotcha"]
+WORKSPACE_RULE_KINDS = ["constraint", "howto", "info", "convention", "gotcha", "testenv"]
 
 # kind -> (бейдж, цвет rich). ⛔ и ⚠ намеренно те же, что у записей работы: одна и та же
 # вещь должна выглядеть одинаково, где бы она ни встретилась.
@@ -1124,6 +1126,9 @@ WORKSPACE_RULE_BADGES: dict[str, tuple[str, str]] = {
     "info":       ("ℹ ИНФО", "white"),         # где что лежит, кто за что отвечает, ссылки
     "convention": ("📐 СОГЛАШЕНИЕ", "blue"),   # код-стайл, нейминг, ветки, формат коммита
     "gotcha":     ("⚠ ГРАБЛИ", "yellow"),      # известные подводные камни
+    # тестовое окружение: как работе поднять СВОЙ стенд — команды подъёма/проверки/сноса,
+    # порты со смещением по номеру работы, метка jwu.job=<id> на всё созданное
+    "testenv":    ("🧪 ТЕСТОВОЕ ОКРУЖЕНИЕ", "magenta"),
 }
 
 

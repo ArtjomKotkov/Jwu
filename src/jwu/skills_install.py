@@ -20,8 +20,8 @@ from pathlib import Path
 EXPECTED_SKILLS = {
     "jwu-start-job",
     "jwu-queue",
-    "jwu-resume-job",
-    "jwu-track-job",
+    "jwu-continue-job",
+    "jwu-close-job",
     "jwu-job-review",
     "jwu-commit-message",
     "jwu-task-create",
@@ -43,7 +43,6 @@ EXPECTED_SKILLS = {
     "jwu-context",
     "jwu-review-pr",
     "jwu-qa-triage",
-    "jwu-wrap-up",
     "jwu-setup-remote",
     "jwu-session-init",
     "jwu-review-queue",
@@ -59,6 +58,10 @@ EXPECTED_SKILLS = {
 # удалять нельзя.
 RETIRED_SKILLS = {
     "jwu-create-issue",  # 1.8.0: разъехался на jwu-task-create/comment/status/attach/branches
+    # 2.0.0: флоу работ — три скилла start/continue/close
+    "jwu-track-job",     # журнал → раздел «Журнал работы» в jwu-start-job
+    "jwu-resume-job",    # → jwu-continue-job (плюс переоткрытие закрытой)
+    "jwu-wrap-up",       # → jwu-close-job (итог, уборка) / jwu-continue-job (пауза)
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

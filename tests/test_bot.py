@@ -61,10 +61,12 @@ def test_process_updates_commands_notes_and_replies(tmp_path):
     assert kinds == ["command", "command", "command", "command", "note", "ignored", "command"]
     assert kicks == [1]
     replies = [json.loads(c.request.content) for c in sent.calls]
-    assert len(replies) == 7 and all(r["reply_to_message_id"] for r in replies)
+    assert len(replies) == 7
+    # цитатой — только заметка и «не понял»; ответы на команды — обычными сообщениями
+    assert [bool(r.get("reply_to_message_id")) for r in replies] == [False, False, False, False, True, True, False]
     texts = [r["text"] for r in replies]
     assert "<b>Команды</b>" in texts[0]
-    assert "демон: не запущен" in texts[1] and "синк: 1 ок" in texts[1]
+    assert "демон не запущен" in texts[1] and "1 ок" in texts[1]
     assert texts[2].startswith("🔄 Синк запущен")
     assert "ЗАСТРЯЛО (1)" in texts[3] and 'pull-requests/7">P/r#7</a> · ' in texts[3]
     assert texts[4].startswith("📝 записал в") and "P/r#7" in texts[4]

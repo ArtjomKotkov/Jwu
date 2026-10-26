@@ -1651,7 +1651,10 @@ async def jwu_job_add(
     """Добавить запись в работу (фаза/пункт/замечание/баг/прогон тестов и т.п.).
 
     kind — один из: phase, note, decision, remark, constraint, warning, bug,
-    bug-resolved, test-pass, test-fail, todo, review. status — опц. (напр. "done" у фаз).
+    bug-resolved, test-pass, test-fail, todo, review, summary. status — опц. (напр. "done" у фаз).
+    summary — одна строка простыми словами, что сделано за шаг («перенёс правку в 10.8,
+    починил тесты»): без хешей, путей и номеров сборок. Её показывает сводка дня в Telegram
+    и берёт трекинг времени — ставь в конце каждого законченного куска работы.
     К записи прикладываются ветка и коммит HEAD репозитория в cwd (по умолчанию —
     папка процесса; передай cwd, если правишь в другой папке воркспейса). Читается из
     .git, в git ничего не пишется.
@@ -1737,6 +1740,141 @@ async def jwu_job_status(job_id: int, status: str, workspace: Optional[str] = No
     return _stamp({"ok": True, "job_id": job_id, "status": status, "context_notes": keys},
                   _resolve(workspace))
 
+
+
+@mcp.tool()
+async def jwu_job_close(job_id: int, summary: str, cleanup: bool = True,
+                        workspace: Optional[str] = None) -> dict:
+    """Закрыть работу: уборка → итог summary → статус done (+ выжимка заметкой на задачу и PR).
+
+    summary — ОБЯЗАТЕЛЕН: одна строка простыми словами, что сделано («перенёс правку в
+    10.8 и починил тесты») — её берёт трекинг времени. cleanup=True — сначала убрать всё,
+    что создала работа (стенд, контейнеры, вольюмы, сети, образы, кеш, рабочие копии).
+    Копия с незакоммиченным/незапушенным не удаляется: тогда работа НЕ закрывается, в ответе
+    blocked=True и что мешает — разберись с пользователем (закоммить/запушь/подтверди потерю
+    → jwu_job_cleanup(force=True)) и вызови снова.
+    """
+    from .core import jobspace
+
+    if not summary.strip():
+        raise ValueError("summary обязателен: одна строка простыми словами, что сделано")
+    store = _store_only(workspace)
+    if store.get_job(job_id) is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    report = jobspace.cleanup(store, job_id) if cleanup else None
+    if report is not None and (report.blocked or report.errors):
+        return _stamp({"ok": False, "job_id": job_id, "closed": False, "cleanup": report.to_dict()},
+                      _resolve(workspace))
+    if report is not None and report.removed:
+        store.add_job_record(job_id, "Уборка: " + "; ".join(report.removed)[:900], kind="note")
+    store.add_job_record(job_id, summary.strip(), kind="summary")
+    store.set_job_status(job_id, "done")
+    job = store.get_job(job_id)
+    keys = handoff.save_context_notes(store, handoff.collect(store, job, offline=True))
+    return _stamp({"ok": True, "job_id": job_id, "closed": True, "context_notes": keys,
+                   "cleanup": report.to_dict() if report else None}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_reopen(job_id: int, workspace: Optional[str] = None) -> dict:
+    """Переоткрыть закрытую работу (done/cancelled/paused → active)."""
+    store = _store_only(workspace)
+    job = store.get_job(job_id)
+    if job is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    store.set_job_status(job_id, "active")
+    store.add_job_record(job_id, f"Работа переоткрыта (была {job.status})", kind="phase")
+    return _stamp({"ok": True, "job_id": job_id, "was": job.status}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_worktree(job_id: int, repo: str, branch: str = "", base: str = "",
+                           workspace: Optional[str] = None) -> dict:
+    """Рабочая копия (git worktree) репозитория для работы — ТОЛЬКО когда будут правки кода.
+
+    Копия ложится в общую папку воркспейса (jobs.dir) с номером работы в имени
+    (<repo>-job<id>-<ключ>). Уже есть — вернёт её (created=False). Перед созданием
+    проверяется свободное место; мало — ошибка с подсказкой, что убрать. branch — ветка
+    копии: есть — берётся, нет — создаётся от base (по умолчанию HEAD репозитория).
+    Дальше ВСЯ работа с кодом — в возвращённом пути ref, не в основной папке.
+    """
+    from .core import jobspace
+
+    store = _store_only(workspace)
+    job = store.get_job(job_id)
+    if job is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    try:
+        res = jobspace.add_worktree(store, job, repo, branch=branch, base=base)
+    except jobspace.JobSpaceError as exc:
+        raise ValueError(str(exc)) from exc
+    if res.get("created"):
+        store.add_job_record(job_id, f"Рабочая копия: {res['ref']} (ветка {res['meta']['branch']})", kind="note")
+    return _stamp(res, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_resource(job_id: int, kind: str, ref: str, workspace: Optional[str] = None) -> dict:
+    """Запомнить, что создала работа, чтобы уборка снесла и это.
+
+    kind: container | volume | network | image | compose | path | worktree. Docker-ресурсы
+    ВСЕГДА создавай с меткой jwu.job=<id> (compose: -p jwu-job<id>) — их уборка найдёт и
+    без записи; записывай то, что метку не несёт (образ, собранный без --label, каталог кеша).
+    """
+    from .core import jobspace
+
+    if kind not in jobspace.RESOURCE_KINDS:
+        raise ValueError(f"kind: {', '.join(jobspace.RESOURCE_KINDS)}")
+    store = _store_only(workspace)
+    if store.get_job(job_id) is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    rid = store.add_job_resource(job_id, kind, ref)
+    return _stamp({"ok": True, "id": rid, "label": jobspace.label(job_id),
+                   "compose_project": jobspace.compose_project(job_id)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_resources(job_id: int, workspace: Optional[str] = None) -> dict:
+    """Что создала работа и ещё не убрано, плюс её docker-метка и имя compose-проекта."""
+    from .core import jobspace
+
+    store = _store_only(workspace)
+    return _stamp({"label": jobspace.label(job_id), "compose_project": jobspace.compose_project(job_id),
+                   "items": store.job_resources(job_id)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_cleanup(job_id: int, dry_run: bool = True, force: bool = False,
+                          workspace: Optional[str] = None) -> dict:
+    """Убрать всё, что создала работа: стенд, контейнеры, вольюмы, сети, образы, кеш, копии.
+
+    По умолчанию dry_run=True — только показать список. Копии с незакоммиченным или
+    незапушенным попадают в kept и не удаляются; force=True — удалить с потерей, ТОЛЬКО после
+    явного «да» пользователя.
+    """
+    from .core import jobspace
+
+    store = _store_only(workspace)
+    if store.get_job(job_id) is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    report = jobspace.cleanup(store, job_id, dry_run=dry_run, force=force)
+    if not dry_run and report.removed:
+        store.add_job_record(job_id, "Уборка: " + "; ".join(report.removed)[:900], kind="note")
+    return _stamp(report.to_dict(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_disk(path: Optional[str] = None, workspace: Optional[str] = None) -> dict:
+    """Свободное место (папка рабочих копий или path), docker и неубранное у закрытых работ.
+
+    ok=False — места меньше порога (disk.min_free_gb, 20 ГБ): НЕ создавай копий, не поднимай
+    стенд и не собирай образы — сначала скажи пользователю и предложи убрать (leftovers,
+    docker «можно освободить»). Docker и агент виснут на полном диске.
+    """
+    from .core import jobspace
+
+    store = _store_only(workspace)
+    return _stamp(jobspace.check_space(store, store.workspace_id, path).to_dict(), _resolve(workspace))
 
 @mcp.tool()
 async def jwu_worklog(

@@ -32,7 +32,7 @@ SECRET_SLOTS: tuple[str, ...] = (
     "jira.token", "jira.password", "jira.gate_password",
     "sdesk.token", "sdesk.password", "sdesk.gate_password",
     "bitbucket.token", "github.token", "jenkins.token",
-    "telegram.token",
+    "telegram.token", "matrix.token",
 )
 
 # Слоты, которые можно перебить переменной окружения (как и раньше).
@@ -45,6 +45,7 @@ SLOT_ENV: dict[str, str] = {
     "github.token": "GITHUB_TOKEN",
     "jenkins.token": "JENKINS_TOKEN",
     "telegram.token": "TELEGRAM_BOT_TOKEN",
+    "matrix.token": "MATRIX_TOKEN",
     # Пароли для сессионного логина и nginx-гейта — чтобы контур поднимался из одних
     # переменных окружения, без keyring и визарда (облачная сессия, CI).
     "jira.password": "JIRA_PASSWORD",

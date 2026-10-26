@@ -1,6 +1,6 @@
 ---
 name: jwu-session-init
-description: Use at the START of a session (and again after /clear or context compaction) in any folder managed by jwu, BEFORE reading or editing code — to switch into «работаем через jwu» mode. Triggers like «начнём», «инициализируй сессию», «подними контекст jwu», «работай через jwu», «где мы», «что тут у нас», «/jwu-session-init», or simply the first coding request in a fresh session when you have not yet called jwu_workspace_current. Resolves the workspace for the current folder, loads its rules, shows active jobs and open features/tasks, and routes to jwu-resume-job / jwu-start-job / jwu-workspace-setup. Read-only: nothing is written.
+description: Use at the START of a session (and again after /clear or context compaction) in any folder managed by jwu, BEFORE reading or editing code — to switch into «работаем через jwu» mode. Triggers like «начнём», «инициализируй сессию», «подними контекст jwu», «работай через jwu», «где мы», «что тут у нас», «/jwu-session-init», or simply the first coding request in a fresh session when you have not yet called jwu_workspace_current. Resolves the workspace for the current folder, loads its rules, shows active jobs and open features/tasks, and routes to jwu-continue-job / jwu-start-job / jwu-close-job / jwu-workspace-setup. Read-only: nothing is written.
 ---
 
 # jwu: инит сессии в воркспейсе
@@ -38,7 +38,7 @@ description: Use at the START of a session (and again after /clear or context co
 
 3. **Что уже в работе.** `jwu_jobs(status="active")`.
    - Есть активные — покажи списком (`id`, якорь `anchor`, дата обновления, последняя запись).
-     Если просьба пользователя про одну из них — дальше **jwu-resume-job**.
+     Если просьба пользователя про одну из них — дальше **jwu-continue-job**.
    - Нет — ок.
 
 4. **Очередь.** `jwu_queue()` (bash: `jwu queue --json`). Есть пункты `queued`/`running` —
@@ -62,8 +62,8 @@ description: Use at the START of a session (and again after /clear or context co
 
 - Новая задача или фича → **jwu-start-job** (для `local` сначала `jwu_feature_add`,
   если подходящей фичи нет, потом `jwu_job_start(feature=KEY)`).
-- Продолжение → **jwu-resume-job**. Ход работы → **jwu-track-job**.
-- Конец сессии → **jwu-wrap-up**.
+- Продолжение или переоткрытие → **jwu-continue-job**. Журнал ведётся по ходу (раздел «Журнал работы» в jwu-start-job).
+- Цель работы достигнута → **jwu-close-job** (итог для трекинга времени, уборка стенда и копий).
 - Работа без якоря — только если пользователь явно не хочет фичу: `jwu_job_start(title=…)`.
 
 ## Частые ошибки

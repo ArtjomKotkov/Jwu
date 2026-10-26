@@ -127,7 +127,8 @@ def test_install_writes_service_file_and_calls_launchctl(tmp_path, monkeypatch):
 
     msgs = daemon.install(90, jwu_bin="/opt/jwu", runner=runner_ok)
     assert (tmp_path / "agents" / "x.plist").exists()
-    assert cmds[-1][:2] == ["launchctl", "bootstrap"]
+    assert ["launchctl", "bootstrap"] in [c[:2] for c in cmds]
+    assert cmds[-1][:2] == ["launchctl", "print"]          # проверили, что служба реально загружена
     assert any("90с" in m for m in msgs)
     # интервал ниже минимума поднимается до минимума
     daemon.install(5, jwu_bin="/opt/jwu", runner=runner_ok)
@@ -295,7 +296,10 @@ def test_report_pass_one_message_per_requested_chat(tmp_path, monkeypatch):
 
 
 def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
-    """/sync между проходами (опрос бота) → итог после следующего прохода."""
+    """/sync из бота (слушатель в своём потоке) будит синк → итог после внепланового прохода."""
+    import os
+    import signal
+
     from jwu.core import bot
 
     db = tmp_path / "state.db"
@@ -311,13 +315,22 @@ def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
     def fake_poll(store, **kw):
         polls.append(1)
         if len(polls) == 1:
-            bot.request_sync(store, "work")   # как handle_command("/sync")
-            return [{"workspace": "work", "kind": "command", "text": "/sync"}]
+            bot.request_sync(store, "work")       # как кнопка «Синк сейчас»
+            os.kill(os.getpid(), signal.SIGUSR1)  # как on_sync → waiter.kick
+        import time
+        time.sleep(0.2)
+        return []
+
+    def fake_report(store, report, requested):
+        reported.append(list(requested))
         raise KeyboardInterrupt   # после внепланового прохода — выходим из цикла
 
     monkeypatch.setattr(daemon, "run_pass", lambda store, **kw: _stamped(fake_pass(store)))
     monkeypatch.setattr(daemon, "poll_bots", fake_poll)
-    monkeypatch.setattr(daemon, "report_pass", lambda store, report, requested: reported.append(list(requested)))
+    monkeypatch.setattr(daemon, "poll_duty", lambda store: [])
+    monkeypatch.setattr(daemon, "report_pass", fake_report)
+    import time
+    time.sleep(1.1)   # started_at первого прохода — строго раньше запроса
     try:
         daemon.run_loop(lambda: Store(db), interval=3600, announce=False, poll_interval=1)
     except KeyboardInterrupt:

@@ -1,6 +1,6 @@
 ---
 name: jwu-track-time
-description: Use when the user wants to actually LOG/track spent time into Jira's time tracker (worklog) across today's jwu jobs — phrases like «затрекай время в жиру», «разнеси часы по задачам», «залогируй время», «занеси ворклог», «разнести время», «/jwu-track-time». Builds the list from jwu-post-analyze-day (что сделано сегодня), PLUS code reviews the user did (PR'ы, которые он апрувнул/поставил needs work — описание «Ревью»), plus any extra tasks the user dictates; asks how much time per task, and logs NOTHING until the user explicitly confirms. For just a text summary without logging, use jwu-post-analyze-day instead.
+description: Use when the user wants to actually LOG/track spent time into Jira's time tracker (worklog) across today's jwu jobs — phrases like «затрекай время в жиру», «разнеси часы по задачам», «залогируй время», «занеси ворклог», «разнести время», «/jwu-track-time». Builds the list from the jobs' closing summaries (запись summary; a job active today without one is probably not closed — remind to close it via jwu-close-job when it looks done), PLUS code reviews the user did (PR'ы, которые он апрувнул/поставил needs work — описание «Ревью»), plus any extra tasks the user dictates; asks how much time per task, and logs NOTHING until the user explicitly confirms. For just a text summary without logging, use jwu-post-analyze-day instead.
 ---
 
 # jwu: трекинг времени в Jira (worklog)
@@ -65,24 +65,31 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 
 ## Шаги
 
-1. **Собери задачи дня.** Если итоги дня уже есть в контексте (после
-   `jwu-post-analyze-day`) — переиспользуй их. Иначе собери сам тем же источником
-   (локальная БД jwu, без сети); дату можно передать аргументом
-   (`/jwu-track-time 2026-05-21`), иначе сегодня:
+1. **Собери задачи дня — из итогов работ.** Работа при закрытии пишет запись `summary`
+   (одна строка простыми словами, что сделано, — скилл **jwu-close-job**); она и идёт в
+   комментарий worklog. Дату можно передать аргументом (`/jwu-track-time 2026-05-21`), иначе
+   сегодня. Источник — локальная БД jwu, без сети:
 
    ```bash
    today=${1:-$(date +%F)}
    jwu jobs --json | jq --arg d "$today" '
-     map(select(any(.records[]?; .ts[0:10] == $d) or (.updated_at[0:10] == $d)))
-     | map({task_key,
-            done: [.records[]? | select(.ts[0:10] == $d) | "[\(.kind)] \(.text)"]})'
+     map(select(any(.records[]?; .ts[0:10] == $d)))
+     | map({id, task_key, status, title,
+            summary: ([.records[]? | select(.kind == "summary") | .text] | last),
+            today: [.records[]? | select(.ts[0:10] == $d) | "[\(.kind)] \(.text)"]})'
    ```
 
-   Для каждой задачи сделай **сухое описание** того, что реально сделано по сути
-   (это и пойдёт в комментарий worklog). Действуют те же правила, что в
-   `jwu-post-analyze-day`: **без рутины** — не пиши про прогон ревьювера (нейропрогон),
-   коммиты, пуши, переключение веток; тесты — только если это была заметная отдельная
-   работа, а не штатный прогон после правок; конфликты/мердж — писать стоит.
+   - **Есть `summary`** — описание worklog = итог (можно чуть сократить, смысл не меняй).
+   - **Нет `summary`, работа открыта** — скорее всего, её не закрыли. Посмотри записи дня
+     и живые признаки «сделано»: последняя `phase` про коммит/пуш (`done`), сборка зелёная,
+     PR в апрувах или смержен, после этого новых записей нет. Есть признаки — **напомни**
+     одной строкой на работу: «#442 PROJ-1160 — похоже, всё сделали (запушено,
+     сборка зелёная), но работу не закрыли и итог не написали. Закрыть сейчас?» и после «да»
+     — **jwu-close-job**. Признаков нет — работа идёт несколько дней, это нормально: опиши
+     сделанное за день сухо по записям дня и не напоминай.
+   - Описание без рутины (правила `jwu-post-analyze-day`): не пиши про прогон ревьювера,
+     коммиты, пуши, переключение веток; тесты — только если это была отдельная работа;
+     конфликты и мердж — писать стоит.
 
 2. **Собери ревью, которые пользователь посмотрел за день.** Это PR'ы, где статус
    пользователя — апрув (галка) или needs work, **с датой ревья за нужный день**. Дата

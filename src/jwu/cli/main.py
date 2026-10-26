@@ -69,6 +69,11 @@ statusline_app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(statusline_app, name="statusline")
+duty_app = typer.Typer(
+    help="Matrix в Telegram-боте: дежурство за комнатой и личное (непрочитанное 1:1 и упоминания).",
+    invoke_without_command=True,
+)
+app.add_typer(duty_app, name="duty")
 queue_app = typer.Typer(
     help="Очередь задач сессии: мелкие просьбы из чата встают в конец и выполняются подряд "
          "в основном потоке либо субагентами по свободным слотам.",
@@ -479,6 +484,12 @@ def configure_main(
         help="chat_id Telegram для уведомлений после синка (пусто — выключить)."),
     telegram_token_opt: Optional[str] = typer.Option(None, "--telegram-token",
         help="Токен бота Telegram (от @BotFather)."),
+    matrix_host: Optional[str] = typer.Option(None, "--matrix-host",
+        help="Homeserver Matrix для дежурства в боте (пусто — брать из конфига matrix-mcp)."),
+    matrix_user: Optional[str] = typer.Option(None, "--matrix-user",
+        help="Свой mxid в Matrix (@login:server); пусто — узнаем по токену."),
+    matrix_token_opt: Optional[str] = typer.Option(None, "--matrix-token",
+        help="Access-токен Matrix (Element → Настройки → Помощь и о программе)."),
     db_path_opt: Optional[str] = typer.Option(None, "--db-path"),
     force: bool = typer.Option(False, "--force",
         help="Разрешить путь до БД в облачной папке (iCloud/Dropbox) — там токены уедут в облако."),
@@ -634,6 +645,12 @@ def configure_main(
             "bitbucket.token": btok,
             "jenkins.token": ktok,
         }
+
+    # Matrix (дежурство в боте) не спрашиваем в визарде: обычно хватает конфига
+    # matrix-mcp. Флаги — для тех, у кого его нет или нужен другой аккаунт.
+    if matrix_host is not None: cfg.matrix.homeserver = matrix_host.strip().rstrip("/")
+    if matrix_user is not None: cfg.matrix.user_id = matrix_user.strip()
+    if matrix_token_opt is not None: new_secrets["matrix.token"] = matrix_token_opt
 
     # Путь до БД — единственное, что остаётся глобальным: БД надо найти ДО того,
     # как известен воркспейс (в ней же лежат конфиги воркспейсов).
@@ -3867,7 +3884,7 @@ def job_start(
 def job_add(
     job_id: int = typer.Argument(..., help="ID работы."),
     text: str = typer.Argument(..., help="Текст записи."),
-    kind: str = typer.Option("note", "--kind", "-k", help=" | ".join(JOB_RECORD_KINDS) + " (decision — решение с обоснованием, constraint — запрет, bug/bug-resolved — баг/исправлен, test-pass/test-fail — прогон тестов, todo — отложенное).", click_type=click.Choice(JOB_RECORD_KINDS)),
+    kind: str = typer.Option("note", "--kind", "-k", help=" | ".join(JOB_RECORD_KINDS) + " (decision — решение с обоснованием, constraint — запрет, bug/bug-resolved — баг/исправлен, test-pass/test-fail — прогон тестов, todo — отложенное, summary — итог шага простыми словами для сводки дня).", click_type=click.Choice(JOB_RECORD_KINDS)),
     status: Optional[str] = typer.Option(None, "--status", help="Опц. статус записи (напр. done)."),
     git_state: bool = typer.Option(True, "--git/--no-git",
         help="Запомнить ветку и коммит HEAD текущей папки (читается из .git, в git не пишется)."),
@@ -3921,14 +3938,27 @@ def job_status(
 @job_app.command("done")
 def job_done(
     job_id: int = typer.Argument(..., help="ID работы."),
+    summary: Optional[str] = typer.Option(None, "--summary", "-s",
+        help="Итог простыми словами — что сделано (для трекинга времени). Пишется записью summary."),
+    cleanup_opt: bool = typer.Option(False, "--cleanup", help="Сначала убрать всё, что создала работа (стенд, docker, кеш, копии)."),
     no_note: bool = typer.Option(False, "--no-note", help="Не писать заметку-контекст на задачу и PR."),
 ) -> None:
     """Пометить работу завершённой; выжимка уезжает заметкой-контекстом на задачу и её PR."""
+    from ..core import jobspace
+
     with _store() as store:
         job = store.get_job(job_id)
         if job is None:
             err.print(f"[red]Работа #{job_id} не найдена.[/red]")
             raise typer.Exit(code=1)
+        if cleanup_opt:
+            report = jobspace.cleanup(store, job_id)
+            _print_cleanup(report)
+            if report.blocked or report.errors:
+                err.print("[red]Работа не закрыта:[/red] уборка не закончена — разберись с тем, что выше.")
+                raise typer.Exit(code=1)
+        if summary and summary.strip():
+            store.add_job_record(job_id, summary.strip(), kind="summary")
         store.set_job_status(job_id, "done")
         keys: list[str] = []
         if not no_note:
@@ -3953,16 +3983,186 @@ def job_cancel(job_id: int = typer.Argument(..., help="ID работы.")) -> No
 def job_delete(
     job_id: int = typer.Argument(..., help="ID работы."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+    force: bool = typer.Option(False, "--force", help="Удалить рабочие копии даже с незакоммиченным/незапушенным."),
 ) -> None:
-    """Удалить работу полностью (записи и связи с PR тоже)."""
+    """Удалить работу полностью: сначала уборка (стенд, docker, кеш, копии), потом записи и связи."""
     with _store() as store:
         if store.get_job(job_id) is None:
             err.print(f"[red]Работа #{job_id} не найдена.[/red]")
             raise typer.Exit(code=1)
         if not yes and not typer.confirm(f"Удалить работу #{job_id} безвозвратно?"):
             raise typer.Exit(code=1)
+        from ..core import jobspace
+
+        report = jobspace.cleanup(store, job_id, force=force)
+        _print_cleanup(report)
+        if report.blocked or report.errors:
+            err.print("[red]Работа не удалена:[/red] уборка не закончена. --force — удалить копии с потерей правок.")
+            raise typer.Exit(code=1)
         store.delete_job(job_id)
     console.print(f"[red]Работа #{job_id}[/red] удалена")
+
+
+@job_app.command("reopen")
+def job_reopen(job_id: int = typer.Argument(..., help="ID работы.")) -> None:
+    """Переоткрыть закрытую работу (статус active). Рабочую копию заводит заново скилл."""
+    with _store() as store:
+        job = store.get_job(job_id)
+        if job is None:
+            err.print(f"[red]Работа #{job_id} не найдена.[/red]")
+            raise typer.Exit(code=1)
+        store.set_job_status(job_id, "active")
+        store.add_job_record(job_id, f"Работа переоткрыта (была {job.status})", kind="phase")
+    console.print(f"[green]Работа #{job_id}[/green] снова активна")
+
+
+def _print_cleanup(report) -> None:
+    head = "Будет убрано" if report.dry_run else "Убрано"
+    if report.removed:
+        console.print(f"[green]{head}:[/green]")
+        for line in report.removed:
+            console.print(f"  · {line}", markup=False, highlight=False)
+    if report.kept:
+        err.print("[yellow]Не тронуто:[/yellow]")
+        for line in report.kept:
+            err.print(f"  · {line}", markup=False, highlight=False)
+    for line in report.errors:
+        err.print(f"[red]Ошибка:[/red] {line}", highlight=False)
+    if not (report.removed or report.kept or report.errors):
+        console.print("[dim]Убирать нечего.[/dim]")
+
+
+@job_app.command("worktree")
+def job_worktree(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    repo: str = typer.Argument(".", help="Основной репозиторий (папка воркспейса)."),
+    branch: str = typer.Option("", "--branch", "-b", help="Ветка копии: есть — берётся, нет — создаётся."),
+    base: str = typer.Option("", "--base", help="От чего создавать новую ветку (по умолчанию HEAD репозитория)."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Рабочая копия репозитория для работы (git worktree в папке jobs.dir). Есть — вернёт её."""
+    from ..core import jobspace
+
+    with _store() as store:
+        job = store.get_job(job_id)
+        if job is None:
+            err.print(f"[red]Работа #{job_id} не найдена.[/red]")
+            raise typer.Exit(code=1)
+        try:
+            res = jobspace.add_worktree(store, job, repo, branch=branch, base=base)
+        except jobspace.JobSpaceError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        if res.get("created"):
+            store.add_job_record(job_id, f"Рабочая копия: {res['ref']} (ветка {res['meta']['branch']})", kind="note")
+    if as_json:
+        _emit_json(res)
+        return
+    console.print(f"{'Создана' if res.get('created') else 'Уже есть'} копия: [bold]{res['ref']}[/bold] · ветка {res['meta'].get('branch', '')}")
+
+
+@job_app.command("resource")
+def job_resource(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    kind: str = typer.Option(..., "--kind", "-k", help="container | volume | network | image | compose | path | worktree.",
+                             click_type=click.Choice(["container", "volume", "network", "image", "compose", "path", "worktree"])),
+    ref: str = typer.Option(..., "--ref", "-r", help="Имя/id ресурса, имя compose-проекта или путь каталога."),
+) -> None:
+    """Запомнить, что создала работа, — уборка при закрытии снесёт и это."""
+    with _store() as store:
+        if store.get_job(job_id) is None:
+            err.print(f"[red]Работа #{job_id} не найдена.[/red]")
+            raise typer.Exit(code=1)
+        store.add_job_resource(job_id, kind, ref)
+    console.print(f"Запомнил за работой #{job_id}: {kind} {ref}")
+
+
+@job_app.command("resources")
+def job_resources_cmd(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Что создала работа и ещё не убрано (плюс метка для docker)."""
+    from ..core import jobspace
+
+    with _store() as store:
+        items = store.job_resources(job_id)
+    if as_json:
+        _emit_json({"label": jobspace.label(job_id), "compose_project": jobspace.compose_project(job_id), "items": items})
+        return
+    console.print(f"[dim]docker: метка {jobspace.label(job_id)}, compose-проект {jobspace.compose_project(job_id)}[/dim]")
+    for r in items:
+        console.print(f"  {r['kind']:<9} {r['ref']}", markup=False, highlight=False)
+    if not items:
+        console.print("[dim]Записанных ресурсов нет.[/dim]")
+
+
+@job_app.command("cleanup")
+def job_cleanup(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Только показать, что будет убрано."),
+    force: bool = typer.Option(False, "--force", help="Удалить копии даже с незакоммиченным/незапушенным."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Убрать всё, что создала работа: стенд (compose), контейнеры, вольюмы, сети, образы, кеш, копии."""
+    from ..core import jobspace
+
+    with _store() as store:
+        if store.get_job(job_id) is None:
+            err.print(f"[red]Работа #{job_id} не найдена.[/red]")
+            raise typer.Exit(code=1)
+        report = jobspace.cleanup(store, job_id, dry_run=dry_run, force=force)
+        if not dry_run and report.removed:
+            store.add_job_record(job_id, "Уборка: " + "; ".join(report.removed)[:900], kind="note")
+    if as_json:
+        _emit_json(report.to_dict())
+    else:
+        _print_cleanup(report)
+    if report.blocked or report.errors:
+        raise typer.Exit(code=1)
+
+
+@app.command("disk")
+def disk_cmd(
+    path: Optional[str] = typer.Argument(None, help="Где проверять (по умолчанию — папка рабочих копий)."),
+    min_gb: Optional[float] = typer.Option(None, "--min", help="Задать порог свободного места, ГБ (настройка воркспейса)."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Свободное место: диск, docker и неубранное у закрытых работ. Код 3 — места мало."""
+    from ..core import jobspace
+
+    with _store() as store:
+        ws_id = store.workspace_id
+        if min_gb is not None:
+            jobspace.set_min_free_gb(store, ws_id, min_gb)
+        report = jobspace.check_space(store, ws_id, path)
+    if as_json:
+        _emit_json(report.to_dict())
+    else:
+        color = "green" if report.ok else "red"
+        console.print(f"[{color}]Диск {report.path}:[/{color}] {report.summary()}")
+        for kind, size in report.docker.items():
+            console.print(f"  docker {kind}: {size}", highlight=False)
+        jobs = sorted({r["job_id"] for r in report.leftovers})
+        if jobs:
+            console.print(f"[yellow]Не убрано у закрытых работ:[/yellow] {', '.join(f'#{j}' for j in jobs)} — jwu job cleanup <id>")
+    if not report.ok:
+        raise typer.Exit(code=3)
+
+
+@workspace_app.command("jobs-dir")
+def workspace_jobs_dir(path: Optional[str] = typer.Argument(None, help="Общая папка для рабочих копий работ.")) -> None:
+    """Папка, где работы заводят свои рабочие копии (git worktree). Без аргумента — показать."""
+    from ..core import jobspace
+
+    with _store() as store:
+        ws = _resolve_workspace(store)
+        if path:
+            target = jobspace.set_jobs_dir(store, ws.id, path)
+            console.print(f"Рабочие копии работ воркспейса {ws.slug}: [bold]{target}[/bold]")
+            return
+        current = jobspace.jobs_dir(store, ws.id)
+    console.print(str(current) if current else "[dim]не задана[/dim] — jwu workspace jobs-dir <путь>")
 
 
 @job_app.command("show")
@@ -5473,6 +5673,157 @@ def statusline_preview() -> None:
 
     with _open_store() as store:
         typer.echo(sl.render({"cwd": str(Path.cwd())}, store, with_claude=False), color=True)
+
+
+# --------------------------------------------------------------------------- #
+# duty: дежурство в Telegram-боте — слежение за комнатой Matrix
+# --------------------------------------------------------------------------- #
+
+
+def _duty_client(store: Store):
+    from ..core import matrix
+
+    ws = _resolve_workspace(store)
+    cfg = workspaces.config_for_workspace(store, ws)
+    client = matrix.client_from_config(cfg)
+    if client is None:
+        err.print("[red]Matrix не настроен.[/red] jwu configure --non-interactive "
+                  "--matrix-host … --matrix-token …  (или конфиг matrix-mcp на этой машине)")
+        raise typer.Exit(code=1)
+    return client
+
+
+def _duty_state_dict(state) -> dict:
+    return {"room_id": state.room_id, "room_name": state.room_name, "enabled": state.enabled,
+            "active": state.active, "personal": state.personal, "me": state.me}
+
+
+@duty_app.callback()
+def duty_root(ctx: typer.Context,
+              as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Состояние (без подкоманды): дежурство за комнатой и личное."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from ..core import duty
+
+    with _store() as store:
+        state = duty.load(store)
+    if as_json:
+        _emit_json(_duty_state_dict(state))
+        return
+    if not state.configured:
+        console.print("[dim]Дежурство: комната не выбрана.[/dim] jwu duty rooms → jwu duty room <номер|название>")
+    else:
+        mark = "[green]включено[/green]" if state.active else "[yellow]выключено[/yellow]"
+        console.print(f"Дежурство: {mark} · комната [bold]{state.title}[/bold]")
+    mark = "[green]включено[/green]" if state.personal else "[yellow]выключено[/yellow]"
+    console.print(f"Личное (1:1 и упоминания): {mark}")
+
+
+@duty_app.command("rooms")
+def duty_rooms(
+    show_all: bool = typer.Option(False, "--all", help="И личные диалоги (комнаты без названия)."),
+    refresh: bool = typer.Option(False, "--refresh", help="Перечитать имена всех комнат, а не только новых."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Комнаты Matrix, где я состою (номер — для `jwu duty room`)."""
+    from ..core import duty
+
+    with _store() as store:
+        with _duty_client(store) as client:
+            rooms = duty.list_rooms(store, client, refresh=refresh)
+    if not show_all:
+        rooms = [r for r in rooms if r.name]
+    if as_json:
+        _emit_json([{"n": i + 1, "id": r.id, "name": r.name} for i, r in enumerate(rooms)])
+        return
+    for i, r in enumerate(rooms, 1):
+        console.print(f"{i:>3}. {r.title}  [dim]{r.id}[/dim]")
+
+
+@duty_app.command("room")
+def duty_room(query: str = typer.Argument(..., help="Номер из `jwu duty rooms`, id или часть названия.")) -> None:
+    """Выбрать комнату дежурства (настройка; включённое дежурство переедет в неё)."""
+    from ..core import duty
+
+    with _store() as store:
+        with _duty_client(store) as client:
+            rooms = duty.list_rooms(store, client)
+            named = [r for r in rooms if r.name]
+            # номер — как в `jwu duty rooms` (без --all); id и название — по всем комнатам
+            room = duty.pick_room(named, query) if query.strip().isdigit() else duty.pick_room(rooms, query)
+            if room is None:
+                err.print(f"[red]Комната не найдена или неоднозначна:[/red] {query}. Список — jwu duty rooms")
+                raise typer.Exit(code=1)
+            state = duty.set_room(store, client, room)
+    console.print(f"Комната дежурства: [bold]{state.title}[/bold]"
+                  + ("" if state.active else " · включить — jwu duty on или /duty в боте"))
+
+
+@duty_app.command("on")
+def duty_on() -> None:
+    """Включить дежурство в выбранной комнате."""
+    from ..core import duty
+
+    with _store() as store:
+        if not duty.load(store).configured:
+            err.print("[red]Комната не выбрана.[/red] jwu duty rooms → jwu duty room <номер|название>")
+            raise typer.Exit(code=1)
+        with _duty_client(store) as client:
+            state = duty.enable(store, client)
+    console.print(f"Дежурство [green]включено[/green]: {state.title}. Сообщения пришлёт демон в Telegram.")
+
+
+@duty_app.command("off")
+def duty_off() -> None:
+    """Выключить дежурство (комната остаётся в настройке)."""
+    from ..core import duty
+
+    with _store() as store:
+        state = duty.disable(store)
+    console.print(f"Дежурство [yellow]выключено[/yellow]{' · ' + state.title if state.configured else ''}.")
+
+
+@duty_app.command("personal")
+def duty_personal(switch: str = typer.Argument(..., help="on | off")) -> None:
+    """Личное: непрочитанное из диалогов 1:1 и упоминания в чатах — независимо от дежурства."""
+    from ..core import duty
+
+    switch = switch.strip().lower()
+    if switch not in ("on", "off"):
+        err.print("[red]Нужно on или off.[/red]")
+        raise typer.Exit(code=1)
+    with _store() as store:
+        if switch == "off":
+            duty.set_personal(store, False)
+            console.print("Личное [yellow]выключено[/yellow].")
+            return
+        with _duty_client(store) as client:
+            duty.set_personal(store, True, client)
+    console.print("Личное [green]включено[/green]: непрочитанное 1:1 и упоминания пришлёт демон в Telegram.")
+
+
+@duty_app.command("check")
+def duty_check(as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Проверить прямо сейчас и показать новое (позиция сдвигается, в Telegram не шлёт)."""
+    import re as _re
+
+    from ..core import duty
+
+    with _store() as store:
+        if not duty.load(store).watching:
+            err.print("[yellow]Ничего не включено.[/yellow] jwu duty on · jwu duty personal on")
+            raise typer.Exit(code=1)
+        with _duty_client(store) as client:
+            state, items, _ = duty.check(store, client)
+    if as_json:
+        _emit_json([{"who": i.who, "body": i.body, "thread": i.thread, "to_me": i.to_me,
+                     "direct": i.direct, "room": i.room} for i in items])
+        return
+    if not items:
+        console.print("[dim]Нового нет.[/dim]")
+        return
+    console.print(_re.sub(r"<[^>]+>", "", duty.format_items(state, items)), markup=False, highlight=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

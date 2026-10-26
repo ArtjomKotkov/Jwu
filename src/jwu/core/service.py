@@ -2024,7 +2024,8 @@ class Service:
             issues = {i.key: i for i in self.store.latest_issues(None)}
             status: dict[str, dict] = {}
             for d in note.deltas:
-                if d.kind not in notify.STATUS_KINDS or d.key in status:
+                # «ушла из выборки» — тоже: без «куда, на кого и кто перевёл» она бесполезна
+                if (d.kind not in notify.STATUS_KINDS and d.kind != "gone") or d.key in status:
                     continue
                 client = self._client_for_key(d.key) if self.tasks_client is not None else None
                 if client is None or not hasattr(client, "status_actor"):
@@ -2033,6 +2034,9 @@ class Service:
                     status[d.key] = client.status_actor(d.key)
                 except Exception:  # noqa: BLE001 — без «кто перевёл» уведомление всё равно полезно
                     pass
+            for d in note.deltas:
+                if d.kind == "gone" and d.key in status:
+                    d.detail = notify.explain_gone(status[d.key], issues.get(d.key), me=self._me_names())
             return notify.resolve_roles(
                 keys, me=self._me_names(), issues=issues,
                 my_prs=self.store.latest_prs("mine"), review_prs=self.store.latest_prs("review"),

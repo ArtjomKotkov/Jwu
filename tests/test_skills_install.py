@@ -22,11 +22,11 @@ def test_installs_all_bundled_skills(tmp_path):
 def test_replaces_existing(tmp_path):
     install_skills(tmp_path)
     # подменим один скилл локально — повторная установка должна перезаписать
-    target = tmp_path / "jwu-resume-job" / "SKILL.md"
+    target = tmp_path / "jwu-continue-job" / "SKILL.md"
     target.write_text("СТАРОЕ", encoding="utf-8")
 
     results = dict(install_skills(tmp_path))
-    assert results["jwu-resume-job"] == "обновлён"
+    assert results["jwu-continue-job"] == "обновлён"
     assert "СТАРОЕ" not in target.read_text(encoding="utf-8")
 
 

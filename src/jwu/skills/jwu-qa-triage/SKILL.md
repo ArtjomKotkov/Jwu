@@ -43,7 +43,7 @@ description: Use when a task came back from testing or QA left a comment and the
 5. **Черновик ответа** тестировщику в 3–6 строк. Показать целиком → «да» →
    `jwu_comment(KEY, text)`. Для SDESK-задач (их читает клиент) — правила jwu-task-comment.
 6. **Зафиксировать:** `jwu_note(KEY, "вернули с тестов: …", kind="status")`; если чиним —
-   заводи работу (jwu-start-job) и веди её (jwu-track-job); если вернули зря — предложи
+   заводи работу (jwu-start-job; закрытую по той же задаче — переоткрой jwu-continue-job); если вернули зря — предложи
    перевести обратно на тесты (jwu-task-status) после «да».
 
 ## Текст от имени пользователя (голос)

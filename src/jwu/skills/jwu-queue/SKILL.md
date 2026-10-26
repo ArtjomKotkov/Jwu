@@ -83,7 +83,7 @@ description: Use when the user wants small tasks and remarks typed into the chat
 
 1. `jwu_queue_finish(id, "done", result="…")` — итог одной строкой. Не вышло —
    `"failed"` с причиной. Если у пункта есть `job_id` — продублировать итог записью в
-   работу (`jwu_job_add`, **jwu-track-job**): очередь — не журнал, закрытые пункты чистятся.
+   работу (`jwu_job_add`, журнал работы): очередь — не журнал, закрытые пункты чистятся.
 2. `jwu_queue_take(mode="main")`. В основном потоке выполняется **один** пункт за раз:
    `busy=True` означает, что предыдущий не закрыт — закрой (`done`/`failed`) или верни
    (`status="queued"`), не бери второй.

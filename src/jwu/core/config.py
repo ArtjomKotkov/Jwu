@@ -153,6 +153,20 @@ class TelegramConfig:
 
 
 @dataclass
+class MatrixConfig:
+    """Matrix для режима дежурства бота: homeserver, свой mxid и токен (секрет ``matrix.token``).
+
+    Пусто — jwu попробует взять homeserver и токен из конфига matrix-mcp
+    (см. ``matrix.client_from_config``); нет и его — дежурство недоступно.
+    """
+
+    homeserver: str = ""
+    user_id: str = ""
+    token_service: str = "jwu-matrix"
+    token_env: str = "MATRIX_TOKEN"
+
+
+@dataclass
 class StorageConfig:
     db_path: str = ""  # пусто => дефолт data_dir()/state.db; переопределяется env JWU_DB_PATH
 
@@ -165,6 +179,7 @@ class Config:
     github: GitHubConfig = field(default_factory=GitHubConfig)
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    matrix: MatrixConfig = field(default_factory=MatrixConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     # Откуда берутся секреты. По умолчанию — системный keyring (как исторически);
     # для конфига воркспейса подставляется secrets.DbSecrets (см. workspaces.config_for_workspace).
@@ -190,6 +205,8 @@ def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
         pairs = {"token": (cfg.jenkins.token_service, cfg.jenkins.username)}
     elif section == "telegram":
         pairs = {"token": (cfg.telegram.token_service, "bot")}
+    elif section == "matrix":
+        pairs = {"token": (cfg.matrix.token_service, cfg.matrix.user_id or "me")}
     else:
         return None
     ref = pairs.get(kind)
@@ -306,6 +323,11 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     cfg.telegram.chat_id = str(t.get("chat_id", cfg.telegram.chat_id) or "")
     cfg.telegram.token_env = t.get("token_env", cfg.telegram.token_env)
 
+    m = raw.get("matrix", {}) or {}
+    cfg.matrix.homeserver = str(m.get("homeserver", cfg.matrix.homeserver) or "").rstrip("/")
+    cfg.matrix.user_id = str(m.get("user_id", cfg.matrix.user_id) or "")
+    cfg.matrix.token_env = m.get("token_env", cfg.matrix.token_env)
+
     s = raw.get("storage", {}) or {}
     cfg.storage.db_path = s.get("db_path", cfg.storage.db_path)
     return cfg
@@ -334,6 +356,8 @@ ENV_SETTINGS: dict[str, tuple[str, str]] = {
     "JWU_JENKINS_URL": ("jenkins", "base_url"),
     "JWU_JENKINS_USER": ("jenkins", "username"),
     "JWU_TELEGRAM_CHAT": ("telegram", "chat_id"),
+    "JWU_MATRIX_URL": ("matrix", "homeserver"),
+    "JWU_MATRIX_USER": ("matrix", "user_id"),
 }
 
 
@@ -471,6 +495,11 @@ def telegram_token(cfg: Config) -> str:
     return get_slot(cfg, "telegram.token") or ""
 
 
+def matrix_token(cfg: Config) -> str:
+    """Токен Matrix для дежурства (пусто — не настроен). Не бросает: дежурство опционально."""
+    return get_slot(cfg, "matrix.token") or ""
+
+
 def jenkins_auth(cfg: Config) -> tuple[str, str] | None:
     """Basic-auth (username, apiToken) для Jenkins или None, если токен/логин не заданы.
 
@@ -546,6 +575,8 @@ def export_bundle(cfg: Config, path: Path) -> int:
         raw["jenkins"] = {"base_url": cfg.jenkins.base_url, "username": cfg.jenkins.username}
     if cfg.telegram.chat_id:
         raw["telegram"] = {"chat_id": cfg.telegram.chat_id}
+    if cfg.matrix.homeserver:
+        raw["matrix"] = {"homeserver": cfg.matrix.homeserver, "user_id": cfg.matrix.user_id}
 
     sec_list: list[dict] = []
     for slot in secrets.SECRET_SLOTS:

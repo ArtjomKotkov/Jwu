@@ -159,6 +159,19 @@ def _daemon_part() -> str:
     return f"демон {_c('32', '✓') if alive else _c('31', '✗')}"
 
 
+def _disk_part(store: "Store", workspace_id: int) -> str:
+    """Места меньше порога — красным; иначе ничего (не занимаем строку лишним)."""
+    try:
+        from . import jobspace
+
+        report = jobspace.check_space(store, workspace_id, with_docker=False)
+    except Exception:  # noqa: BLE001
+        return ""
+    if report.ok:
+        return ""
+    return _dim("   ·   ") + _c("1;31", f"диск {report.free_gb:.0f} ГБ свободно!")
+
+
 def jwu_lines(store: "Store", cwd: str) -> list[str]:
     """Что знает jwu о папке: воркспейс и демон, работа, очередь — по строке на каждое."""
     match = workspaces.workspace_for_path(store, cwd)
@@ -167,7 +180,7 @@ def jwu_lines(store: "Store", cwd: str) -> list[str]:
     ws, _ = match
     store.use_workspace(ws.id)
     head = (_dim("jwu      ") + _c("1;34", ws.name or ws.slug) + _dim(f" ({ws.provider})")
-            + _dim("   ·   ") + _daemon_part())
+            + _dim("   ·   ") + _daemon_part() + _disk_part(store, ws.id))
     return [head, _job_line(store), _queue_line(store)]
 
 
