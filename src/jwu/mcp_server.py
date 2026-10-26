@@ -10,7 +10,8 @@ prs, pr, builds, build, attachments, jobs, features, worklogs, task_branches, is
 issue_similar, issue_transitions, auth_refresh. Write: workspace_create, workspace_add_path, workspace_remove_path,
 workspace_tag, workspace_use, rule_add, rule_edit, rule_rm, note, worklog, comment, issue_create,
 issue_link, issue_transition, issue_attach, job_start, job_add,
-job_link, job_status, feature_add, feature_status, feature_edit, feature_rm. Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
+job_link, job_status, feature_add, feature_status, feature_edit, feature_rm, queue_add, queue_take,
+queue_finish, queue_edit, queue_clear, queue_slots (очередь задач сессии; чтение — queue). Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
 у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в SDESK его читает КЛИЕНТ),
 `jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition`, `jwu_issue_attach`,
 `jwu_pr_task_add` и `jwu_pr_task_done` (задачи на комментах PR в Bitbucket),
@@ -48,10 +49,11 @@ from .core import workspaces as ws_mod
 from .core.config import db_path
 from .core.maintenance import ensure_db_available
 from .core.models import (
-    JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, WORKSPACE_RULE_KINDS, Workspace,
+    JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, QUEUE_MODES, QUEUE_STATUSES, WORKSPACE_RULE_KINDS,
+    Workspace,
 )
 from .core.service import Service
-from .core.store import Store
+from .core.store import QueueBusy, Store
 
 # Допустимые статусы работы (как в CLI `jwu job status`).
 _JOB_STATUSES = ("active", "done", "paused", "cancelled")
@@ -2098,6 +2100,152 @@ async def jwu_issue_link(
     """
     svc = _require_jira(_full_svc(workspace))
     return {"ok": True, **svc.link_issues(inward, outward, link_type)}
+
+
+# --------------------------------------------------------------------------- #
+# Очередь задач сессии
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def jwu_queue(
+    status: Optional[str] = None,
+    mode: Optional[str] = None,
+    all_items: bool = False,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Очередь задач сессии: пункты по порядку + сводка (slots, slots_free, main_running).
+
+    По умолчанию — только queued и running; all_items=True — вместе с закрытыми.
+    status — queued | running | done | failed | cancelled; mode — main | parallel.
+    Без сети. Скилл **jwu-queue** описывает, как сессия с ней работает.
+    """
+    store = _store_only(workspace)
+    items = store.queue_list(status=status, mode=mode, open_only=not all_items and not status)
+    payload = {**store.queue_counts(), "items": [i.model_dump() for i in items]}
+    return _stamp(payload, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_queue_add(
+    text: str,
+    mode: str = "main",
+    job_id: Optional[int] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Положить пункт в КОНЕЦ очереди и вернуться к текущему делу.
+
+    mode: main (ДЕФОЛТ) — выполнит сам основной поток, подряд, после текущего атомарного
+    шага; parallel — субагент, когда освободится слот. ⛔ parallel ставь ТОЛЬКО если
+    пользователь в этой просьбе явно сказал «параллельно» / «отдай агенту»; сам так не
+    решай, даже если пункт выглядит независимым. job_id — работа, в журнал которой
+    уедет итог. Локальная память, подтверждения не требует.
+    """
+    if mode not in QUEUE_MODES:
+        raise ValueError(f"Недопустимый режим {mode!r}. Допустимо: {', '.join(QUEUE_MODES)}")
+    ws = _resolve(workspace)
+    return _stamp(_store_only(workspace).queue_add(text, mode=mode, job_id=job_id).model_dump(), ws)
+
+
+@mcp.tool()
+async def jwu_queue_take(
+    mode: Optional[str] = None,
+    worker: str = "",
+    workspace: Optional[str] = None,
+) -> dict:
+    """Взять следующий пункт в работу (queued → running), атомарно.
+
+    mode="main" — следующий пункт основного потока (в нём выполняется один пункт за
+    раз); mode="parallel" — пункт для субагента, если есть свободный слот; без mode —
+    первый по порядку. Ответ: {"item": …} либо {"item": null, "busy": bool, "reason": …}:
+    busy=True — занято (закрой текущий пункт или подожди слот), busy=False — пусто.
+    worker — метка исполнителя (имя субагента), видна в списке.
+    """
+    if mode is not None and mode not in QUEUE_MODES:
+        raise ValueError(f"Недопустимый режим {mode!r}. Допустимо: {', '.join(QUEUE_MODES)}")
+    ws = _resolve(workspace)
+    store = _store_only(workspace)
+    try:
+        item = store.queue_take(mode=mode, worker=worker)
+    except QueueBusy as exc:
+        return _stamp({"item": None, "busy": True, "reason": str(exc)}, ws)
+    if item is None:
+        return _stamp({"item": None, "busy": False, "reason": "подходящих пунктов нет"}, ws)
+    return _stamp({"item": item.model_dump(), "busy": False, "reason": ""}, ws)
+
+
+@mcp.tool()
+async def jwu_queue_finish(
+    item_id: int,
+    status: str = "done",
+    result: str = "",
+    workspace: Optional[str] = None,
+) -> dict:
+    """Закрыть пункт: done | failed | cancelled — либо вернуть в очередь: queued (release).
+
+    result — итог одной строкой (что сделано / почему не вышло). Если у пункта есть
+    job_id, итог стоит продублировать записью в работу (jwu_job_add) — очередь не журнал.
+    """
+    store = _store_only(workspace)
+    if status == "queued":
+        item = store.queue_release(item_id)
+    elif status in ("done", "failed", "cancelled"):
+        item = store.queue_finish(item_id, status, result=result)
+    else:
+        raise ValueError("status — done | failed | cancelled | queued")
+    return _stamp(item.model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_queue_edit(
+    item_id: int,
+    text: Optional[str] = None,
+    mode: Optional[str] = None,
+    job_id: Optional[int] = None,
+    position: Optional[int] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Править пункт: текст, режим (только у ещё не взятых), работа, место в очереди.
+
+    position — место среди ожидающих, 1 — первым. Передавай только то, что меняешь.
+    """
+    store = _store_only(workspace)
+    item = store.queue_update(item_id, text=text, mode=mode, job_id=job_id)
+    if position is not None:
+        store.queue_move(item_id, position)
+        item = store.queue_get(item_id) or item
+    return _stamp(item.model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_queue_clear(
+    include_queued: bool = False,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Удалить закрытые пункты (done / failed / cancelled); include_queued=True — и ожидающие.
+
+    Ожидающие сносить только по явной просьбе пользователя. Выполняемые не трогаются.
+    """
+    statuses: tuple[str, ...] = ("done", "failed", "cancelled")
+    if include_queued:
+        statuses += ("queued",)
+    n = _store_only(workspace).queue_clear(statuses=statuses)
+    return _stamp({"ok": True, "removed": n}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_queue_slots(
+    slots: Optional[int] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Лимит параллельных слотов воркспейса (настройка queue.slots, по умолчанию 3).
+
+    Без slots — показать; с slots — задать (≥ 1). Менять по просьбе пользователя.
+    """
+    store = _store_only(workspace)
+    if slots is not None:
+        store.set_queue_slots(slots)
+    return _stamp(store.queue_counts(), _resolve(workspace))
 
 
 def main() -> None:

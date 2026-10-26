@@ -36,12 +36,13 @@ from ..core.jira import JiraError
 from ..core import models
 from ..core.models import (
     JOB_RECORD_BADGES, JOB_RECORD_KINDS, LOCAL_FEATURE_BADGES, LOCAL_FEATURE_STATUSES,
+    QUEUE_BADGES, QUEUE_MODES, QUEUE_STATUSES,
     WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS,
-    Delta, Issue, Job, LocalFeature, PR, Workspace,
+    Delta, Issue, Job, LocalFeature, PR, QueueItem, Workspace,
 )
 from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
 from .dashboard import render_jira_text
-from ..core.store import Store
+from ..core.store import QueueBusy, Store
 from ..core import workspaces
 
 app = typer.Typer(
@@ -63,6 +64,12 @@ db_app = typer.Typer(help="Файл БД: сколько занимает, чи�
 app.add_typer(db_app, name="db")
 feature_app = typer.Typer(help="Локальные фичи: мини-трекер воркспейса, когда Jira нет.")
 app.add_typer(feature_app, name="feature")
+queue_app = typer.Typer(
+    help="Очередь задач сессии: мелкие просьбы из чата встают в конец и выполняются подряд "
+         "в основном потоке либо субагентами по свободным слотам.",
+    invoke_without_command=True,
+)
+app.add_typer(queue_app, name="queue")
 issue_app = typer.Typer(
     help="Задачи: создание и связи (ВНЕШНЯЯ запись в Jira)."
 )
@@ -5116,6 +5123,279 @@ def video_frames(
         console.print(f"  лист: {sh}")
     if not res.stamped:
         console.print("[yellow]ffmpeg собран без drawtext — время на кадрах не подписано: кадр N ↔ время — в frames.json (и в --json).[/yellow]")
+
+
+# --------------------------------------------------------------------------- #
+# Очередь задач сессии
+# --------------------------------------------------------------------------- #
+
+_QUEUE_MODE_ICON = {"main": "→", "parallel": "⇉"}
+
+
+def _queue_line(item: QueueItem) -> str:
+    label, color = QUEUE_BADGES.get(item.status, (item.status, "white"))
+    who = f" [dim]{escape(item.worker)}[/dim]" if item.status == "running" and item.worker else ""
+    tail = f" [dim]· {escape(item.result)}[/dim]" if item.result else ""
+    return (f"[cyan]#{item.id}[/cyan] {_QUEUE_MODE_ICON.get(item.mode, '?')} "
+            f"[{color}]{label}[/{color}]{who}  {escape(item.text)}{tail}")
+
+
+def _render_queue(items: list[QueueItem], summary: dict) -> None:
+    c = summary["counts"]
+    console.print(
+        f"[bold]Очередь[/bold] · ждёт {c['queued']} · выполняется {c['running']} · "
+        f"слоты {summary['slots_busy']}/{summary['slots']}"
+        + (f" · основной поток: #{summary['main_running']}" if summary["main_running"] else "")
+    )
+    if not items:
+        console.print("[dim]Пусто. Добавить: jwu queue add \"что сделать\" [--mode parallel][/dim]")
+        return
+    for item in items:
+        console.print("  " + _queue_line(item))
+
+
+def _queue_emit(item: QueueItem, json_out: bool) -> None:
+    if json_out:
+        _emit_json(item.model_dump())
+    else:
+        console.print(_queue_line(item))
+
+
+def _queue_require(store: Store, item_id: int) -> QueueItem:
+    item = store.queue_get(item_id)
+    if item is None:
+        err.print(f"[red]Пункт очереди #{item_id} не найден.[/red]")
+        raise typer.Exit(code=1)
+    return item
+
+
+@queue_app.callback()
+def queue_root(ctx: typer.Context) -> None:
+    """Без подкоманды — то же, что `jwu queue list`."""
+    if ctx.invoked_subcommand is None:
+        queue_list(status=None, mode=None, all_items=False, json_out=False)
+
+
+@queue_app.command("add")
+def queue_add(
+    text: str = typer.Argument(..., help="Что сделать — одной внятной формулировкой."),
+    mode: str = typer.Option("main", "--mode", "-m",
+                             help="main (дефолт) | parallel — только если пользователь явно попросил параллельно.",
+                             click_type=click.Choice(QUEUE_MODES)),
+    job: Optional[int] = typer.Option(None, "--job", "-j", help="Работа (job), к которой относится пункт."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Положить пункт в конец очереди (режим main, если пользователь не сказал «параллельно»)."""
+    with _store() as store:
+        try:
+            item = store.queue_add(text, mode=mode, job_id=job)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    _queue_emit(item, json_out)
+
+
+@queue_app.command("list")
+def queue_list(
+    status: Optional[str] = typer.Option(None, "--status", "-s", help=" | ".join(QUEUE_STATUSES),
+                                         click_type=click.Choice(QUEUE_STATUSES)),
+    mode: Optional[str] = typer.Option(None, "--mode", "-m", help=" | ".join(QUEUE_MODES),
+                                       click_type=click.Choice(QUEUE_MODES)),
+    all_items: bool = typer.Option(False, "--all", "-a", help="Вместе с закрытыми."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Очередь по порядку; по умолчанию — только ожидающие и выполняемые."""
+    with _store() as store:
+        items = store.queue_list(status=status, mode=mode, open_only=not all_items and not status)
+        summary = store.queue_counts()
+    if json_out:
+        _emit_json({**summary, "items": [i.model_dump() for i in items]})
+    else:
+        _render_queue(items, summary)
+
+
+@queue_app.command("show")
+def queue_show(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Карточка пункта очереди."""
+    with _store() as store:
+        item = _queue_require(store, item_id)
+    if json_out:
+        _emit_json(item.model_dump())
+        return
+    console.print(_queue_line(item))
+    console.print(f"[dim]режим:[/dim] {item.mode}  [dim]позиция:[/dim] {item.position}"
+                  + (f"  [dim]работа:[/dim] #{item.job_id}" if item.job_id else ""))
+    console.print(f"[dim]добавлен:[/dim] {fmt_dt(item.created_at)}"
+                  + (f"  [dim]взят:[/dim] {fmt_dt(item.started_at)}" if item.started_at else "")
+                  + (f"  [dim]закрыт:[/dim] {fmt_dt(item.finished_at)}" if item.finished_at else ""))
+
+
+@queue_app.command("take")
+def queue_take(
+    mode: Optional[str] = typer.Option(None, "--mode", "-m", help=" | ".join(QUEUE_MODES),
+                                       click_type=click.Choice(QUEUE_MODES)),
+    worker: str = typer.Option("", "--worker", "-w", help="Метка исполнителя (имя субагента)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Взять следующий пункт в работу (queued → running).
+
+    Основной поток выполняет один пункт за раз; параллельные ограничены слотами
+    (`jwu queue slots`). Нет подходящих пунктов — код выхода 2, занято — код 3.
+    """
+    with _store() as store:
+        try:
+            item = store.queue_take(mode=mode, worker=worker)
+        except QueueBusy as exc:
+            if json_out:
+                _emit_json({"ok": False, "busy": True, "error": str(exc)})
+            else:
+                err.print(f"[yellow]{exc}[/yellow]")
+            raise typer.Exit(code=3)
+    if item is None:
+        if json_out:
+            _emit_json({"ok": False, "busy": False, "error": "очередь пуста"})
+        else:
+            console.print("[dim]Подходящих пунктов нет.[/dim]")
+        raise typer.Exit(code=2)
+    _queue_emit(item, json_out)
+
+
+def _queue_close(item_id: int, status: str, result: str, json_out: bool) -> None:
+    with _store() as store:
+        _queue_require(store, item_id)
+        try:
+            item = store.queue_finish(item_id, status, result=result)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    _queue_emit(item, json_out)
+
+
+@queue_app.command("done")
+def queue_done(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    result: str = typer.Option("", "--result", "-r", help="Итог одной строкой."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Закрыть пункт как выполненный."""
+    _queue_close(item_id, "done", result, json_out)
+
+
+@queue_app.command("fail")
+def queue_fail(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    result: str = typer.Option("", "--result", "-r", help="Почему не вышло — одной строкой."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Закрыть пункт как не выполненный."""
+    _queue_close(item_id, "failed", result, json_out)
+
+
+@queue_app.command("cancel")
+def queue_cancel(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    result: str = typer.Option("", "--result", "-r", help="Причина — одной строкой."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Снять пункт с очереди."""
+    _queue_close(item_id, "cancelled", result, json_out)
+
+
+@queue_app.command("release")
+def queue_release(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Вернуть выполняемый пункт обратно в очередь (исполнитель пропал)."""
+    with _store() as store:
+        _queue_require(store, item_id)
+        try:
+            item = store.queue_release(item_id)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    _queue_emit(item, json_out)
+
+
+@queue_app.command("edit")
+def queue_edit(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    text: Optional[str] = typer.Option(None, "--text", "-t", help="Новая формулировка."),
+    mode: Optional[str] = typer.Option(None, "--mode", "-m", help=" | ".join(QUEUE_MODES),
+                                       click_type=click.Choice(QUEUE_MODES)),
+    job: Optional[int] = typer.Option(None, "--job", "-j", help="Привязать к работе (job)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Изменить текст, режим или работу пункта."""
+    with _store() as store:
+        _queue_require(store, item_id)
+        try:
+            item = store.queue_update(item_id, text=text, mode=mode, job_id=job)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    _queue_emit(item, json_out)
+
+
+@queue_app.command("move")
+def queue_move(
+    item_id: int = typer.Argument(..., help="id пункта."),
+    to: int = typer.Option(..., "--to", help="Место среди ожидающих: 1 — первым."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Переставить ожидающий пункт на другое место."""
+    with _store() as store:
+        _queue_require(store, item_id)
+        try:
+            items = store.queue_move(item_id, to)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        summary = store.queue_counts()
+    if json_out:
+        _emit_json([i.model_dump() for i in items])
+    else:
+        _render_queue(items, summary)
+
+
+@queue_app.command("clear")
+def queue_clear(
+    everything: bool = typer.Option(False, "--all", "-a", help="Снести и ожидающие (не выполняемые)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Удалить закрытые пункты (done / failed / cancelled); с --all — и ожидающие."""
+    statuses: tuple[str, ...] = ("done", "failed", "cancelled")
+    if everything:
+        statuses += ("queued",)
+    if everything and not yes and not typer.confirm("Снести и ожидающие пункты?", default=False):
+        raise typer.Exit(code=1)
+    with _store() as store:
+        n = store.queue_clear(statuses=statuses)
+    console.print(f"[green]Удалено пунктов: {n}[/green]")
+
+
+@queue_app.command("slots")
+def queue_slots(
+    slots: Optional[int] = typer.Option(None, "--set", help="Новый лимит параллельных слотов (≥ 1)."),
+) -> None:
+    """Лимит параллельных слотов воркспейса: показать или задать (по умолчанию 3)."""
+    with _store() as store:
+        if slots is not None:
+            try:
+                store.set_queue_slots(slots)
+            except ValueError as exc:
+                err.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1)
+        summary = store.queue_counts()
+    console.print(f"Слотов: [cyan]{summary['slots']}[/cyan] · занято {summary['slots_busy']}")
+
+
+# --------------------------------------------------------------------------- #
+# Строка статуса Claude Code
+# --------------------------------------------------------------------------- #
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1168,3 +1168,49 @@ class LocalFeature(BaseModel):
     description: str = ""
     created_at: str = ""
     updated_at: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Очередь задач сессии
+# --------------------------------------------------------------------------- #
+
+# Режим выполнения пункта: main — подряд в основном потоке сессии после текущего
+# атомарного шага; parallel — субагентом, как только освободится слот.
+QUEUE_MODES = ["main", "parallel"]
+QUEUE_STATUSES = ["queued", "running", "done", "failed", "cancelled"]
+QUEUE_DEFAULT_SLOTS = 3
+QUEUE_SLOTS_SETTING = "queue.slots"
+
+# статус -> (подпись, цвет rich)
+QUEUE_BADGES: dict[str, tuple[str, str]] = {
+    "queued":    ("в очереди", "white"),
+    "running":   ("выполняется", "yellow"),
+    "done":      ("готово", "green"),
+    "failed":    ("не вышло", "red"),
+    "cancelled": ("отменено", "dim"),
+}
+
+
+class QueueItem(BaseModel):
+    """Пункт очереди задач воркспейса — мелкое замечание, пришедшее в чат во время работы.
+
+    Очередь нужна, чтобы новая просьба не выбивала сессию из текущего шага: её кладут в
+    конец и возвращаются к делу. ``mode`` говорит, кто пункт выполнит: ``main`` — сам
+    основной поток, подряд, по одному; ``parallel`` — субагент, когда есть свободный
+    слот (лимит — настройка воркспейса ``queue.slots``). ``position`` задаёт порядок
+    внутри очереди, ``worker`` — метка того, кто взял пункт, ``result`` — итог одной
+    строкой. ``job_id`` связывает пункт с работой, чтобы итог лёг в её журнал.
+    """
+
+    id: int = 0
+    workspace_id: int = 0
+    text: str = ""
+    mode: str = "main"
+    status: str = "queued"
+    position: int = 0
+    worker: str = ""
+    result: str = ""
+    job_id: int | None = None
+    created_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""

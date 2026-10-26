@@ -19,6 +19,7 @@ from pathlib import Path
 # Ожидаемые скиллы (для проверок/тестов; фактически ставится всё, что лежит в пакете).
 EXPECTED_SKILLS = {
     "jwu-start-job",
+    "jwu-queue",
     "jwu-resume-job",
     "jwu-track-job",
     "jwu-job-review",

@@ -20,9 +20,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import (
-    NOTE_KINDS,
+    NOTE_KINDS, QUEUE_DEFAULT_SLOTS, QUEUE_MODES, QUEUE_SLOTS_SETTING, QUEUE_STATUSES,
     WORKSPACE_PROVIDERS, WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS, Delta, Issue, Job,
-    JobPRLink, JobRecord, LocalFeature, Mention, Note, PR, Workspace, WorkspacePath,
+    JobPRLink, JobRecord, LocalFeature, Mention, Note, PR, QueueItem, Workspace, WorkspacePath,
     WorkspaceRule,
 )
 
@@ -217,10 +217,43 @@ CREATE TABLE IF NOT EXISTS pending_changes (
     ts           TEXT NOT NULL,
     workspace_id INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS queue_items (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    text         TEXT NOT NULL,
+    mode         TEXT NOT NULL DEFAULT 'main',
+    status       TEXT NOT NULL DEFAULT 'queued',
+    position     INTEGER NOT NULL DEFAULT 0,
+    worker       TEXT NOT NULL DEFAULT '',
+    result       TEXT NOT NULL DEFAULT '',
+    job_id       INTEGER,
+    created_at   TEXT NOT NULL,
+    started_at   TEXT NOT NULL DEFAULT '',
+    finished_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_queue_items_ws ON queue_items(workspace_id, status, position);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+
+QUEUE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS queue_items (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    text         TEXT NOT NULL,
+    mode         TEXT NOT NULL DEFAULT 'main',
+    status       TEXT NOT NULL DEFAULT 'queued',
+    position     INTEGER NOT NULL DEFAULT 0,
+    worker       TEXT NOT NULL DEFAULT '',
+    result       TEXT NOT NULL DEFAULT '',
+    job_id       INTEGER,
+    created_at   TEXT NOT NULL,
+    started_at   TEXT NOT NULL DEFAULT '',
+    finished_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_queue_items_ws ON queue_items(workspace_id, status, position);
 """
 
 # Индексы по workspace_id живут ОТДЕЛЬНО от SCHEMA: на старой БД колонки ещё нет в момент
@@ -233,6 +266,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_ws       ON jobs(workspace_id, task_key);
 CREATE INDEX IF NOT EXISTS idx_notes_ws      ON notes(workspace_id, key);
 CREATE INDEX IF NOT EXISTS idx_pending_ws    ON pending_changes(workspace_id);
 """
+
+
+class QueueBusy(RuntimeError):
+    """Пункт очереди не выдан: занят основной поток или все параллельные слоты."""
 
 
 def _now() -> str:
@@ -326,7 +363,7 @@ def _readiness_detail(sig: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -493,6 +530,16 @@ def _m010_mention_archive(conn: sqlite3.Connection) -> None:
     _add_column(conn, "mentions", "archived", "INTEGER NOT NULL DEFAULT 0")
 
 
+def _m011_queue(conn: sqlite3.Connection) -> None:
+    """v10 → v11: очередь задач сессии (``queue_items``).
+
+    Таблица уже описана в SCHEMA и создаётся при открытии; шаг нужен, чтобы версия
+    схемы честно отражала её появление (старый jwu на новой БД предупредит, а не молча
+    промолчит о неизвестной таблице).
+    """
+    conn.executescript(QUEUE_SCHEMA)
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
@@ -503,6 +550,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (8, _m008_job_git_state),
     (9, _m009_note_kinds),
     (10, _m010_mention_archive),
+    (11, _m011_queue),
 ]
 
 
@@ -2286,3 +2334,242 @@ class Store:
 
     def jobs_for_pr(self, pr_id: int, project: str = "", repo: str = "") -> list[Job]:
         return self.list_jobs(pr_id=pr_id, project=project or None, repo=repo or None)
+
+    # --- очередь задач сессии ---------------------------------------------- #
+
+    def queue_slots(self) -> int:
+        """Лимит параллельных слотов очереди: настройка воркспейса, иначе дефолт."""
+        raw = (self.workspace_settings(self.workspace_id).get(QUEUE_SLOTS_SETTING) or "").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            return QUEUE_DEFAULT_SLOTS
+        return value if value > 0 else QUEUE_DEFAULT_SLOTS
+
+    def set_queue_slots(self, slots: int) -> None:
+        if slots < 1:
+            raise ValueError("Слотов должно быть не меньше одного")
+        self.set_workspace_settings(self.workspace_id, {QUEUE_SLOTS_SETTING: str(slots)})
+
+    @staticmethod
+    def _queue_from_row(row) -> QueueItem:
+        return QueueItem(
+            id=row["id"], workspace_id=row["workspace_id"], text=row["text"], mode=row["mode"],
+            status=row["status"], position=row["position"], worker=row["worker"],
+            result=row["result"], job_id=row["job_id"], created_at=row["created_at"],
+            started_at=row["started_at"], finished_at=row["finished_at"],
+        )
+
+    @staticmethod
+    def _check_queue_mode(mode: str) -> str:
+        if mode not in QUEUE_MODES:
+            raise ValueError(f"Недопустимый режим {mode!r}. Допустимо: {', '.join(QUEUE_MODES)}")
+        return mode
+
+    def queue_add(self, text: str, *, mode: str = "main", job_id: int | None = None) -> QueueItem:
+        """Положить пункт в КОНЕЦ очереди. Порядок — только через queue_move."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Пустой пункт очереди")
+        self._check_queue_mode(mode)
+        if job_id is not None:
+            self._require_own_job(job_id)
+        ts = _now()
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM queue_items WHERE workspace_id = ?",
+            (self.workspace_id,),
+        ).fetchone()
+        position = int(row[0]) + 1
+        cur = self.conn.execute(
+            "INSERT INTO queue_items (workspace_id, text, mode, status, position, job_id,"
+            " created_at) VALUES (?, ?, ?, 'queued', ?, ?, ?)",
+            (self.workspace_id, text, mode, position, job_id, ts),
+        )
+        self.conn.commit()
+        return self.queue_get(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def queue_get(self, item_id: int) -> QueueItem | None:
+        row = self.conn.execute(
+            "SELECT * FROM queue_items WHERE id = ? AND workspace_id = ?",
+            (item_id, self.workspace_id),
+        ).fetchone()
+        return self._queue_from_row(row) if row else None
+
+    def queue_list(self, *, status: str | None = None, mode: str | None = None,
+                   open_only: bool = False) -> list[QueueItem]:
+        """Пункты очереди по порядку. ``open_only`` — только queued и running."""
+        sql = "SELECT * FROM queue_items WHERE workspace_id = ?"
+        params: list = [self.workspace_id]
+        if status:
+            if status not in QUEUE_STATUSES:
+                raise ValueError(f"Недопустимый статус {status!r}. "
+                                 f"Допустимо: {', '.join(QUEUE_STATUSES)}")
+            sql += " AND status = ?"; params.append(status)
+        elif open_only:
+            sql += " AND status IN ('queued', 'running')"
+        if mode:
+            sql += " AND mode = ?"; params.append(self._check_queue_mode(mode))
+        sql += " ORDER BY position, id"
+        return [self._queue_from_row(r) for r in self.conn.execute(sql, params)]
+
+    def queue_counts(self) -> dict:
+        """Сводка: сколько в каком статусе, занято ли слотов, кто сейчас в основном потоке."""
+        counts = {s: 0 for s in QUEUE_STATUSES}
+        for row in self.conn.execute(
+            "SELECT status, COUNT(*) AS n FROM queue_items WHERE workspace_id = ? GROUP BY status",
+            (self.workspace_id,),
+        ):
+            counts[row["status"]] = int(row["n"])
+        running = self.queue_list(status="running")
+        parallel_busy = sum(1 for it in running if it.mode == "parallel")
+        main_running = next((it.id for it in running if it.mode == "main"), None)
+        slots = self.queue_slots()
+        return {
+            "counts": counts,
+            "slots": slots,
+            "slots_busy": parallel_busy,
+            "slots_free": max(slots - parallel_busy, 0),
+            "main_running": main_running,
+        }
+
+    def queue_take(self, *, mode: str | None = None, worker: str = "") -> QueueItem | None:
+        """Взять следующий пункт в работу (queued → running) — атомарно между процессами.
+
+        ``mode="main"`` — следующий пункт основного потока; в нём может выполняться
+        только один пункт, второй не выдаётся, пока первый не закрыт (done/fail/release).
+        ``mode="parallel"`` — следующий пункт для субагента, если есть свободный слот.
+        Без режима — первый по порядку, с теми же ограничениями по его режиму.
+        Возвращает None, когда подходящих пунктов нет; при занятом слоте — QueueBusy.
+        """
+        if mode is not None:
+            self._check_queue_mode(mode)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            sql = "SELECT * FROM queue_items WHERE workspace_id = ? AND status = 'queued'"
+            params: list = [self.workspace_id]
+            if mode:
+                sql += " AND mode = ?"; params.append(mode)
+            sql += " ORDER BY position, id LIMIT 1"
+            row = self.conn.execute(sql, params).fetchone()
+            if row is None:
+                self.conn.rollback()
+                return None
+            item = self._queue_from_row(row)
+            running = [self._queue_from_row(r) for r in self.conn.execute(
+                "SELECT * FROM queue_items WHERE workspace_id = ? AND status = 'running'",
+                (self.workspace_id,),
+            )]
+            if item.mode == "main":
+                busy = next((it for it in running if it.mode == "main"), None)
+                if busy is not None:
+                    raise QueueBusy(
+                        f"В основном потоке уже выполняется #{busy.id}; закрой его "
+                        f"(done / fail / release), прежде чем брать следующий."
+                    )
+            else:
+                slots = self.queue_slots()
+                busy_n = sum(1 for it in running if it.mode == "parallel")
+                if busy_n >= slots:
+                    raise QueueBusy(f"Свободных слотов нет: занято {busy_n} из {slots}.")
+            ts = _now()
+            self.conn.execute(
+                "UPDATE queue_items SET status = 'running', worker = ?, started_at = ?"
+                " WHERE id = ?",
+                (worker or item.mode, ts, item.id),
+            )
+            self.conn.commit()
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        return self.queue_get(item.id)
+
+    def _queue_require(self, item_id: int) -> QueueItem:
+        item = self.queue_get(item_id)
+        if item is None:
+            raise ValueError(f"Пункт очереди #{item_id} не найден в этом воркспейсе")
+        return item
+
+    def queue_finish(self, item_id: int, status: str = "done", *, result: str = "") -> QueueItem:
+        """Закрыть пункт: done | failed | cancelled. Итог — одной строкой в ``result``."""
+        if status not in ("done", "failed", "cancelled"):
+            raise ValueError("Закрыть пункт можно статусом done, failed или cancelled")
+        item = self._queue_require(item_id)
+        if item.status in ("done", "failed", "cancelled"):
+            raise ValueError(f"Пункт #{item_id} уже закрыт ({item.status})")
+        self.conn.execute(
+            "UPDATE queue_items SET status = ?, result = ?, finished_at = ? WHERE id = ?",
+            (status, (result or "").strip(), _now(), item_id),
+        )
+        self.conn.commit()
+        return self.queue_get(item_id)  # type: ignore[return-value]
+
+    def queue_release(self, item_id: int) -> QueueItem:
+        """Вернуть пункт из running обратно в очередь (агент умер или передумали)."""
+        item = self._queue_require(item_id)
+        if item.status != "running":
+            raise ValueError(f"Пункт #{item_id} не выполняется (статус {item.status})")
+        self.conn.execute(
+            "UPDATE queue_items SET status = 'queued', worker = '', started_at = '' WHERE id = ?",
+            (item_id,),
+        )
+        self.conn.commit()
+        return self.queue_get(item_id)  # type: ignore[return-value]
+
+    def queue_update(self, item_id: int, *, text: str | None = None,
+                     mode: str | None = None, job_id: int | None = None) -> QueueItem:
+        """Править текст/режим/работу пункта. Режим меняется только у ещё не взятых."""
+        item = self._queue_require(item_id)
+        sets, params = [], []
+        if text is not None:
+            text = text.strip()
+            if not text:
+                raise ValueError("Пустой пункт очереди")
+            sets.append("text = ?"); params.append(text)
+        if mode is not None:
+            self._check_queue_mode(mode)
+            if item.status != "queued" and mode != item.mode:
+                raise ValueError(f"Режим пункта #{item_id} уже нельзя менять (статус {item.status})")
+            sets.append("mode = ?"); params.append(mode)
+        if job_id is not None:
+            self._require_own_job(job_id)
+            sets.append("job_id = ?"); params.append(job_id)
+        if sets:
+            params.append(item_id)
+            self.conn.execute(f"UPDATE queue_items SET {', '.join(sets)} WHERE id = ?", params)
+            self.conn.commit()
+        return self.queue_get(item_id)  # type: ignore[return-value]
+
+    def queue_move(self, item_id: int, to_position: int) -> list[QueueItem]:
+        """Переставить пункт на N-е место среди ОЖИДАЮЩИХ (1 — первым). Возвращает очередь."""
+        item = self._queue_require(item_id)
+        if item.status != "queued":
+            raise ValueError(f"Переставлять можно только ожидающие пункты (#{item_id}: {item.status})")
+        waiting = self.queue_list(status="queued")
+        ids = [it.id for it in waiting if it.id != item_id]
+        index = min(max(to_position, 1), len(ids) + 1) - 1
+        ids.insert(index, item_id)
+        # Позиции ожидающих переписываются «после» всех закрытых: закрытые пункты
+        # порядок не меняют, а новые всё так же встают в конец.
+        base = int(self.conn.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM queue_items"
+            " WHERE workspace_id = ? AND status != 'queued'",
+            (self.workspace_id,),
+        ).fetchone()[0])
+        for offset, qid in enumerate(ids, start=1):
+            self.conn.execute("UPDATE queue_items SET position = ? WHERE id = ?", (base + offset, qid))
+        self.conn.commit()
+        return self.queue_list(status="queued")
+
+    def queue_clear(self, *, statuses: tuple[str, ...] = ("done", "failed", "cancelled")) -> int:
+        """Удалить закрытые пункты (по умолчанию) — очередь не должна копить историю."""
+        bad = [s for s in statuses if s not in QUEUE_STATUSES]
+        if bad:
+            raise ValueError(f"Неизвестные статусы: {', '.join(bad)}")
+        marks = ", ".join("?" for _ in statuses)
+        cur = self.conn.execute(
+            f"DELETE FROM queue_items WHERE workspace_id = ? AND status IN ({marks})",
+            (self.workspace_id, *statuses),
+        )
+        self.conn.commit()
+        return int(cur.rowcount)
