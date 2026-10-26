@@ -30,8 +30,6 @@ EXPECTED_SKILLS = {
     "jwu-task-status",
     "jwu-task-attach",
     "jwu-task-branches",
-    "jwu-analyze-day",
-    "jwu-post-analyze-day",
     "jwu-track-time",
     "jwu-4test-message",
     "jwu-build-failure",
@@ -67,6 +65,8 @@ RETIRED_SKILLS = {
     "build-failure",     # → jwu-build-failure
     "duty-support",      # → jwu-duty
     "jwu-duty-support",  # → jwu-duty (короче и по делу)
+    "jwu-analyze-day",       # → доска /jwu-todo (двигать дальше, буксует, ответить, закрыть работу)
+    "jwu-post-analyze-day",  # → jwu-track-time (план без записи — «покажи, что затрекал бы»)
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

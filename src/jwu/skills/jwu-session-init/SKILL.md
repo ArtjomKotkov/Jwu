@@ -57,7 +57,7 @@ description: Use at the START of a session, again after /clear or context compac
 5. **Откуда задачи** — по `provider`:
    - `local` — задач Jira/GitHub нет, якорь работы — локальная фича:
      `jwu_features(status="open")` и `in_progress`. Инструменты задач/PR **не вызывай**.
-   - `jira` / `github` — задачи и PR внешние; сводку дня даёт **jwu-analyze-day**
+   - `jira` / `github` — задачи и PR внешние; что делать — доска **jwu-todo**
      (сам не запускай — сетевой и длинный, предложи).
 
 6. **Стенды.** `jwu_ssh_servers()` — есть SSH-стенды контура? Если да, проверь, что в

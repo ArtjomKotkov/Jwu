@@ -28,9 +28,12 @@ if TYPE_CHECKING:
     from .models import PR, Issue, Job
     from .store import Store
 
-GROUPS = ("duty", "simple", "fixes", "todo", "review")
+GROUPS = ("duty", "simple", "fixes", "reply", "move", "todo", "review", "close")
 GROUP_TITLES = {
     "duty": "🛟 Дежурство",
+    "reply": "📣 Ответить",
+    "move": "➡️ Двигать дальше",
+    "close": "🧹 Закрыть работу",
     "simple": "🔧 Конфликты и сборки",
     "fixes": "✍️ Правки по ревью и QA",
     "todo": "📋 Несделанные задачи",
@@ -223,6 +226,9 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
         items.append(Item(n=0, group="duty", key=q["id"], title=q["summary"],
                           problems=[source] if source else [], taken=taken))
 
+    listed = {i.key for i in items}
+    _extra_groups(store, workspace_id, login, items, listed, issues, qa_st)
+
     # Группы — в фиксированном порядке; внутри: свободное выше взятого, в работе выше не начатого,
     # дальше от важного приоритета к неважному.
     items.sort(key=lambda i: (GROUPS.index(i.group), i.taken is not None,
@@ -246,6 +252,64 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
     return Board(items=items, synced_at=last, synced_ago=fmt_ago(last) if last else "ещё не было",
                  stale=stale, session=session, syncing_since=running or "",
                  sessions=sessions(store))
+
+
+DONE_STATUSES = ("done", "closed", "resolved", "закрыта", "решена")
+
+
+def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, listed: set,
+                  issues: dict, qa_st: set) -> None:
+    """То, что раньше давал дневной анализ: двигать дальше, ответить, закрыть работу."""
+    from .duty import QUESTION_PREFIX
+    from .store import is_testing_status
+
+    by_key, by_pr = _taken_index(store)
+    mine_prs = [pr for pr in store.latest_prs("mine") if not pr.state or pr.state.upper() == "OPEN"]
+
+    # ➡️ апрувы собраны, блокеров нет — задачу перевести дальше / мержить
+    for pr in mine_prs:
+        ref = _pr_ref(pr)
+        if ref in listed or not pr.reviewers or not all(r.approved for r in pr.reviewers):
+            continue
+        if pr.conflicted or pr.build_state == "FAILED" or pr.tasks_open:
+            continue
+        key = _issue_key(pr)
+        issue = issues.get(key)
+        status = issue.status if issue else ""
+        nxt = ("задача уже на тестах — мержить по готовности" if is_testing_status(status)
+               else "апрувы собраны — перевести задачу в тестирование")
+        items.append(Item(n=0, group="move", key=ref, title=pr.title, status=status,
+                          priority=issue.priority if issue else "", issue_key=key,
+                          problems=[f"апрувы {len(pr.reviewers)}/{len(pr.reviewers)}", nxt],
+                          pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title},
+                          taken=_taken(by_pr.get((pr.project, pr.repository, pr.id)) or by_key.get(key))))
+        listed.add(ref)
+
+    # 📣 непрочитанные упоминания — от меня чего-то ждут
+    seen_keys: dict[str, list] = {}
+    for m in store.unseen_mentions():
+        seen_keys.setdefault(m.task_key, []).append(m)
+    for task_key, ms in seen_keys.items():
+        last = ms[-1]
+        text = " ".join((last.text or "").split())
+        items.append(Item(n=0, group="reply", key=f"{task_key} ↩", title=last.summary or task_key,
+                          issue_key=task_key,
+                          problems=[f"{last.author}: {text[:70]}" + (f" (+{len(ms) - 1})" if len(ms) > 1 else "")],
+                          taken=_taken(by_key.get(task_key))))
+
+    # 🧹 работа открыта, а задача закрыта или ушла от меня
+    for job in store.list_jobs(status="active"):
+        if not job.task_key or job.title.startswith(QUESTION_PREFIX):
+            continue
+        issue = issues.get(job.task_key)
+        if issue is None:
+            reason = "задача ушла из моих (переназначена или закрыта)"
+        elif (issue.status or "").casefold() in DONE_STATUSES or issue.resolution:
+            reason = f"задача в статусе {issue.status}"
+        else:
+            continue
+        items.append(Item(n=0, group="close", key=f"#{job.id}", title=job.title, issue_key=job.task_key,
+                          problems=[reason]))
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +456,10 @@ def _goal(item: Item) -> str:
             else f"Правки по возврату QA{pr}"
     if item.group == "review":
         return f"Ревью{pr}"
+    if item.group == "move":
+        return f"Довести{pr}: апрувы собраны"
+    if item.group == "reply":
+        return "Ответить на упоминание"
     return "Сделать задачу"
 
 
@@ -438,6 +506,9 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
             item = items.get(key)
             if item is None:
                 skipped.append({"key": key, "reason": "больше не требует действия (синк обновился)"})
+                continue
+            if item.group == "close":
+                skipped.append({"key": key, "n": item.n, "reason": f"это закрытие работы {key}: «закрой работу {key}» (jwu-close-job)"})
                 continue
             job = (by_pr.get((item.pr["project"], item.pr["repo"], item.pr["id"])) if item.pr else None) \
                 or (by_key.get(item.issue_key) if item.issue_key else None)
@@ -533,6 +604,9 @@ def _prio_cell(item: Item) -> str:
 # Колонки по группе: у «несделанных» проблем нет — там важны статус и приоритет.
 _COLUMNS = {
     "duty":   ("№", "Вопрос", "Откуда", "Взято"),
+    "reply":  ("№", "Задача", "Заголовок", "Кто и что", "Взято"),
+    "move":   ("№", "PR", "Задача", "Заголовок", "Статус", "Что дальше", "Взято"),
+    "close":  ("№", "Работа", "Задача", "Почему"),
     "simple": ("№", "PR", "Задача", "Заголовок", "Приоритет", "Что не так", "Взято"),
     "fixes":  ("№", "PR", "Задача", "Заголовок", "Приоритет", "Статус", "Что не так", "Взято"),
     "todo":   ("№", "Задача", "Заголовок", "Приоритет", "Статус", "Взято"),
@@ -549,6 +623,14 @@ def _title(i: Item) -> str:
 
 
 def _row(group: str, i: Item) -> list[str]:
+    key_md = f"**{_cell(i.issue_key)}**" if i.issue_key else "—"
+    pr_md = f"{i.pr['repo']}#{i.pr['id']}" if i.pr else "—"
+    if group == "reply":
+        return [str(i.n), key_md, _cell(i.title, 50), _cell(", ".join(i.problems), 80), _taken_cell(i)]
+    if group == "move":
+        return [str(i.n), pr_md, key_md, _title(i), _cell(i.status), _cell(i.problems[-1]), _taken_cell(i)]
+    if group == "close":
+        return [str(i.n), f"**{i.key}**", key_md, _cell(", ".join(i.problems))]
     if group == "duty":
         return [str(i.n), f"**{i.key}** {_cell(i.title, 70)}", _cell(", ".join(i.problems), 50), _taken_cell(i)]
     pr = f"{i.pr['repo']}#{i.pr['id']}" if i.pr else "—"

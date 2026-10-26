@@ -1,6 +1,6 @@
 ---
 name: jwu-track-time
-description: Use when the user wants to actually LOG/track spent time into Jira's time tracker (worklog) across today's jwu jobs — phrases like «затрекай время в жиру», «разнеси часы по задачам», «залогируй время», «занеси ворклог», «разнести время», «/jwu-track-time». Builds the list from the jobs' closing summaries (запись summary; a job active today without one is probably not closed — remind to close it via jwu-close-job when it looks done), PLUS code reviews the user did (PR'ы, которые он апрувнул/поставил needs work — описание «Ревью»), plus any extra tasks the user dictates («добавь KEY созвон 30m» ADDS a line to the found list, never replaces it); asks how much time per task, and logs NOTHING until the user explicitly confirms. For just a text summary without logging, use jwu-post-analyze-day instead.
+description: Use when the user wants to actually LOG/track spent time into Jira's time tracker (worklog) across today's jwu jobs — phrases like «затрекай время в жиру», «разнеси часы по задачам», «залогируй время», «занеси ворклог», «разнести время», «/jwu-track-time». Builds the list from the jobs' closing summaries (запись summary; a job active today without one is probably not closed — remind to close it via jwu-close-job when it looks done), PLUS code reviews the user did (PR'ы, которые он апрувнул/поставил needs work — описание «Ревью»), plus any extra tasks the user dictates («добавь KEY созвон 30m» ADDS a line to the found list, never replaces it); asks how much time per task, and logs NOTHING until the user explicitly confirms. To just see the day's summary without logging («итоги дня», «покажи, что затрекал бы»), run this skill and stop at the plan.
 ---
 
 # jwu: трекинг времени в Jira (worklog)
@@ -12,7 +12,7 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 ## Overview
 
 Залогировать в таймтрекер Jira (worklog) время по задачам за день. Список задач берётся
-из итогов дня (как в `jwu-post-analyze-day`), **плюс ревью** чужих PR, которые пользователь
+из итогов работ за день, **плюс ревью** чужих PR, которые пользователь
 посмотрел (апрувнул / поставил needs work — описание «Ревью»), **плюс** любые дополнительные
 задачи, которые пользователь продиктует с описанием. По каждой задаче спрашиваем потраченное
 время, показываем **сводный план** и **ничего не трекаем до явного подтверждения**.
@@ -92,7 +92,7 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
      сборка зелёная), но работу не закрыли и итог не написали. Закрыть сейчас?» и после «да»
      — **jwu-close-job**. Признаков нет — работа идёт несколько дней, это нормально: опиши
      сделанное за день сухо по записям дня и не напоминай.
-   - Описание без рутины (правила `jwu-post-analyze-day`): не пиши про прогон ревьювера,
+   - Описание без рутины : не пиши про прогон ревьювера,
      коммиты, пуши, переключение веток; тесты — только если это была отдельная работа;
      конфликты и мердж — писать стоит.
 
@@ -198,7 +198,7 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
   запуском обязательно. До «да» — только чтение и показ плана.
 - Формат времени — Jira-нотация в одну строку: `"1d 4h 30m"`. Часы/минуты, а не доли.
 - Это про **залогировать** время. Просто текстовая выжимка дня без записи — это
-  `jwu-post-analyze-day`. Что делать дальше / на ревью — `jwu-analyze-day`.
+  этот же скилл без записи (остановиться на плане). Что делать дальше — доска `jwu-todo`.
 - Одиночный ворклог (`jwu_worklog` / `jwu worklog KEY "1h" --started …`) — только если
   пользователь просит одну запись вне цепочки; `started` тогда тоже со смещением пояса.
 - Поправить или удалить уже записанный ворклог — `jwu_worklog_edit` / `jwu_worklog_delete`

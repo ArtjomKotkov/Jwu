@@ -201,3 +201,23 @@ def test_duty_question_no_job_until_taken(store):
     q2 = duty.question_add(store, summary="вопрос попроще", event_id="$e2")
     duty.question_close(store, q2["id"])
     assert [x["id"] for x in duty.questions(store)] == ["Д1"] and len(store.list_jobs()) == 1
+
+
+def test_board_move_reply_close_groups(store):
+    from jwu.core.models import Mention
+
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-8", summary="Апрувнуто", status="In Review", priority="Major"), ["mine"])
+    store.save_pr_snapshot(run, PR(id=8, title="AB-8: готово", project="P", repository="r", state="OPEN",
+                                   reviewers=[Reviewer(name="x", approved=True, status="APPROVED")]), ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 1, "prs:mine": 1})
+    store.add_mentions([Mention(task_key="AB-9", comment_id="1", author="Петя", text="[~me] глянь?",
+                                created="2026-10-26T10:00:00+03:00", summary="Чужая задача")])
+    gone = store.create_job("AB-77", "старая работа")            # задачи нет среди моих
+    board = todo.build(store, store.workspace_id, "me", session="S")
+    groups = {i.group: i for i in board.items}
+    assert groups["move"].key == "P/r#8" and "перевести задачу в тестирование" in groups["move"].problems[-1]
+    assert groups["reply"].issue_key == "AB-9" and "Петя" in groups["reply"].problems[0]
+    assert groups["close"].key == f"#{gone.id}"
+    res = todo.take(store, store.workspace_id, "me", numbers=[groups["close"].n], session="S")
+    assert res["taken"] == [] and "jwu-close-job" in res["skipped"][0]["reason"]
