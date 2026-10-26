@@ -21,6 +21,7 @@ mxid, личные комнаты, кеш имён людей и комнат. �
 from __future__ import annotations
 
 import html
+from datetime import datetime, timezone
 import json
 import re
 from dataclasses import dataclass
@@ -574,33 +575,111 @@ def poll(store: "Store", client_factory, sender) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Вопросы дежурства — локальные работы
+# Вопросы дежурства: сначала вопрос, работа — только когда взяли
 # --------------------------------------------------------------------------- #
 
 QUESTION_PREFIX = "🛟 Дежурство: "
-QUESTIONS_META = "duty:questions"   # {event_id: job_id} — один вопрос = одна работа
+QUESTIONS_META = "duty:questions_v2"   # {"seq": N, "items": [вопрос, …]}
+QUESTION_STATES = ("open", "taken", "closed")
 
 
-def question_job(store: "Store", *, summary: str, author: str = "", when: str = "", where: str = "",
+def _questions(store: "Store") -> dict:
+    data = _json_meta(store, QUESTIONS_META, {})
+    data.setdefault("seq", 0)
+    data.setdefault("items", [])
+    return data
+
+
+def _save_questions(store: "Store", data: dict) -> None:
+    # закрытые старше 200 последних не держим
+    items = data["items"]
+    closed = [q for q in items if q["status"] == "closed"]
+    if len(closed) > 200:
+        drop = {q["id"] for q in closed[:-200]}
+        data["items"] = [q for q in items if q["id"] not in drop]
+    store.set_workspace_meta(QUESTIONS_META, json.dumps(data, ensure_ascii=False))
+
+
+def question_add(store: "Store", *, summary: str, author: str = "", when: str = "", where: str = "",
                  event_id: str = "", link: str = "", details: str = "") -> dict:
-    """Вопрос с дежурства → локальная работа «🛟 Дежурство: …». Повтор того же сообщения
-    (event_id) — та же работа. Номер работы и есть номер вопроса («берём #922»)."""
-    known = _json_meta(store, QUESTIONS_META, {})
-    if event_id and event_id in known:
-        job = store.get_job(int(known[event_id]))
-        if job is not None:
-            return {"job_id": job.id, "created": False, "status": job.status}
-    job = store.create_job("", QUESTION_PREFIX + " ".join(summary.split())[:120])
-    source = " · ".join(p for p in (f"от {author}" if author else "", when, where) if p)
-    store.add_job_record(job.id, f"Вопрос дежурства — {source}" + (f"\nСсылка: {link}" if link else "")
-                         + (f"\nevent_id: {event_id}" if event_id else ""), kind="note")
-    if details.strip():
-        store.add_job_record(job.id, details.strip(), kind="note")
-    if event_id:
-        known[event_id] = job.id
-        store.set_workspace_meta(QUESTIONS_META, json.dumps(known))
-    return {"job_id": job.id, "created": True, "status": "active"}
+    """Вопрос с дежурства — запись «Д<N>», БЕЗ работы: работа заводится, только когда вопрос взяли.
+
+    То же сообщение (event_id) — тот же вопрос; его детали обновляются (новые реплики в треде).
+    """
+    data = _questions(store)
+    for q in data["items"]:
+        if event_id and q.get("event_id") == event_id:
+            q.update({k: v for k, v in (("summary", summary), ("details", details), ("when", when),
+                                        ("where", where), ("link", link)) if v})
+            _save_questions(store, data)
+            return {**q, "created": False}
+    data["seq"] += 1
+    q = {"id": f"Д{data['seq']}", "summary": " ".join(summary.split())[:160], "author": author,
+         "when": when, "where": where, "event_id": event_id, "link": link, "details": details.strip(),
+         "status": "open", "job_id": None,
+         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    data["items"].append(q)
+    _save_questions(store, data)
+    return {**q, "created": True}
+
+
+def _find(data: dict, qid: str) -> dict:
+    qid = qid.strip().lstrip("#").upper().replace("D", "Д")
+    if not qid.startswith("Д"):
+        qid = "Д" + qid
+    for q in data["items"]:
+        if q["id"] == qid:
+            return q
+    raise ValueError(f"Вопроса {qid} нет")
+
+
+def questions(store: "Store", *, include_closed: bool = False) -> list[dict]:
+    data = _questions(store)
+    out = []
+    for q in data["items"]:
+        if q["status"] == "taken" and q.get("job_id"):
+            job = store.get_job(int(q["job_id"]))
+            if job is None or job.status in ("done", "cancelled"):
+                q = {**q, "status": "closed"}
+        if include_closed or q["status"] != "closed":
+            out.append(q)
+    return out
+
+
+def question_take(store: "Store", qid: str, *, session: str = "") -> dict:
+    """Взять вопрос в работу: теперь заводится работа «🛟 Дежурство: …» с источником и деталями."""
+    from .todo import SESSION_MARK
+
+    data = _questions(store)
+    q = _find(data, qid)
+    if q["status"] == "closed":
+        raise ValueError(f"Вопрос {q['id']} закрыт")
+    if q["status"] == "taken" and q.get("job_id"):
+        job = store.get_job(int(q["job_id"]))
+        if job is not None and job.status == "active":
+            return {**q, "job_id": job.id, "created": False}
+    job = store.create_job("", QUESTION_PREFIX + q["summary"][:120])
+    source = " · ".join(p for p in (f"от {q['author']}" if q["author"] else "", q["when"], q["where"]) if p)
+    store.add_job_record(job.id, f"Вопрос дежурства {q['id']} — {source}"
+                         + (f"\nСсылка: {q['link']}" if q["link"] else "")
+                         + (f"\nevent_id: {q['event_id']}" if q["event_id"] else ""), kind="note")
+    if q["details"]:
+        store.add_job_record(job.id, q["details"], kind="note")
+    store.add_job_record(job.id, f"{SESSION_MARK} «{session or 'без имени'}»: вопрос дежурства {q['id']}", kind="note")
+    q.update(status="taken", job_id=job.id)
+    _save_questions(store, data)
+    return {**q, "created": True}
+
+
+def question_close(store: "Store", qid: str) -> dict:
+    """Закрыть вопрос, не беря в работу: без работы, без итога, в учёт времени не попадает."""
+    data = _questions(store)
+    q = _find(data, qid)
+    q["status"] = "closed"
+    _save_questions(store, data)
+    return q
 
 
 def open_questions(store: "Store") -> list:
+    """Активные работы по взятым вопросам (для совместимости с прежними вызовами)."""
     return [j for j in store.list_jobs(status="active") if j.title.startswith(QUESTION_PREFIX)]

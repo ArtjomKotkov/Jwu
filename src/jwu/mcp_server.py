@@ -2099,32 +2099,51 @@ async def jwu_guide_save(name: str, title: str, text: str, tag: str = "", scope:
 async def jwu_duty_question(summary: str, author: str = "", when: str = "", where: str = "",
                             event_id: str = "", link: str = "", details: str = "",
                             workspace: Optional[str] = None) -> dict:
-    """Завести вопрос с дежурства как локальную работу «🛟 Дежурство: <summary>» — её номер и
-    есть номер вопроса («берём #922»). То же сообщение (event_id) — та же работа, без дубля.
-
-    summary — суть одной строкой (клиент + симптом); author/when/where — кто, когда, где
-    (комната/тред); details — что спрашивает, что у него есть, срочность (markdown).
-    Это локальная память jwu, наружу ничего не пишется.
+    """Записать вопрос с дежурства — номер «Д<N>». РАБОТА НЕ ЗАВОДИТСЯ: она появится, только когда
+    вопрос возьмут (jwu_duty_question_take). То же сообщение (event_id) — тот же вопрос, детали
+    обновятся. summary — суть (клиент + симптом); author/when/where — кто, когда, где;
+    details — что спрашивает, что у него есть, что уже ответили, срочность. Наружу ничего не пишет.
     """
     from .core import duty
 
     store = _store_only(workspace)
-    return _stamp(duty.question_job(store, summary=summary, author=author, when=when, where=where,
+    return _stamp(duty.question_add(store, summary=summary, author=author, when=when, where=where,
                                     event_id=event_id, link=link, details=details), _resolve(workspace))
 
 
 @mcp.tool()
-async def jwu_duty_questions(workspace: Optional[str] = None) -> dict:
-    """Открытые вопросы дежурства (активные работы «🛟 Дежурство: …»): номер, суть, кто взял."""
-    from .core import duty, todo
+async def jwu_duty_questions(include_closed: bool = False, workspace: Optional[str] = None) -> dict:
+    """Вопросы дежурства: открытые и взятые (с работой), по просьбе — и закрытые."""
+    from .core import duty
 
     store = _store_only(workspace)
-    out = []
-    for job in duty.open_questions(store):
-        info = todo._taken(job)
-        out.append({"job_id": job.id, "summary": job.title[len(duty.QUESTION_PREFIX):],
-                    "created_at": job.created_at, "taken_by": (info or {}).get("session", "")})
-    return _stamp({"questions": out}, _resolve(workspace))
+    return _stamp({"questions": duty.questions(store, include_closed=include_closed)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_duty_question_take(question: str, workspace: Optional[str] = None) -> dict:
+    """«Берём Д12» — взять вопрос в работу этой сессией: заводится работа «🛟 Дежурство: …» с
+    источником и деталями; дальше — jwu-continue-job по ней (разбор, ответ голосом, закрытие)."""
+    from .core import duty
+
+    store = _store_only(workspace)
+    try:
+        return _stamp(duty.question_take(store, question, session=_session_name(store)), _resolve(workspace))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+@mcp.tool()
+async def jwu_duty_question_close(question: str, workspace: Optional[str] = None) -> dict:
+    """«Закрой вопрос Д12», «не берём» — закрыть, не заводя работы: ни итога, ни строки в учёте
+    времени. Если вопрос уже взят и над ним работали — закрывай его работу через jwu-close-job."""
+    from .core import duty
+
+    store = _store_only(workspace)
+    try:
+        return _stamp(duty.question_close(store, question), _resolve(workspace))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 @mcp.tool()

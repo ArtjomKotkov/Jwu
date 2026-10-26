@@ -210,15 +210,18 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                           pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title},
                           taken=_taken(by_pr.get((pr.project, pr.repository, pr.id)))))
 
-    # Дежурство: вопросы уже заведены работами («🛟 Дежурство: …»); «взято» — за ней сессия
-    from .duty import QUESTION_PREFIX, open_questions
+    # Дежурство: вопросы «Д<N>»; работа у вопроса появляется, только когда его взяли
+    from .duty import questions as duty_questions
 
-    for job in open_questions(store):
-        info = _taken(job)
-        source = next((r.text.split("\n")[0] for r in job.records if r.text.startswith("Вопрос дежурства")), "")
-        items.append(Item(n=0, group="duty", key=f"#{job.id}", title=job.title[len(QUESTION_PREFIX):],
-                          problems=[source.replace("Вопрос дежурства — ", "")] if source else [],
-                          taken=info if info and info["session"] else None))
+    for q in duty_questions(store):
+        taken = None
+        if q.get("job_id"):
+            job = store.get_job(int(q["job_id"]))
+            info = _taken(job) if job else None
+            taken = info if info and info["session"] else None
+        source = " · ".join(x for x in (q.get("author", ""), q.get("when", ""), q.get("where", "")) if x)
+        items.append(Item(n=0, group="duty", key=q["id"], title=q["summary"],
+                          problems=[source] if source else [], taken=taken))
 
     # Группы — в фиксированном порядке; внутри: свободное выше взятого, в работе выше не начатого,
     # дальше от важного приоритета к неважному.
@@ -414,6 +417,18 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
     items = {i.key: i for i in board.items}
     taken: list[dict] = []
     skipped: list[dict] = [{"n": n, "reason": "нет такого номера в показанном списке"} for n in unknown]
+    # Вопросы дежурства берутся отдельно: работа у них заводится только сейчас
+    from .duty import question_take
+
+    for key in [k for k in dict.fromkeys(wanted_keys) if items.get(k) and items[k].group == "duty"]:
+        item = items[key]
+        if item.taken:
+            skipped.append({"key": key, "n": item.n, "reason": f"уже взято сессией «{item.taken['session']}», {item.taken['ago']}"})
+            continue
+        q = question_take(store, key, session=session)
+        taken.append({"n": item.n, "key": key, "group": "duty", "job_id": q["job_id"],
+                      "goal": item.title, "issue_key": "", "pr": None})
+    wanted_keys = [k for k in wanted_keys if not (items.get(k) and items[k].group == "duty")]
     conn = store.conn
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -423,18 +438,6 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
             item = items.get(key)
             if item is None:
                 skipped.append({"key": key, "reason": "больше не требует действия (синк обновился)"})
-                continue
-            if item.group == "duty":
-                jid = int(item.key.lstrip("#"))
-                info = _taken(store.get_job(jid))
-                if info and info["session"]:
-                    skipped.append({"key": key, "n": item.n, "reason": f"уже взято сессией «{info['session']}», {info['ago']}",
-                                    "job_id": jid})
-                    continue
-                conn.execute("INSERT INTO job_records (job_id, kind, text, ts) VALUES (?, 'note', ?, ?)",
-                             (jid, f"{SESSION_MARK} «{session or 'без имени'}»: вопрос дежурства", _iso()))
-                taken.append({"n": item.n, "key": key, "group": "duty", "job_id": jid,
-                              "goal": item.title, "issue_key": "", "pr": None})
                 continue
             job = (by_pr.get((item.pr["project"], item.pr["repo"], item.pr["id"])) if item.pr else None) \
                 or (by_key.get(item.issue_key) if item.issue_key else None)
