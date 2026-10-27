@@ -382,6 +382,12 @@ class BitbucketClient:
         self._fill_attachment_urls(project, repo, pull.attachments)
         return pull
 
+    def users(self, query: str, limit: int = 25) -> list[dict]:
+        """Люди Bitbucket по подстроке (логин, имя, почта) — для выбора ревьюверов PR."""
+        raw = self._get("/users", {"filter": query, "limit": limit}).get("values") or []
+        return [{"name": u.get("name") or u.get("slug"), "display_name": u.get("displayName") or ""}
+                for u in raw if u.get("active", True)]
+
     # --- задачи на комментах (Bitbucket Server tasks API) ------------------ #
 
     def pr_tasks(self, project: str, repo: str, pr_id: int) -> list[PRTask]:

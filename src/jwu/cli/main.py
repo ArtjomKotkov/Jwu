@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,8 @@ statusline_app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(statusline_app, name="statusline")
+zephyr_app = typer.Typer(help="Zephyr Scale: тест-кейсы в Jira — чтение; запись только с подтверждением.")
+app.add_typer(zephyr_app, name="zephyr")
 guide_app = typer.Typer(
     help="Инструкции: полные пошаговые тексты (запуск стенда и т.п.), на которые ссылаются правила.",
     invoke_without_command=True,
@@ -335,8 +338,9 @@ def auth_check(json_out: bool = typer.Option(False, "--json", help="Вывест
         console.print("[dim]Локальный контур: внешних доступов нет — проверять нечего.[/dim]")
         raise typer.Exit(code=0)
     ok = True
-    # Jenkins опционален — печатаем, если настроен, но на код выхода не влияет.
-    for name in ("jira", "sdesk", "bitbucket", "github", "jenkins"):
+    # Jenkins опционален — печатаем, если настроен, но на код выхода не влияет. Confluence и
+    # Zephyr — только если настроены в контуре, и тогда их сбой — сбой проверки.
+    for name in ("jira", "sdesk", "bitbucket", "github", "jenkins", "confluence", "zephyr"):
         r = result.get(name)
         if r is None:
             continue
@@ -428,7 +432,7 @@ def _auth_check_report() -> None:
             return  # локальному контуру проверять нечего
         with Service.for_workspace(ws) as svc:
             res = svc.auth_check()
-        for name in ("jira", "sdesk", "bitbucket", "github", "jenkins"):
+        for name in ("jira", "sdesk", "bitbucket", "github", "jenkins", "confluence", "zephyr"):
             r = res.get(name)
             if r is None:
                 continue
@@ -450,10 +454,11 @@ def configure_main(
     jira_project: Optional[str] = typer.Option(None, "--jira-project"),
     jira_token_opt: Optional[str] = typer.Option(None, "--jira-token"),
     jira_password: Optional[str] = typer.Option(None, "--jira-password",
-        help="Пароль для сессионного логина Jira."),
+        help="Пароль сессионного логина Jira: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной JIRA_PASSWORD."),
     gate_user: Optional[str] = typer.Option(None, "--gate-user",
         help="Логин nginx Basic-гейта перед Jira (если есть)."),
-    gate_password: Optional[str] = typer.Option(None, "--gate-password"),
+    gate_password: Optional[str] = typer.Option(None, "--gate-password",
+        help="Пароль nginx-гейта Jira: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной JIRA_GATE_PASSWORD."),
     sdesk_host: Optional[str] = typer.Option(None, "--sdesk-host",
         help="Хост второго Jira-инстанса SDESK (Enter/пусто — без SDESK)."),
     sdesk_project: Optional[str] = typer.Option(None, "--sdesk-project",
@@ -461,9 +466,9 @@ def configure_main(
     sdesk_user: Optional[str] = typer.Option(None, "--sdesk-user"),
     sdesk_token_opt: Optional[str] = typer.Option(None, "--sdesk-token"),
     sdesk_password: Optional[str] = typer.Option(None, "--sdesk-password",
-        help="Пароль для сессионного логина SDESK."),
+        help="Пароль сессионного логина SDESK: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной SDESK_PASSWORD."),
     sdesk_gate_password: Optional[str] = typer.Option(None, "--sdesk-gate-password",
-        help="Пароль nginx-гейта перед SDESK (логин-гейт берётся из --gate-user, если не задан отдельно)."),
+        help="Пароль nginx-гейта SDESK: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной SDESK_GATE_PASSWORD."),
     sdesk_gate_user: Optional[str] = typer.Option(None, "--sdesk-gate-user"),
     bitbucket_host: Optional[str] = typer.Option(None, "--bitbucket-host"),
     bitbucket_project: Optional[str] = typer.Option(None, "--bitbucket-project"),
@@ -518,6 +523,12 @@ def configure_main(
         ws0 = _resolve_workspace(probe)
         provider = ws0.provider
         cfg = workspaces.config_for_workspace(probe, ws0)
+    # Пароли — не значением аргумента: «-» (stdin), «?» (скрытый ввод) или переменная окружения.
+    jira_password = _password_opt("--jira-password", jira_password, "JIRA_PASSWORD", non_interactive)
+    gate_password = _password_opt("--gate-password", gate_password, "JIRA_GATE_PASSWORD", non_interactive)
+    sdesk_password = _password_opt("--sdesk-password", sdesk_password, "SDESK_PASSWORD", non_interactive)
+    sdesk_gate_password = _password_opt("--sdesk-gate-password", sdesk_gate_password,
+                                        "SDESK_GATE_PASSWORD", non_interactive)
     if not non_interactive and provider == "local":
         provider = _prompt_default(
             "Провайдер задач и PR (local / jira / github)", provider
@@ -729,20 +740,26 @@ def configure_import(
 
 @app.command("install")
 def install(
-    target: str = typer.Option("claude", "--for", click_type=click.Choice(["claude", "cursor", "both"]),
-                               help="Куда ставить: Claude Code, Cursor или оба."),
+    target: str = typer.Option("claude", "--for",
+                               click_type=click.Choice(["claude", "cursor", "codex", "both", "all"]),
+                               help="Куда ставить: Claude Code, Cursor, Codex; both — Claude Code и Cursor; "
+                                    "all — все три."),
     skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Не регистрировать MCP-сервер jwu."),
 ) -> None:
-    """Поставить jwu в агента: скиллы, субагенты и MCP-сервер (Claude Code и/или Cursor)."""
+    """Поставить jwu в агента: скиллы, субагенты и MCP-сервер (Claude Code, Cursor, Codex)."""
     from .. import skills_install as si
 
-    for tgt in (("claude", "cursor") if target == "both" else (target,)):
-        skills_dir = _skills_dest() if tgt == "claude" else si.cursor_skills_dest()
-        agents_dir = _agents_dest() if tgt == "claude" else si.cursor_agents_dest()
-        title = "Claude Code" if tgt == "claude" else "Cursor"
+    targets = {"both": ("claude", "cursor"), "all": ("claude", "cursor", "codex")}.get(target, (target,))
+    for tgt in targets:
+        skills_dir = {"claude": _skills_dest(), "cursor": si.cursor_skills_dest(),
+                      "codex": si.codex_skills_dest()}[tgt]
+        # В Codex субагенты — TOML-файлы (name, description, developer_instructions).
+        agents_dir = {"claude": _agents_dest(), "cursor": si.cursor_agents_dest(),
+                      "codex": si.codex_agents_dest()}[tgt]
+        title = {"claude": "Claude Code", "cursor": "Cursor", "codex": "Codex"}[tgt]
         try:
             skills = install_skills(skills_dir)
-            agents = install_agents(agents_dir, cursor=(tgt == "cursor"))
+            agents = install_agents(agents_dir, cursor=(tgt == "cursor"), codex=(tgt == "codex"))
         except Exception as exc:  # noqa: BLE001
             err.print(f"[red]{title}: не удалось поставить:[/red] {exc}")
             raise typer.Exit(code=1)
@@ -750,11 +767,13 @@ def install(
         if skip_mcp:
             continue
         try:
-            status = si.register_mcp_claude() if tgt == "claude" else si.register_mcp_cursor()
+            status = {"claude": si.register_mcp_claude, "cursor": si.register_mcp_cursor,
+                      "codex": si.register_mcp_codex}[tgt]()
         except ValueError as exc:
             err.print(f"[red]{title}: MCP не зарегистрирован:[/red] {exc}")
             raise typer.Exit(code=1)
-        where = "claude mcp (user)" if tgt == "claude" else str(si.cursor_mcp_path())
+        where = {"claude": "claude mcp (user)", "cursor": str(si.cursor_mcp_path()),
+                 "codex": str(si.codex_config_path())}[tgt]
         console.print(f"  MCP jwu: {status} [dim]({where})[/dim]")
     console.print("[dim]Перезапусти сессию агента, чтобы он увидел новые инструменты. "
                   "Дальше: jwu init в папке проекта.[/dim]")
@@ -1885,6 +1904,23 @@ def changes(
         _emit_json([d.model_dump() for d in deltas])
     else:
         _render_deltas(deltas)
+
+
+def _password_opt(flag: str, value: Optional[str], env: str, non_interactive: bool) -> Optional[str]:
+    """Пароль из флага configure: «-» — stdin, «?» — скрытый ввод; значение в аргументе — отказ.
+
+    Без флага: в неинтерактивном режиме берётся переменная окружения (если задана), в
+    интерактивном — визард спросит сам, как раньше.
+    """
+    if value is None:
+        return (os.environ.get(env) or None) if non_interactive else None
+    if value == "-":
+        return sys.stdin.readline().rstrip("\n") or None
+    if value == "?":
+        return typer.prompt(f"{flag.lstrip('-')}", hide_input=True, default="", show_default=False) or None
+    err.print(f"[red]{flag}: пароль значением аргумента не принимаю[/red] — он виден в ps и истории "
+              f"шелла. Передай «{flag} -» (из stdin), «{flag} ?» (спрошу скрыто) или переменную {env}.")
+    raise typer.Exit(code=2)
 
 
 def _prompt_telegram(cfg, chat_opt: Optional[str], token_opt: Optional[str]) -> str:
@@ -4129,6 +4165,36 @@ def job_ports(
         console.print(f"{name}: {port}")
 
 
+@job_app.command("push")
+def job_push(job_id: int = typer.Argument(...), repo: str = typer.Option("", "--repo", help="Какая копия, если их несколько."),
+             yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения.")) -> None:
+    """Запушить ветку рабочей копии работы: только своя ветка, без force, не в защищённые."""
+    from ..core import jobspace
+
+    with _store() as store:
+        job = store.get_job(job_id)
+        if job is None:
+            err.print(f"[red]Работа #{job_id} не найдена[/red]")
+            raise typer.Exit(code=1)
+        try:
+            plan = jobspace.push_worktree(store, job, repo, dry_run=True)
+            if not plan["commits"]:
+                console.print(f"{plan['branch']}: пушить нечего.")
+                return
+            console.print(f"{plan['branch']}" + (" (новая на origin)" if plan["new_branch"] else "")
+                          + f" ← {len(plan['commits'])} коммит(ов):", highlight=False)
+            for c in plan["commits"]:
+                console.print(f"  {c}", highlight=False)
+            if not yes and not typer.confirm("Пушим?"):
+                raise typer.Exit(code=1)
+            res = jobspace.push_worktree(store, job, repo)
+        except jobspace.JobSpaceError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        store.add_job_record(job_id, f"Запушено в {res['branch']}: {len(res['commits'])} коммит(ов)", kind="note")
+    console.print("Запушено.")
+
+
 @job_app.command("cleanup")
 def job_cleanup(
     job_id: int = typer.Argument(..., help="ID работы."),
@@ -4180,6 +4246,39 @@ def disk_cmd(
             console.print(f"[yellow]Не убрано у закрытых работ:[/yellow] {', '.join(f'#{j}' for j in jobs)} — jwu job cleanup <id>")
     if not report.ok:
         raise typer.Exit(code=3)
+
+
+# Настройки потока работы, которые задаются руками (остальные — своими командами).
+EDITABLE_SETTINGS = {
+    "job.review.max_iterations": "сколько кругов ревью подряд до вопроса пользователю (по умолчанию 3)",
+    "push.protected": "ветки, куда jwu job push не пушит: маски через запятую "
+                      "(по умолчанию develop,master,main,release*,stable*)",
+}
+
+
+@workspace_app.command("setting")
+def workspace_setting(key: Optional[str] = typer.Argument(None, help="Имя настройки; без него — список."),
+                      value: Optional[str] = typer.Argument(None, help="Новое значение; без него — показать."),
+                      unset: bool = typer.Option(False, "--unset", help="Вернуть значение по умолчанию.")) -> None:
+    """Настройки потока работы воркспейса: кругов ревью, защищённые ветки."""
+    with _store() as store:
+        current = store.workspace_settings(store.workspace_id)
+        if key is None:
+            for k, about in EDITABLE_SETTINGS.items():
+                console.print(f"[b]{k}[/b] = {current.get(k) or '—'}  [dim]{about}[/dim]", highlight=False)
+            return
+        if key not in EDITABLE_SETTINGS:
+            err.print(f"[red]Не знаю настройку {key}.[/red] Можно: {', '.join(EDITABLE_SETTINGS)}")
+            raise typer.Exit(code=2)
+        if key == "job.review.max_iterations" and value is not None and not (value.isdigit() and int(value) > 0):
+            err.print("[red]Нужно целое число больше нуля[/red]")
+            raise typer.Exit(code=2)
+        if unset:
+            store.delete_workspace_settings(store.workspace_id, [key])
+        elif value is not None:
+            store.set_workspace_settings(store.workspace_id, {key: value.strip()})
+        now = store.workspace_settings(store.workspace_id).get(key)
+    console.print(f"{key} = {now or '— (по умолчанию)'}", highlight=False)
 
 
 @workspace_app.command("jobs-dir")
@@ -5997,6 +6096,171 @@ def guide_rm(name: str = typer.Argument(..., help="Имя инструкции."
             raise typer.Exit(code=1)
     console.print(f"Инструкция {name} удалена")
 
+
+
+# --------------------------------------------------------------------------- #
+# zephyr: тест-кейсы Zephyr Scale
+# --------------------------------------------------------------------------- #
+
+
+def _zephyr(svc, project: Optional[str] = None, *, require: bool = True):
+    from ..core import zephyr as z
+
+    try:
+        client = svc.zephyr(require_project=require and not project)
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    if project:
+        client.project_key = project
+    return client
+
+
+def _zephyr_call(fn):
+    from ..core.jira import JiraError
+    from ..core.zephyr import ZephyrError
+
+    try:
+        return fn()
+    except (ZephyrError, JiraError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+def _json_arg(file: str) -> dict:
+    text = sys.stdin.read() if file == "-" else Path(file).expanduser().read_text()
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        err.print(f"[red]Не JSON: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+@zephyr_app.command("setup")
+def zephyr_setup(project: str = typer.Option(..., "--project", "-p", help="Ключ проекта, где живут тест-кейсы."),
+                 agent: Optional[str] = typer.Option(None, "--agent", help="Свой агент тестировщика (по умолчанию jwu-testing-agent).")) -> None:
+    """Проект кейсов контура (и, по желанию, свой агент, который пишет кейсы)."""
+    from ..core import zephyr as z
+
+    with _store() as store:
+        values = {z.PROJECT_SETTING: project.strip()}
+        if agent is not None:
+            values[z.AGENT_SETTING] = agent.strip()
+        store.set_workspace_settings(store.workspace_id, values)
+    console.print(f"Zephyr: проект кейсов {project}" + (f", агент {agent}" if agent else ""))
+
+
+@zephyr_app.command("rules")
+def zephyr_rules(file: str = typer.Argument(..., help="Markdown регламента тест-кейсов.")) -> None:
+    """Загрузить регламент тест-кейсов одной командой (инструкция zephyr-testcase-rules)."""
+    from ..core import guides as g
+    from ..core import zephyr as z
+
+    with _store() as store:
+        g.save_guide(store, store.workspace_id, g.Guide(
+            name=z.RULES_GUIDE, title="Регламент тест-кейсов Zephyr", text=Path(file).expanduser().read_text()))
+    console.print(f"Регламент загружен — инструкция {z.RULES_GUIDE}; скилл и агент прочтут его сами.")
+
+
+@zephyr_app.command("projects")
+def zephyr_projects(as_json: bool = typer.Option(False, "--json")) -> None:
+    """Проекты, где включён Zephyr Scale."""
+    with _service() as svc:
+        items = _zephyr_call(lambda: _zephyr(svc, require=False).projects())
+    if as_json:
+        _emit_json(items)
+        return
+    for p in items:
+        console.print(f"{p['key']:<20} {p['name']}", highlight=False)
+
+
+@zephyr_app.command("fields")
+def zephyr_fields(project: Optional[str] = typer.Option(None, "--project", "-p")) -> None:
+    """Статусы, приоритеты и свои поля кейсов проекта."""
+    with _service() as svc:
+        _emit_json(_zephyr_call(lambda: _zephyr(svc, project).fields()))
+
+
+@zephyr_app.command("folders")
+def zephyr_folders(project: Optional[str] = typer.Option(None, "--project", "-p")) -> None:
+    """Дерево папок кейсов проекта (путь и число кейсов)."""
+    with _service() as svc:
+        for f in _zephyr_call(lambda: _zephyr(svc, project).folders()):
+            console.print(f"{f['count']:>5}  {f['path']}", highlight=False)
+
+
+@zephyr_app.command("case")
+def zephyr_case(key: str = typer.Argument(...)) -> None:
+    """Тест-кейс целиком (JSON)."""
+    with _service() as svc:
+        _emit_json(_zephyr_call(lambda: _zephyr(svc, require=False).case(key)))
+
+
+@zephyr_app.command("search")
+def zephyr_search(query: str = typer.Argument(..., help='TQL, напр. projectKey = "QA" AND folder = "/smoke"'),
+                  limit: int = typer.Option(50, "--limit")) -> None:
+    """Поиск кейсов (TQL Zephyr Scale)."""
+    with _service() as svc:
+        _emit_json(_zephyr_call(lambda: _zephyr(svc, require=False).search(query, limit)))
+
+
+@zephyr_app.command("for-issue")
+def zephyr_for_issue(issue: str = typer.Argument(...)) -> None:
+    """Кейсы, привязанные к задаче, и куда класть новые (папки её кейсов)."""
+    with _service() as svc:
+        z = _zephyr(svc, require=False)
+        cases = _zephyr_call(lambda: z.for_issue(issue))
+        folders = _zephyr_call(lambda: z.suggest_folder(issue)) if z.project_key else []
+    _emit_json({"cases": [{"key": c.get("key"), "name": c.get("name"), "folder": c.get("folder"),
+                           "status": c.get("status")} for c in cases], "suggested_folders": folders})
+
+
+@zephyr_app.command("create")
+def zephyr_create(file: str = typer.Argument(..., help="JSON кейса: name, steps[], objective, precondition, folder, …; «-» — stdin."),
+                  yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения.")) -> None:
+    """Создать тест-кейс (ВНЕШНЯЯ запись) — показывает и спрашивает перед записью."""
+    data = _json_arg(file)
+    _emit_json(data)
+    if not yes and not typer.confirm("Создать этот кейс в Zephyr?"):
+        raise typer.Exit(code=1)
+    with _service() as svc:
+        z = _zephyr(svc, data.pop("project", None))
+        res = _zephyr_call(lambda: z.create(name=data.pop("name"), steps=data.pop("steps", []), **data))
+        console.print(f"Создан {res.get('key')}: {z.case_url(res.get('key', ''))}")
+
+
+@zephyr_app.command("update")
+def zephyr_update(key: str = typer.Argument(...), file: str = typer.Argument(..., help="JSON с полями, которые меняем; «-» — stdin."),
+                  yes: bool = typer.Option(False, "--yes", "-y")) -> None:
+    """Поправить тест-кейс (ВНЕШНЯЯ запись)."""
+    data = _json_arg(file)
+    _emit_json(data)
+    if not yes and not typer.confirm(f"Поправить {key}?"):
+        raise typer.Exit(code=1)
+    with _service() as svc:
+        z = _zephyr(svc, require=False)
+        _emit_json(_zephyr_call(lambda: z.update(key, steps=data.pop("steps", None), **data)))
+
+
+@zephyr_app.command("link")
+def zephyr_link(key: str = typer.Argument(...), issues: list[str] = typer.Argument(...),
+                yes: bool = typer.Option(False, "--yes", "-y")) -> None:
+    """Привязать кейс к задачам (добавляет к уже привязанным; ВНЕШНЯЯ запись)."""
+    if not yes and not typer.confirm(f"Привязать {key} к {', '.join(issues)}?"):
+        raise typer.Exit(code=1)
+    with _service() as svc:
+        _emit_json(_zephyr_call(lambda: _zephyr(svc, require=False).link(key, issues)))
+
+
+@zephyr_app.command("folder-create")
+def zephyr_folder_create(path: str = typer.Argument(..., help="Путь папки, напр. /Чат/Вложения"),
+                         project: Optional[str] = typer.Option(None, "--project", "-p"),
+                         yes: bool = typer.Option(False, "--yes", "-y")) -> None:
+    """Завести папку кейсов (ВНЕШНЯЯ запись)."""
+    if not yes and not typer.confirm(f"Создать папку {path}?"):
+        raise typer.Exit(code=1)
+    with _service() as svc:
+        _emit_json(_zephyr_call(lambda: _zephyr(svc, project).create_folder(path)))
 
 
 # --------------------------------------------------------------------------- #

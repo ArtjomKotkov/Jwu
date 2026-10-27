@@ -23,6 +23,9 @@ from typing import Callable, Optional
 import httpx
 
 DEFAULT_TIMEOUT = 30.0
+# Установка соединения — отдельно и коротко: недоступный хост не должен держать минуты
+# (30 с × повторы). Ответ сервера по-прежнему ждём DEFAULT_TIMEOUT.
+DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_RETRIES = 2
 # Первая пауза и множитель: 0.5с, 1.5с, 4.5с…
 BACKOFF_BASE = 0.5
@@ -41,6 +44,16 @@ def _env_float(name: str, default: float) -> float:
 
 def default_timeout() -> float:
     return _env_float("JWU_HTTP_TIMEOUT", DEFAULT_TIMEOUT)
+
+
+def default_connect_timeout() -> float:
+    return _env_float("JWU_HTTP_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)
+
+
+def make_timeout(total: Optional[float] = None) -> httpx.Timeout:
+    """Таймаут jwu: соединение — коротко (JWU_HTTP_CONNECT_TIMEOUT, 5 с), остальное — total."""
+    total = default_timeout() if total is None else float(total)
+    return httpx.Timeout(total, connect=min(total, default_connect_timeout()))
 
 
 def default_retries() -> int:
@@ -82,5 +95,7 @@ class RetryingClient(httpx.Client):
 
 def new_client(**kwargs) -> httpx.Client:
     """Клиент для API-обёрток jwu: общий тайм-аут из окружения и повторы (см. модуль)."""
-    kwargs.setdefault("timeout", default_timeout())
+    timeout = kwargs.get("timeout")
+    if timeout is None or isinstance(timeout, (int, float)):
+        kwargs["timeout"] = make_timeout(timeout)
     return RetryingClient(**kwargs)

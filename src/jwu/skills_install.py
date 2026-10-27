@@ -23,6 +23,7 @@ EXPECTED_SKILLS = {
     "jwu-continue-job",
     "jwu-close-job",
     "jwu-todo",
+    "jwu-zephyr-testcase",
     "jwu-job-review",
     "jwu-commit-message",
     "jwu-task-create",
@@ -77,6 +78,7 @@ EXPECTED_AGENTS = {
     "qa-triage-sample",
     "voice-writer-sample",
     "review-filter-sample",
+    "jwu-testing-agent",
 }
 
 
@@ -152,7 +154,7 @@ def _remove_retired(dest: Path) -> list[tuple[str, str]]:
 
 # Куда ставить под каждого клиента. Cursor (2.4+) понимает те же SKILL.md и те же
 # markdown-субагенты, что Claude Code, но ищет их в своих каталогах.
-TARGETS = ("claude", "cursor")
+TARGETS = ("claude", "cursor", "codex")
 
 
 def cursor_skills_dest() -> Path:
@@ -165,6 +167,109 @@ def cursor_agents_dest() -> Path:
 
 def cursor_mcp_path() -> Path:
     return Path.home() / ".cursor" / "mcp.json"
+
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Python 3.10 — бэкпорт tomli (зависимость jwu)
+    import tomli as tomllib  # type: ignore[no-redef]
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def codex_skills_dest() -> Path:
+    return codex_home() / "skills"
+
+
+def codex_agents_dest() -> Path:
+    return codex_home() / "agents"
+
+
+def _frontmatter(text: str) -> tuple[dict, str]:
+    """Простой frontmatter агента (``key: value`` построчно) и тело."""
+    if not text.startswith("---\n"):
+        return {}, text
+    head, sep, body = text[4:].partition("\n---\n")
+    if not sep:
+        return {}, text
+    meta = {}
+    for line in head.splitlines():
+        key, colon, value = line.partition(":")
+        if colon and key.strip():
+            meta[key.strip()] = value.strip().strip('"')
+    return meta, body.lstrip("\n")
+
+
+def _toml_str(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)  # базовая строка JSON — валидная базовая строка TOML
+
+
+_TRIPLE = "'" * 3
+
+
+def _for_codex(text: str) -> str:
+    """Субагент для Codex: TOML с name, description, developer_instructions (тело агента).
+    Поля Claude Code (tools, color) Codex не знает — их нет."""
+    meta, body = _frontmatter(text)
+    name, description = meta.get("name", ""), meta.get("description", "")
+    if not (name and description):
+        raise ValueError("у агента нет name или description во frontmatter")
+    instructions = body.rstrip() + "\n"
+    value = (_TRIPLE + "\n" + instructions + _TRIPLE) if _TRIPLE not in instructions else _toml_str(instructions)
+    out = ("# Поставлено jwu install --for codex — перезаписывается при обновлении.\n"
+           f"name = {_toml_str(name)}\ndescription = {_toml_str(description)}\n"
+           f"developer_instructions = {value}\n")
+    tomllib.loads(out)  # сломанный TOML не пишем
+    return out
+
+
+def codex_config_path() -> Path:
+    return codex_home() / "config.toml"
+
+
+def codex_mcp_entry(path: Path | None = None) -> dict:
+    """Секция [mcp_servers.jwu] из config.toml Codex (пустой dict — нет)."""
+    path = path or codex_config_path()
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return (data.get("mcp_servers") or {}).get("jwu") or {}
+
+
+def register_mcp_codex(path: Path | None = None, command: str | None = None) -> str:
+    """Добавить/обновить [mcp_servers.jwu] в config.toml Codex, НЕ трогая остальной файл.
+
+    Файл правится текстом, а не пересборкой TOML: чужие секции, комментарии и порядок (плагины,
+    доверенные проекты, другие серверы) остаются байт в байт. Заменяется только своя секция —
+    от заголовка [mcp_servers.jwu] до следующего заголовка.
+    """
+    import re
+
+    path = path or codex_config_path()
+    cmd = command or mcp_command()
+    block = f'[mcp_servers.jwu]\ncommand = {json.dumps(cmd)}\nargs = []\n'
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if text:
+        try:
+            tomllib.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"{path} — не TOML, правь руками: {exc}") from exc
+    if codex_mcp_entry(path) == {"command": cmd, "args": []}:
+        return "без изменений"
+    pattern = re.compile(r"^\[mcp_servers\.jwu\][^\n]*\n(?:(?!^\[).*\n?)*", re.M)
+    if pattern.search(text):
+        new = pattern.sub(block + "\n", text, count=1).rstrip("\n") + "\n"
+        action = "обновлён"
+    else:
+        new = (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+        action = "добавлен"
+    tomllib.loads(new)   # не записываем то, что сами же не прочитаем
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new, encoding="utf-8")
+    return action
 
 
 def _for_cursor(text: str) -> str:
@@ -229,7 +334,7 @@ def register_mcp_claude(command: str | None = None) -> str:
     return "добавлен"
 
 
-def install_agents(dest: Path, *, cursor: bool = False) -> list[tuple[str, str]]:
+def install_agents(dest: Path, *, cursor: bool = False, codex: bool = False) -> list[tuple[str, str]]:
     """Развернуть забандленные субагенты в ``dest``. Перезаписывает существующие.
 
     Структура источника: ``jwu/agents/<name>.md``. Каждый агент — один markdown-файл
@@ -249,8 +354,12 @@ def install_agents(dest: Path, *, cursor: bool = False) -> list[tuple[str, str]]
         content = entry.read_text(encoding="utf-8")
         if cursor:
             content = _for_cursor(content)
+        target_name = entry.name
+        if codex:
+            content = _for_codex(content)
+            target_name = f"{name}.toml"
         dest.mkdir(parents=True, exist_ok=True)
-        target = dest / entry.name
+        target = dest / target_name
         action = "обновлён" if target.exists() else "добавлен"
         target.write_text(content, encoding="utf-8")
         results.append((name, action))

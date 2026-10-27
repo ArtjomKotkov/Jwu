@@ -120,3 +120,17 @@ def test_get_updates_long_poll_passes_timeout():
         assert route.calls.last.request.url.params["timeout"] == "0"
     finally:
         sender.close()
+
+
+def test_cmd_tasks_groups_by_status_meaning(tmp_path):
+    store, ws, _ = _env(tmp_path)
+    run = store.start_sync_run(["mine"])
+    for issue in (Issue(key="AB-1", summary="Ревью", status="In Review", priority="Major"),
+                  Issue(key="AB-2", summary="Новая", status="To Do", priority="Critical"),
+                  Issue(key="AB-3", summary="Делаю", status="In Progress", priority="Minor")):
+        store.save_issue_snapshot(run, issue, ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 3})
+    text = bot._cmd_tasks(store, ws, None)
+    assert "В работе" in text and "Не начаты" in text and "На ревью" in text
+    assert text.index("В работе") < text.index("Не начаты") < text.index("На ревью")
+    store.close()

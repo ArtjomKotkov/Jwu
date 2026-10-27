@@ -18,17 +18,26 @@ jwu init ~/code/my-project --provider jira    # подключить проек�
 
 Первый раз после `pipx install` может понадобиться `pipx ensurepath` и перезапуск шелла.
 
-### Cursor
+### Cursor и Codex
 
 ```bash
 jwu install --for cursor     # только Cursor
+jwu install --for codex      # только Codex
 jwu install --for both       # Claude Code и Cursor
+jwu install --for all        # Claude Code, Cursor и Codex
 ```
 
 Для Cursor (2.4+) jwu кладёт те же скиллы в `~/.cursor/skills`, субагентов — в
 `~/.cursor/agents` (без поля `tools`: там имена инструментов Claude Code) и добавляет сервер
 `jwu` в `~/.cursor/mcp.json` — остальные серверы в файле не трогаются. После установки
-перезапусти Cursor. `jwu doctor` проверяет и Claude Code, и Cursor.
+перезапусти Cursor.
+
+Для Codex скиллы ложатся в `~/.codex/skills` (или `$CODEX_HOME/skills`), сервер — секцией
+`[mcp_servers.jwu]` в `~/.codex/config.toml` с путём до `jwu-mcp`; остальные секции файла
+не меняются. Субагенты — TOML-файлами в `~/.codex/agents` (имя, описание, инструкции); поля
+Claude Code вроде списка инструментов Codex не знает, их там нет. Codex зовёт субагента, когда
+скилл или ты просите его по имени. `jwu doctor` проверяет все три: скиллы и субагентов (нет или
+устарели), запись MCP и что путь до `jwu-mcp` существует.
 
 ### Обновление
 
@@ -116,19 +125,29 @@ jwu job done <id> --summary "что сделано" --cleanup
 jwu configure                    # визард: хосты, логины, токены, Telegram, путь до БД
 jwu configure --non-interactive --jira-host … --jira-user … --jira-token "$JIRA_TOKEN" \
   --bitbucket-host … --bitbucket-token "$BITBUCKET_TOKEN"
-jwu auth check
+jwu auth check                   # Jira, SDESK, Bitbucket/GitHub, Jenkins, Confluence и Zephyr — что настроено
 jwu doctor [--offline]           # всё разом: БД, папки, конфиг, доступы, демон, MCP, скиллы, версия
 ```
 
 Настройки и секреты лежат в БД (`~/.local/share/jwu/state.db`, права 600). **Не держи БД в
 облачной папке** — `configure --db-path` туда откажет без `--force`, `doctor` считает это ошибкой.
 
+**Пароли — не значением аргумента**: он виден в `ps` и истории шелла, так что
+`--jira-password`, `--gate-password`, `--sdesk-password` и `--sdesk-gate-password` принимают только
+`-` (прочитать из stdin) или `?` (спросить скрыто). Без флага `--non-interactive` берёт пароль из
+переменной окружения, а визард спрашивает сам.
+
+```bash
+printf '%s\n' "$PW" | jwu configure --non-interactive --jira-password -
+```
+
 **Переменные окружения перекрывают БД** — так контур поднимается без визарда: секреты
 `JIRA_TOKEN`, `JIRA_PASSWORD`, `JIRA_GATE_PASSWORD`, `SDESK_*`, `BITBUCKET_TOKEN`,
 `GITHUB_TOKEN`, `JENKINS_TOKEN`, `TELEGRAM_BOT_TOKEN`; настройки `JWU_JIRA_URL/USER/PROJECT/GATE_USER`,
 `JWU_SDESK_URL/PROJECT/USER`, `JWU_BITBUCKET_URL/PROJECT/REPO`, `JWU_GITHUB_API/WEB/OWNER/REPOS/USER`,
-`JWU_JENKINS_URL/USER`, `JWU_TELEGRAM_CHAT`; сеть — `JWU_HTTP_TIMEOUT` (30 с), `JWU_HTTP_RETRIES`
-(2 повтора GET при таймауте и 5xx).
+`JWU_JENKINS_URL/USER`, `JWU_TELEGRAM_CHAT`; сеть — `JWU_HTTP_TIMEOUT` (30 с на ответ),
+`JWU_HTTP_CONNECT_TIMEOUT` (5 с на соединение — недоступный хост не держит минутами),
+`JWU_HTTP_RETRIES` (2 повтора GET при таймауте и 5xx).
 
 GitHub: PAT classic со scope `repo` (или fine-grained с чтением Metadata, Issues, Pull requests,
 Actions; для репозиториев организации Resource owner — организация). Без `--github-owner`

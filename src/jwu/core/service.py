@@ -1166,6 +1166,17 @@ class Service:
                 base, proxy_basic=jira_proxy_basic(self.cfg), session_login=jira_login(self.cfg))
         return self._confluence
 
+    def zephyr(self, *, require_project: bool = True):
+        """Клиент Zephyr Scale контура — через Jira (та же сессия). Проект кейсов — zephyr.project."""
+        from . import zephyr as z
+
+        if self.jira is None:
+            raise ValueError("Zephyr Scale живёт в Jira — в этом контуре Jira нет")
+        key = z.project(self.store, self.store.workspace_id) if self.store else ""
+        if require_project and not key:
+            raise ValueError("Zephyr не настроен: jwu zephyr setup --project KEY")
+        return z.ZephyrClient(self.jira, key)
+
     def confluence_space(self, space: str | None = None) -> str:
         from . import confluence as conf_mod
 
@@ -1685,6 +1696,42 @@ class Service:
         return client.pr_create(project or default_project, repo or default_repo,
                                 source=source, target=target, title=title.strip(),
                                 description=description, reviewers=reviewers)
+
+    def usual_reviewers(self, limit: int = 6) -> list[dict]:
+        """Кого пользователь обычно ставит ревьюверами: по его PR из последнего синка."""
+        from collections import Counter
+
+        me = (self._resolve_username() or "").casefold()
+        counts: Counter = Counter()
+        names: dict[str, str] = {}
+        for pr in (self.store.latest_prs("mine") if self.store else []):
+            for r in pr.reviewers:
+                if r.name and r.name.casefold() != me:
+                    counts[r.name] += 1
+                    names[r.name] = r.display_name or r.name
+        return [{"name": n, "display_name": names[n], "prs": c} for n, c in counts.most_common(limit)]
+
+    def find_people(self, query: str, limit: int = 10) -> list[dict]:
+        """Человек по тому, как его назвали словами: «Саша Волков», «Смирновский», логин.
+
+        Сначала среди тех, кого пользователь обычно ставит, потом поиск хостинга по началу
+        латинского написания каждого слова; выше — у кого совпало больше слов запроса
+        (транслит, уменьшительные имена, опечатки — core.people).
+        """
+        from . import people
+
+        words = [w for w in query.replace(",", " ").split() if len(w) >= 2]
+        found: dict[str, dict] = {u["name"]: u for u in self.usual_reviewers(limit=30)}
+        if not any(people.score(query, u) == len(words) for u in found.values()):
+            client = self._require_prs()
+            for w in sorted(words, key=len, reverse=True):
+                for key in people.search_keys(w):
+                    for u in client.users(key):
+                        found.setdefault(u["name"], u)
+        ranked = sorted(found.values(), key=lambda u: (-people.score(query, u), u.get("display_name", "")))
+        best = people.score(query, ranked[0]) if ranked else 0
+        return [{"name": u["name"], "display_name": u.get("display_name", "")}
+                for u in ranked if best and people.score(query, u) == best][:limit]
 
     # --- задачи на комментах PR (Bitbucket tasks) ------------------------- #
 
@@ -2349,4 +2396,31 @@ class Service:
                 result["jenkins"] = {"ok": True}
             except Exception as exc:  # noqa: BLE001
                 result["jenkins"] = {"ok": False, "error": str(exc)}
+        result.update(self._auth_extras())
         return result
+
+    def _auth_extras(self) -> dict:
+        """Confluence и Zephyr — только если настроены в контуре; иначе ключа нет в ответе."""
+        out: dict = {}
+        try:
+            conf = self.confluence()
+        except ValueError:
+            conf = None
+        if conf is not None:
+            try:
+                me = conf.myself()
+                out["confluence"] = {"ok": True, "user": me.get("username"), "name": me.get("displayName")}
+            except Exception as exc:  # noqa: BLE001
+                out["confluence"] = {"ok": False, "error": str(exc)}
+        zephyr = getattr(self, "zephyr", None)
+        if callable(zephyr):
+            try:
+                client = zephyr()
+            except ValueError:
+                client = None
+            if client is not None:
+                try:
+                    out["zephyr"] = {"ok": True, **client.ping()}
+                except Exception as exc:  # noqa: BLE001
+                    out["zephyr"] = {"ok": False, "error": str(exc)}
+        return out

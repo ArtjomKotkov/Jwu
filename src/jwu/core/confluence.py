@@ -110,6 +110,10 @@ class ConfluenceClient:
 
     # --- чтение -------------------------------------------------------------- #
 
+    def myself(self) -> dict:
+        """Кто я в Confluence — проверка входа (jwu auth check)."""
+        return self._get("/user/current")
+
     def page_url(self, raw: dict) -> str:
         webui = ((raw.get("_links") or {}).get("webui") or "")
         return f"{self.base_url}{webui}" if webui else f"{self.base_url}/pages/viewpage.action?pageId={raw.get('id')}"

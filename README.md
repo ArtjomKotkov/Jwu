@@ -46,7 +46,7 @@ PR, заметки и журнал работы, сам синкается в ф
 
 ```bash
 pipx install git+<адрес этого репозитория>   # или из клона: pipx install .
-jwu install                                  # скиллы + MCP для Claude Code (--for cursor | both)
+jwu install                                  # скиллы + MCP для Claude Code (--for cursor | codex | both | all)
 jwu init ~/code/my-project --provider jira    # подключить проект (jira | github | local)
 ```
 
@@ -55,9 +55,10 @@ jwu init ~/code/my-project --provider jira    # подключить проек�
 
 ## Документация
 
-- [Установка и настройка](docs/setup.md) — Cursor, обновление, воркспейсы, доступы, бэкап
+- [Работа над задачей](docs/workflow.md) — что jwu делает сам, где спрашивает, что без «да» не сделает
+- [Установка и настройка](docs/setup.md) — Cursor и Codex, обновление, воркспейсы, доступы, бэкап
 - [Синк, демон и Telegram](docs/notifications.md)
 - [Задачи, PR и память](docs/tasks-and-prs.md) — запись наружу, трекинг времени
 - [Скиллы, субагенты и MCP](docs/agents.md) — в том числе агент голоса
-- [Confluence и SSH-стенды](docs/integrations.md)
+- [Confluence, Zephyr, пуш работы, SSH-стенды](docs/integrations.md)
 - [Дашборд](docs/dashboard.md) · [Все команды](docs/commands.md)

@@ -532,3 +532,14 @@ def test_day_context_tool_returns_markdown_and_data(fresh_server, monkeypatch):
     assert "кратко: только требующее действия" in payload["markdown"]
     assert 'заметка: «ждём»' in payload["markdown"]
     assert payload["data"]["prs_mine"][0]["id"] == 1 and payload["data"]["status_notes"] == {"P/r#1": "ждём"}
+
+
+def test_job_reviewer_from_settings_with_iteration_cap(fresh_server):
+    store = Store(fresh_server)
+    ws = store.get_workspace_by_slug("work")
+    store.set_workspace_settings(ws.id, {"review.reviewer.app": "reviewer-app", "job.review.max_iterations": "2"})
+    store.close()
+    r = _run(srv.jwu_job_reviewer("app", workspace="work"))
+    assert (r["reviewer"], r["max_iterations"], r["voice_agent"]) == ("reviewer-app", 2, "voice-writer-sample")
+    r = _run(srv.jwu_job_reviewer("other", workspace="work"))
+    assert r["reviewer"] == "reviewer-jwu-sample"

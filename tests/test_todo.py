@@ -221,3 +221,13 @@ def test_board_move_reply_close_groups(store):
     assert groups["close"].key == f"#{gone.id}"
     res = todo.take(store, store.workspace_id, "me", numbers=[groups["close"].n], session="S")
     assert res["taken"] == [] and "jwu-close-job" in res["skipped"][0]["reason"]
+
+
+def test_render_shows_only_live_sessions():
+    from jwu.core.todo import Board, render_md
+
+    board = Board(items=[], synced_ago="сейчас", session="A",
+                  sessions={"A": {"alive": True}, "B": {"alive": True}, "Z": {"alive": False, "seen_ago": "15 ч"}})
+    text = render_md(board)
+    assert "🟢 A (эта) · 🟢 B" in text
+    assert "Z" not in text and "молчит" not in text and "освободи" not in text

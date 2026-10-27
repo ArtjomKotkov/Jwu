@@ -70,6 +70,18 @@ def _cmd_status(store: "Store", ws: "Workspace") -> str:
     return "\n".join(lines)
 
 
+TASKS_LIMIT = 40
+
+# Блоки «Моих задач» по смыслу статуса: (заголовок, совпадение(статус, QA-статусы, «в работе»)).
+_STATUS_BLOCKS = [
+    ("🔁 Вернули — доделать", lambda s, q, w: s in q),
+    ("🛠 В работе", lambda s, q, w: s in w),
+    ("📋 Не начаты", lambda s, q, w: s in ("open", "to do", "selected for development", "backlog")),
+    ("👀 На ревью", lambda s, q, w: "review" in s),
+    ("🧪 На тестах и дальше", lambda s, q, w: True),
+]
+
+
 def _cmd_tasks(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -> str:
     """Мои задачи по смыслу статуса (что делать — сверху), внутри — по приоритету."""
     from . import todo

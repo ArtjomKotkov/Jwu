@@ -233,6 +233,16 @@ class GitHubClient:
                 self._owner_kind = "user"
         return f"org:{self.owner}" if self._owner_kind == "organization" else f"user:{self.owner}"
 
+    def users(self, query: str, limit: int = 25, repo: str = "") -> list[dict]:
+        """Кого можно поставить ревьювером: участники репозитория, логин содержит запрос."""
+        repo = repo or (self.repos[0] if self.repos else "")
+        if not repo:
+            return []
+        q = query.casefold()
+        out = [{"name": u.get("login", ""), "display_name": u.get("login", "")}
+               for u in self._get_list(f"/repos/{self._full_repo(repo)}/assignees", {"per_page": 100})]
+        return [u for u in out if q in u["name"].casefold()][:limit]
+
     def _full_repo(self, repo: str) -> str:
         """``repo`` → ``owner/repo`` (если owner не указан прямо в имени)."""
         return repo if "/" in repo else f"{self.owner}/{repo}"

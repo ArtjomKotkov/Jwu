@@ -397,11 +397,14 @@ def test_configure_export_then_import_cli(monkeypatch, tmp_path):
     """configure export пишет бандл, configure import восстанавливает воркспейс."""
     db, cfg_path, _ = _configure_env(monkeypatch, tmp_path)
 
+    # пароли — из переменных окружения: значением аргумента configure их не принимает
+    monkeypatch.setenv("JIRA_PASSWORD", "JPW")
+    monkeypatch.setenv("JIRA_GATE_PASSWORD", "GPW")
     res = runner.invoke(cli.app, [
         "configure", "--non-interactive",
         "--jira-host", "https://jira.acme.com", "--jira-user", "alice",
-        "--jira-project", "ACME", "--jira-password", "JPW",
-        "--gate-user", "gw", "--gate-password", "GPW",
+        "--jira-project", "ACME",
+        "--gate-user", "gw",
         "--bitbucket-token", "BTOK",
     ])
     assert res.exit_code == 0, res.output
@@ -1212,3 +1215,43 @@ def test_pr_state_red_build_ranks_after_conflict():
     assert cli._pr_state(PR(id=1, conflicted=True, builds=red)) == "конфликт"
     assert cli._pr_state(PR(id=1, reviewers=approved)) == "апрувы собраны"
     assert "сборка: красная" in cli._pr_line(PR(id=1, builds=red))
+
+
+def test_configure_rejects_password_as_argument_value(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setenv("JWU_DB_PATH", str(tmp_path / "s.db"))
+    r = CliRunner().invoke(cli.app, ["-W", "work", "configure", "--non-interactive", "--jira-password", "secret123"])
+    assert r.exit_code == 2 and "значением аргумента не принимаю" in " ".join(r.output.split())
+
+
+def test_configure_password_from_stdin_and_env(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from jwu.core.store import Store
+
+    monkeypatch.setenv("JWU_DB_PATH", str(tmp_path / "s.db"))
+    r = CliRunner().invoke(cli.app, ["-W", "work", "configure", "--non-interactive", "--jira-password", "-"],
+                           input="from-stdin\n")
+    assert r.exit_code == 0, r.output
+    monkeypatch.setenv("SDESK_PASSWORD", "from-env")
+    r = CliRunner().invoke(cli.app, ["-W", "work", "configure", "--non-interactive"])
+    assert r.exit_code == 0, r.output
+    s = Store(tmp_path / "s.db")
+    ws = s.get_workspace_by_slug("work")
+    assert s.get_workspace_secret(ws.id, "jira.password") == "from-stdin"
+    assert s.get_workspace_secret(ws.id, "sdesk.password") == "from-env"
+    s.close()
+
+
+def test_workspace_setting_known_keys_only(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setenv("JWU_DB_PATH", str(tmp_path / "s.db"))
+    run = lambda *a: CliRunner().invoke(cli.app, ["-W", "work", "workspace", "setting", *a])
+    assert run("job.review.max_iterations", "5").exit_code == 0
+    assert "= 5" in run("job.review.max_iterations").output
+    assert run("job.review.max_iterations", "0").exit_code == 2
+    assert run("anything.else", "x").exit_code == 2
+    assert run("push.protected", "--unset").exit_code == 0
+    assert "по умолчанию" in run("push.protected").output

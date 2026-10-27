@@ -60,7 +60,14 @@ from .core.store import QueueBusy, Store
 # Допустимые статусы работы (как в CLI `jwu job status`).
 _JOB_STATUSES = ("active", "done", "paused", "cancelled")
 
-mcp = FastMCP("jwu")
+mcp = FastMCP("jwu", instructions=(
+    "Когда нужен ответ пользователя, чтобы идти дальше, задавай вопрос интерактивным меню "
+    "(инструмент AskUserQuestion), а не текстом в конце ответа. Это и подтверждение «да / нет» "
+    "перед записью наружу, коммитом или пушем, и выбор следующего шага после разбора: «разобрался — "
+    "делаем по плану, от какой базы, или иначе?». Варианты — 2–4 конкретных действия, рекомендуемый "
+    "первым; так же — «закрыть работу?». Нет такого инструмента (Cursor, Codex) — обычным текстом. "
+    "Пуш ветки работы — только jwu_job_push, не git push. Тесты, сборки и прочие долгие прогоны — "
+    "в фоне с таймаутом и под наблюдением: 5 минут без нового вывода — зависание, останови и разбери."))
 
 # Ленивые кэши ПО воркспейсам — тут и живёт переиспользуемая сессия/соединения.
 _full: dict[int, Service] = {}    # полный сервис (Jira/SDESK + Bitbucket + Jenkins)
@@ -865,6 +872,161 @@ async def jwu_worklog_delete(key: str, worklog_id: str, workspace: Optional[str]
 
 
 
+def _zephyr(workspace: Optional[str], project: Optional[str] = None, *, require: bool = True):
+    svc = _full_svc(workspace)
+    try:
+        z = svc.zephyr(require_project=require and not project)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    if project:
+        z.project_key = project
+    return z
+
+
+@mcp.tool()
+async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_approved: bool = False,
+                       workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: запушить ветку рабочей копии работы — вместо голого git push.
+
+    Пушит только текущую ветку копии ЭТОЙ работы в одноимённую ветку origin, без force.
+    Откажет: защищённая ветка (develop/master/main/release*… — настройка push.protected),
+    незакоммиченное, origin ушёл вперёд или разошёлся (force решает человек), не та ветка.
+    dry_run=True (по умолчанию) — что уйдёт: ветка, новые коммиты. Реальный пуш —
+    dry_run=False и user_approved=True, только после «да» пользователя на публикацию.
+    repo — какая копия, если у работы их несколько."""
+    from .core import jobspace
+
+    store = _store_only(workspace)
+    job = store.get_job(job_id)
+    if job is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    if not dry_run and not user_approved:
+        raise ValueError("Пуш — только после «да» пользователя (user_approved=True).")
+    try:
+        res = jobspace.push_worktree(store, job, repo, dry_run=dry_run)
+    except jobspace.JobSpaceError as exc:
+        raise ValueError(str(exc)) from exc
+    if res["pushed"]:
+        store.add_job_record(job_id, f"Запушено в {res['branch']}: {len(res['commits'])} коммит(ов)", kind="note")
+    return _stamp(res, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_reviewer(repo: str = "", workspace: Optional[str] = None) -> dict:
+    """Кого звать ревьювером своих правок в репозитории (без записи, без вопросов пользователю):
+    reviewer — субагент из настроек воркспейса для repo (папка/слаг репозитория), иначе дефолт;
+    max_iterations — сколько раз подряд гонять «правки → ревью», пока остаются блокеры
+    (настройка job.review.max_iterations, по умолчанию 3), дальше — вопрос пользователю."""
+    from .core import reviewq
+    from .core import voice as voice_mod
+
+    store = _store_only(workspace)
+    ws_id = store.workspace_id
+    raw = (store.workspace_settings(ws_id).get("job.review.max_iterations") or "").strip()
+    return _stamp({"repo": repo, "reviewer": reviewq.reviewer_for(store, ws_id, repo) if repo else reviewq.DEFAULT_REVIEWER,
+                   "max_iterations": int(raw) if raw.isdigit() and int(raw) > 0 else 3,
+                   "voice_agent": (store.workspace_settings(ws_id).get(voice_mod.AGENT_SETTING) or "").strip()
+                   or voice_mod.DEFAULT_AGENT},
+                  _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_context(issue_key: str, project: Optional[str] = None,
+                             workspace: Optional[str] = None) -> dict:
+    """Всё для работы с тест-кейсами задачи одним вызовом (без записи): кейсы, уже привязанные к
+    задаче; папки, куда класть новые (папки её кейсов); статусы, приоритеты и свои поля проекта
+    кейсов; агент тестировщика воркспейса и есть ли инструкция-регламент (jwu_guide)."""
+    from .core import guides, zephyr
+
+    z = _zephyr(workspace, project)
+    store = _store_only(workspace)
+    cases = z.for_issue(issue_key)
+    try:
+        guides.get_guide(store, store.workspace_id, zephyr.RULES_GUIDE)
+        rules = zephyr.RULES_GUIDE
+    except guides.GuideError:
+        rules = ""
+    return _stamp({
+        "project": z.project_key, "issue": issue_key,
+        "cases": [{"key": c.get("key"), "name": c.get("name"), "folder": c.get("folder"),
+                   "status": c.get("status"), "url": z.case_url(c.get("key", ""))} for c in cases],
+        "suggested_folders": z.suggest_folder(issue_key),
+        "fields": z.fields(), "agent": zephyr.agent(store, store.workspace_id), "rules_guide": rules,
+    }, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_case(key: str, workspace: Optional[str] = None) -> dict:
+    """Тест-кейс Zephyr Scale целиком: шаги (testScript), папка, статус, связи с задачами. Без записи."""
+    z = _zephyr(workspace, require=False)
+    return _stamp({**z.case(key), "url": z.case_url(key)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_search(query: str, limit: int = 50, workspace: Optional[str] = None) -> dict:
+    """Поиск кейсов по TQL Zephyr Scale (напр. projectKey = "QA" AND folder = "/smoke"). Без записи."""
+    return _stamp({"cases": _zephyr(workspace, require=False).search(query, limit)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_folders(project: Optional[str] = None, workspace: Optional[str] = None) -> dict:
+    """Дерево папок кейсов проекта: путь и число кейсов. Без записи."""
+    return _stamp({"folders": _zephyr(workspace, project).folders()}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_create(name: str, steps: list[dict], objective: str = "", precondition: str = "",
+                            folder: str = "", status: str = "", priority: str = "",
+                            labels: Optional[list[str]] = None, issue_links: Optional[list[str]] = None,
+                            custom_fields: Optional[dict] = None, project: Optional[str] = None,
+                            user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Создать тест-кейс — ВНЕШНЯЯ запись, только после «да» пользователя на показанный кейс
+    (user_approved=True). steps — [{"description", "testData"?, "expectedResult"}].
+    issue_links — ключи задач (могут быть из другого проекта, чем проект кейсов)."""
+    if not user_approved:
+        raise ValueError("Кейс создаётся только после «да» пользователя на показанный текст.")
+    z = _zephyr(workspace, project)
+    res = z.create(name=name, steps=steps, objective=objective, precondition=precondition, folder=folder,
+                   status=status, priority=priority, labels=labels or [], issueLinks=issue_links or [],
+                   customFields=custom_fields or {})
+    return _stamp({**res, "url": z.case_url(res.get("key", ""))}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_update(key: str, name: Optional[str] = None, steps: Optional[list[dict]] = None,
+                            objective: Optional[str] = None, precondition: Optional[str] = None,
+                            folder: Optional[str] = None, status: Optional[str] = None,
+                            priority: Optional[str] = None, labels: Optional[list[str]] = None,
+                            custom_fields: Optional[dict] = None, user_approved: bool = False,
+                            workspace: Optional[str] = None) -> dict:
+    """Поправить тест-кейс — ВНЕШНЯЯ запись, только после «да» (user_approved=True). Передавай только меняемое."""
+    if not user_approved:
+        raise ValueError("Правка кейса — только после «да» пользователя на показанные изменения.")
+    z = _zephyr(workspace, require=False)
+    res = z.update(key, steps=steps, name=name, objective=objective, precondition=precondition,
+                   folder=folder, status=status, priority=priority, labels=labels, customFields=custom_fields)
+    return _stamp({**res, "url": z.case_url(key)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_link(key: str, issue_keys: list[str], user_approved: bool = False,
+                          workspace: Optional[str] = None) -> dict:
+    """Привязать кейс к задачам (добавляет к уже привязанным) — ВНЕШНЯЯ запись, только после «да»."""
+    if not user_approved:
+        raise ValueError("Привязка — только после «да» пользователя.")
+    return _stamp(_zephyr(workspace, require=False).link(key, issue_keys), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_zephyr_folder_create(path: str, project: Optional[str] = None, user_approved: bool = False,
+                                   workspace: Optional[str] = None) -> dict:
+    """Завести папку кейсов (напр. /Чат/Вложения) — ВНЕШНЯЯ запись, только после «да».
+    Сначала посмотри jwu_zephyr_folders: папка часто уже есть."""
+    if not user_approved:
+        raise ValueError("Папка заводится только после «да» пользователя.")
+    return _stamp(_zephyr(workspace, project).create_folder(path), _resolve(workspace))
+
+
 @mcp.tool()
 async def jwu_confluence_page(page_id: str, with_body: bool = True, workspace: Optional[str] = None) -> dict:
     """Страница Confluence: заголовок, пространство, версия, путь (предки), url и текст в
@@ -968,6 +1130,20 @@ async def jwu_pr_create(
     pull = svc.pr_create(project, repo, source=branch, target=target, title=title,
                          description=description, reviewers=list(reviewers or []))
     return _stamp(pull.model_dump(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_people(names: Optional[list[str]] = None, workspace: Optional[str] = None) -> dict:
+    """Ревьюверы для PR (без записи). Без names — кого пользователь обычно ставит (`usual`,
+    по его PR): предложи их вариантами меню. names — как пользователь их назвал словами
+    («Олег Смирнов», «Саша Волков», фамилия, логин): по каждому — кандидаты
+    (`name` — логин для jwu_pr_create(reviewers=…), `display_name`). Один кандидат — бери;
+    несколько — уточни меню; ноль — скажи, кого не нашёл."""
+    svc = _full_svc(workspace)
+    out: dict = {"usual": svc.usual_reviewers()}
+    if names:
+        out["found"] = {n: svc.find_people(n) for n in names if n.strip()}
+    return _stamp(out, _resolve(workspace))
 
 
 @mcp.tool()

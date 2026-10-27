@@ -658,15 +658,15 @@ def render_md(board: Board, *, disk: str = "") -> str:
     _SESSIONS_SEEN.clear()
     _SESSIONS_SEEN.update(board.sessions)
     lines = [" · ".join(head)]
-    if board.sessions:
-        parts = []
-        for name, info in sorted(board.sessions.items(), key=lambda kv: not kv[1].get("alive")):
-            mark = "🟢" if info.get("alive") else "💤"
-            me = " (эта)" if name == board.session else ""
-            parts.append(f"{mark} {name}{me}" + ("" if info.get("alive") else f", молчит {info.get('seen_ago', '')}"))
-        lines.append("**Сессии:** " + " · ".join(parts))
-        if any(not i.get("alive") for i in board.sessions.values()):
-            lines.append("Работы молчащей сессии можно освободить: «освободи <имя>».")
+    # В строке «Сессии» — только живые: молчащие видны там, где важны, — в ячейке «взято»
+    # у их работ (💤), и тогда же подсказка, как эти работы освободить.
+    alive = [name for name, info in board.sessions.items() if info.get("alive")]
+    if alive:
+        lines.append("**Сессии:** " + " · ".join(
+            f"🟢 {name}" + (" (эта)" if name == board.session else "") for name in alive))
+    if any(i.taken and i.taken.get("session") and not board.sessions.get(i.taken["session"], {}).get("alive", True)
+           for i in board.items):
+        lines.append("Работы молчащей сессии (💤) можно освободить: «освободи <имя>».")
     lines.append("")
     free = sum(1 for i in board.items if not i.taken)
     lines.append(f"Всего {len(board.items)}, свободно {free}. Взять: «делай 1 и 3» или «бери все конфликты и падения».")

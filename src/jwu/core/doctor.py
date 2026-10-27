@@ -149,8 +149,28 @@ def check_config(store: "Store", ws) -> tuple[list[Check], object]:
     out.append(_matrix_check(cfg))
     out.append(_disk_check(store, ws))
     out += _jobflow_checks(store, ws)
+    out += _integration_checks(store, ws)
     out += _addon_checks(store, ws)
     return out, cfg
+
+
+def _integration_checks(store, ws) -> list["Check"]:
+    """Confluence и Zephyr: настроены ли так, чтобы работали без лишних вопросов."""
+    from . import confluence as conf_mod, zephyr
+
+    out: list[Check] = []
+    settings = store.workspace_settings(ws.id)
+    if (settings.get(conf_mod.BASE_URL_SETTING) or "").strip():
+        space = (settings.get(conf_mod.SPACE_SETTING) or "").strip()
+        if space:
+            out.append(Check("Confluence", "ok", f"{settings[conf_mod.BASE_URL_SETTING]} · пространство {space}"))
+        else:
+            out.append(Check("Confluence", "warn", "пространство по умолчанию не задано — страницу без "
+                             "родителя создать не получится", "jwu confluence setup --space KEY"))
+    key = zephyr.project(store, ws.id)
+    if key:
+        out.append(Check("Zephyr Scale", "ok", f"проект кейсов {key} · агент {zephyr.agent(store, ws.id)}"))
+    return out
 
 
 def _addon_checks(store, ws) -> list["Check"]:
@@ -352,6 +372,48 @@ def check_cursor() -> list[Check]:
     return [Check("MCP в Cursor", "ok", entry.get("command", "зарегистрирован"))]
 
 
+def check_codex() -> list[Check]:
+    """Codex: есть ли на машине и выдан ли ему jwu — скиллы, секция [mcp_servers.jwu], путь к jwu-mcp."""
+    from ..skills_install import codex_config_path, codex_home, codex_mcp_entry, codex_skills_dest
+
+    if not codex_home().exists():
+        return []  # Codex не ставился — молчим
+    out: list[Check] = []
+    root = resources.files("jwu") / "skills"
+    names = [e.name for e in root.iterdir() if (e / "SKILL.md").is_file()]
+    missing = [n for n in names if not (codex_skills_dest() / n / "SKILL.md").exists()]
+    stale = [n for n in names if n not in missing and
+             (codex_skills_dest() / n / "SKILL.md").read_text(encoding="utf-8") != (root / n / "SKILL.md").read_text(encoding="utf-8")]
+    if missing or stale:
+        out.append(Check("Скиллы в Codex", "warn",
+                         f"нет {len(missing)}, устарели {len(stale)}", "jwu install --for codex"))
+    else:
+        out.append(Check("Скиллы в Codex", "ok", f"{len(names)} в {codex_skills_dest()}"))
+    from ..skills_install import _for_codex, codex_agents_dest
+
+    agents_root = resources.files("jwu") / "agents"
+    agent_files = [e for e in agents_root.iterdir() if e.name.endswith(".md")]
+    bad = []
+    for e in agent_files:
+        target = codex_agents_dest() / f"{e.name[:-3]}.toml"
+        if not target.exists() or target.read_text(encoding="utf-8") != _for_codex(e.read_text(encoding="utf-8")):
+            bad.append(e.name[:-3])
+    if bad:
+        out.append(Check("Субагенты в Codex", "warn", f"нет или устарели: {len(bad)}", "jwu install --for codex"))
+    else:
+        out.append(Check("Субагенты в Codex", "ok", f"{len(agent_files)} в {codex_agents_dest()}"))
+    entry = codex_mcp_entry()
+    if not entry:
+        out.append(Check("MCP в Codex", "warn", f"в {codex_config_path()} нет [mcp_servers.jwu]",
+                         "jwu install --for codex"))
+    elif not Path(entry.get("command", "")).exists():
+        out.append(Check("MCP в Codex", "fail", f"jwu-mcp не найден: {entry.get('command')}",
+                         "jwu install --for codex"))
+    else:
+        out.append(Check("MCP в Codex", "ok", entry["command"]))
+    return out
+
+
 def check_skills() -> list[Check]:
     out: list[Check] = []
     dest = default_dest()
@@ -419,6 +481,7 @@ def run(store: "Store", *, explicit_workspace: Optional[str] = None, network: bo
     checks += check_daemon(store)
     checks += check_mcp()
     checks += check_cursor()
+    checks += check_codex()
     checks += check_ffmpeg()
     checks += check_skills()
     checks += check_memory(store)
