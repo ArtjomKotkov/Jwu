@@ -21,6 +21,13 @@ JIRA = "https://jira.test"
 TG = "https://api.telegram.org"
 
 
+
+def plain(text: str) -> str:
+    """Текст уведомления без тегов и пробелов выравнивания — для проверок по смыслу."""
+    import html as _h
+    import re as _re
+    return " ".join(_h.unescape(_re.sub(r"<[^>]+>", "", text)).replace("\u200a", " ").split())
+
 def test_select_notable_filters_and_dedupes():
     deltas = [
         Delta(key="P/r#1", kind="new_conflict"),
@@ -53,14 +60,13 @@ def test_format_message_sections_links_and_escapes():
     head, _, rest = text.partition("\n\n")
     assert head.startswith("🔔 <b>work</b> · ")                  # контур и время в одной строке
     cards = rest.split("\n\n")                                   # одна карточка на ключ, тревожные сверху
-    assert cards[0] == ('<a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a>'
-                        "\n<i>second</i>\n   ⚠️ конфликт")
-    assert cards[1].startswith('<a href="https://git.x/projects/P/repos/r/pull-requests/3">P/r#3</a>')
-    assert cards[2] == ('<a href="https://git.x/projects/P/repos/r/pull-requests/1">P/r#1</a>'
-                        "\n<i>&lt;fix&gt; &amp; go</i>\n   ✍️ needs work — bob")
-    assert cards[3].startswith('<a href="https://jira.x/browse/TS-5">TS-5</a>') and "Anna QA · +2" in cards[3]
-    assert cards[4] == ('<a href="https://jira.x/browse/PROJ-9">PROJ-9</a>'
-                        "\n   📣 Ann: <i>«глянь &lt;это&gt;»</i>")
+    assert cards[0].startswith('<b>1.</b> <a href="https://git.x/projects/P/repos/r/pull-requests/2">P/r#2</a> · second')
+    assert "<blockquote>⚠️ <b>конфликт</b></blockquote>" in cards[0]
+    assert cards[1].startswith('<b>2.</b> <a href="https://git.x/projects/P/repos/r/pull-requests/3">P/r#3</a>')
+    assert plain(cards[2]) == "3. P/r#1 · <fix> & go ✍️ needs work bob"
+    assert "&lt;fix&gt; &amp; go" in cards[2]                    # экранирование
+    assert cards[3].startswith('<b>4.</b> <a href="https://jira.x/browse/TS-5">TS-5</a>') and "Anna QA · +2" in plain(cards[3])
+    assert plain(cards[4]) == "5. PROJ-9 📣 упоминание Ann «глянь <это>»"
     assert "•" not in text and "появился" not in text
     assert "<b>P/r#1</b>" in notify.format_message(note)          # без хостов — жирный ключ
     assert notify.key_url("dndeck/ui#5", notify.Links(github="https://github.com")) == "https://github.com/dndeck/ui/pull/5"
@@ -153,7 +159,7 @@ def test_sync_sends_notification_when_configured(tmp_path, monkeypatch):
         assert "PROJ/repo#42" in tg.calls.last.request.content.decode()
         # роль вычислена из памяти: PR из вкладки «мои» — блок «МОЁ» с меткой «мой PR»
         sent = json.loads(tg.calls.last.request.content)["text"]
-        assert "📌 <b>Моё</b>" in sent and "🔧 мой PR" in sent
+        assert "📌 Моё</b>" in sent and "<blockquote>" in sent
     finally:
         svc.close()
 
@@ -219,7 +225,7 @@ def test_ready_and_approved_are_notable_and_titled():
     note = notify.build_notification("work", deltas)
     assert [d.kind for d in note.deltas] == ["pr_all_approved"]        # «готов к мержу» не шлём
     note = notify.build_notification("work", deltas, kinds=["pr_ready_to_merge", "pr_all_approved"])
-    text = notify.format_message(note)
+    text = plain(notify.format_message(note))
     assert "🚀 готов к мержу" in text and "👍 все апрувы" in text
     assert "апрувов 2/2 · сборка ок · конфликтов нет" in text and "сборка красная" in text
 
@@ -234,6 +240,6 @@ def test_all_sync_events_have_titles_and_default_set():
         Delta(key="P/r#9", kind="new_review_pr", summary="feat", detail="автор Иванов"),
         Delta(key="PROJ-6", kind="status_change", summary="Старая", detail="Open → In Progress"),
     ])
-    text = notify.format_message(note)
-    assert "🆕 новая задача" in text and "👀 новый PR на ревью — автор Иванов" in text
+    text = plain(notify.format_message(note))
+    assert "🆕 новая задача" in text and "👀 новый PR на ревью автор Иванов" in text
     assert text.index("PROJ-5") < text.index("P/r#9") < text.index("PROJ-6")   # по важности

@@ -4281,6 +4281,51 @@ def workspace_setting(key: Optional[str] = typer.Argument(None, help="Имя н�
     console.print(f"{key} = {now or '— (по умолчанию)'}", highlight=False)
 
 
+_SWEEP_TITLES = {"closed_jobs": "Неубранное у закрытых работ", "orphan_docker": "Docker без живой работы",
+                 "orphan_worktrees": "Рабочие копии без живой работы", "temp": "Старые скачанные вложения",
+                 "dead_sessions": "Замолчавшие сессии"}
+
+
+@app.command("sweep")
+def sweep_cmd(only: Optional[str] = typer.Option(None, "--only", help="Группы через запятую: " + ", ".join(_SWEEP_TITLES)),
+              yes: bool = typer.Option(False, "--yes", "-y", help="Убрать без подтверждения."),
+              force: bool = typer.Option(False, "--force", help="Убрать и копии с незакоммиченным/незапушенным."),
+              json_out: bool = typer.Option(False, "--json", help="Только показать, JSON.")) -> None:
+    """Уборка за всеми сессиями: стенды, копии, docker, вложения, замолчавшие сессии. Открытые работы не трогает."""
+    from ..core import sweep
+
+    with _store() as store:
+        plan = sweep.scan(store)
+        if json_out:
+            _emit_json(plan)
+            return
+        groups = [g.strip() for g in only.split(",")] if only else list(sweep.GROUPS)
+        total = 0
+        for g in groups:
+            items = plan.get(g) or []
+            if not items:
+                continue
+            total += len(items)
+            console.print(f"[b]{_SWEEP_TITLES.get(g, g)}[/b] · {len(items)}")
+            for it in items:
+                what = it.get("path") or it.get("session") or f"работа #{it.get('job_id')}"
+                extra = it.get("items") or it.get("jobs") or ""
+                console.print(f"  {what}" + (f" — {extra}" if extra else ""), highlight=False)
+        for k in plan["kept"]:
+            console.print(f"[yellow]не трогаю[/yellow] {k.get('path') or '#' + str(k.get('job_id'))}: {k.get('why')}", highlight=False)
+        if not total and not (force and plan["kept"]):
+            console.print("Убирать нечего.")
+            return
+        if not yes and not typer.confirm("Убрать это?"):
+            raise typer.Exit(code=1)
+        res = sweep.apply(store, groups, force=force, plan=plan)
+    for g, items in res["done"].items():
+        if items:
+            console.print(f"убрано · {_SWEEP_TITLES.get(g, g)}: {len(items)}")
+    for e in res["errors"]:
+        err.print(f"[red]{e}[/red]")
+
+
 @workspace_app.command("jobs-dir")
 def workspace_jobs_dir(path: Optional[str] = typer.Argument(None, help="Общая папка для рабочих копий работ.")) -> None:
     """Папка, где работы заводят свои рабочие копии (git worktree). Без аргумента — показать."""

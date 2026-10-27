@@ -72,15 +72,20 @@ def _note():
     return note
 
 
-def test_format_two_blocks_with_role_lines():
-    text = notify.format_message(_note())
-    mine, part = text.index("📌 <b>Моё</b>"), text.index("👥 <b>Участвую</b>")
-    assert mine < text.index("SHOP-243") < part < text.index("CORE-12728")
-    assert "👤 исполнитель · перевёл Мария QA · на мне" in text
-    assert "👁 наблюдаю · исп. Иван Иванов" in text
-    assert "✍️ автор задачи · исп. Пётр Петров" in text   # упоминание в задаче, которую я завёл
-    # внутри блока — карточки с событиями
-    assert text.index("↩️ вернули с тестов") < part and text.index("📣 ") > part
+def _plain(text):
+    import html as _h
+    import re as _re
+    return " ".join(_h.unescape(_re.sub(r"<[^>]+>", "", text)).replace("\u200a", " ").split())
+
+
+def test_format_two_messages_with_assignee_rows():
+    mine, part = notify.format_messages(_note())               # «Моё» и «Участвую» — два сообщения
+    assert "📌 Моё" in mine and "SHOP-243" in mine and "CORE-12728" not in mine
+    assert "👥 Участвую" in part and "CORE-12728" in part
+    assert "исполнитель" in _plain(mine) and "Мария QA" in _plain(mine)   # кто перевёл — у события статуса
+    assert "исполнитель Иван Иванов" in _plain(part) and "исполнитель Пётр Петров" in _plain(part)
+    assert "наблюдаю" not in part and "<blockquote>" in mine
+    assert "↩️ <b>вернули с тестов</b>" in mine and "📣 <b>упоминание</b>" in part
 
 
 def test_status_change_unassigned_and_no_block_when_empty():
@@ -89,9 +94,10 @@ def test_status_change_unassigned_and_no_block_when_empty():
                                      kinds=("status_change",))
     note.roles = notify.resolve_roles(["PROJ-3"], me=ME, issues=_issues(),
                                       status={"PROJ-3": {"actor": "Лид", "assignee": ""}})
-    text = notify.format_message(note)
-    assert "👁 наблюдаю · перевёл Лид · не назначена" in text
-    assert "📌 <b>Моё</b>" not in text and "👥 <b>Участвую</b>" in text
+    msgs = notify.format_messages(note)
+    assert len(msgs) == 1 and "👥 Участвую" in msgs[0]          # пустое «Моё» не шлётся
+    text = _plain(msgs[0])
+    assert "исполнитель не назначена" in text and "Open → In Progress · Лид" in text
 
 
 def test_without_roles_old_format():

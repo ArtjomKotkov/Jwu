@@ -112,6 +112,8 @@ class Role:
     assignee: str = ""
     assignee_is_me: bool = False
     actor: str = ""
+    status: str = ""     # текущий статус задачи (из памяти)
+    priority: str = ""   # приоритет задачи
 
 
 @dataclass
@@ -359,7 +361,9 @@ def resolve_roles(keys: Iterable[str], *, me: Iterable[str], issues: dict[str, I
         else:
             label, mine = ROLE_WATCHER, False
         out[key] = Role(label, mine, assignee=assignee, assignee_is_me=a_me,
-                        actor=fresh.get("actor", "") or "")
+                        actor=fresh.get("actor", "") or "",
+                        status=(issue.status if issue else "") or "",
+                        priority=(issue.priority if issue else "") or "")
     return out
 
 
@@ -420,26 +424,48 @@ def _role_extra(role: Optional[Role], kinds: set[str]) -> str:
     return line[len(role.label):].lstrip(" ·") if line.startswith(role.label) else ""
 
 
-def _card(key: str, deltas: list[Delta], mentions: list[Mention], role: Optional[Role],
+_PRIORITY_ICON = {"blocker": "🔴", "highest": "🔴", "critical": "🔴", "high": "🟠", "major": "🟠",
+                  "medium": "🟡", "normal": "🟡", "minor": "🟡", "low": "🟢", "trivial": "🟢", "lowest": "🟢"}
+
+
+def _split_label(kind: str) -> tuple[str, str]:
+    """«✅ апрув» → ("✅", "апрув")."""
+    label = NOTABLE_KINDS.get(kind, kind)
+    head, _, rest = label.partition(" ")
+    return (head, rest) if rest and not head.isalnum() else ("", label)
+
+
+def _event_value(d: Delta, role: Optional[Role]) -> str:
+    who = _who(d.kind, d.detail)
+    if d.kind in STATUS_KINDS and role is not None and role.actor and role.actor not in who:
+        return f"{who} · {role.actor}" if who else role.actor
+    return who
+
+
+def _card(n: int, key: str, deltas: list[Delta], mentions: list[Mention], role: Optional[Role],
           links: Optional[Links]) -> list[str]:
-    """Карточка задачи или PR: ссылка и роль, заголовок курсивом, ниже — все её события."""
-    head = _key_html(key, links)
-    if role is not None:
-        head += f" · {html.escape(role.label)}"
-        extra = _role_extra(role, {d.kind for d in deltas})
-        if extra:
-            head += f" · {html.escape(_short(extra, 60))}"
-    lines = [head]
+    """Карточка: «N. ключ-ссылка · заголовок»; у задачи — исполнитель, статус, приоритет;
+    ниже цитатой — события строками «подпись ……… значение» (выравнивание — textwidth)."""
+    from . import textwidth as tw
+
     summary = next((d.summary for d in deltas if d.summary), "")
-    if summary:
-        lines.append(f"<i>{html.escape(_short(summary, 110))}</i>")
+    head = f"<b>{n}.</b> {_key_html(key, links)}" + (f" · {html.escape(_short(summary, 110))}" if summary else "")
+    lines = [head]
+    if role is not None and not PR_KEY_RE.match(key):
+        lines.append(tw.row("👤", "исполнитель", role.assignee or "не назначена"))
+        if role.status:
+            lines.append(tw.row("🔖", "статус", role.status))
+        if role.priority:
+            lines.append(tw.row(_PRIORITY_ICON.get(role.priority.casefold(), "⚪"), "приоритет", role.priority))
+    events = []
     for d in sorted(deltas, key=lambda d: _rank(d.kind)):
-        label = NOTABLE_KINDS.get(d.kind, d.kind)
-        who = _who(d.kind, d.detail)
-        lines.append(f"   {html.escape(label)}" + (f" — {html.escape(_short(who, 60))}" if who else ""))
+        emoji, label = _split_label(d.kind)
+        events.append(tw.row(emoji, label, _short(_event_value(d, role), 60), cap=tw.CAP_QUOTE))
     for m in mentions:
-        lines.append(f"   📣 {html.escape(m.author or 'кто-то')}: "
-                     f"<i>«{html.escape(_short(strip_mention_tags(m.text), 140))}»</i>")
+        events.append(tw.row("📣", "упоминание", m.author or "кто-то", cap=tw.CAP_QUOTE))
+        events.append(f"<i>«{html.escape(_short(strip_mention_tags(m.text), 160))}»</i>")
+    if events:
+        lines.append("<blockquote>" + "\n".join(events) + "</blockquote>")
     return lines
 
 
@@ -455,29 +481,33 @@ def _cards(deltas: list[Delta], mentions: list[Mention], roles: dict[str, Role],
     keys = list(dict.fromkeys(list(by_key) + list(by_mention)))
     keys.sort(key=lambda k: min([_rank(d.kind) for d in by_key.get(k, [])] or [len(_GROUP_ORDER)]))
     out: list[str] = []
-    for key in keys:
+    for n, key in enumerate(keys, 1):
         out.append("")
-        out += _card(key, by_key.get(key, []), by_mention.get(key, []), roles.get(key), links)
+        out += _card(n, key, by_key.get(key, []), by_mention.get(key, []), roles.get(key), links)
     return out
 
 
-def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
-    """HTML для Telegram: шапка и карточки — по одной на задачу или PR со всеми её событиями.
-
-    Ключ — ссылкой, рядом моя роль; ниже курсивом заголовок и строки событий («✅ апрув —
-    Иванов», «💬 комментарий в PR — +2»). С ролями карточки делятся на «Моё» и «Участвую».
-    """
+def format_messages(note: Notification, *, links: Optional[Links] = None) -> list[str]:
+    """HTML-сообщения для Telegram. С ролями — два: «Моё» и «Участвую» (пустое не шлётся);
+    без ролей — одно. В каждом — шапка и карточки по задаче или PR со всеми её событиями."""
     stamp = datetime.now().strftime("%d.%m %H:%M")
-    lines = [f"🔔 <b>{html.escape(note.workspace)}</b> · {stamp}"]
+    ws = html.escape(note.workspace)
     if note.roles:
         mine = lambda key: bool(note.roles.get(key) and note.roles[key].mine)  # noqa: E731
-        for title, pick in (("📌 <b>Моё</b>", True), ("👥 <b>Участвую</b>", False)):
+        out = []
+        for title, pick in (("📌 Моё", True), ("👥 Участвую", False)):
             deltas = [d for d in note.deltas if mine(d.key) is pick]
             mentions = [m for m in note.mentions if mine(m.task_key) is pick]
             if deltas or mentions:
-                lines += ["", title] + _cards(deltas, mentions, note.roles, links)
-        return "\n".join(lines)
-    return "\n".join(lines + _cards(note.deltas, note.mentions, {}, links))
+                out.append("\n".join([f"🔔 <b>{ws + ' · ' if ws else ''}{title}</b> · {stamp}"]
+                                     + _cards(deltas, mentions, note.roles, links)))
+        return out
+    return ["\n".join([f"🔔 <b>{ws}</b> · {stamp}"] + _cards(note.deltas, note.mentions, {}, links))]
+
+
+def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
+    """Всё одним текстом (для превью и тестов); в Telegram уходит format_messages."""
+    return "\n\n".join(format_messages(note, links=links))
 
 
 def split_message(text: str, limit: int = MAX_MESSAGE) -> list[str]:
@@ -662,7 +692,8 @@ def send_after_sync(notifier: TelegramNotifier, note: Notification,
     """Отправить, если есть что. True — ушло."""
     if not note:
         return False
-    notifier.send(format_message(note, links=links))
+    for text in format_messages(note, links=links):
+        notifier.send(text)
     return True
 
 

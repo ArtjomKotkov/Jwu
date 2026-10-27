@@ -912,6 +912,29 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
 
 
 @mcp.tool()
+async def jwu_sweep(apply: bool = False, groups: Optional[list[str]] = None, force: bool = False,
+                    user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Уборка за всеми сессиями (все воркспейсы). Без apply — только список по группам:
+    closed_jobs (неубранное у закрытых работ), orphan_docker (docker с меткой работы, а работы
+    нет или закрыта), orphan_worktrees (копии в каталоге работ без живой работы), temp (скачанные
+    вложения старше суток), dead_sessions (сессии молчат > 2 ч: их работы — в паузу); kept —
+    что не тронется (незакоммиченное/незапушенное) и почему. Открытые работы не трогаются.
+
+    apply=True — убрать выбранные groups, только после «да» (user_approved=True). force=True —
+    убрать и копии из kept: несохранённое ПРОПАДЁТ — отдельное явное «да» на этот список."""
+    from .core import sweep
+
+    store = _store_only(workspace)
+    plan = sweep.scan(store)
+    if not apply:
+        return _stamp(plan, _resolve(workspace))
+    if not user_approved:
+        raise ValueError("Уборка — только после «да» пользователя на показанный список.")
+    return _stamp({"plan": plan, **sweep.apply(store, groups or list(sweep.GROUPS), force=force, plan=plan)},
+                  _resolve(workspace))
+
+
+@mcp.tool()
 async def jwu_job_reviewer(repo: str = "", workspace: Optional[str] = None) -> dict:
     """Кого звать ревьювером своих правок в репозитории (без записи, без вопросов пользователю):
     reviewer — субагент из настроек воркспейса для repo (папка/слаг репозитория), иначе дефолт;
