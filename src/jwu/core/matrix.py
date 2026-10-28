@@ -87,10 +87,12 @@ class Event:
     reply_to: str = ""         # id сообщения, на которое это ответ
     mentions: list[str] = field(default_factory=list)   # mxid из m.mentions
     display_name: str = ""     # имя отправителя, если известно
+    replaces: str = ""         # правка: id исправленного сообщения (m.replace)
 
     @property
     def is_message(self) -> bool:
-        return self.type == "m.room.message" and bool(self.body)
+        """Новое сообщение. Правка — не новое: об исходном уже сказали, второй раз не шлём."""
+        return self.type == "m.room.message" and bool(self.body) and not self.replaces
 
 
 def sort_rooms(rooms: list[Room]) -> list[Room]:
@@ -102,6 +104,7 @@ def parse_event(raw: dict) -> Event:
     rel = content.get("m.relates_to") or {}
     reply_to = ((rel.get("m.in_reply_to") or {}).get("event_id") or "")
     thread_root = rel.get("event_id", "") if rel.get("rel_type") == "m.thread" else ""
+    replaces = rel.get("event_id", "") if rel.get("rel_type") == "m.replace" else ""
     body = content.get("body") or ""
     if content.get("msgtype") in ("m.image", "m.file", "m.video", "m.audio") and body:
         body = f"[{content['msgtype'][2:]}] {body}"
@@ -110,7 +113,7 @@ def parse_event(raw: dict) -> Event:
         id=raw.get("event_id", ""), sender=raw.get("sender", ""), body=body,
         ts=int(raw.get("origin_server_ts") or 0), type=raw.get("type", ""),
         msgtype=content.get("msgtype", ""), thread_root=thread_root, reply_to=reply_to,
-        mentions=mentions,
+        mentions=mentions, replaces=replaces,
     )
 
 

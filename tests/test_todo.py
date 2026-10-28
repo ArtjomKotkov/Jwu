@@ -185,9 +185,9 @@ def test_two_prs_for_one_task_are_flagged_and_linked(store):
 def test_duty_question_no_job_until_taken(store):
     from jwu.core import duty
 
-    q = duty.question_add(store, summary="mtbank — Too many open files", author="ivan", when="26.10 17:17",
+    q = duty.question_add(store, summary="shop — Too many open files", author="ivan", when="26.10 17:17",
                           where="корень комнаты", event_id="$e1", details="Спрашивает: …")
-    again = duty.question_add(store, summary="mtbank — уточнили", event_id="$e1")
+    again = duty.question_add(store, summary="shop — уточнили", event_id="$e1")
     assert q["id"] == "Д1" and q["created"] and not again["created"] and again["id"] == "Д1"
     assert store.list_jobs() == []                                   # пока не взяли — работы нет
     board = todo.build(store, store.workspace_id, "me", session="S1")

@@ -131,7 +131,7 @@ def _cmd_today(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -
     """Что делал сегодня: задачи с заголовком, текущим статусом и итогом простыми словами.
 
     Задачи — из работ jwu с записями за сегодня (в поясе ворклогов контура). «Что делалось»
-    — записи ``summary`` за сегодня; их нет — заголовок работы.
+    — последний ``summary`` за сегодня у каждой работы задачи; их нет — заголовок работы.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -163,7 +163,9 @@ def _cmd_today(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -
         key = job.task_key or job.feature_key or f"#{job.id}"
         task = tasks.setdefault(key, {"first": recs[0][0], "summaries": [], "titles": [], "job": job})
         task["first"] = min(task["first"], min(dt for dt, _ in recs))
-        task["summaries"] += [r.text for _, r in recs if r.kind == "summary" and r.text.strip()]
+        # итог работы — последний: закрыли повторно — прежний итог устарел, не дублируем
+        summaries = [r.text for _, r in recs if r.kind == "summary" and r.text.strip()]
+        task["summaries"] += summaries[-1:]
         task["titles"].append(job.title)
     head = f"🕒 <b>Сегодня</b> · {today.strftime('%d.%m')}"
     if not tasks:

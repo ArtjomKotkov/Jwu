@@ -134,3 +134,17 @@ def test_cmd_tasks_groups_by_status_meaning(tmp_path):
     assert "В работе" in text and "Не начаты" in text and "На ревью" in text
     assert text.index("В работе") < text.index("Не начаты") < text.index("На ревью")
     store.close()
+
+
+def test_today_shows_only_latest_summary_of_a_job(tmp_path):
+    """Работу закрыли дважды — в «Сегодня» один, последний итог, а не оба."""
+    store, ws, cfg = _env(tmp_path)
+    job = store.create_job("PROJ-1", "задача")
+    store.add_job_record(job.id, "убрал поле: бэкенд и PR", kind="summary")
+    store.add_job_record(job.id, "убрал поле: бэкенд, PR и 4test", kind="summary")
+    other = store.create_job("PROJ-1", "возврат")
+    store.add_job_record(other.id, "починил возврат с тестов", kind="summary")
+    text = bot._cmd_today(store, ws, None)
+    assert "бэкенд и PR" not in text
+    assert text.count("✍️") == 2
+    assert "PR и 4test" in text and "починил возврат" in text

@@ -358,3 +358,15 @@ def test_pick_room():
 
 def test_client_never_posts():
     assert not [m for m in dir(matrix.MatrixClient) if m.startswith(("send", "post", "put", "reply"))]
+
+
+def test_edit_is_not_a_new_message():
+    """Правку (m.replace) не пересказываем второй раз: об исходном сообщении уже сказали."""
+    edit = {"event_id": "$e", "sender": "@olga:mx.test", "type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "* исправленный текст",
+                        "m.new_content": {"msgtype": "m.text", "body": "исправленный текст"},
+                        "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
+                        "m.mentions": {"user_ids": [ME]}}}
+    ev = matrix.parse_event(edit)
+    assert ev.replaces == "$orig" and not ev.is_message
+    assert matrix.parse_event(_ev("$1", "@olga:mx.test", "текст")).is_message
