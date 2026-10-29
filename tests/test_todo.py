@@ -231,3 +231,90 @@ def test_render_shows_only_live_sessions():
     text = render_md(board)
     assert "🟢 A (эта) · 🟢 B" in text
     assert "Z" not in text and "молчит" not in text and "освободи" not in text
+
+
+def _approved_pr(pr_id, repo="r", **kw):
+    return PR(id=pr_id, title=f"AB-{pr_id}: готово", project="P", repository=repo, state="OPEN",
+              reviewers=[Reviewer(name="x", approved=True, status="APPROVED")], **kw)
+
+
+def test_board_build_gate_like_conflict(store):
+    """Где CI присылает сборки, без зелёной на последнем коммите PR не «двигают»:
+    нет и не в очереди — «🧪 Запустить сборку»; в очереди или идёт — «двигать», но «дождаться»."""
+    green = [BuildStatus(state="SUCCESSFUL", key="ci", url="u1")]
+    running = [BuildStatus(state="INPROGRESS", key="ci", url="u2")]
+    run = store.start_sync_run(["mine", "prs:mine"])
+    for n in (1, 2, 3, 4, 5):
+        store.save_issue_snapshot(run, Issue(key=f"AB-{n}", summary="з", status="In Review", priority="Major"), ["mine"])
+    store.save_pr_snapshot(run, _approved_pr(1, builds=green), ["mine"])          # зелёная
+    store.save_pr_snapshot(run, _approved_pr(2), ["mine"])                        # нет и не в очереди
+    store.save_pr_snapshot(run, _approved_pr(3, build_queued=True), ["mine"])     # в очереди
+    store.save_pr_snapshot(run, _approved_pr(4, builds=running), ["mine"])        # идёт
+    store.save_pr_snapshot(run, _approved_pr(5, repo="nobuilds"), ["mine"])       # CI статусы не шлёт
+    store.finish_sync_run(run, {"tasks:mine": 5, "prs:mine": 5})
+    board = todo.build(store, store.workspace_id, "me", session="S")
+    by_pr = {i.pr["id"]: i for i in board.items if i.pr}
+    assert by_pr[1].group == "move" and "сборка: ✓ зелёная" in by_pr[1].problems
+    assert "апрувы и зелёная сборка" in by_pr[1].problems[-1]
+    assert by_pr[2].group == "build" and by_pr[2].problems == [todo.NO_BUILD] and by_pr[2].pr["approvals"] == "1/1 ✓"
+    assert by_pr[3].group == "move" and "сборка в очереди" in by_pr[3].problems[-1]
+    assert by_pr[4].group == "move" and "сборка идёт" in by_pr[4].problems[-1]
+    assert by_pr[5].group == "move" and "CI сборку не сообщает" in by_pr[5].problems[-1]
+    md = todo.render_md(board)
+    assert todo.GROUP_TITLES["build"] in md and "| Сборка |" in md and "⏳ в очереди" in md
+    res = todo.take(store, store.workspace_id, "me", numbers=[by_pr[2].n], session="S")
+    assert store.get_job(res["taken"][0]["job_id"]).title.startswith("Запустить сборку PR #2")
+
+
+def test_build_required_setting(store):
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_pr_snapshot(run, _approved_pr(2), ["mine"])
+    store.save_pr_snapshot(run, _approved_pr(5, repo="nobuilds"), ["mine"])
+    store.finish_sync_run(run, {"prs:mine": 2})
+    ws = store.workspace_id
+    store.set_workspace_settings(ws, {todo.BUILD_REQUIRED_SETTING: "*"})
+    groups = {i.pr["id"]: i.group for i in todo.build(store, ws, "me").items if i.pr}
+    assert groups == {2: "build", 5: "build"}
+    store.set_workspace_settings(ws, {todo.BUILD_REQUIRED_SETTING: "-"})
+    groups = {i.pr["id"]: i.group for i in todo.build(store, ws, "me").items if i.pr}
+    assert groups == {2: "move", 5: "move"}
+    store.set_workspace_settings(ws, {todo.BUILD_REQUIRED_SETTING: "NoBuilds"})
+    groups = {i.pr["id"]: i.group for i in todo.build(store, ws, "me").items if i.pr}
+    assert groups == {2: "move", 5: "build"}
+
+
+def test_no_build_with_conflict_stays_simple(store):
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_pr_snapshot(run, PR(id=7, project="P", repository="r", state="OPEN", conflicted=True), ["mine"])
+    store.finish_sync_run(run, {"prs:mine": 1})
+    store.set_workspace_settings(store.workspace_id, {todo.BUILD_REQUIRED_SETTING: "*"})
+    [item] = [i for i in todo.build(store, store.workspace_id, "me").items if i.pr]
+    assert item.group == "simple" and item.problems == ["конфликт", todo.NO_BUILD]
+
+
+def test_approvals_cell():
+    two = [Reviewer(name="a", approved=True), Reviewer(name="b", approved=False)]
+    assert todo.approvals_cell(PR(id=1, reviewers=two)) == "1/2"
+    assert todo.approvals_cell(PR(id=1, reviewers=two[:1])) == "1/1 ✓"
+    assert todo.approvals_cell(PR(id=1)) == "нет ревьюеров"
+
+
+def test_board_demo_group(store):
+    """Dev at stand и Demo — своя группа «🎬 Демо и подготовка»: не «несделанные» и не «двигать»."""
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-1", summary="на стенде", status="Dev at stand", priority="Major"), ["mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-2", summary="к показу", status="Demo", priority="High"), ["mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-3", summary="в работе", status="In Progress"), ["mine"])
+    store.save_pr_snapshot(run, _approved_pr(2), ["mine"])      # PR задачи на демо: апрувы есть, сборки нет
+    store.finish_sync_run(run, {"tasks:mine": 3, "prs:mine": 1})
+    store.set_workspace_settings(store.workspace_id, {todo.BUILD_REQUIRED_SETTING: "*"})
+    board = todo.build(store, store.workspace_id, "me")
+    groups = {i.issue_key: i for i in board.items}
+    assert groups["AB-1"].group == "demo" and groups["AB-1"].pr is None
+    assert groups["AB-2"].group == "demo" and groups["AB-2"].problems == ["r#2 · апрувы 1/1 ✓"]
+    assert groups["AB-3"].group == "todo"
+    assert [i for i in board.items if i.group in ("move", "build")] == []
+    assert todo.GROUP_TITLES["demo"] in todo.render_md(board)
+    store.set_workspace_settings(store.workspace_id, {todo.DEMO_STATUSES_SETTING: "demo"})
+    groups = {i.issue_key: i.group for i in todo.build(store, store.workspace_id, "me").items}
+    assert groups["AB-2"] == "demo" and "AB-1" not in groups      # Dev at stand больше не демо и не todo

@@ -3,7 +3,8 @@
 Claude Code на каждое обновление запускает команду из ``settings.json`` → ``statusLine``,
 подаёт ей на stdin JSON о сессии (модель, папка, занятый контекст, стоимость) и печатает
 вывод под строкой ввода. ``jwu statusline`` читает этот JSON и дописывает своё: воркспейс,
-активную работу с последней фазой, очередь задач и живость демона.
+активную работу с последней фазой, очередь задач и живость демона; в сессии-оркестраторе
+(``jwu worker orchestrator``) — ещё блок воркеров с их состоянием.
 
 Команда дёргается часто, поэтому здесь только локальная БД и файл лока демона — без сети.
 Любая ошибка глушится: сломанная строка статуса хуже пустой.
@@ -33,6 +34,7 @@ PREV_META_KEY = "statusline.prev"      # прежняя команда statusLin
 OUR_COMMAND = "jwu statusline"      # по этому хвосту узнаём свою запись в settings.json
 CHAIN_TIMEOUT = 3.0                    # сек на прежнюю команду; дольше — печатаем без неё
 TITLE_MAX = 40                         # символов названия работы/фичи
+REFRESH_SECONDS = 15                   # statusLine.refreshInterval: перерисовка без событий
 
 
 # --------------------------------------------------------------------------- #
@@ -193,6 +195,41 @@ def jwu_lines(store: "Store", cwd: str) -> list[str]:
     return [head, _job_line(store), _queue_line(store)]
 
 
+WORKERS_SHOWN = 5
+_WORKER_COLORS = {"waiting": "1;33", "dead": "1;31", "stuck": "31", "silent": "2", "working": "36",
+                  "starting": "2", "done": "32"}
+_SUMMARY_WORDS = (("waiting", "ждут тебя"), ("dead", "упали"), ("stuck", "застряли"),
+                  ("silent", "молчат"), ("working", "работают"), ("starting", "запускаются"),
+                  ("done", "готовы"))
+
+
+def workers_lines(store: "Store", session_id: str) -> list[str]:
+    """Блок воркеров — только в сессии-оркестраторе (её id запомнил ``jwu worker orchestrator``)."""
+    from . import workers
+
+    boss = workers.orchestrator(store)
+    if not session_id or boss.get("session_id") != session_id:
+        return []
+    items = workers.list_workers(store)
+    label = _dim("воркеры  ")
+    if not items:
+        return [label + _dim("нет — «возьми … воркеру»")]
+    counts = workers.summary(items)
+    bits = [_c(_WORKER_COLORS[k], f"{workers.ICONS[k]} {counts[k]} {word}") for k, word in _SUMMARY_WORDS if counts.get(k)]
+    lines = [label + f"{len(items)}" + _dim("  ·  ") + _dim("  ·  ").join(bits)]
+    width = min(32, max(len(w["name"]) for w in items[:WORKERS_SHOWN]))
+    for w in items[:WORKERS_SHOWN]:
+        what = w.get("note") or w["state_text"]
+        if w["state"] == "waiting":
+            what = "ждёт: " + what if w.get("note") else what
+        lines.append("  " + _c(_WORKER_COLORS.get(w["state"], "0"), w["icon"]) + " "
+                     + _shorten(w["name"], width).ljust(width) + "  " + _shorten(what, TITLE_MAX)
+                     + (_dim(f"  {w['ago']}") if w.get("ago") and w["state"] != "done" else ""))
+    if len(items) > WORKERS_SHOWN:
+        lines.append(_dim(f"  … ещё {len(items) - WORKERS_SHOWN}"))
+    return lines
+
+
 def render(stdin: dict, store: "Store", *, with_claude: bool) -> str:
     """Готовый блок строки статуса. ``with_claude=False`` — поверх стоит другая строка."""
     lines: list[str] = []
@@ -201,6 +238,10 @@ def render(stdin: dict, store: "Store", *, with_claude: bool) -> str:
         if claude:
             lines.append(_dim("   ·   ").join(claude))
     lines.extend(jwu_lines(store, session_cwd(stdin)))
+    try:
+        lines.extend(workers_lines(store, str(stdin.get("session_id") or "")))
+    except Exception:  # noqa: BLE001 — строка статуса не падает
+        pass
     return "\n".join(lines)
 
 
@@ -291,7 +332,10 @@ def install(store: "Store", path: Path | None = None, *, chain: bool = True,
         store.set_meta(PREV_META_KEY, prev if chain else "")
     elif not chain:
         store.set_meta(PREV_META_KEY, "")
-    data["statusLine"] = {"type": "command", "command": command or our_command()}
+    data["statusLine"] = {"type": "command", "command": command or our_command(),
+                          # по таймеру, а не только по событиям: оркестратор видит воркеров,
+                          # даже когда сам простаивает
+                          "refreshInterval": REFRESH_SECONDS}
     _write_settings(path, data)
     kept = previous_command(store)
     return (f"statusLine → {OUR_COMMAND}; прежняя команда сохранена и печатается первой строкой"

@@ -162,3 +162,44 @@ def test_build_report_none_when_no_builds(tmp_path):
     svc = _service(tmp_path)
     assert svc.build_report("PROJ", "repo", 42) is None
     svc.close()
+
+
+@respx.mock
+def test_fill_builds_marks_pr_queued_in_jenkins(tmp_path):
+    """Сборки на head-коммите нет, а в очереди Jenkins стоит сборка ветки PR — «в очереди».
+    Очередь читается один раз на проход, не на каждый PR."""
+    from jwu.core.models import PR
+
+    for pr_id in (42, 43):
+        respx.get(f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/{pr_id}/commits").mock(
+            return_value=httpx.Response(200, json={"values": [{"id": f"c{pr_id}"}], "isLastPage": True}))
+        respx.get(f"{BB}/rest/build-status/1.0/commits/c{pr_id}").mock(
+            return_value=httpx.Response(200, json={"values": []}))
+    queue = respx.get(f"{JEN}/queue/api/json").mock(return_value=httpx.Response(200, json={"items": [
+        {"task": {"name": "app-pr-tests"},
+         "actions": [{}, {"parameters": [{"name": "SOURCE_BRANCH", "value": "AB-42-fix"},
+                                         {"name": "MAXFAIL", "value": 3}]}]},
+    ]}))
+    svc = _service(tmp_path)
+    queued = PR(id=42, project="PROJ", repository="repo", source_branch="AB-42-fix")
+    idle = PR(id=43, project="PROJ", repository="repo", source_branch="AB-43-other")
+    svc._fill_builds(queued)
+    svc._fill_builds(idle)
+    assert queued.latest_commit == "c42" and queued.builds == [] and queued.build_queued
+    assert not idle.build_queued and queue.call_count == 1
+    svc.close()
+
+
+@respx.mock
+def test_fill_builds_queue_unavailable_is_not_queued(tmp_path):
+    from jwu.core.models import PR
+
+    respx.get(f"{BB}/rest/api/1.0/projects/PROJ/repos/repo/pull-requests/42/commits").mock(
+        return_value=httpx.Response(200, json={"values": [{"id": "c42"}], "isLastPage": True}))
+    respx.get(f"{BB}/rest/build-status/1.0/commits/c42").mock(return_value=httpx.Response(200, json={"values": []}))
+    respx.get(f"{JEN}/queue/api/json").mock(return_value=httpx.Response(403, text="nope"))
+    svc = _service(tmp_path)
+    pr = PR(id=42, project="PROJ", repository="repo", source_branch="AB-42-fix")
+    svc._fill_builds(pr)
+    assert pr.build_queued is False
+    svc.close()

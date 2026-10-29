@@ -95,6 +95,26 @@ class JenkinsClient:
 
     # --- API --------------------------------------------------------------- #
 
+    def queued_refs(self) -> set[str]:
+        """Что стоит в очереди: имена задач и строковые значения параметров (ветка PR и т.п.).
+
+        Сборку PR в очереди узнаём по ветке в параметрах (``BITBUCKET_SOURCE_BRANCH`` и
+        подобные) или по имени задачи multibranch (``PR-123``) — без знания, как устроены джобы.
+        """
+        data = self._get_json("/queue/api/json",
+                              params={"tree": "items[task[name],actions[parameters[name,value]]]"})
+        refs: set[str] = set()
+        for item in data.get("items") or []:
+            name = (item.get("task") or {}).get("name")
+            if name:
+                refs.add(str(name))
+            for action in item.get("actions") or []:
+                for param in (action or {}).get("parameters") or []:
+                    value = (param or {}).get("value")
+                    if isinstance(value, str) and value:
+                        refs.add(value)
+        return refs
+
     def ping(self) -> dict:
         """Проверка доступа/токена: корневой api/json на закрытом Jenkins требует авторизации."""
         return self._get_json("/api/json", params={"tree": "mode"})

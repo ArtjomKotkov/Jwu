@@ -27,7 +27,7 @@ def test_notes_kinds_status_pinning_and_bulk(tmp_path):
     try:
         assert int(store.get_meta("schema_version")) >= 9
         a = store.add_note("PROJ-1", "решили порт в 10.7", kind="decision")
-        s1 = store.add_note("PROJ-1", "ждём ответа Eugeny", kind="status")
+        s1 = store.add_note("PROJ-1", "ждём ответа Козлова", kind="status")
         s2 = store.add_note("PROJ-1", "  ждём  QA  ", kind="status")
         store.add_note("PROJ/repo#42", "грабли с таймаутом", kind="gotcha", pinned=True)
         with pytest.raises(ValueError):
@@ -112,9 +112,9 @@ def test_handoff_includes_notes_and_summary_note(tmp_path):
 
 def test_day_context_shows_status_notes():
     pr = PR(id=42, project="PROJ", repository="repo", title="T")
-    ctx = DayContext(prs_mine=[pr], status_notes={"PROJ/repo#42": "ждём Eugeny"})
+    ctx = DayContext(prs_mine=[pr], status_notes={"PROJ/repo#42": "ждём Козлова"})
     text = cli._render_day_context_md(ctx)
-    assert 'заметка: «ждём Eugeny»' in text
+    assert 'заметка: «ждём Козлова»' in text
 
 
 def test_mcp_context_and_note(tmp_path, monkeypatch):

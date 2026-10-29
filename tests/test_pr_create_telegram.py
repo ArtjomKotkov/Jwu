@@ -95,8 +95,8 @@ def test_parse_incoming_reply_and_prefixed():
     reply = {"update_id": 5, "message": {"chat": {"id": 42}, "text": "поправил, жду ревью",
              "reply_to_message": {"text": "jwu · work\n⚠️ конфликт: PROJ/repo#893 — появился"}}}
     assert notify.parse_incoming(reply, chat_id="42") == ("PROJ/repo#893", "поправил, жду ревью")
-    prefixed = {"update_id": 6, "message": {"chat": {"id": 42}, "text": "PROJ-1: ждём ответа Eugeny"}}
-    assert notify.parse_incoming(prefixed, chat_id="42") == ("PROJ-1", "ждём ответа Eugeny")
+    prefixed = {"update_id": 6, "message": {"chat": {"id": 42}, "text": "PROJ-1: ждём ответа Козлова"}}
+    assert notify.parse_incoming(prefixed, chat_id="42") == ("PROJ-1", "ждём ответа Козлова")
     assert notify.parse_incoming({"message": {"chat": {"id": 1}, "text": "PROJ-1 x"}}, chat_id="42") is None
     assert notify.parse_incoming({"message": {"chat": {"id": 42}, "text": "просто текст"}}, chat_id="42") is None
     assert notify.parse_incoming({"message": {"chat": {"id": 42}, "text": "PROJ-1"}}, chat_id="42") is None
@@ -155,8 +155,8 @@ def test_dashboard_data_carries_status_notes(tmp_path):
         store.use_workspace(store.get_workspace_by_slug("work").id)
         run = store.start_sync_run(["prs:mine"])
         store.save_pr_snapshot(run, PR(id=42, project="PROJ", repository="repo", title="T"), ["mine"])
-        store.add_note("PROJ/repo#42", "ждём Eugeny", kind="status")
+        store.add_note("PROJ/repo#42", "ждём Козлова", kind="status")
         data = dashboard_from_memory(store, "me")
-        assert data.status_notes == {"PROJ/repo#42": "ждём Eugeny"}
+        assert data.status_notes == {"PROJ/repo#42": "ждём Козлова"}
     finally:
         store.close()

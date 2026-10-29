@@ -72,6 +72,8 @@ statusline_app = typer.Typer(
 app.add_typer(statusline_app, name="statusline")
 zephyr_app = typer.Typer(help="Zephyr Scale: тест-кейсы в Jira — чтение; запись только с подтверждением.")
 app.add_typer(zephyr_app, name="zephyr")
+worker_app = typer.Typer(help="Воркеры оркестратора: отдельные сессии Claude под задания — запуск, состояние, остановка.")
+app.add_typer(worker_app, name="worker")
 guide_app = typer.Typer(
     help="Инструкции: полные пошаговые тексты (запуск стенда и т.п.), на которые ссылаются правила.",
     invoke_without_command=True,
@@ -4253,6 +4255,8 @@ EDITABLE_SETTINGS = {
     "job.review.max_iterations": "сколько кругов ревью подряд до вопроса пользователю (по умолчанию 3)",
     "push.protected": "ветки, куда jwu job push не пушит: маски через запятую "
                       "(по умолчанию develop,master,main,release*,stable*)",
+    "todo.build.required": "где без зелёной сборки на последнем коммите PR не двигать: репозитории "
+                           "через запятую, * — все, - — нигде (по умолчанию — где CI присылает сборки)",
 }
 
 
@@ -4283,7 +4287,127 @@ def workspace_setting(key: Optional[str] = typer.Argument(None, help="Имя н�
 
 _SWEEP_TITLES = {"closed_jobs": "Неубранное у закрытых работ", "orphan_docker": "Docker без живой работы",
                  "orphan_worktrees": "Рабочие копии без живой работы", "temp": "Старые скачанные вложения",
-                 "dead_sessions": "Замолчавшие сессии"}
+                 "dead_sessions": "Замолчавшие сессии", "dead_workers": "Упавшие воркеры"}
+
+
+# --------------------------------------------------------------------------- #
+# Воркеры оркестратора
+# --------------------------------------------------------------------------- #
+
+
+def _worker_err(exc: Exception) -> None:
+    err.print(f"[red]{exc}[/red]", highlight=False)
+    raise typer.Exit(code=1)
+
+
+@worker_app.command("orchestrator")
+def worker_orchestrator(name: str = typer.Option("", "--name", help="Имя этой сессии для сообщений (из ListAgents)."),
+                        session: str = typer.Option("", "--session", help="id сессии; по умолчанию CLAUDE_CODE_SESSION_ID."),
+                        off: bool = typer.Option(False, "--off", help="Снять роль оркестратора (воркеры не трогаются).")) -> None:
+    """Сделать текущую сессию Claude оркестратором: её строка статуса покажет воркеров."""
+    from ..core import workers
+
+    if off:
+        with _store() as store:
+            was = workers.clear_orchestrator(store)
+        console.print(f"Оркестратор снят: {was.get('name') or was.get('session_id') or 'его и не было'}", highlight=False)
+        return
+    with _store() as store:
+        try:
+            info = workers.set_orchestrator(store, session or os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+                                            name, str(Path.cwd()))
+        except workers.WorkerError as exc:
+            _worker_err(exc)
+    console.print(f"Оркестратор: {info['name'] or info['session_id']}", highlight=False)
+
+
+@worker_app.command("start")
+def worker_start(name: str = typer.Argument(..., help="Имя по делу: «PROJ-1 · выгрузка», «Сборки · PR 12–14»."),
+                 task_file: Optional[Path] = typer.Option(None, "--task-file", help="Файл с заданием (иначе --task)."),
+                 task: str = typer.Option("", "--task", help="Задание текстом."),
+                 cwd: Optional[Path] = typer.Option(None, "--cwd", help="Папка, где работать (по умолчанию текущая)."),
+                 job: list[int] = typer.Option([], "--job", help="Работы воркера (можно несколько)."),
+                 permission_mode: str = typer.Option("", "--permission-mode", help="Режим прав сессии (по умолчанию — из настроек Claude)."),
+                 json_out: bool = typer.Option(False, "--json")) -> None:
+    """Поднять воркер: фоновая сессия Claude с Remote Control под этим именем и со стартовым заданием."""
+    from ..core import workers
+
+    text = task_file.read_text() if task_file else task
+    with _store() as store:
+        ws = _resolve_workspace(store)
+        try:
+            info = workers.start(store, name, text, cwd=str(cwd or Path.cwd()), jobs=job,
+                                 workspace=ws.slug, permission_mode=permission_mode)
+            for job_id in job:
+                store.add_job_record(job_id, f"Задание воркеру «{info['name']}»:\n{text.strip()}", kind="brief")
+            info["url"] = workers.wait_url(store, info["name"])
+        except workers.WorkerError as exc:
+            _worker_err(exc)
+    if json_out:
+        _emit_json(info)
+        return
+    console.print(f"Воркер «{info['name']}» запущен" + (f" → {info['url']}" if info["url"] else " (ссылка ещё не готова — jwu worker list)"),
+                  highlight=False)
+
+
+@worker_app.command("list")
+def worker_list(json_out: bool = typer.Option(False, "--json")) -> None:
+    """Воркеры и их состояние: сначала те, кто ждёт тебя, и упавшие."""
+    from ..core import workers
+
+    with _store() as store:
+        items = workers.list_workers(store)
+    if json_out:
+        _emit_json({"workers": items, "summary": workers.summary(items)})
+        return
+    if not items:
+        console.print("Воркеров нет.")
+        return
+    for w in items:
+        jobs = " ".join(f"#{j}" for j in w.get("jobs", []))
+        console.print(f"{w['icon']} [b]{w['name']}[/b]  {w['state_text']}" + (f" · {w['note']}" if w.get("note") else "")
+                      + (f"  [dim]{w['ago']}[/dim]" if w.get("ago") else ""), highlight=False)
+        if jobs or w.get("url"):
+            console.print(f"   {jobs}  {w.get('url', '')}".rstrip(), highlight=False)
+
+
+@worker_app.command("report")
+def worker_report(state: str = typer.Argument(..., help="working | waiting | stuck | done"),
+                  note: str = typer.Option("", "--note", "-n", help="Что сейчас, одна строка."),
+                  name: str = typer.Option("", "--name", help="Имя воркера; по умолчанию JWU_SESSION_NAME."),
+                  job: list[int] = typer.Option([], "--job", help="Добавить работу к своим.")) -> None:
+    """Отчёт воркера о себе — его видят оркестратор и строка статуса."""
+    from ..core import workers
+
+    who = name or os.environ.get("JWU_SESSION_NAME", "")
+    if not who:
+        _worker_err(workers.WorkerError("Не знаю, какой это воркер: нет JWU_SESSION_NAME — передай --name."))
+    with _store() as store:
+        try:
+            info = workers.report(store, who, state, note, jobs=job)
+        except workers.WorkerError as exc:
+            _worker_err(exc)
+    console.print(f"{workers.ICONS[info['state']]} {info['name']}: {workers.STATES[info['state']]}"
+                  + (f" · {info['note']}" if info["note"] else ""), highlight=False)
+
+
+@worker_app.command("stop")
+def worker_stop(name: str = typer.Argument(...),
+                force: bool = typer.Option(False, "--force", help="Остановить и с открытыми работами (уйдут в паузу)."),
+                yes: bool = typer.Option(False, "--yes", "-y")) -> None:
+    """Остановить воркер. С открытыми работами — только с --force."""
+    from ..core import workers
+
+    if not yes and not typer.confirm(f"Остановить воркер «{name}»?"):
+        raise typer.Exit(code=1)
+    with _store() as store:
+        try:
+            res = workers.stop(store, name, force=force)
+        except workers.WorkerError as exc:
+            _worker_err(exc)
+    paused = res["paused_jobs"]
+    console.print(f"Воркер «{name}» остановлен" + (f"; на паузе: {', '.join(f'#{j}' for j in paused)}" if paused else ""),
+                  highlight=False)
 
 
 @app.command("sweep")
@@ -6011,7 +6135,7 @@ def duty_check(as_json: bool = typer.Option(False, "--json", help="Вывест�
 def todo_cmd(
     take_numbers: list[int] = typer.Argument(None, help="Номера из показанного списка — взять в работу этой сессией."),
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Взять всю группу: simple | fixes | todo | review.",
-                                        click_type=click.Choice(["simple", "fixes", "todo", "review"])),
+                                        click_type=click.Choice(["simple", "build", "fixes", "demo", "todo", "review"])),
     session: str = typer.Option("", "--session", "-s", help="Имя сессии — видно другим сессиям в «взято»."),
     refresh_opt: Optional[bool] = typer.Option(None, "--refresh/--no-refresh",
         help="Обновить данные перед показом (синк через демон). По умолчанию — если синку больше 30 мин."),
@@ -6031,7 +6155,7 @@ def todo_cmd(
         login = _read_identity(store).get("user", "")
         # без -s имя придумывается, но в CLI каждый вызов — новый процесс: для «делай 1 и 3»
         # после показа доски передай то же -s, что напечатано в шапке
-        session = session or todo_mod.random_session_name(todo_mod.active_session_names(store))
+        session = session or os.environ.get("JWU_SESSION_NAME", "").strip() or todo_mod.random_session_name(todo_mod.active_session_names(store))
         if take_numbers or group:
             result = todo_mod.take(store, ws_id, login, numbers=take_numbers or [], group=group or "", session=session)
             if as_json:

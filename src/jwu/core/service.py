@@ -1488,6 +1488,28 @@ class Service:
                 )
         except Exception:  # noqa: BLE001 — без сборок PR всё равно полезен
             pr.builds = []
+        if not pr.builds:
+            refs = self._jenkins_queue()
+            pr.build_queued = bool(refs) and (bool(pr.source_branch and pr.source_branch in refs)
+                                              or f"PR-{pr.id}" in refs)
+
+    _QUEUE_TTL = 60.0
+
+    def _jenkins_queue(self) -> set[str]:
+        """Очередь Jenkins — один запрос на проход синка (кеш на минуту); нет доступа — пусто."""
+        import time as _time
+
+        if self.jenkins is None or getattr(self.jenkins, "auth", None) is None:
+            return set()
+        cached = getattr(self, "_queue_cache", None)
+        if cached and _time.monotonic() - cached[0] < self._QUEUE_TTL:
+            return cached[1]
+        try:
+            refs = self.jenkins.queued_refs()
+        except Exception:  # noqa: BLE001 — без очереди доска просто скажет «запустить»
+            refs = set()
+        self._queue_cache = (_time.monotonic(), refs)
+        return refs
 
     def _fill_tasks(self, pr: PR) -> None:
         """Счётчики задач на комментах (один запрос; у GitHub задач нет — молча 0)."""
@@ -2127,10 +2149,8 @@ class Service:
             commits = client.pr_commits(project, repo, pr_id)
         except Exception:  # noqa: BLE001
             commits = []
-        try:
-            pr.builds = self.build_statuses_for_pr(project, repo, pr_id)
-        except Exception:  # noqa: BLE001
-            pr.builds = []
+        # head-коммит, сборки по нему и «в очереди CI» — как в синке (ошибки глушатся там же)
+        self._fill_builds(pr)
         tasks = [t for c in comments for t in c.tasks]
         pr.tasks_open = sum(1 for t in tasks if not t.resolved)
         pr.tasks_resolved = sum(1 for t in tasks if t.resolved)

@@ -917,7 +917,8 @@ async def jwu_sweep(apply: bool = False, groups: Optional[list[str]] = None, for
     """Уборка за всеми сессиями (все воркспейсы). Без apply — только список по группам:
     closed_jobs (неубранное у закрытых работ), orphan_docker (docker с меткой работы, а работы
     нет или закрыта), orphan_worktrees (копии в каталоге работ без живой работы), temp (скачанные
-    вложения старше суток), dead_sessions (сессии молчат > 2 ч: их работы — в паузу); kept —
+    вложения старше суток), dead_sessions (сессии молчат > 2 ч: их работы — в паузу), dead_workers
+    (воркеры оркестратора, чей процесс умер без «готово»: работы — в паузу); kept —
     что не тронется (незакоммиченное/незапушенное) и почему. Открытые работы не трогаются.
 
     apply=True — убрать выбранные groups, только после «да» (user_approved=True). force=True —
@@ -932,6 +933,72 @@ async def jwu_sweep(apply: bool = False, groups: Optional[list[str]] = None, for
         raise ValueError("Уборка — только после «да» пользователя на показанный список.")
     return _stamp({"plan": plan, **sweep.apply(store, groups or list(sweep.GROUPS), force=force, plan=plan)},
                   _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_worker_start(name: str, task: str, cwd: str, jobs: Optional[list[int]] = None,
+                           permission_mode: str = "", user_approved: bool = False,
+                           workspace: Optional[str] = None) -> dict:
+    """Оркестратор: поднять воркер — фоновую сессию Claude (Remote Control) с именем и заданием.
+
+    ТОЛЬКО по прямой команде пользователя («возьми X воркеру») и ровно столько воркеров, сколько
+    он сказал — user_approved=True. name — по делу и уникальное («PROJ-1 · выгрузка»), task —
+    задание (шапку «кто ты, как отчитываться» jwu добавит сам), cwd — папка репозитория задачи,
+    jobs — работы воркера (задание запишется в их журнал, kind=brief). Перед запуском текущая
+    сессия должна быть оркестратором: `jwu worker orchestrator --name <своё имя>` (Bash).
+    Возвращает запись воркера со ссылкой url на его сессию (может быть пустой — появится в list)."""
+    from .core import workers
+
+    if not user_approved:
+        raise ValueError("Воркер — только по команде пользователя: user_approved=True после его «возьми … воркеру».")
+    store = _store_only(workspace)
+    ws = _resolve(workspace)
+    info = workers.start(store, name, task, cwd=cwd, jobs=jobs or [], workspace=ws.slug,
+                         permission_mode=permission_mode)
+    for job_id in jobs or []:
+        store.add_job_record(job_id, f"Задание воркеру «{info['name']}»:\n{task.strip()}", kind="brief")
+    info["url"] = workers.wait_url(store, info["name"])
+    return _stamp(info, ws)
+
+
+@mcp.tool()
+async def jwu_worker_list(workspace: Optional[str] = None) -> dict:
+    """Воркеры и их состояние (без сети): state — starting | working | waiting (ждёт пользователя)
+    | stuck | done | silent (не отчитывался > 30 мин) | dead (процесса нет, а «готово» не было);
+    note — что сейчас, url — ссылка на сессию, jobs — работы. Порядок: ждущие и упавшие — первыми."""
+    from .core import workers
+
+    store = _store_only(workspace)
+    items = workers.list_workers(store)
+    return _stamp({"workers": items, "summary": workers.summary(items),
+                   "orchestrator": workers.orchestrator(store)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_worker_report(state: str, note: str = "", jobs: Optional[list[int]] = None, name: str = "",
+                            workspace: Optional[str] = None) -> dict:
+    """Воркер: отчёт о себе — state working | waiting (перед вопросом пользователю) | stuck | done
+    (все задачи закрыты), note — что сейчас одной строкой, jobs — добавить свои работы.
+    name по умолчанию — имя этой сессии (JWU_SESSION_NAME)."""
+    from .core import workers
+
+    who = name or os.environ.get("JWU_SESSION_NAME", "")
+    if not who:
+        raise ValueError("Эта сессия не воркер (нет JWU_SESSION_NAME) — передай name.")
+    return _stamp(workers.report(_store_only(workspace), who, state, note, jobs=jobs or []), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_worker_stop(name: str, force: bool = False, user_approved: bool = False,
+                          workspace: Optional[str] = None) -> dict:
+    """Оркестратор: остановить воркер и убрать его запись. Когда воркер сказал «готово» и его
+    работы закрыты — можно без вопроса (user_approved=True ставит оркестратор по скиллу); с
+    открытыми работами — только force=True после явного «да» пользователя (работы уйдут в паузу)."""
+    from .core import workers
+
+    if not user_approved:
+        raise ValueError("Остановка воркера — по правилу скилла или после «да» пользователя: user_approved=True.")
+    return _stamp(workers.stop(_store_only(workspace), name, force=force), _resolve(workspace))
 
 
 @mcp.tool()
@@ -2127,6 +2194,8 @@ def _session_name(store: "Store", explicit: str = "") -> str:
 
     if explicit.strip():
         _SESSION_NAME = explicit.strip()
+    if not _SESSION_NAME:   # воркер оркестратора: имя на доске = имя сессии для сообщений
+        _SESSION_NAME = os.environ.get("JWU_SESSION_NAME", "").strip()
     if not _SESSION_NAME:
         _SESSION_NAME = todo_mod.random_session_name(todo_mod.active_session_names(store))
     _start_heartbeat(store.path)
@@ -2167,7 +2236,10 @@ async def jwu_todo(session: str = "", refresh: Optional[bool] = None,
                    workspace: Optional[str] = None) -> dict:
     """Доска «что делать» из кеша (без сети): нумерованные пункты по группам.
 
-    Группы: simple — мой PR с конфликтом/красной сборкой без замечаний людей; fixes — правки
+    Группы: simple — мой PR с конфликтом/красной сборкой без замечаний людей; build — мой PR без
+    сборки на последнем коммите и не в очереди CI (там, где CI сборки присылает) — запустить
+    сборку/тесты; demo — задачи в статусах Dev at stand / Demo (настройка todo.statuses.demo):
+    подготовить и провести демо, с PR и апрувами; fixes — правки
     (needs work, открытые задачи PR, возврат с QA; конфликт и сборка там тоже); todo —
     несделанные задачи на мне (не начата / в работе, без открытого PR); review — чужие PR
     ждут моего ревью. У пункта taken — уже взят (работа, кем, сколько назад).
@@ -2227,14 +2299,16 @@ async def jwu_todo_release(session: str, workspace: Optional[str] = None) -> dic
 
 @mcp.tool()
 async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", session: str = "",
-                        workspace: Optional[str] = None) -> dict:
+                        for_worker: str = "", workspace: Optional[str] = None) -> dict:
     """Взять пункты доски в работу этой сессией: по номерам из её последнего jwu_todo или всю группу.
 
     Заводит работы атомарно (две сессии одно не возьмут): цель в заголовке («Конфликт и
     красная сборка PR #1092», «Правки по ревью PR #1027», «Сделать задачу», «Ревью PR #…»),
     PR привязан, запись «Взято сессией «…»». Уже взятое — в skipped с кем и когда.
-    group: simple | fixes | todo | review — свободные пункты группы целиком.
+    group: simple | build | fixes | demo | todo | review — свободные пункты группы целиком.
     Дальше по каждой взятой работе — jwu-continue-job (работа уже есть), по очереди.
+    for_worker — оркестратор берёт пункты для воркера с этим именем (работы помечаются им,
+    имя самой сессии не меняется).
     """
     from .core import todo as todo_mod
     from .core.service import _read_identity
@@ -2242,7 +2316,7 @@ async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", se
     if group and group not in todo_mod.GROUPS:
         raise ValueError(f"group: {', '.join(todo_mod.GROUPS)}")
     store = _store_only(workspace)
-    session = _session_name(store, session)
+    session = for_worker.strip() or _session_name(store, session)
     result = todo_mod.take(store, store.workspace_id, _read_identity(store).get("user", ""),
                            numbers=numbers or [], group=group, session=session)
     return _stamp({**result, "session": session}, _resolve(workspace))

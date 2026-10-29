@@ -617,6 +617,9 @@ class PR(BaseModel):
     my_review_at: Optional[int] = None   # дата (ms) моего апрува/needs-work, из activities
     # статусы CI-сборок по head-коммиту (build-status API); пусто, если не запрашивались:
     builds: list[BuildStatus] = Field(default_factory=list)
+    # Сборок на head-коммите нет, но в очереди CI (Jenkins) стоит сборка этой ветки/PR —
+    # «подождать», а не «запустить». Ставится при синке; без CI-доступа — False.
+    build_queued: bool = False
     # Задачи на комментах PR (Bitbucket tasks): сколько открыто и сколько закрыто.
     # Открытые — это и есть «что ещё надо поправить» по этому PR.
     tasks_open: int = 0
@@ -982,7 +985,7 @@ class Mention(BaseModel):
 # Типы записей работы (jwu job add --kind) — единый источник для CLI-валидации и рендера.
 JOB_RECORD_KINDS = [
     "phase", "note", "decision", "remark", "constraint", "warning",
-    "bug", "bug-resolved", "test-pass", "test-fail", "todo", "review", "summary",
+    "bug", "bug-resolved", "test-pass", "test-fail", "todo", "review", "summary", "brief",
 ]
 
 # kind -> (бейдж, цвет rich) для выделения в выводе (CLI + TUI).
@@ -998,6 +1001,7 @@ JOB_RECORD_BADGES: dict[str, tuple[str, str]] = {
     "todo":         ("📌 TODO", "magenta"),
     "review":       ("🔍 РЕВЬЮ", "blue"),
     "summary":      ("📝 ИТОГ", "green"),
+    "brief":        ("📋 ЗАДАНИЕ", "blue"),   # задание воркеру от оркестратора — целиком
 }
 
 

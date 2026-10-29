@@ -119,7 +119,7 @@ def test_install_keeps_previous_command_and_uninstall_restores(store, tmp_path):
     note = sl.install(store, path, command="jwu statusline")
     assert "прежняя" in note
     data = json.loads(path.read_text())
-    assert data["statusLine"] == {"type": "command", "command": "jwu statusline"}
+    assert data["statusLine"] == {"type": "command", "command": "jwu statusline", "refreshInterval": sl.REFRESH_SECONDS}
     assert data["theme"] == "dark"
     assert sl.previous_command(store) == "node hud.js"
     assert sl.is_installed(path)

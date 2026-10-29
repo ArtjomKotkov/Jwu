@@ -14,7 +14,9 @@
   или она закрыта и копия за ней не записана;
 * ``temp`` — скачанные вложения во временной папке jwu старше суток;
 * ``dead_sessions`` — замолчавшие сессии: их активные работы уходят в паузу (снова свободны
-  на доске), запись о сессии удаляется.
+  на доске), запись о сессии удаляется;
+* ``dead_workers`` — воркеры оркестратора, чей процесс завершился без «готово»: запись
+  убирается, их открытые работы — в паузу (продолжит новый воркер или сессия).
 
 Открытые (активные, на паузе) работы и их ресурсы не трогаются никогда. Копия с
 незакоммиченным или незапушенным попадает в ``kept`` — убрать её можно только с ``force``.
@@ -34,7 +36,7 @@ from . import jobspace, todo
 if TYPE_CHECKING:
     from .store import Store
 
-GROUPS = ("closed_jobs", "orphan_docker", "orphan_worktrees", "temp", "dead_sessions")
+GROUPS = ("closed_jobs", "orphan_docker", "orphan_worktrees", "temp", "dead_sessions", "dead_workers")
 CLOSED = ("done", "cancelled")
 TEMP_MAX_AGE_HOURS = 24
 _JOB_IN_NAME = re.compile(r"-job(\d+)(?:-|$)")
@@ -165,6 +167,12 @@ def scan(store: "Store", *, runner: jobspace.Runner = jobspace._run, now: Option
         store.use_workspace(original_ws)
     for name, info in dead.items():
         out["dead_sessions"].append({"session": name, "seen_ago": info.get("seen_ago", ""), "jobs": held[name]})
+
+    # 6. упавшие воркеры оркестратора
+    from . import workers
+
+    for w in workers.dead(store):
+        out["dead_workers"].append({"session": w["name"], "jobs": w.get("jobs", []), "seen_ago": w.get("ago", "")})
     return out
 
 
@@ -225,5 +233,15 @@ def apply(store: "Store", groups: Iterable[str], *, force: bool = False,
             done["dead_sessions"].append({"session": item["session"], "released_jobs": released})
     finally:
         store.use_workspace(original_ws)
+
+    if "dead_workers" in groups:
+        from . import workers
+
+        for item in plan["dead_workers"]:
+            try:
+                res = workers.stop(store, item["session"], force=True)
+                done["dead_workers"].append({"session": item["session"], "released_jobs": res["paused_jobs"]})
+            except workers.WorkerError as exc:
+                errors.append(f"{item['session']}: {exc}")
 
     return {"done": done, "errors": errors}

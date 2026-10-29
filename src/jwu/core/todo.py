@@ -20,7 +20,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from .dates import fmt_ago
 
@@ -28,27 +28,32 @@ if TYPE_CHECKING:
     from .models import PR, Issue, Job
     from .store import Store
 
-GROUPS = ("duty", "simple", "fixes", "reply", "move", "todo", "review", "close")
+GROUPS = ("duty", "simple", "build", "fixes", "demo", "reply", "move", "todo", "review", "close")
 GROUP_TITLES = {
     "duty": "🛟 Дежурство",
     "reply": "📣 Ответить",
     "move": "➡️ Двигать дальше",
     "close": "🧹 Закрыть работу",
     "simple": "🔧 Конфликты и сборки",
+    "build": "🧪 Запустить сборку",
     "fixes": "✍️ Правки по ревью и QA",
+    "demo": "🎬 Демо и подготовка",
     "todo": "📋 Несделанные задачи",
     "review": "👀 Ждут моего ревью",
 }
 TODO_STATUSES_SETTING = "todo.statuses.todo"
 QA_STATUSES_SETTING = "todo.statuses.qa_failed"
-DEFAULT_TODO_STATUSES = ("open", "to do", "selected for development", "in progress", "dev at stand")
+DEMO_STATUSES_SETTING = "todo.statuses.demo"
+DEFAULT_TODO_STATUSES = ("open", "to do", "selected for development", "in progress")
+# Задача на стенде разработки или ждёт показа — своя группа: подготовить и провести демо.
+DEFAULT_DEMO_STATUSES = ("dev at stand", "demo")
 DEFAULT_QA_STATUSES = ("defect", "need update", "qa failed", "reopened", "failed")
 # Приоритет Jira → вес (меньше — важнее) и значок. Неизвестный — в конец.
 PRIORITY_ORDER = {"blocker": 0, "highest": 0, "critical": 1, "high": 1, "major": 2, "medium": 2,
                   "minor": 3, "low": 3, "trivial": 4, "lowest": 4}
 PRIORITY_ICON = {0: "🔴", 1: "🟠", 2: "🟡", 3: "🟢", 4: "⚪"}
 # Статус внутри группы «несделанные»: что уже в работе — выше того, что не начато.
-IN_WORK_STATUSES = ("in progress", "dev at stand")
+IN_WORK_STATUSES = ("in progress",)
 STALE_MINUTES = 30
 STALE_JOB_DAYS = 3      # работа висит дольше — на доске подсказка «давно: закрыть или продолжить?»
 SESSION_MARK = "Взято сессией"
@@ -134,17 +139,66 @@ def _taken(job: Optional["Job"]) -> Optional[dict]:
             "session": session, "title": job.title}
 
 
+BUILD_REQUIRED_SETTING = "todo.build.required"
+NO_BUILD = "нет сборки на последнем коммите"
+BUILD_RUNNING = "сборка идёт"
+BUILD_RED = "сборка красная"
+
+
+def build_expected(store: "Store", workspace_id: int) -> Callable[["PR"], bool]:
+    """Ждём ли зелёную сборку у PR этого репозитория.
+
+    Настройка ``todo.build.required``: репозитории через запятую, ``*`` — все, ``-`` — никакие.
+    Не задана — по истории: сборки ждём там, где CI их вообще присылает в хостинг (есть хоть
+    один PR со сборкой). У репозитория, чей CI статусы не шлёт, «нет сборки» — не блокер.
+    """
+    raw = (store.workspace_settings(workspace_id).get(BUILD_REQUIRED_SETTING) or "").strip()
+    if raw == "-":
+        return lambda pr: False
+    if raw == "*":
+        return lambda pr: True
+    if raw:
+        repos = {r.strip().casefold() for r in raw.split(",") if r.strip()}
+        return lambda pr: (pr.repository or "").casefold() in repos
+    with_builds = {(pr.project, pr.repository) for pr in store.latest_prs() if pr.builds}
+    return lambda pr: (pr.project, pr.repository) in with_builds
+
+
+def approvals_cell(pr: "PR") -> str:
+    """Апрувы одним словом: «1/3», «3/3 ✓», «нет ревьюеров»."""
+    if not pr.reviewers:
+        return "нет ревьюеров"
+    done = sum(1 for r in pr.reviewers if r.approved)
+    return f"{done}/{len(pr.reviewers)}" + (" ✓" if done == len(pr.reviewers) else "")
+
+
+def build_cell(pr: "PR", expected: bool) -> str:
+    """Сборка на head-коммите одним словом — для доски."""
+    state = pr.build_state
+    if state == "SUCCESSFUL":
+        return "✓ зелёная"
+    if state == "FAILED":
+        return "✗ красная"
+    if state == "INPROGRESS":
+        return "⏳ идёт"
+    if pr.build_queued:
+        return "⏳ в очереди"
+    return "— нет на последнем коммите" if expected else "— CI не сообщает"
+
+
 def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
           now: Optional[datetime] = None) -> Board:
     """Собрать доску из кеша и запомнить её номера за сессией."""
     from .daemon import LAST_PASS_META
 
     todo_st = _statuses(store, workspace_id, TODO_STATUSES_SETTING, DEFAULT_TODO_STATUSES)
+    demo_st = _statuses(store, workspace_id, DEMO_STATUSES_SETTING, DEFAULT_DEMO_STATUSES)
     qa_st = _statuses(store, workspace_id, QA_STATUSES_SETTING, DEFAULT_QA_STATUSES)
     issues = {i.key: i for i in store.latest_issues("mine")}
     by_key, by_pr = _taken_index(store)
     items: list[Item] = []
     covered: set[str] = set()
+    expects_build = build_expected(store, workspace_id)
 
     for pr in store.latest_prs("mine"):
         if pr.state and pr.state.upper() != "OPEN":
@@ -165,16 +219,22 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
         if pr.conflicted:
             tech.append("конфликт")
         if pr.build_state == "FAILED":
-            tech.append("сборка красная")
+            tech.append(BUILD_RED)
+        elif (not pr.build_state and not pr.build_queued and expects_build(pr)
+              and not (issue and (issue.status or "").casefold() in demo_st)):
+            # сродни конфликту: без сборки на последнем коммите PR дальше не двигают; в очереди
+            # CI — ждём («➡️ Двигать дальше» скажет «дождаться»), не в очереди — запустить
+            tech.append(NO_BUILD)
         if not review and not tech:
             continue
-        group = "fixes" if review else "simple"
+        group = "fixes" if review else ("build" if tech == [NO_BUILD] else "simple")
         problems = review + tech
         job = by_pr.get((pr.project, pr.repository, pr.id)) or (by_key.get(key) if key else None)
         items.append(Item(n=0, group=group, key=_pr_ref(pr), title=pr.title, status=issue.status if issue else "",
                           priority=issue.priority if issue else "",
                           problems=problems, issue_key=key,
-                          pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title},
+                          pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title,
+                              "approvals": approvals_cell(pr)},
                           taken=_taken(job)))
         if key:
             covered.add(key)
@@ -199,6 +259,15 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
             items.append(Item(n=0, group="fixes", key=key, title=issue.summary, status=issue.status,
                               priority=issue.priority, problems=[f"QA: {issue.status}"], issue_key=key,
                               taken=_taken(by_key.get(key))))
+        elif status in demo_st:
+            demo_prs = [pr for pr in store.latest_prs("mine")
+                        if _issue_key(pr) == key and (not pr.state or pr.state.upper() == "OPEN")]
+            pr0 = demo_prs[0] if demo_prs else None
+            items.append(Item(n=0, group="demo", key=key, title=issue.summary, status=issue.status,
+                              priority=issue.priority, issue_key=key, taken=_taken(by_key.get(key)),
+                              problems=[f"{pr.repository}#{pr.id} · апрувы {approvals_cell(pr)}" for pr in demo_prs],
+                              pr={"id": pr0.id, "project": pr0.project, "repo": pr0.repository, "title": pr0.title,
+                                  "approvals": approvals_cell(pr0)} if pr0 else None))
         elif status in todo_st and key not in open_pr_keys:
             items.append(Item(n=0, group="todo", key=key, title=issue.summary, status=issue.status,
                               priority=issue.priority, problems=[], issue_key=key, taken=_taken(by_key.get(key))))
@@ -265,6 +334,8 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
 
     by_key, by_pr = _taken_index(store)
     mine_prs = [pr for pr in store.latest_prs("mine") if not pr.state or pr.state.upper() == "OPEN"]
+    expects_build = build_expected(store, workspace_id)
+    demo_st = _statuses(store, workspace_id, DEMO_STATUSES_SETTING, DEFAULT_DEMO_STATUSES)
 
     # ➡️ апрувы собраны, блокеров нет — задачу перевести дальше / мержить
     for pr in mine_prs:
@@ -273,14 +344,28 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
             continue
         if pr.conflicted or pr.build_state == "FAILED" or pr.tasks_open:
             continue
+        expected = expects_build(pr)
+        if expected and not pr.build_state and not pr.build_queued:
+            continue   # нет сборки на последнем коммите и не в очереди — «🧪 Запустить сборку»
         key = _issue_key(pr)
         issue = issues.get(key)
         status = issue.status if issue else ""
-        nxt = ("задача уже на тестах — мержить по готовности" if is_testing_status(status)
-               else "апрувы собраны — перевести задачу в тестирование")
+        if status.casefold() in demo_st:
+            continue   # задача на стенде/демо — её ведёт «🎬 Демо и подготовка», не «двигать»
+        if pr.build_state == "INPROGRESS":
+            nxt = "апрувы собраны, сборка идёт — дождаться зелёной"
+        elif expected and not pr.build_state:
+            nxt = "апрувы собраны, сборка в очереди — дождаться зелёной"
+        elif is_testing_status(status):
+            nxt = "задача уже на тестах — мержить по готовности"
+        elif expected:
+            nxt = "апрувы и зелёная сборка — перевести задачу в тестирование"
+        else:
+            nxt = "апрувы собраны, CI сборку не сообщает — проверь её, потом перевести задачу в тестирование"
         items.append(Item(n=0, group="move", key=ref, title=pr.title, status=status,
                           priority=issue.priority if issue else "", issue_key=key,
-                          problems=[f"апрувы {len(pr.reviewers)}/{len(pr.reviewers)}", nxt],
+                          problems=[f"апрувы {len(pr.reviewers)}/{len(pr.reviewers)}",
+                                    "сборка: " + build_cell(pr, expected), nxt],
                           pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title},
                           taken=_taken(by_pr.get((pr.project, pr.repository, pr.id)) or by_key.get(key))))
         listed.add(ref)
@@ -449,11 +534,16 @@ def refresh(store: "Store", *, timeout: float = REFRESH_TIMEOUT, sleep=None) -> 
 def _goal(item: Item) -> str:
     pr = f" PR #{item.pr['id']}" if item.pr else ""
     if item.group == "simple":
-        what = " и ".join(p for p in item.problems if p in ("конфликт", "сборка красная"))
-        return f"{what.capitalize()}{pr}".replace("Сборка красная", "Красная сборка").replace("сборка красная", "красная сборка")
+        what = " и ".join(p for p in item.problems if p in ("конфликт", BUILD_RED, NO_BUILD))
+        return (f"{what.capitalize()}{pr}".replace("Сборка красная", "Красная сборка").replace("сборка красная", "красная сборка")
+                .replace("Нет сборки на последнем коммите", "Нет сборки").replace("нет сборки на последнем коммите", "нет сборки"))
     if item.group == "fixes":
-        return f"Правки по ревью{pr}" if any(not p.startswith("QA:") for p in item.problems if p not in ("конфликт", "сборка красная")) \
+        return f"Правки по ревью{pr}" if any(not p.startswith("QA:") for p in item.problems if p not in ("конфликт", BUILD_RED, NO_BUILD)) \
             else f"Правки по возврату QA{pr}"
+    if item.group == "build":
+        return f"Запустить сборку{pr}"
+    if item.group == "demo":
+        return "Подготовить и провести демо"
     if item.group == "review":
         return f"Ревью{pr}"
     if item.group == "move":
@@ -605,11 +695,13 @@ def _prio_cell(item: Item) -> str:
 _COLUMNS = {
     "duty":   ("№", "Вопрос", "Откуда", "Взято"),
     "reply":  ("№", "Задача", "Заголовок", "Кто и что", "Взято"),
-    "move":   ("№", "PR", "Задача", "Заголовок", "Статус", "Что дальше", "Взято"),
+    "move":   ("№", "PR", "Задача", "Заголовок", "Статус", "Сборка", "Что дальше", "Взято"),
     "close":  ("№", "Работа", "Задача", "Почему"),
-    "simple": ("№", "PR", "Задача", "Заголовок", "Приоритет", "Что не так", "Взято"),
+    "simple": ("№", "PR", "Задача", "Заголовок", "Апрувы", "Приоритет", "Что не так", "Взято"),
+    "build":  ("№", "PR", "Задача", "Заголовок", "Апрувы", "Приоритет", "Статус", "Взято"),
     "fixes":  ("№", "PR", "Задача", "Заголовок", "Приоритет", "Статус", "Что не так", "Взято"),
     "todo":   ("№", "Задача", "Заголовок", "Приоритет", "Статус", "Взято"),
+    "demo":   ("№", "Задача", "Заголовок", "Приоритет", "Статус", "PR", "Взято"),
     "review": ("№", "PR", "Задача", "Заголовок", "Автор", "Взято"),
 }
 
@@ -628,7 +720,8 @@ def _row(group: str, i: Item) -> list[str]:
     if group == "reply":
         return [str(i.n), key_md, _cell(i.title, 50), _cell(", ".join(i.problems), 80), _taken_cell(i)]
     if group == "move":
-        return [str(i.n), pr_md, key_md, _title(i), _cell(i.status), _cell(i.problems[-1]), _taken_cell(i)]
+        build = next((p[len("сборка: "):] for p in i.problems if p.startswith("сборка: ")), "—")
+        return [str(i.n), pr_md, key_md, _title(i), _cell(i.status), _cell(build), _cell(i.problems[-1]), _taken_cell(i)]
     if group == "close":
         return [str(i.n), f"**{i.key}**", key_md, _cell(", ".join(i.problems))]
     if group == "duty":
@@ -636,12 +729,17 @@ def _row(group: str, i: Item) -> list[str]:
     pr = f"{i.pr['repo']}#{i.pr['id']}" if i.pr else "—"
     key = f"**{_cell(i.issue_key)}**" if i.issue_key else "—"
     problems = _cell(", ".join(p for p in i.problems if not p.startswith("автор ")))
+    approvals = _cell((i.pr or {}).get("approvals", "")) or "—"
     if group == "simple":
-        return [str(i.n), pr, key, _title(i), _prio_cell(i), problems, _taken_cell(i)]
+        return [str(i.n), pr, key, _title(i), approvals, _prio_cell(i), problems, _taken_cell(i)]
+    if group == "build":
+        return [str(i.n), pr, key, _title(i), approvals, _prio_cell(i), _cell(i.status), _taken_cell(i)]
     if group == "fixes":
         return [str(i.n), pr, key, _title(i), _prio_cell(i), _cell(i.status), problems, _taken_cell(i)]
     if group == "todo":
         return [str(i.n), key, _title(i), _prio_cell(i), _cell(i.status), _taken_cell(i)]
+    if group == "demo":
+        return [str(i.n), key, _title(i), _prio_cell(i), _cell(i.status), _cell("; ".join(i.problems)) or "—", _taken_cell(i)]
     author = next((p[len("автор "):] for p in i.problems if p.startswith("автор ")), "")
     return [str(i.n), pr, key, _title(i), _cell(author), _taken_cell(i)]
 

@@ -25,6 +25,7 @@ EXPECTED_SKILLS = {
     "jwu-todo",
     "jwu-zephyr-testcase",
     "jwu-cleanup",
+    "jwu-orchestrator",
     "jwu-job-review",
     "jwu-commit-message",
     "jwu-task-create",
