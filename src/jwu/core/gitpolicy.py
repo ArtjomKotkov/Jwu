@@ -39,11 +39,12 @@ if TYPE_CHECKING:
 
 LEVELS = ("allow", "ask", "grant", "deny")
 OPS = ("commit", "switch", "sync", "stash", "discard", "history",
-       "push", "force_push", "delete_branch", "tag")
+       "push", "force_push", "delete_branch", "tag", "worktree")
 OP_TITLES = {
     "commit": "коммит", "switch": "переключить/создать ветку", "sync": "подтянуть целевую ветку",
     "stash": "stash", "discard": "выкинуть несохранённое", "history": "переписать незапушенную историю",
     "push": "пуш", "force_push": "force-пуш", "delete_branch": "удалить ветку", "tag": "тег",
+    "worktree": "убрать рабочую копию (worktree)",
 }
 WHERE = ("any", "job", "main")
 SYNC_MODES = ("merge", "rebase")
@@ -52,7 +53,7 @@ GRANT_VIA = ("telegram", "cli")
 DEFAULT_OPS = {
     "commit": "allow", "switch": "allow", "sync": "allow", "stash": "allow",
     "discard": "ask", "history": "ask", "push": "ask", "force_push": "ask",
-    "delete_branch": "ask", "tag": "grant",
+    "delete_branch": "ask", "tag": "grant", "worktree": "ask",
 }
 DEFAULT_SETTINGS = {"guard": True, "sync": "merge", "backup_days": 14,
                     "grant_ttl": 600, "grant_via": ["telegram", "cli"], "grant_bind": "head"}

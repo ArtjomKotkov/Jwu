@@ -462,6 +462,10 @@ def push(ctx: Ctx, *, force: bool = False, dry_run: bool = False, user_approved:
 def delete_branch(ctx: Ctx, branch: str, *, remote: bool = False, user_approved: bool = False) -> dict:
     if branch == ctx.branch:
         raise GitOpError("Нельзя удалить текущую ветку — сначала переключись")
+    busy = next((p for p, b in _linked_trees(ctx).items() if b == branch), "")
+    if busy:
+        raise GitOpError(f"Ветка {branch} занята рабочей копией {busy} — убери копию: "
+                         f"jwu_git_worktree_remove(path=«{busy}») (ветку она удалит сама)")
     gate(ctx, "delete_branch", branch=branch, user_approved=user_approved,
          detail=f"удалить {branch}{' и на origin' if remote else ''}")
     ref = f"{BACKUP_PREFIX}{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-delete-{branch.replace('/', '_')}"
@@ -494,6 +498,9 @@ def undo(ctx: Ctx, ref: str = "", *, user_approved: bool = False) -> dict:
         ref = BACKUP_PREFIX + ref
     if not any(b["ref"] == ref for b in items):
         raise GitOpError(f"Нет такой backup-ссылки: {ref}")
+    if "-worktree-" in ref:
+        raise GitOpError(f"{ref} — бэкап убранной копии, а не этой ветки: вернуть правки — "
+                         f"`git stash apply {ref}` или патч из ответа jwu_git_worktree_remove (git apply)")
     if not user_approved:
         raise Blocked(op="undo", level="ask", rule="откат всегда с «да»", reason="откат меняет ветку и дерево",
                       ask_user=f"Покажи пользователю, к чему откатываемся ({ref}), и спроси «да / нет».",
@@ -507,3 +514,142 @@ def undo(ctx: Ctx, ref: str = "", *, user_approved: bool = False) -> dict:
     ctx.refresh()
     _record(ctx, f"откат к {ref} (прежнее состояние — {before})")
     return {"ok": True, "head": ctx.head[:12], "restored": ref, "backup": before}
+
+
+# --------------------------------------------------------------------------- #
+# Рабочие копии (git worktree): убрать копию агента или работы
+# --------------------------------------------------------------------------- #
+
+AGENT_TREES = Path(".claude") / "worktrees"     # куда harness Claude Code кладёт копии субагентов
+HARNESS_BRANCH = re.compile(r"^worktree-")      # их ветки: worktree-agent-<id>, worktree-<имя>
+
+
+def patch_dir() -> Path:
+    from .config import data_dir
+
+    return data_dir() / "git-backups"
+
+
+def _prune_patches(days: int) -> None:
+    root = patch_dir()
+    edge = datetime.now(timezone.utc).timestamp() - days * 86400
+    for f in root.glob("*/*.patch") if root.is_dir() else []:
+        try:
+            if f.stat().st_mtime < edge:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _linked_trees(ctx: Ctx) -> dict[str, str]:
+    """Связанные копии репозитория: путь (resolved) → ветка ('' — detached)."""
+    out: dict[str, str] = {}
+    cur = ""
+    for line in ctx.git("worktree", "list", "--porcelain", check=False).splitlines():
+        if line.startswith("worktree "):
+            cur = str(Path(line[9:]).resolve())
+            out[cur] = ""
+        elif line.startswith("branch ") and cur:
+            out[cur] = line[7:].removeprefix("refs/heads/")
+    out.pop(str(Path(ctx.root).resolve()), None)
+    return out
+
+
+def allowed_place(store: "Store", repo_root: str, path: Path) -> bool:
+    """Копия лежит там, где jwu может её убирать: ``.claude/worktrees/`` репо или каталог работ."""
+    from . import jobspace
+
+    roots = [Path(repo_root).resolve() / AGENT_TREES]
+    jobs = jobspace.jobs_dir(store, store.workspace_id)
+    if jobs:
+        roots.append(Path(jobs).resolve())
+    return any(path != r and str(path).startswith(str(r) + "/") for r in roots)
+
+
+def main_repo_of(path: str, runner: Runner = _run) -> str:
+    """Корень основного репозитория для папки (в т.ч. для связанной копии)."""
+    code, out = runner(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if code != 0 or not out.strip():
+        return ""
+    common = Path(out.strip().splitlines()[-1])
+    return str(common.parent if common.name == ".git" else common)
+
+
+def worktree_remove(store: "Store", path: str, *, delete_branch: bool = True, user_approved: bool = False,
+                    runner: Runner = _run, notify: Optional[Notify] = None) -> dict:
+    """Убрать рабочую копию: бэкап несохранённого → worktree remove --force → prune → ветка копии.
+
+    Только копии в ``<репо>/.claude/worktrees/`` (субагенты Claude Code) и в каталоге работ jwu.
+    Несохранённое в копии — норма (агент оставляет правки в индексе): оно уходит в бэкап
+    (патч в каталоге данных jwu + backup-ссылка), а не мешает удалению. ``path`` = корень
+    репозитория — только ``git worktree prune`` (убрать записи о пропавших копиях).
+
+    Служебная ветка копии (``worktree-*``, её создаёт harness) уходит вместе с копией по
+    решению ``worktree``; любую другую ветку (например, ветку работы) — только по решению
+    ``delete_branch`` для неё самой.
+    """
+    target = Path(path).expanduser()
+    probe = str(target if target.exists() else target.parent)
+    main = main_repo_of(probe, runner)
+    if not main:
+        raise GitOpError(f"{path}: не git-репозиторий и не копия")
+    ctx = context(store, main, runner=runner, notify=notify)
+    if target.exists() and target.resolve() == Path(ctx.root).resolve():
+        gate(ctx, "worktree", user_approved=user_approved, detail="git worktree prune")
+        before = set(_linked_trees(ctx))
+        ctx.git("worktree", "prune")
+        gone = sorted(before - set(_linked_trees(ctx)))
+        _record(ctx, f"worktree prune: убрано записей {len(gone)}")
+        return {"ok": True, "pruned": gone, "removed": None}
+    real = target.resolve()
+    trees = _linked_trees(ctx)
+    if str(real) not in trees:
+        raise GitOpError(f"{path}: это не рабочая копия {ctx.remote or ctx.root} (git worktree list её не знает)")
+    if not allowed_place(store, ctx.root, real):
+        raise GitOpError(f"{path}: убираю только копии в {AGENT_TREES}/ репозитория и в каталоге работ jwu")
+    branch = trees[str(real)]
+    gate(ctx, "worktree", user_approved=user_approved, detail=f"убрать копию {real.name}"
+         + (f" и ветку {branch}" if delete_branch and branch else ""))
+
+    # бэкап: всё несохранённое (вместе с неотслеживаемым) одним патчем + ссылка на состояние
+    wt = Ctx(store=store, path=str(real), root=str(real), remote=ctx.remote, branch=branch, head="",
+             where=ctx.where, policy=ctx.policy, runner=runner)
+    wt.head = wt.git("rev-parse", "HEAD", check=False).strip()
+    wt.git("add", "-A", check=False)
+    patch_text = wt.git("diff", "--cached", "--binary", "HEAD", check=False) if wt.head else ""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    patch = ""
+    if patch_text.strip():
+        folder = patch_dir() / (ctx.remote.replace("/", "_") or Path(ctx.root).name)
+        folder.mkdir(parents=True, exist_ok=True)
+        f = folder / f"{stamp}-{real.name}.patch"
+        f.write_text(patch_text + ("" if patch_text.endswith("\n") else "\n"), encoding="utf-8")
+        patch = str(f)
+    state = wt.git("stash", "create", f"jwu backup before worktree {real.name}", check=False).strip() or wt.head
+    ref = ""
+    if state:
+        ref = f"{BACKUP_PREFIX}{stamp}-worktree-{real.name}"
+        ctx.git("update-ref", ref, state)
+    _prune_backups(ctx)
+    _prune_patches(ctx.policy.backup_days)
+
+    ctx.git("worktree", "remove", "--force", str(real))
+    ctx.git("worktree", "prune", check=False)
+    files = len([ln for ln in patch_text.splitlines() if ln.startswith("diff --git")])
+    result = {"ok": True, "removed": str(real), "branch": branch, "branch_deleted": False,
+              "backup": {"ref": ref, "patch": patch, "files": files, "keep_days": ctx.policy.backup_days,
+                         "restore": (f"git apply --index {patch}" if patch else "")
+                         or (f"git stash apply {ref}" if ref else "")}}
+    if delete_branch and branch and branch != ctx.branch:
+        try:
+            if not HARNESS_BRANCH.match(branch):
+                gate(ctx, "delete_branch", branch=branch, user_approved=user_approved, detail=f"удалить {branch}")
+            ctx.git("branch", "-D", branch)
+            result["branch_deleted"] = True
+        except Blocked as b:
+            result["branch_blocked"] = b.to_dict()
+        except GitOpError as exc:
+            result["branch_error"] = str(exc)
+    _record(ctx, f"убрал копию {real.name}" + (f" и ветку {branch}" if result["branch_deleted"] else "")
+            + (f"; бэкап {ref}" if ref else ""))
+    return result

@@ -118,9 +118,46 @@ def _substitutions(cmd: str) -> list[str]:
     return out
 
 
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredocs(cmd: str) -> tuple[str, list[str]]:
+    """Тело heredoc — данные, а не команды (``cat > f <<'EOF'`` с кодом внутри). Исключения:
+    тело читает shell (``bash <<EOF``) — это команды; разделитель без кавычек — ``$(…)`` в
+    теле выполнится, его проверяем. → (команда без тел, что проверить дополнительно)."""
+    lines = cmd.split("\n")
+    out: list[str] = []
+    extra: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in _HEREDOC.finditer(line):
+            quoted, delim = bool(m.group(1)), m.group(2)
+            strip_tabs = line[m.start():m.start() + 3] == "<<-"
+            body = []
+            while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]) != delim:
+                body.append(lines[i])
+                i += 1
+            i += 1   # строка с разделителем
+            head = line[:m.start()].split("|")[-1].split(";")[-1].split("&&")[-1].strip()
+            consumer = os.path.basename((head.split() or [""])[0])
+            text = "\n".join(body)
+            if consumer in _SHELLS or consumer == "eval":
+                extra.append(text)
+            elif not quoted:
+                extra += _substitutions(text)
+    return "\n".join(out), extra
+
+
 def segments(cmd: str) -> list[list[str]]:
     """Команда → список простых команд (argv). Вложенные sh -c / eval / $(…) — раскрыты."""
     result: list[list[str]] = []
+    if "<<" in cmd:
+        cmd, extra = _strip_heredocs(cmd)
+        for sub in extra:
+            result += segments(sub)
     for sub in _substitutions(cmd):
         result += segments(sub)
     try:
@@ -231,6 +268,8 @@ _INSTEAD = {
     "clean": "jwu_git_discard (untracked=True)", "stash": "jwu_git_stash", "branch": "jwu_git_switch / "
     "jwu_git_branch_delete", "tag": "jwu_git_tag", "cherry-pick": "попроси пользователя",
     "revert": "попроси пользователя", "am": "попроси пользователя", "apply": "правь файлы и jwu_git_commit",
+    "worktree": "jwu_git_worktree_remove(path=<копия>) — убрать копию с бэкапом и её веткой; "
+                "path=<корень репо> — prune. Копии субагентов harness создаёт сам",
 }
 
 

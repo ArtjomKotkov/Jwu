@@ -1070,6 +1070,35 @@ async def jwu_git_branch_delete(branch: str, path: str = "", remote: bool = Fals
 
 
 @mcp.tool()
+async def jwu_git_worktree_remove(path: str, delete_branch: bool = True, user_approved: bool = False,
+                                  workspace: Optional[str] = None) -> dict:
+    """Git: убрать рабочую копию (git worktree) — вместо голого `git worktree remove/prune`.
+
+    path — копия: только в <репо>/.claude/worktrees/ (копии субагентов с isolation: "worktree")
+    или в каталоге работ jwu, иначе отказ. Несохранённое в копии — норма (субагент оставляет
+    правки в индексе): перед удалением всё уходит в бэкап — патч (staged + unstaged +
+    неотслеживаемое) в каталоге данных jwu и backup-ссылка refs/jwu/backup/…-worktree-<имя>,
+    хранятся backup_days. Потом worktree remove --force, prune и удаление ветки копии
+    (delete_branch): служебная worktree-* — вместе с копией, другая (ветка работы) — по своему
+    решению политики delete_branch. path = корень репозитория — только prune.
+    Под политикой, операция worktree (по умолчанию ask: user_approved после «да»). Ответ: что
+    удалено, ветка, backup {ref, patch, files, restore}; отказ — {blocked, ask_user, retry}."""
+    import os
+
+    from .core import gitops
+
+    store = _store_only(workspace)
+    try:
+        res = gitops.worktree_remove(store, path or os.getcwd(), delete_branch=delete_branch,
+                                     user_approved=user_approved, notify=_grant_notify)
+    except gitops.Blocked as b:
+        res = b.to_dict()
+    except (gitops.GitOpError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    return _stamp(res, _resolve(workspace))
+
+
+@mcp.tool()
 async def jwu_git_tag(name: str, path: str = "", message: str = "", push: bool = False,
                       user_approved: bool = False, workspace: Optional[str] = None) -> dict:
     """Git: тег на HEAD (message — аннотированный; push — запушить, ВНЕШНЯЯ запись). Обычно grant."""
@@ -1113,7 +1142,7 @@ async def jwu_sweep(apply: bool = False, groups: Optional[list[str]] = None, for
                     user_approved: bool = False, workspace: Optional[str] = None) -> dict:
     """Уборка за всеми сессиями (все воркспейсы). Без apply — только список по группам:
     closed_jobs (неубранное у закрытых работ), orphan_docker (docker с меткой работы, а работы
-    нет или закрыта), orphan_worktrees (копии в каталоге работ без живой работы), temp (скачанные
+    нет или закрыта), orphan_worktrees (копии в каталоге работ без живой работы и копии субагентов .claude/worktrees/agent-* без изменений > 2 ч — их несохранённое уходит в бэкап), temp (скачанные
     вложения старше суток), dead_sessions (сессии молчат > 2 ч: их работы — в паузу), dead_workers
     (воркеры оркестратора, чей процесс умер без «готово»: работы — в паузу); kept —
     что не тронется (незакоммиченное/незапушенное) и почему. Открытые работы не трогаются.

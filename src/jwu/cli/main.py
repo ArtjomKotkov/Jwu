@@ -4571,7 +4571,7 @@ def git_policy_import(path: Path = typer.Argument(..., help="TOML-файл по�
 @git_policy_app.command("check")
 def git_policy_check(op: str = typer.Argument(..., help="Операция: " + ", ".join(
                          ("commit", "switch", "sync", "stash", "discard", "history", "push", "force_push",
-                          "delete_branch", "tag"))),
+                          "delete_branch", "tag", "worktree"))),
                      branch: str = typer.Option("", "--branch", "-b", help="Ветка (по умолчанию — текущая в папке)."),
                      repo: str = typer.Option("", "--repo", "-r", help="project/repo (по умолчанию — из папки)."),
                      where: str = typer.Option("", "--where", help="job | main (по умолчанию — по папке)."),

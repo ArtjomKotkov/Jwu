@@ -18,7 +18,8 @@ Bash мимо jwu режет хук Claude Code `jwu-git-guard`.
 
 `commit`, `switch` (переключить/создать ветку), `sync` (подтянуть целевую ветку merge или
 rebase), `stash`, `discard` (выкинуть несохранённое), `history` (amend, reset — только
-незапушенное), `push`, `force_push` (только `--force-with-lease`), `delete_branch`, `tag`.
+незапушенное), `push`, `force_push` (только `--force-with-lease`), `delete_branch`, `tag`,
+`worktree` (убрать рабочую копию: remove + prune).
 Чтение (`status`, `diff`, `log`, `show`, `fetch`…) политикой не ограничивается.
 
 ## Как решается
@@ -59,6 +60,7 @@ push = "ask"
 force_push = "ask"
 delete_branch = "ask"
 tag = "grant"
+worktree = "ask"
 
 [[git.rule]]
 name = "прод-ветки"
@@ -116,6 +118,31 @@ ops = { push = "deny", commit = "deny" }   # только читать
 памятью (`jwu memory export/import`; при импорте чужая копия не заменяет уже настроенную).
 Допуски и журнал — только на этой машине.
 
+## Рабочие копии (worktree)
+
+Субагенты Claude Code с `isolation: "worktree"` работают в копиях `<репо>/.claude/worktrees/agent-<id>`
+на ветках `worktree-agent-<id>` и оставляют правки в индексе. Убрать такую копию (и копию в
+каталоге работ jwu) — `jwu_git_worktree_remove(path)`:
+
+1. только копии в `.claude/worktrees/` репозитория и в каталоге работ jwu, другие — отказ;
+2. решение политики по операции `worktree` (по умолчанию `ask`);
+3. бэкап несохранённого — норма, а не повод отказать: патч (staged, unstaged и
+   неотслеживаемое) в `<данные jwu>/git-backups/<репо>/` и ссылка
+   `refs/jwu/backup/<время>-worktree-<имя>`, хранятся `backup_days`; вернуть —
+   `git apply --index <патч>` или `git stash apply <ссылка>`;
+4. `git worktree remove --force`, `git worktree prune`;
+5. ветка копии: служебная `worktree-*` уходит вместе с копией; другая (ветка работы) — только
+   по решению `delete_branch` для неё самой (не пустили — копия убрана, ветка осталась).
+
+`path` = корень репозитория — только `prune`. `jwu_sweep` находит копии субагентов, не
+менявшиеся больше 2 часов, в группе `orphan_worktrees` и убирает их так же.
+
+Пример: в своём `main` разрешить агенту убирать копии без вопроса:
+
+```
+jwu git rule add --repo proj/app --branch main --at 1 --name "main владельца" --op worktree=allow
+```
+
 ## Что видит агент
 
 Отказ — ответ, а не ошибка:
@@ -139,7 +166,11 @@ ops = { push = "deny", commit = "deny" }   # только читать
   `jwu workspace setting git.*`, `jwu job push` и `sqlite3` по базе jwu. `jwu git grant`
   работает только в терминале (TTY).
 - Хук разбирает команду целиком: цепочки, `$(…)`, `sh -c`, `eval`, `env`/`VAR=…`/`timeout`,
-  `git -C`, `-c`. Вне папок воркспейсов jwu хук git не трогает.
+  `git -C`, `-c`. Тело heredoc (`cat > f <<'EOF' … EOF`) — данные и не проверяется, кроме
+  случаев, когда его читает shell (`bash <<EOF`) или в нём есть `$(…)` без кавычек у
+  разделителя. Хук смотрит только Bash: копии субагентов harness создаёт сам (Agent
+  isolation, EnterWorktree/ExitWorktree) — это не затрагивается. Вне папок воркспейсов jwu
+  хук git не трогает.
 
 Это страховка от случайности и самодеятельности агента, а не песочница: окончательный замок —
 права веток на сервере git.

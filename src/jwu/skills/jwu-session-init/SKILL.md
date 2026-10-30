@@ -90,6 +90,7 @@ description: Use at the START of a session, again after /clear or context compac
 | ветка | `jwu_git_switch(branch, create=True, base=…)` |
 | выкинуть правки, amend, reset | `jwu_git_discard` / `jwu_git_history` |
 | откатить сделанное jwu | `jwu_git_undo(path)` — список, потом `ref` |
+| убрать копию (субагента `.claude/worktrees/…`, работы) | `jwu_git_worktree_remove(path)` — бэкап несохранённого, remove, prune, ветка копии |
 | что можно в этой ветке | `jwu_git_policy(path)` |
 
 Ответ `{"ok": false, "blocked": …}` — это **политика**, а не сбой. Не обходи её:
