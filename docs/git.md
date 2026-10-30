@@ -99,6 +99,26 @@ remote = "proj/legacy"
 ops = { push = "deny", commit = "deny" }   # только читать
 ```
 
+## Инструменты агента (MCP)
+
+| что | инструмент |
+|---|---|
+| состояние, дифф, история | `jwu_git_status(path)`, `jwu_git_diff(path, staged, ref, stat)`, `jwu_git_log(path, n)` — только чтение |
+| коммит | `jwu_git_commit(message, path, files)` |
+| ветка | `jwu_git_switch(branch, path, create, base)` |
+| подтянуть целевую ветку | `jwu_git_sync(path, action=start\|continue\|abort, target, mode)` |
+| stash | `jwu_git_stash(path, action=push\|pop\|apply\|list)` |
+| выкинуть правки | `jwu_git_discard(path, files, untracked)` |
+| amend, reset незапушенного | `jwu_git_history(action=amend\|reset, path, message, ref)` |
+| пуш | `jwu_git_push(path, force, dry_run)`; ветка работы — `jwu_job_push(job_id)` |
+| удалить ветку, тег | `jwu_git_branch_delete(branch, path, remote)`, `jwu_git_tag(name, path, push)` |
+| убрать рабочую копию | `jwu_git_worktree_remove(path, delete_branch)` |
+| откат к бэкапу | `jwu_git_undo(path, ref)` — без `ref` список |
+| что можно здесь | `jwu_git_policy(path)` — уровни операций и ждущие допуски |
+
+У пишущих — `user_approved`: его ставят только после «да» пользователя (уровень `ask`).
+Для `grant` его мало, для `deny` ничего не поможет.
+
 ## Команды
 
 | что | команда |

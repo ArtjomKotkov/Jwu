@@ -73,6 +73,13 @@ MCP-инструменты повторяют CLI: `jwu_task`, `jwu_pr`, `jwu_pr
 `jwu_pr_comment*`, `jwu_pr_review`, `jwu_pr_create`, `jwu_pr_update`, `jwu_pr_task_*`,
 `jwu_confluence_create|update`) скиллы зовут только после явного подтверждения.
 
+Git — только через jwu, под [политикой git](git.md): чтение `jwu_git_status|diff|log`,
+запись `jwu_git_commit|switch|sync|stash|discard|history|push|branch_delete|tag`,
+`jwu_job_push`, уборка копий `jwu_git_worktree_remove`, откат `jwu_git_undo`, что можно —
+`jwu_git_policy`. Отказ политики — ответ `{blocked, ask_user, retry}`, а не ошибка. Голый
+пишущий git из Bash режет хук `jwu-git-guard` (ставит `jwu install`); менять политику и
+выдавать допуски агент не может.
+
 
 ## Несколько сессий: доска `/jwu-todo`
 
