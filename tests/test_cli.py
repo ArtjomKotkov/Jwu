@@ -311,7 +311,7 @@ def test_configure_interactive_writes_to_workspace(monkeypatch, tmp_path):
     db, cfg_path, keyring_store = _configure_env(monkeypatch, tmp_path)
 
     # порядок промптов: host, user, project, PAT, session-pw, gate-login, gate-pw,
-    # sdesk-host (пусто => SDESK пропускается целиком),
+    # support-host (пусто => Support пропускается целиком),
     # bb-host, bb-project, bb-repo, bb-PAT, jenkins-host, jenkins-user, db-path,
     # telegram-chat (пусто => уведомления выключены, токен не спрашивается).
     # Jenkins username пустой => токен не спрашивается.
@@ -1053,11 +1053,11 @@ def test_issue_link_requires_confirmation(monkeypatch):
 class _CommentSvc:
     """Заглушка для `jwu comment`: помнит, что и куда отправлено."""
 
-    def __init__(self, sdesk_keys=("SDESK",)):
+    def __init__(self, support_keys=("SUP",)):
         self.tasks_client = object()
         self.pr_client = None
         self.workspace = None
-        self.sdesk_keys = sdesk_keys
+        self.support_keys = support_keys
         self.sent: list[tuple] = []
 
     def __enter__(self): return self
@@ -1065,7 +1065,7 @@ class _CommentSvc:
     def close(self): pass
 
     def key_is_client_facing(self, key):
-        return key.split("-", 1)[0] in self.sdesk_keys
+        return key.split("-", 1)[0] in self.support_keys
 
     def add_comment(self, key, text, *, client_facing=False):
         if self.key_is_client_facing(key) and not client_facing:
@@ -1088,22 +1088,22 @@ def test_comment_json_requires_confirmation(monkeypatch):
     assert svc.sent == [("PROJ-1", "перенёс фикс", False)]
 
 
-def test_comment_to_sdesk_requires_to_client_flag(monkeypatch, tmp_path):
+def test_comment_to_support_requires_to_client_flag(monkeypatch, tmp_path):
     """Клиентский инстанс: без --to-client команда обязана отказать, ничего не отправив."""
     svc = _CommentSvc()
     monkeypatch.setattr(cli, "_service_with_jira", lambda: svc)
     body = tmp_path / "answer.md"
     body.write_text("Ответ клиенту", encoding="utf-8")
 
-    res = runner.invoke(cli.app, ["comment", "SDESK-9", "-F", str(body), "--yes", "--json"])
+    res = runner.invoke(cli.app, ["comment", "SUP-9", "-F", str(body), "--yes", "--json"])
     assert res.exit_code == 1
     assert json.loads(res.stdout)["reason"] == "client_facing_confirmation_required"
     assert svc.sent == []
 
-    res = runner.invoke(cli.app, ["comment", "SDESK-9", "-F", str(body),
+    res = runner.invoke(cli.app, ["comment", "SUP-9", "-F", str(body),
                                   "--to-client", "--yes", "--json"])
     assert res.exit_code == 0
-    assert svc.sent == [("SDESK-9", "Ответ клиенту", True)]
+    assert svc.sent == [("SUP-9", "Ответ клиенту", True)]
 
 
 def test_comment_dry_run_sends_nothing(monkeypatch):
@@ -1234,13 +1234,13 @@ def test_configure_password_from_stdin_and_env(tmp_path, monkeypatch):
     r = CliRunner().invoke(cli.app, ["-W", "work", "configure", "--non-interactive", "--jira-password", "-"],
                            input="from-stdin\n")
     assert r.exit_code == 0, r.output
-    monkeypatch.setenv("SDESK_PASSWORD", "from-env")
+    monkeypatch.setenv("SUPPORT_PASSWORD", "from-env")
     r = CliRunner().invoke(cli.app, ["-W", "work", "configure", "--non-interactive"])
     assert r.exit_code == 0, r.output
     s = Store(tmp_path / "s.db")
     ws = s.get_workspace_by_slug("work")
     assert s.get_workspace_secret(ws.id, "jira.password") == "from-stdin"
-    assert s.get_workspace_secret(ws.id, "sdesk.password") == "from-env"
+    assert s.get_workspace_secret(ws.id, "support.password") == "from-env"
     s.close()
 
 

@@ -150,59 +150,59 @@ def test_export_read_bundle_roundtrip(tmp_path, monkeypatch):
     assert not cfg_path.exists()
 
 
-def test_sdesk_disabled_by_default():
-    from jwu.core.config import sdesk_enabled
+def test_support_disabled_by_default():
+    from jwu.core.config import support_enabled
 
-    assert sdesk_enabled(Config()) is False
+    assert support_enabled(Config()) is False
 
 
-def test_sdesk_save_load_roundtrip(tmp_path):
-    """[sdesk] пишется, только когда инстанс подключён (base_url + project)."""
-    from jwu.core.config import sdesk_enabled
+def test_support_save_load_roundtrip(tmp_path):
+    """[support] пишется, только когда инстанс подключён (base_url + project)."""
+    from jwu.core.config import support_enabled
 
     p = tmp_path / "config.toml"
     cfg = Config()
     cfg.jira.base_url = "https://jira.acme.com"
-    cfg.sdesk.base_url = "https://sdesk.acme.com"
-    cfg.sdesk.project = "SDESK"
-    cfg.sdesk.username = "alice"
-    cfg.sdesk.proxy_basic_user = "gw"
+    cfg.support.base_url = "https://support.acme.com"
+    cfg.support.project = "SUP"
+    cfg.support.username = "alice"
+    cfg.support.proxy_basic_user = "gw"
     save_config(cfg, p)
 
     loaded = load_config(p)
-    assert sdesk_enabled(loaded) is True
-    assert loaded.sdesk.base_url == "https://sdesk.acme.com"
-    assert loaded.sdesk.project == "SDESK"
-    assert loaded.sdesk.username == "alice"
-    assert loaded.sdesk.proxy_basic_user == "gw"
-    # секреты SDESK лежат под отдельными сервисами
-    assert loaded.sdesk.token_service == "sdesk-pat"
-    assert loaded.sdesk.login_service == "sdesk-login"
-    assert loaded.sdesk.proxy_basic_service == "sdesk-proxy-basic"
+    assert support_enabled(loaded) is True
+    assert loaded.support.base_url == "https://support.acme.com"
+    assert loaded.support.project == "SUP"
+    assert loaded.support.username == "alice"
+    assert loaded.support.proxy_basic_user == "gw"
+    # секреты Support лежат под отдельными сервисами
+    assert loaded.support.token_service == "support-pat"
+    assert loaded.support.login_service == "support-login"
+    assert loaded.support.proxy_basic_service == "support-proxy-basic"
 
 
-def test_sdesk_section_omitted_when_disabled(tmp_path):
+def test_support_section_omitted_when_disabled(tmp_path):
     p = tmp_path / "config.toml"
-    save_config(Config(), p)  # SDESK не задан
-    assert "[sdesk]" not in p.read_text()
+    save_config(Config(), p)  # Support не задан
+    assert "[support]" not in p.read_text()
 
 
-def test_sdesk_secrets_use_own_services(monkeypatch):
+def test_support_secrets_use_own_services(monkeypatch):
     m = _mem(monkeypatch)
-    monkeypatch.delenv("SDESK_TOKEN", raising=False)
+    monkeypatch.delenv("SUPPORT_TOKEN", raising=False)
     cfg = Config()
-    cfg.sdesk.username = "alice"
-    m.set_password("sdesk-pat", "sdesk", "SDTOK")
-    m.set_password("sdesk-login", "alice", "SDPW")
-    assert cfgmod.sdesk_token(cfg) == "SDTOK"
-    assert cfgmod.sdesk_login(cfg) == ("alice", "SDPW")
+    cfg.support.username = "alice"
+    m.set_password("support-pat", "support", "SDTOK")
+    m.set_password("support-login", "alice", "SDPW")
+    assert cfgmod.support_token(cfg) == "SDTOK"
+    assert cfgmod.support_login(cfg) == ("alice", "SDPW")
     # Jira-секреты не задеты — инстансы независимы
     assert cfgmod.jira_login(cfg) is None
 
 
-def test_export_read_bundle_includes_sdesk(tmp_path, monkeypatch):
+def test_export_read_bundle_includes_support(tmp_path, monkeypatch):
     from jwu.core import secrets
-    from jwu.core.config import export_bundle, read_bundle, sdesk_enabled
+    from jwu.core.config import export_bundle, read_bundle, support_enabled
 
     _mem(monkeypatch)
     cfg_path = tmp_path / "config.toml"
@@ -211,26 +211,26 @@ def test_export_read_bundle_includes_sdesk(tmp_path, monkeypatch):
     cfg = Config()
     cfg.jira.base_url = "https://jira.acme.com"
     cfg.jira.username = "alice"
-    cfg.sdesk.base_url = "https://sdesk.acme.com"
-    cfg.sdesk.project = "SDESK"
-    cfg.sdesk.username = "alice"
-    cfg.sdesk.proxy_basic_user = "gw"
+    cfg.support.base_url = "https://support.acme.com"
+    cfg.support.project = "SUP"
+    cfg.support.username = "alice"
+    cfg.support.proxy_basic_user = "gw"
     secrets.set_secret(cfg.jira.token_service, cfg.jira.token_account, "JTOK")
-    secrets.set_secret(cfg.sdesk.token_service, cfg.sdesk.token_account, "SDTOK")
-    secrets.set_secret(cfg.sdesk.login_service, "alice", "SDPW")
-    secrets.set_secret(cfg.sdesk.proxy_basic_service, "gw", "SDGPW")
+    secrets.set_secret(cfg.support.token_service, cfg.support.token_account, "SDTOK")
+    secrets.set_secret(cfg.support.login_service, "alice", "SDPW")
+    secrets.set_secret(cfg.support.proxy_basic_service, "gw", "SDGPW")
 
     bundle = tmp_path / "bundle.toml"
     n = export_bundle(cfg, bundle)
-    assert n == 4  # jira PAT + 3 sdesk-секрета
+    assert n == 4  # jira PAT + 3 support-секрета
     assert "SDPW" in bundle.read_text()
 
     _mem(monkeypatch)
     cfg2, values = read_bundle(bundle)
-    assert sdesk_enabled(cfg2) is True
-    assert cfg2.sdesk.project == "SDESK"
-    assert values["sdesk.password"] == "SDPW"
-    assert values["sdesk.gate_password"] == "SDGPW"
+    assert support_enabled(cfg2) is True
+    assert cfg2.support.project == "SUP"
+    assert values["support.password"] == "SDPW"
+    assert values["support.gate_password"] == "SDGPW"
 
 
 def test_read_bundle_missing_file_raises(tmp_path):
@@ -327,14 +327,14 @@ def test_workspace_config_roundtrip_keeps_views(tmp_path, monkeypatch):
     cfg = Config()
     cfg.jira.base_url = "https://jira.acme.com"
     cfg.jira.views = dict(cfg.jira.views, mine="assignee = currentUser() ORDER BY key")
-    cfg.sdesk.base_url = "https://sdesk.acme.com"
-    cfg.sdesk.project = "SDESK"
+    cfg.support.base_url = "https://support.acme.com"
+    cfg.support.project = "SUP"
     workspaces.save_workspace_config(store, ws, cfg)
 
     loaded = workspaces.config_for_workspace(store, ws)
     assert loaded.jira.base_url == "https://jira.acme.com"
     assert loaded.jira.views["mine"] == "assignee = currentUser() ORDER BY key"
-    assert cfgmod.sdesk_enabled(loaded) is True
+    assert cfgmod.support_enabled(loaded) is True
     store.close()
 
 

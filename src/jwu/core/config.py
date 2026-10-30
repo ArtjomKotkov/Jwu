@@ -55,24 +55,24 @@ class JiraConfig:
 
 
 @dataclass
-class SdeskConfig:
-    """Второй Jira-инстанс (SDESK) — тот же REST API, но отдельный хост и СВОИ секреты.
+class SupportConfig:
+    """Второй Jira-инстанс (Support) — тот же REST API, но отдельный хост и СВОИ секреты.
 
     Креды могут совпадать с основной Jira, но лежат под отдельными keyring-сервисами
-    (``sdesk-*``), чтобы их можно было ротировать/сносить независимо. Инстанс считается
-    подключённым, только когда заданы ``base_url`` и ``project`` (см. ``sdesk_enabled``);
-    иначе jwu ведёт себя как раньше, будто SDESK нет. Задачи резолвятся в этот инстанс
-    по префиксу ключа, совпадающему с ``project`` (напр. ``SDESK-39336``).
+    (``support-*``), чтобы их можно было ротировать/сносить независимо. Инстанс считается
+    подключённым, только когда заданы ``base_url`` и ``project`` (см. ``support_enabled``);
+    иначе jwu ведёт себя как раньше, будто Support нет. Задачи резолвятся в этот инстанс
+    по префиксу ключа, совпадающему с ``project`` (напр. ``SUP-39336``).
     """
 
     base_url: str = ""
-    project: str = ""  # префикс ключей этого инстанса (SDESK); пусто => инстанс выключен
+    project: str = ""  # префикс ключей этого инстанса (Support); пусто => инстанс выключен
     username: str = ""  # логин для login/proxy-секретов; пусто => берётся из session_login
-    token_account: str = "sdesk"
-    token_service: str = "sdesk-pat"
-    token_env: str = "SDESK_TOKEN"
-    proxy_basic_service: str = "sdesk-proxy-basic"
-    login_service: str = "sdesk-login"
+    token_account: str = "support"
+    token_service: str = "support-pat"
+    token_env: str = "SUPPORT_TOKEN"
+    proxy_basic_service: str = "support-proxy-basic"
+    login_service: str = "support-login"
     proxy_basic_user: str = ""
 
 
@@ -174,7 +174,7 @@ class StorageConfig:
 @dataclass
 class Config:
     jira: JiraConfig = field(default_factory=JiraConfig)
-    sdesk: SdeskConfig = field(default_factory=SdeskConfig)
+    support: SupportConfig = field(default_factory=SupportConfig)
     bitbucket: BitbucketConfig = field(default_factory=BitbucketConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
@@ -190,8 +190,8 @@ class Config:
 # потому что account — это логин/имя аккаунта из соответствующей секции.
 def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
     section, _, kind = slot.partition(".")
-    if section in ("jira", "sdesk"):
-        sec = cfg.jira if section == "jira" else cfg.sdesk
+    if section in ("jira", "support"):
+        sec = cfg.jira if section == "jira" else cfg.support
         pairs = {
             "token": (sec.token_service, sec.token_account),
             "password": (sec.login_service, sec.username),
@@ -281,16 +281,16 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     if views:
         cfg.jira.views = {**DEFAULT_VIEWS, **views}
 
-    sd = raw.get("sdesk", {}) or {}
-    cfg.sdesk.base_url = sd.get("base_url", cfg.sdesk.base_url).rstrip("/")
-    cfg.sdesk.project = sd.get("project", cfg.sdesk.project)
-    cfg.sdesk.username = sd.get("username", cfg.sdesk.username)
-    cfg.sdesk.token_account = sd.get("token_account", cfg.sdesk.token_account)
-    cfg.sdesk.token_service = sd.get("token_service", cfg.sdesk.token_service)
-    cfg.sdesk.token_env = sd.get("token_env", cfg.sdesk.token_env)
-    cfg.sdesk.proxy_basic_service = sd.get("proxy_basic_service", cfg.sdesk.proxy_basic_service)
-    cfg.sdesk.proxy_basic_user = sd.get("proxy_basic_user", cfg.sdesk.proxy_basic_user)
-    cfg.sdesk.login_service = sd.get("login_service", cfg.sdesk.login_service)
+    sd = raw.get("support", {}) or {}
+    cfg.support.base_url = sd.get("base_url", cfg.support.base_url).rstrip("/")
+    cfg.support.project = sd.get("project", cfg.support.project)
+    cfg.support.username = sd.get("username", cfg.support.username)
+    cfg.support.token_account = sd.get("token_account", cfg.support.token_account)
+    cfg.support.token_service = sd.get("token_service", cfg.support.token_service)
+    cfg.support.token_env = sd.get("token_env", cfg.support.token_env)
+    cfg.support.proxy_basic_service = sd.get("proxy_basic_service", cfg.support.proxy_basic_service)
+    cfg.support.proxy_basic_user = sd.get("proxy_basic_user", cfg.support.proxy_basic_user)
+    cfg.support.login_service = sd.get("login_service", cfg.support.login_service)
 
     b = raw.get("bitbucket", {}) or {}
     cfg.bitbucket.base_url = b.get("base_url", cfg.bitbucket.base_url).rstrip("/")
@@ -341,10 +341,10 @@ ENV_SETTINGS: dict[str, tuple[str, str]] = {
     "JWU_JIRA_USER": ("jira", "username"),
     "JWU_JIRA_PROJECT": ("jira", "project"),
     "JWU_JIRA_GATE_USER": ("jira", "proxy_basic_user"),
-    "JWU_SDESK_URL": ("sdesk", "base_url"),
-    "JWU_SDESK_PROJECT": ("sdesk", "project"),
-    "JWU_SDESK_USER": ("sdesk", "username"),
-    "JWU_SDESK_GATE_USER": ("sdesk", "proxy_basic_user"),
+    "JWU_SUPPORT_URL": ("support", "base_url"),
+    "JWU_SUPPORT_PROJECT": ("support", "project"),
+    "JWU_SUPPORT_USER": ("support", "username"),
+    "JWU_SUPPORT_GATE_USER": ("support", "proxy_basic_user"),
     "JWU_BITBUCKET_URL": ("bitbucket", "base_url"),
     "JWU_BITBUCKET_PROJECT": ("bitbucket", "project"),
     "JWU_BITBUCKET_REPO": ("bitbucket", "repo"),
@@ -393,14 +393,14 @@ def save_config(cfg: Config, path: Path | None = None) -> Path:
     if cfg.jira.proxy_basic_user:
         jira["proxy_basic_user"] = cfg.jira.proxy_basic_user
 
-    # SDESK пишем, только если инстанс подключён — иначе не засоряем конфиг пустой секцией.
-    if sdesk_enabled(cfg):
-        sd = raw.setdefault("sdesk", {})
-        sd["base_url"] = cfg.sdesk.base_url
-        sd["project"] = cfg.sdesk.project
-        sd["username"] = cfg.sdesk.username
-        if cfg.sdesk.proxy_basic_user:
-            sd["proxy_basic_user"] = cfg.sdesk.proxy_basic_user
+    # Support пишем, только если инстанс подключён — иначе не засоряем конфиг пустой секцией.
+    if support_enabled(cfg):
+        sd = raw.setdefault("support", {})
+        sd["base_url"] = cfg.support.base_url
+        sd["project"] = cfg.support.project
+        sd["username"] = cfg.support.username
+        if cfg.support.proxy_basic_user:
+            sd["proxy_basic_user"] = cfg.support.proxy_basic_user
 
     bb = raw.setdefault("bitbucket", {})
     bb["base_url"] = cfg.bitbucket.base_url
@@ -441,9 +441,9 @@ def _require_slot(cfg: Config, slot: str) -> str:
     return val
 
 
-def sdesk_enabled(cfg: Config) -> bool:
-    """Подключён ли второй Jira-инстанс (SDESK): заданы и хост, и project-префикс."""
-    return bool(cfg.sdesk.base_url and cfg.sdesk.project)
+def support_enabled(cfg: Config) -> bool:
+    """Подключён ли второй Jira-инстанс (Support): заданы и хост, и project-префикс."""
+    return bool(cfg.support.base_url and cfg.support.project)
 
 
 def github_enabled(cfg: Config) -> bool:
@@ -455,14 +455,14 @@ def github_token(cfg: Config) -> str:
     return _require_slot(cfg, "github.token")
 
 
-# --- секреты Jira-подобного инстанса (Jira / SDESK) ------------------------- #
-# Обе секции (JiraConfig / SdeskConfig) устроены одинаково, поэтому логика доступа
-# общая и параметризуется префиксом слота ("jira" | "sdesk").
+# --- секреты Jira-подобного инстанса (Jira / Support) ------------------------- #
+# Обе секции (JiraConfig / SupportConfig) устроены одинаково, поэтому логика доступа
+# общая и параметризуется префиксом слота ("jira" | "support").
 
 
 def _section_login(cfg: Config, prefix: str) -> tuple[str, str] | None:
     """Сессионный логин (username из секции, пароль из хранилища) или None."""
-    section = cfg.jira if prefix == "jira" else cfg.sdesk
+    section = cfg.jira if prefix == "jira" else cfg.support
     if not section.username:
         return None
     pw = get_slot(cfg, f"{prefix}.password")
@@ -471,7 +471,7 @@ def _section_login(cfg: Config, prefix: str) -> tuple[str, str] | None:
 
 def _section_proxy_basic(cfg: Config, prefix: str) -> tuple[str, str] | None:
     """Креды nginx-гейта (proxy_basic_user из секции, пароль из хранилища) или None."""
-    section = cfg.jira if prefix == "jira" else cfg.sdesk
+    section = cfg.jira if prefix == "jira" else cfg.support
     if not section.proxy_basic_user:
         return None
     pw = get_slot(cfg, f"{prefix}.gate_password")
@@ -482,8 +482,8 @@ def jira_token(cfg: Config) -> str:
     return _require_slot(cfg, "jira.token")
 
 
-def sdesk_token(cfg: Config) -> str:
-    return _require_slot(cfg, "sdesk.token")
+def support_token(cfg: Config) -> str:
+    return _require_slot(cfg, "support.token")
 
 
 def bitbucket_token(cfg: Config) -> str:
@@ -522,14 +522,14 @@ def jira_proxy_basic(cfg: Config) -> tuple[str, str] | None:
     return _section_proxy_basic(cfg, "jira")
 
 
-def sdesk_login(cfg: Config) -> tuple[str, str] | None:
-    """Сессионный логин SDESK (username из конфига, пароль из хранилища) или None."""
-    return _section_login(cfg, "sdesk")
+def support_login(cfg: Config) -> tuple[str, str] | None:
+    """Сессионный логин Support (username из конфига, пароль из хранилища) или None."""
+    return _section_login(cfg, "support")
 
 
-def sdesk_proxy_basic(cfg: Config) -> tuple[str, str] | None:
-    """Креды nginx-гейта SDESK (proxy_basic_user из конфига, пароль из хранилища) или None."""
-    return _section_proxy_basic(cfg, "sdesk")
+def support_proxy_basic(cfg: Config) -> tuple[str, str] | None:
+    """Креды nginx-гейта Support (proxy_basic_user из конфига, пароль из хранилища) или None."""
+    return _section_proxy_basic(cfg, "support")
 
 
 def export_bundle(cfg: Config, path: Path) -> int:
@@ -555,14 +555,14 @@ def export_bundle(cfg: Config, path: Path) -> int:
     }
     if cfg.jira.proxy_basic_user:
         raw["jira"]["proxy_basic_user"] = cfg.jira.proxy_basic_user
-    if sdesk_enabled(cfg):
-        raw["sdesk"] = {
-            "base_url": cfg.sdesk.base_url,
-            "project": cfg.sdesk.project,
-            "username": cfg.sdesk.username,
+    if support_enabled(cfg):
+        raw["support"] = {
+            "base_url": cfg.support.base_url,
+            "project": cfg.support.project,
+            "username": cfg.support.username,
         }
-        if cfg.sdesk.proxy_basic_user:
-            raw["sdesk"]["proxy_basic_user"] = cfg.sdesk.proxy_basic_user
+        if cfg.support.proxy_basic_user:
+            raw["support"]["proxy_basic_user"] = cfg.support.proxy_basic_user
     if github_enabled(cfg):
         raw["github"] = {
             "api_url": cfg.github.api_url,

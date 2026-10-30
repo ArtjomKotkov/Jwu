@@ -23,7 +23,7 @@ from .fixtures import (
 
 JIRA = "https://jira.test"
 BB = "https://git.test"
-SDESK = "https://sdesk.test"
+SUPPORT_URL = "https://support.test"
 
 
 def _service(tmp_path):
@@ -38,78 +38,78 @@ def _service(tmp_path):
     )
 
 
-def _service_with_sdesk(tmp_path):
+def _service_with_support(tmp_path):
     cfg = Config()
     cfg.jira.base_url = JIRA
     cfg.bitbucket.base_url = BB
-    cfg.sdesk.base_url = SDESK
-    cfg.sdesk.project = "SDESK"
+    cfg.support.base_url = SUPPORT_URL
+    cfg.support.project = "SUP"
     return Service(
         cfg,
         JiraClient(JIRA, "tok"),
         BitbucketClient(BB, "tok"),
         Store(tmp_path / "state.db"),
-        sdesk=JiraClient(SDESK, "stok"),
+        support=JiraClient(SUPPORT_URL, "stok"),
     )
 
 
 def test_client_for_key_routes_by_prefix(tmp_path):
-    svc = _service_with_sdesk(tmp_path)
+    svc = _service_with_support(tmp_path)
     try:
-        assert svc._client_for_key("SDESK-39336") is svc.sdesk
-        assert svc._client_for_key("sdesk-1") is svc.sdesk  # регистр не важен
+        assert svc._client_for_key("SUP-39336") is svc.support
+        assert svc._client_for_key("sup-1") is svc.support  # регистр не важен
         assert svc._client_for_key("TASKS-5") is svc.jira
     finally:
         svc.close()
 
 
-def test_client_for_key_without_sdesk_always_jira(tmp_path):
+def test_client_for_key_without_support_always_jira(tmp_path):
     svc = _service(tmp_path)
     try:
-        assert svc._client_for_key("SDESK-1") is svc.jira  # SDESK не подключён
+        assert svc._client_for_key("SUP-1") is svc.jira  # SUPPORT_URL не подключён
     finally:
         svc.close()
 
 
 @respx.mock
-def test_issue_and_worklog_route_to_sdesk_instance(tmp_path):
-    """SDESK-ключ ходит на хост SDESK, обычный — на основную Jira."""
+def test_issue_and_worklog_route_to_support_instance(tmp_path):
+    """SUPPORT_URL-ключ ходит на хост SUPPORT_URL, обычный — на основную Jira."""
     jira_issue = respx.get(f"{JIRA}/rest/api/2/issue/TASKS-1").mock(
         return_value=httpx.Response(200, json=jira_issue_raw(key="TASKS-1")))
-    sdesk_issue = respx.get(f"{SDESK}/rest/api/2/issue/SDESK-39336").mock(
-        return_value=httpx.Response(200, json=jira_issue_raw(key="SDESK-39336")))
-    for host in (JIRA, SDESK):
+    support_issue = respx.get(f"{SUPPORT_URL}/rest/api/2/issue/SUP-39336").mock(
+        return_value=httpx.Response(200, json=jira_issue_raw(key="SUP-39336")))
+    for host in (JIRA, SUPPORT_URL):
         respx.get(f"{host}/rest/dev-status/1.0/issue/detail").mock(
             return_value=httpx.Response(200, json={"detail": []}))
-    sdesk_wl = respx.post(f"{SDESK}/rest/api/2/issue/SDESK-39336/worklog").mock(
+    support_wl = respx.post(f"{SUPPORT_URL}/rest/api/2/issue/SUP-39336/worklog").mock(
         return_value=httpx.Response(201, json={"id": "1"}))
 
-    svc = _service_with_sdesk(tmp_path)
+    svc = _service_with_support(tmp_path)
     try:
-        assert svc.issue("SDESK-39336").key == "SDESK-39336"
+        assert svc.issue("SUP-39336").key == "SUP-39336"
         assert svc.issue("TASKS-1").key == "TASKS-1"
-        svc.add_worklog("SDESK-39336", "1h")
+        svc.add_worklog("SUP-39336", "1h")
     finally:
         svc.close()
 
-    assert sdesk_issue.called and jira_issue.called
-    assert sdesk_wl.called  # worklog ушёл на SDESK, а не на Jira
+    assert support_issue.called and jira_issue.called
+    assert support_wl.called  # worklog ушёл на SUPPORT_URL, а не на Jira
 
 
 @respx.mock
-def test_broken_sdesk_does_not_break_jira(tmp_path):
-    """Ленивое построение SDESK: недоступный/неверный SDESK не рушит команды по Jira.
+def test_broken_support_does_not_break_jira(tmp_path):
+    """Ленивое построение SUPPORT_URL: недоступный/неверный SUPPORT_URL не рушит команды по Jira.
 
-    Фабрика SDESK кидает при логине; обращение к Jira-ключу этого даже не касается,
-    а auth_check отдаёт jira ok и sdesk error, а не падает целиком.
+    Фабрика SUPPORT_URL кидает при логине; обращение к Jira-ключу этого даже не касается,
+    а auth_check отдаёт jira ok и support error, а не падает целиком.
     """
     from jwu.core.jira import JiraError
 
     cfg = Config()
     cfg.jira.base_url = JIRA
     cfg.bitbucket.base_url = BB
-    cfg.sdesk.base_url = SDESK
-    cfg.sdesk.project = "SDESK"
+    cfg.support.base_url = SUPPORT_URL
+    cfg.support.project = "SUP"
 
     def _boom():
         raise JiraError("401: не удалось залогиниться", 401)
@@ -119,7 +119,7 @@ def test_broken_sdesk_does_not_break_jira(tmp_path):
         JiraClient(JIRA, "tok"),
         BitbucketClient(BB, "tok"),
         Store(tmp_path / "state.db"),
-        sdesk_factory=_boom,
+        support_factory=_boom,
     )
 
     respx.get(f"{JIRA}/rest/api/2/issue/TASKS-1").mock(
@@ -132,11 +132,11 @@ def test_broken_sdesk_does_not_break_jira(tmp_path):
         return_value=httpx.Response(200, json=bitbucket_dashboard_raw([])))
 
     try:
-        # Jira-ключ работает как ни в чём не бывало — SDESK-фабрика не дёргается
+        # Jira-ключ работает как ни в чём не бывало — SUPPORT_URL-фабрика не дёргается
         assert svc.issue("TASKS-1").key == "TASKS-1"
         res = svc.auth_check()
         assert res["jira"]["ok"] is True
-        assert res["sdesk"]["ok"] is False and "401" in res["sdesk"]["error"]
+        assert res["support"]["ok"] is False and "401" in res["support"]["error"]
     finally:
         svc.close()
 
@@ -540,19 +540,19 @@ def test_create_issue_stops_before_post_when_required_field_missing(tmp_path):
 
 
 @respx.mock
-def test_create_issue_in_sdesk_project_goes_to_sdesk_instance(tmp_path):
+def test_create_issue_in_support_project_goes_to_support_instance(tmp_path):
     """Инстанс выбирается по префиксу ключа проекта — как и для карточки задачи."""
-    respx.get(f"{SDESK}/rest/api/2/issue/createmeta").mock(
-        return_value=httpx.Response(200, json=jira_createmeta_raw(project="SDESK")))
-    post = respx.post(f"{SDESK}/rest/api/2/issue").mock(
-        return_value=httpx.Response(201, json={"id": "2", "key": "SDESK-42"}))
+    respx.get(f"{SUPPORT_URL}/rest/api/2/issue/createmeta").mock(
+        return_value=httpx.Response(200, json=jira_createmeta_raw(project="SUP")))
+    post = respx.post(f"{SUPPORT_URL}/rest/api/2/issue").mock(
+        return_value=httpx.Response(201, json={"id": "2", "key": "SUP-42"}))
     jira_post = respx.post(f"{JIRA}/rest/api/2/issue")
-    svc = _service_with_sdesk(tmp_path)
+    svc = _service_with_support(tmp_path)
     try:
-        res = svc.create_issue("SDESK", "обращение клиента")
+        res = svc.create_issue("SUP", "обращение клиента")
     finally:
         svc.close()
-    assert res["issue"]["key"] == "SDESK-42"
+    assert res["issue"]["key"] == "SUP-42"
     assert post.called and not jira_post.called
 
 
@@ -579,14 +579,14 @@ def test_link_issues_checks_type_and_instance(tmp_path):
         200, json={"issueLinkTypes": [{"name": "Relates"}, {"name": "Blocks"}]}))
     route = respx.post(f"{JIRA}/rest/api/2/issueLink").mock(
         return_value=httpx.Response(201, content=b""))
-    svc = _service_with_sdesk(tmp_path)
+    svc = _service_with_support(tmp_path)
     try:
         res = svc.link_issues("PROJ-2", "PROJ-1", "blocks")
         assert res["type"] == "Blocks"  # регистр берём из инстанса
         with pytest.raises(ValueError) as unknown:
             svc.link_issues("PROJ-2", "PROJ-1", "Дублирует")
         with pytest.raises(ValueError) as cross:
-            svc.link_issues("PROJ-2", "SDESK-1", "Relates")
+            svc.link_issues("PROJ-2", "SUP-1", "Relates")
     finally:
         svc.close()
     assert route.call_count == 1
@@ -651,16 +651,16 @@ def test_task_branch_reach_survives_unavailable_pr_host(tmp_path, monkeypatch):
 
 
 @respx.mock
-def test_add_comment_refuses_sdesk_without_client_consent(tmp_path):
-    """Комментарий в SDESK читает клиент — без явного согласия он не уходит."""
-    route = respx.post(f"{SDESK}/rest/api/2/issue/SDESK-1/comment").mock(
+def test_add_comment_refuses_support_without_client_consent(tmp_path):
+    """Комментарий в SUPPORT_URL читает клиент — без явного согласия он не уходит."""
+    route = respx.post(f"{SUPPORT_URL}/rest/api/2/issue/SUP-1/comment").mock(
         return_value=httpx.Response(201, json={"id": "1"}))
-    svc = _service_with_sdesk(tmp_path)
+    svc = _service_with_support(tmp_path)
     try:
         with pytest.raises(ValueError) as exc:
-            svc.add_comment("SDESK-1", "черновик ответа")
+            svc.add_comment("SUP-1", "черновик ответа")
         assert not route.called
-        assert svc.add_comment("SDESK-1", "готовый ответ", client_facing=True)["id"] == "1"
+        assert svc.add_comment("SUP-1", "готовый ответ", client_facing=True)["id"] == "1"
     finally:
         svc.close()
     assert "КЛИЕНТ" in str(exc.value)
@@ -671,7 +671,7 @@ def test_add_comment_refuses_sdesk_without_client_consent(tmp_path):
 def test_add_comment_to_internal_task_needs_no_client_flag(tmp_path):
     route = respx.post(f"{JIRA}/rest/api/2/issue/PROJ-1/comment").mock(
         return_value=httpx.Response(201, json={"id": "7"}))
-    svc = _service_with_sdesk(tmp_path)
+    svc = _service_with_support(tmp_path)
     try:
         assert svc.add_comment("PROJ-1", "команде: перенёс фикс")["id"] == "7"
         with pytest.raises(ValueError, match="Пустой"):
@@ -683,28 +683,28 @@ def test_add_comment_to_internal_task_needs_no_client_flag(tmp_path):
 
 @respx.mock
 def test_my_worklog_keys_on_searches_both_instances(tmp_path):
-    """«Что вообще затрекано за день» ищется JQL-ом и в Jira, и в SDESK."""
+    """«Что вообще затрекано за день» ищется JQL-ом и в Jira, и в SUPPORT_URL."""
     jira = respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(
         200, json=jira_search_raw([jira_issue_raw(key="PROJ-1")])))
-    sdesk = respx.get(f"{SDESK}/rest/api/2/search").mock(return_value=httpx.Response(
-        200, json=jira_search_raw([jira_issue_raw(key="SDESK-9")])))
-    svc = _service_with_sdesk(tmp_path)
+    support = respx.get(f"{SUPPORT_URL}/rest/api/2/search").mock(return_value=httpx.Response(
+        200, json=jira_search_raw([jira_issue_raw(key="SUP-9")])))
+    svc = _service_with_support(tmp_path)
     try:
         keys = svc.my_worklog_keys_on("2026-08-31")
     finally:
         svc.close()
-    assert keys == ["PROJ-1", "SDESK-9"]
+    assert keys == ["PROJ-1", "SUP-9"]
     assert "worklogDate" in jira.calls.last.request.url.params["jql"]
-    assert sdesk.called
+    assert support.called
 
 
 @respx.mock
 def test_my_worklog_keys_on_survives_dead_instance(tmp_path):
-    """SDESK лёг — день всё равно показываем по основной Jira."""
+    """SUPPORT_URL лёг — день всё равно показываем по основной Jira."""
     respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(
         200, json=jira_search_raw([jira_issue_raw(key="PROJ-1")])))
-    respx.get(f"{SDESK}/rest/api/2/search").mock(return_value=httpx.Response(500, text="down"))
-    svc = _service_with_sdesk(tmp_path)
+    respx.get(f"{SUPPORT_URL}/rest/api/2/search").mock(return_value=httpx.Response(500, text="down"))
+    svc = _service_with_support(tmp_path)
     try:
         assert svc.my_worklog_keys_on("2026-08-31") == ["PROJ-1"]
     finally:

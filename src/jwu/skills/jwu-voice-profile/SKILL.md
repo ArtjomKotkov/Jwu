@@ -1,6 +1,6 @@
 ---
 name: jwu-voice-profile
-description: Use when the user wants their writing voice analysed and saved into the jwu voice profile — «собери голосовой профиль», «проанализируй, как я пишу», «обнови профиль голоса», «пересобери анализ голоса», «/jwu-voice-profile». Reads the user's real external texts from the jwu voice corpus per channel (PR comments, replies, Jira, SDESK, PR descriptions, commits), derives concrete style rules per channel, shows them, and only after «да» saves them as the «Анализ корпуса» section of the workspace profile. After that the voice agent writes from the profile and reads corpus examples only when the user says «не похоже на меня».
+description: Use when the user wants their writing voice analysed and saved into the jwu voice profile — «собери голосовой профиль», «проанализируй, как я пишу», «обнови профиль голоса», «пересобери анализ голоса», «/jwu-voice-profile». Reads the user's real external texts from the jwu voice corpus per channel (PR comments, replies, Jira, Support, PR descriptions, commits), derives concrete style rules per channel, shows them, and only after «да» saves them as the «Анализ корпуса» section of the workspace profile. After that the voice agent writes from the profile and reads corpus examples only when the user says «не похоже на меня».
 ---
 
 # jwu: анализ голоса в профиль
@@ -32,7 +32,7 @@ description: Use when the user wants their writing voice analysed and saved into
    противоречь). Корпус пустой или старый — предложи `jwu_voice_collect()` (читает
    Bitbucket/Jira/git, долго) и дождись согласия.
 2. **Тексты по каналам.** Для каждого канала, где текстов ≥ 5:
-   `jwu_voice_examples(channel, limit=40)`; для `sdesk_client` — с `audience="client"`.
+   `jwu_voice_examples(channel, limit=40)`; для `support_client` — с `audience="client"`.
    Каналы с < 5 текстами в анализ не бери — скажи, что для них агент будет смотреть примеры.
 3. **Разбери каждый канал по фактам текстов**, не по общим представлениям о хорошем стиле:
    - длина: типично сколько предложений / строк, бывает ли длиннее;

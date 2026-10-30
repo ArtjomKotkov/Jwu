@@ -31,8 +31,8 @@ def _svc(tmp_path):
     cfg.bitbucket.base_url = BB
     cfg.bitbucket.project = "PROJ"
     cfg.bitbucket.repo = "repo"
-    cfg.sdesk.base_url = JIRA
-    cfg.sdesk.project = "SDESK"
+    cfg.support.base_url = JIRA
+    cfg.support.project = "SUP"
     store = Store(tmp_path / "s.db")
     store.use_workspace(store.get_workspace_by_slug("work").id)
     return Service(cfg, JiraClient(JIRA, "tok"), BitbucketClient(BB, "tok"), store)
@@ -75,13 +75,13 @@ def test_foreign_comment_refused(tmp_path):
         svc.close()
 
 
-def test_sdesk_comment_edit_requires_client_facing(tmp_path):
+def test_support_comment_edit_requires_client_facing(tmp_path):
     svc = _svc(tmp_path)
     try:
         with pytest.raises(ValueError, match="КЛИЕНТ"):
-            svc.issue_comment_update("SDESK-5", "1", "текст")
+            svc.issue_comment_update("SUP-5", "1", "текст")
         with pytest.raises(ValueError, match="КЛИЕНТ"):
-            svc.issue_comment_delete("SDESK-5", "1")
+            svc.issue_comment_delete("SUP-5", "1")
     finally:
         svc.close()
 

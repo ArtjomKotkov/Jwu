@@ -5,7 +5,7 @@ CLI обращается только сюда. Здесь же — локаль
 У контура ОДИН провайдер задач и PR (см. ``Workspace.provider``), поэтому сервис держит
 две ссылки — ``tasks_client`` и ``pr_client``, — а не по клиенту на каждую систему:
 
-- ``jira``   → JiraClient (+SDESK) и BitbucketClient (+Jenkins);
+- ``jira``   → JiraClient (+Support) и BitbucketClient (+Jenkins);
 - ``github`` → один GitHubClient в обеих ролях (Issues, PR, Actions);
 - ``local``  → оба None: работы и фичи живут в памяти jwu и сети не требуют.
 
@@ -36,10 +36,10 @@ from .config import (
     jira_proxy_basic,
     jira_token,
     load_config,
-    sdesk_enabled,
-    sdesk_login,
-    sdesk_proxy_basic,
-    sdesk_token,
+    support_enabled,
+    support_login,
+    support_proxy_basic,
+    support_token,
 )
 from .github import GitHubClient
 from .jenkins import JenkinsClient, JenkinsError, parse_build_url
@@ -104,7 +104,7 @@ def _jira_like_client(
     login: tuple[str, str] | None = None,
     proxy_basic: tuple[str, str] | None = None,
 ) -> JiraClient:
-    """Собрать клиента Jira-подобного инстанса (Jira / SDESK) по кредам.
+    """Собрать клиента Jira-подобного инстанса (Jira / Support) по кредам.
 
     ``login`` задан → сессионная авторизация за nginx Basic-гейтом (``proxy_basic``);
     иначе — обычный PAT через ``Authorization: Bearer``. При session_login сетевой
@@ -115,15 +115,15 @@ def _jira_like_client(
     return JiraClient(base_url, token or "")
 
 
-def _build_sdesk_client(cfg: Config) -> JiraClient:
-    """Клиент SDESK по его СВОИМ кредам (сессия за гейтом либо PAT). Может кинуть
-    JiraError на логине — вызывается лениво, поэтому падение SDESK не рушит Jira."""
-    slogin = sdesk_login(cfg)
+def _build_support_client(cfg: Config) -> JiraClient:
+    """Клиент Support по его СВОИМ кредам (сессия за гейтом либо PAT). Может кинуть
+    JiraError на логине — вызывается лениво, поэтому падение Support не рушит Jira."""
+    slogin = support_login(cfg)
     if slogin is not None:
         return _jira_like_client(
-            cfg.sdesk.base_url, login=slogin, proxy_basic=sdesk_proxy_basic(cfg)
+            cfg.support.base_url, login=slogin, proxy_basic=support_proxy_basic(cfg)
         )
-    return _jira_like_client(cfg.sdesk.base_url, token=sdesk_token(cfg))
+    return _jira_like_client(cfg.support.base_url, token=support_token(cfg))
 
 
 # Слова короче этого в поиск дублей не идут: предлоги и «для»/«при» только зашумляют.
@@ -464,8 +464,8 @@ class Service:
         prs: "BitbucketClient | GitHubClient | None",
         store: Store,
         jenkins: JenkinsClient | None = None,
-        sdesk: JiraClient | None = None,
-        sdesk_factory: "Callable[[], JiraClient] | None" = None,
+        support: JiraClient | None = None,
+        support_factory: "Callable[[], JiraClient] | None" = None,
         workspace: Workspace | None = None,
     ) -> None:
         self.cfg = cfg
@@ -474,13 +474,13 @@ class Service:
         self.workspace = workspace
         # Клиент задач и клиент PR. У GitHub-контура это ОДИН объект в обеих ролях.
         self.tasks_client = tasks
-        # Второй Jira-инстанс (SDESK): строится ЛЕНИВО (self._sdesk_factory) при первом
-        # обращении к его ключу — чтобы недоступный/неверно настроенный SDESK не рушил
+        # Второй Jira-инстанс (Support): строится ЛЕНИВО (self._support_factory) при первом
+        # обращении к его ключу — чтобы недоступный/неверно настроенный Support не рушил
         # работу с основной Jira. Задачи с его префиксом ключа обслуживаются им, всё
         # остальное (вью/синк/дашборд) остаётся на основной Jira. Тесты могут передать
-        # готовый клиент через sdesk=...
-        self.sdesk = sdesk
-        self._sdesk_factory = sdesk_factory
+        # готовый клиент через support=...
+        self.support = support
+        self._support_factory = support_factory
         self.pr_client = prs
         self.jenkins = jenkins
         self.store = store
@@ -533,16 +533,16 @@ class Service:
         else:
             # гейта нет — обычный PAT через Bearer
             jira = _jira_like_client(cfg.jira.base_url, token=jira_token(cfg))
-        # SDESK — второй Jira-инстанс (если подключён): строится ЛЕНИВО, чтобы его
+        # Support — второй Jira-инстанс (если подключён): строится ЛЕНИВО, чтобы его
         # логин (сессия за гейтом либо PAT) не выполнялся, пока не понадобится задача
-        # с его префиксом ключа. Иначе недоступный SDESK ронял бы все команды.
-        sdesk_factory = (lambda: _build_sdesk_client(cfg)) if sdesk_enabled(cfg) else None
+        # с его префиксом ключа. Иначе недоступный Support ронял бы все команды.
+        support_factory = (lambda: _build_support_client(cfg)) if support_enabled(cfg) else None
         bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
         # Jenkins опционален: клиент создаётся всегда (для парсинга/единообразия),
         # но без токена — без auth, и глубокие вызовы вернут 401/403, что мы ловим.
         jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
         store = Store(db_path or str(default_db_path()), workspace_id)
-        return cls(cfg, jira, bitbucket, store, jenkins, sdesk_factory=sdesk_factory)
+        return cls(cfg, jira, bitbucket, store, jenkins, support_factory=support_factory)
 
     @classmethod
     def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None,
@@ -596,7 +596,7 @@ class Service:
             return cls(cfg, gh, gh, store, workspace=workspace)
 
         jira = None
-        sdesk_factory = None
+        support_factory = None
         if workspace.jira_enabled:
             login = jira_login(cfg)
             if login is not None:
@@ -607,7 +607,7 @@ class Service:
                     cfg.jira.username = login[0]
             else:
                 jira = _jira_like_client(cfg.jira.base_url, token=jira_token(cfg))
-            sdesk_factory = (lambda: _build_sdesk_client(cfg)) if sdesk_enabled(cfg) else None
+            support_factory = (lambda: _build_support_client(cfg)) if support_enabled(cfg) else None
 
         bitbucket = jenkins = None
         if workspace.bitbucket_enabled:
@@ -615,7 +615,7 @@ class Service:
             jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
 
         return cls(cfg, jira, bitbucket, store, jenkins,
-                   sdesk_factory=sdesk_factory, workspace=workspace)
+                   support_factory=support_factory, workspace=workspace)
 
     @classmethod
     def builds_for_workspace(
@@ -642,7 +642,7 @@ class Service:
         if isinstance(self._notifier, notify.TelegramNotifier):
             self._notifier.close()
             self._notifier = _UNSET
-        clients = [self.tasks_client, self.pr_client, self.sdesk, self.jenkins,
+        clients = [self.tasks_client, self.pr_client, self.support, self.jenkins,
                    getattr(self, "_confluence", None)]
         seen: list[int] = []
         for client in clients:
@@ -661,31 +661,31 @@ class Service:
 
     # --- Jira ----------------------------------------------------------- #
 
-    def _sdesk_client(self) -> JiraClient | None:
-        """Материализовать SDESK-клиент при первом обращении (здесь и происходит логин).
+    def _support_client(self) -> JiraClient | None:
+        """Материализовать Support-клиент при первом обращении (здесь и происходит логин).
 
-        Тесты могут передать готовый клиент через ``sdesk=`` — тогда фабрика не нужна.
+        Тесты могут передать готовый клиент через ``support=`` — тогда фабрика не нужна.
         """
-        if self.sdesk is None and self._sdesk_factory is not None:
-            self.sdesk = self._sdesk_factory()
-        return self.sdesk
+        if self.support is None and self._support_factory is not None:
+            self.support = self._support_factory()
+        return self.support
 
-    def _key_is_sdesk(self, key: str) -> bool:
-        """Принадлежит ли ключ инстансу SDESK (по совпадению префикса с sdesk.project)."""
-        if not sdesk_enabled(self.cfg):
+    def _key_is_support(self, key: str) -> bool:
+        """Принадлежит ли ключ инстансу Support (по совпадению префикса с support.project)."""
+        if not support_enabled(self.cfg):
             return False
-        return key.split("-", 1)[0].upper() == self.cfg.sdesk.project.upper()
+        return key.split("-", 1)[0].upper() == self.cfg.support.project.upper()
 
     def _client_for_key(self, key: str) -> "JiraClient | GitHubClient | None":
-        """Выбрать инстанс по префиксу ключа: SDESK-* → SDESK-инстанс, иначе основная Jira.
+        """Выбрать инстанс по префиксу ключа: Support-* → Support-инстанс, иначе основная Jira.
 
         Резолвинг по одной задаче (карточка/worklog/вложения) ходит в тот инстанс,
         которому принадлежит ключ. Вью/синк/дашборд остаются на основной Jira.
-        SDESK строится лениво прямо здесь, поэтому его логин случается только для его
+        Support строится лениво прямо здесь, поэтому его логин случается только для его
         ключей — и его ошибки не задевают команды по основной Jira.
         """
-        if self._key_is_sdesk(key):
-            client = self._sdesk_client()
+        if self._key_is_support(key):
+            client = self._support_client()
             if client is not None:
                 return client
         return self.tasks_client
@@ -1008,7 +1008,7 @@ class Service:
         """Создать задачу в трекере, предварительно сверив поля с createmeta проекта.
 
         Инстанс выбирается по ключу проекта тем же правилом, что и по ключу задачи
-        (SDESK-* → SDESK-инстанс). Порядок такой: собрать payload → проверить по
+        (Support-* → Support-инстанс). Порядок такой: собрать payload → проверить по
         createmeta → и только если проверка чистая, отправить POST. ``dry_run`` даёт
         первые два шага без записи — ровно то, что показывается пользователю до «да».
 
@@ -1043,19 +1043,19 @@ class Service:
                 "similar": [], "issue": client.create_issue(fields)}
 
     def add_comment(self, key: str, text: str, *, client_facing: bool = False) -> dict:
-        """Написать комментарий в задачу. Для SDESK нужно отдельное согласие.
+        """Написать комментарий в задачу. Для Support нужно отдельное согласие.
 
         У двух случаев принципиально разная цена ошибки: комментарий во внутреннюю
-        задачу читает команда, а комментарий в SDESK читает КЛИЕНТ. Поэтому случайно
-        отправить черновик клиенту нельзя: для ключей SDESK требуется явный
+        задачу читает команда, а комментарий в Support читает КЛИЕНТ. Поэтому случайно
+        отправить черновик клиенту нельзя: для ключей Support требуется явный
         ``client_facing=True`` (в CLI — флаг ``--to-client``).
         """
         self._require_tasks()
         if not (text or "").strip():
             raise ValueError("Пустой комментарий отправлять некуда")
-        if self._key_is_sdesk(key) and not client_facing:
+        if self._key_is_support(key) and not client_facing:
             raise ValueError(
-                f"{key} — задача SDESK, её комментарии читает КЛИЕНТ. Если текст готов "
+                f"{key} — задача Support, её комментарии читает КЛИЕНТ. Если текст готов "
                 f"для клиента, подтверди это явно: CLI — флаг --to-client, "
                 f"MCP — client_facing=True."
             )
@@ -1069,13 +1069,13 @@ class Service:
             raise ValueError(f"{what} — не твой (автор {author or '?'}): jwu правит и удаляет только своё.")
 
     def _ensure_client_ok(self, key: str, client_facing: bool) -> None:
-        if self._key_is_sdesk(key) and not client_facing:
-            raise ValueError(f"{key} — задача SDESK, её комментарии видит КЛИЕНТ. Подтверди явно: "
+        if self._key_is_support(key) and not client_facing:
+            raise ValueError(f"{key} — задача Support, её комментарии видит КЛИЕНТ. Подтверди явно: "
                              f"CLI — --to-client, MCP — client_facing=True.")
 
     def issue_comment_update(self, key: str, comment_id: str, text: str, *,
                              client_facing: bool = False) -> dict:
-        """Поправить СВОЙ комментарий в задаче. Для SDESK — только с client_facing."""
+        """Поправить СВОЙ комментарий в задаче. Для Support — только с client_facing."""
         self._require_tasks()
         if not (text or "").strip():
             raise ValueError("Пустой текст — для удаления есть отдельная команда")
@@ -1229,8 +1229,8 @@ class Service:
         return {"dry_run": False, **preview, **updated}
 
     def key_is_client_facing(self, key: str) -> bool:
-        """Уедет ли запись по этому ключу клиенту (SDESK), а не только команде."""
-        return self._key_is_sdesk(key)
+        """Уедет ли запись по этому ключу клиенту (Support), а не только команде."""
+        return self._key_is_support(key)
 
     def find_similar_issues(
         self, project: str, summary: str, *, months: int = 12, limit: int = 5
@@ -1278,10 +1278,10 @@ class Service:
         """Связать две задачи. Тип связи сверяется со списком инстанса до отправки.
 
         Инстанс берётся по ключу первой задачи: связывать задачи РАЗНЫХ инстансов
-        (Jira ↔ SDESK) нельзя — это разные Jira, и такая связь просто не существует.
+        (Jira ↔ Support) нельзя — это разные Jira, и такая связь просто не существует.
         """
         self._require_tasks()
-        if self._key_is_sdesk(inward) != self._key_is_sdesk(outward):
+        if self._key_is_support(inward) != self._key_is_support(outward):
             raise ValueError(
                 f"{inward} и {outward} живут в разных инстансах Jira — связать их нельзя. "
                 f"Сошлись на задачу ссылкой в тексте."
@@ -1358,7 +1358,7 @@ class Service:
 
         Без этого «посмотреть, что вообще затрекано за день» можно было только зная
         заранее, куда трекал, — а нужно ровно обратное, когда разносишь время задним
-        числом. Ищем в обоих инстансах (Jira и SDESK): время уходит и туда, и туда.
+        числом. Ищем в обоих инстансах (Jira и Support): время уходит и туда, и туда.
         У GitHub таймтрекера нет вовсе — там список всегда пуст.
         """
         if self.provider == "github":
@@ -1366,10 +1366,10 @@ class Service:
         jql = f'worklogAuthor = currentUser() AND worklogDate = "{date}" ORDER BY updated DESC'
         keys: list[str] = []
         clients = [self.tasks_client]
-        if sdesk_enabled(self.cfg):
+        if support_enabled(self.cfg):
             try:
-                clients.append(self._sdesk_client())
-            except Exception:  # noqa: BLE001 — SDESK недоступен: отдаём хотя бы Jira
+                clients.append(self._support_client())
+            except Exception:  # noqa: BLE001 — Support недоступен: отдаём хотя бы Jira
                 pass
         for client in clients:
             if client is None:
@@ -2375,7 +2375,7 @@ class Service:
     def auth_check(self) -> dict:
         """Проверка доступов по системам текущего провайдера.
 
-        Ключи в ответе — имена систем (jira/sdesk/bitbucket/github/jenkins); отсутствие
+        Ключи в ответе — имена систем (jira/support/bitbucket/github/jenkins); отсутствие
         ключа значит «в этом контуре такой системы нет», а не «не проверяли».
         """
         result: dict = {}
@@ -2395,14 +2395,14 @@ class Service:
             result["jira"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
         except Exception as exc:  # noqa: BLE001
             result["jira"] = {"ok": False, "error": str(exc)}
-        # SDESK — второй Jira-инстанс: проверяем, только если подключён. Материализация
+        # Support — второй Jira-инстанс: проверяем, только если подключён. Материализация
         # (логин) идёт лениво и её ошибка не мешает отчёту по Jira/Bitbucket.
-        if sdesk_enabled(self.cfg):
+        if support_enabled(self.cfg):
             try:
-                me = self._sdesk_client().myself()
-                result["sdesk"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
+                me = self._support_client().myself()
+                result["support"] = {"ok": True, "user": me.get("name"), "name": me.get("displayName")}
             except Exception as exc:  # noqa: BLE001
-                result["sdesk"] = {"ok": False, "error": str(exc)}
+                result["support"] = {"ok": False, "error": str(exc)}
         if self.bitbucket is not None:
             try:
                 self.bitbucket.ping()

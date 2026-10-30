@@ -16,7 +16,7 @@ description: Use to connect a project/repository to jwu — creating or joining 
 | provider | задачи | PR | сборки |
 |---|---|---|---|
 | `local` | локальные фичи jwu | — | — |
-| `jira` | Jira (+SDESK) | Bitbucket | Jenkins |
+| `jira` | Jira (+Support) | Bitbucket | Jenkins |
 | `github` | GitHub Issues | GitHub PR | GitHub Actions |
 
 Смешивать нельзя: у проекта один источник правды.

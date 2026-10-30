@@ -16,7 +16,7 @@
 # В БД лежат СЕКРЕТЫ воркспейсов в открытом виде (файл закрывается правами 600).
 # Не клади её в облачную папку (iCloud/Dropbox/Google Drive) — jwu предупредит.
 # Если облако всё же нужно, держи токены в переменных окружения: JIRA_TOKEN,
-# SDESK_TOKEN, BITBUCKET_TOKEN, GITHUB_TOKEN, JENKINS_TOKEN — они перекрывают БД.
+# SUPPORT_TOKEN, BITBUCKET_TOKEN, GITHUB_TOKEN, JENKINS_TOKEN — они перекрывают БД.
 
 # --- ниже: те же поля, но как они выглядят в настройках воркспейса ------------
 # Правятся через `jwu configure`; оставлено как справка о структуре.
@@ -35,12 +35,12 @@
 # mine = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
 # mentions = "(comment ~ currentUser() OR watcher = currentUser()) AND updated >= -14d ORDER BY updated DESC"
 
-# SDESK — второй Jira-инстанс (тот же REST API, другой хост). Опционален: не задан —
-# и jwu ведёт себя как раньше. Задачи с префиксом ключа = project (напр. SDESK-39336)
+# Support — второй Jira-инстанс (тот же REST API, другой хост). Опционален: не задан —
+# и jwu ведёт себя как раньше. Задачи с префиксом ключа = project (напр. SUP-39336)
 # резолвятся сюда, остальные — в основную jira. Секреты у него свои.
-# [sdesk]
-# base_url = "https://sdesk.example.com"
-# project = "SDESK"
+# [support]
+# base_url = "https://support.example.com"
+# project = "SUP"
 # username = ""
 # proxy_basic_user = ""
 

@@ -30,7 +30,7 @@ if TYPE_CHECKING:  # pragma: no cover — только для типов, что
 # бандла и `jwu workspace show`.
 SECRET_SLOTS: tuple[str, ...] = (
     "jira.token", "jira.password", "jira.gate_password",
-    "sdesk.token", "sdesk.password", "sdesk.gate_password",
+    "support.token", "support.password", "support.gate_password",
     "bitbucket.token", "github.token", "jenkins.token",
     "telegram.token", "matrix.token",
 )
@@ -38,7 +38,7 @@ SECRET_SLOTS: tuple[str, ...] = (
 # Слоты, которые можно перебить переменной окружения (как и раньше).
 SLOT_ENV: dict[str, str] = {
     "jira.token": "JIRA_TOKEN",
-    "sdesk.token": "SDESK_TOKEN",
+    "support.token": "SUPPORT_TOKEN",
     "bitbucket.token": "BITBUCKET_TOKEN",
     # GITHUB_TOKEN — общепринятое имя (его же ставит gh CLI и Actions), поэтому
     # он и подхватывается автоматически: чаще всего токен уже есть в окружении.
@@ -50,8 +50,8 @@ SLOT_ENV: dict[str, str] = {
     # переменных окружения, без keyring и визарда (облачная сессия, CI).
     "jira.password": "JIRA_PASSWORD",
     "jira.gate_password": "JIRA_GATE_PASSWORD",
-    "sdesk.password": "SDESK_PASSWORD",
-    "sdesk.gate_password": "SDESK_GATE_PASSWORD",
+    "support.password": "SUPPORT_PASSWORD",
+    "support.gate_password": "SUPPORT_GATE_PASSWORD",
 }
 
 KeyringRef = Optional[Tuple[str, str]]  # (service, account) в системном keyring

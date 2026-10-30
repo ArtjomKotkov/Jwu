@@ -1,6 +1,6 @@
 """Голос пользователя: профиль стиля и корпус его реальных внешних текстов.
 
-Внешние тексты (комменты в PR и Jira, ответы клиенту в SDESK, тексты задач, 4test,
+Внешние тексты (комменты в PR и Jira, ответы клиенту в Support, тексты задач, 4test,
 коммиты) пишет один агент голоса, а не каждый скилл по-своему. Агент в пакете —
 безличный дефолт (``voice-writer-sample``); персональное живёт только на машине
 пользователя, в каталоге данных jwu по воркспейсу:
@@ -9,7 +9,7 @@
   «было → стало». Пользователь правит его руками; скиллы дописывают журнал только с его
   согласия (``add_feedback``).
 - ``corpus.jsonl`` — реальные тексты пользователя по каналам: его комменты в PR, описания
-  его PR, комменты в Jira/SDESK, коммит-месседжи. Из них агент берёт few-shot примеры.
+  его PR, комменты в Jira/Support, коммит-месседжи. Из них агент берёт few-shot примеры.
 
 Чат с ассистентом в корпус НЕ попадает никогда: там пользователь пишет телеграфно и с
 опечатками, и это не его внешний стиль.
@@ -40,7 +40,7 @@ AGENT_SETTING = "voice.agent"
 
 CHANNELS = (
     "pr_comment", "pr_reply", "pr_review_body", "pr_task", "pr_description",
-    "jira_comment", "sdesk_client", "task", "4test", "commit", "message", "matrix",
+    "jira_comment", "support_client", "task", "4test", "commit", "message", "matrix",
 )
 AUDIENCES = ("colleague", "qa", "analyst", "client")
 
@@ -52,7 +52,7 @@ _CHANNEL_FALLBACK = {
     "pr_task": ("pr_comment",),
     "pr_description": ("task", "commit"),
     "jira_comment": ("pr_reply", "pr_comment"),
-    "sdesk_client": ("jira_comment",),
+    "support_client": ("jira_comment",),
     "task": ("jira_comment", "pr_description"),
     "4test": ("jira_comment", "task"),
     "commit": ("pr_description",),
@@ -77,7 +77,7 @@ PROFILE_TEMPLATE = """# Профиль голоса
 
 - Коллеге-разработчику: (на «ты» / на «вы», насколько прямо)
 - QA и аналитику:
-- Клиенту (SDESK): (на «вы», без внутренней кухни)
+- Клиенту (Support): (на «вы», без внутренней кухни)
 
 ## По каналам
 
@@ -85,7 +85,7 @@ PROFILE_TEMPLATE = """# Профиль голоса
 
 ### jira_comment
 
-### sdesk_client
+### support_client
 
 ### commit
 
@@ -151,7 +151,7 @@ class VoiceSample:
     channel: str
     text: str
     audience: str = "colleague"
-    source: str = ""         # bitbucket | github | jira | sdesk | git
+    source: str = ""         # bitbucket | github | jira | support | git
     ref: str = ""            # PROJ/repo#42, PROJ-123, sha
     created: str = ""        # ISO
     context: str = ""        # на что отвечали (цитата), если есть
@@ -452,16 +452,16 @@ def _collect_issues(svc: "Service", me: set[str], days: int, max_issues: int,
         except Exception as exc:  # noqa: BLE001
             report.errors.append(f"{key}: {exc}")
             continue
-        sdesk = svc._key_is_sdesk(key)
-        source = "sdesk" if sdesk else "jira"
+        support = svc._key_is_support(key)
+        source = "support" if support else "jira"
         prev = ""
         for c in issue.comments:
             if _is_me(c.author_key, me) or _is_me(c.author, me):
                 if c.body.strip():
                     out.append(VoiceSample(
                         id=f"{source}:{key}:{c.id}",
-                        channel="sdesk_client" if sdesk else "jira_comment",
-                        audience="client" if sdesk else "colleague",
+                        channel="support_client" if support else "jira_comment",
+                        audience="client" if support else "colleague",
                         text=c.body.strip(), source=source, ref=key, created=c.created,
                         context=prev[:400],
                     ))
@@ -514,7 +514,7 @@ def _collect_commits(paths: list[str], days: int, report: CollectReport) -> list
 
 def collect(svc: "Service", slug: str, paths: list[str], *, days: int = 180,
             max_prs: int = 80, max_issues: int = 150) -> CollectReport:
-    """Собрать корпус: мои тексты из PR, Jira/SDESK и git за ``days`` дней, дописать к файлу."""
+    """Собрать корпус: мои тексты из PR, Jira/Support и git за ``days`` дней, дописать к файлу."""
     report = CollectReport()
     me = _identity(svc)
     since_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)

@@ -462,7 +462,7 @@ def test_write_tools_preview_before_writing(fresh_server, monkeypatch):
         tasks_client = object()
 
         def key_is_client_facing(self, key):
-            return key.startswith("SDESK")
+            return key.startswith("SUP")
 
         def add_comment(self, key, text, *, client_facing=False):
             sent.append((key, text, client_facing))
@@ -474,7 +474,7 @@ def test_write_tools_preview_before_writing(fresh_server, monkeypatch):
 
     monkeypatch.setattr(srv, "_full_svc", lambda ws=None: _Svc())
 
-    preview = _run(srv.jwu_comment("SDESK-1", "черновик", workspace="work"))
+    preview = _run(srv.jwu_comment("SUP-1", "черновик", workspace="work"))
     assert preview["dry_run"] is True and preview["client_facing"] is True
     assert "клиент" in preview["hint"]
     assert sent == []

@@ -47,7 +47,7 @@ description: Use when a task came back from testing or QA left a comment and the
 5. **Черновик ответа** тестировщику в 3–6 строк — показать целиком и **одним меню**
    (AskUserQuestion): «отправить ответ» и — если вернули зря — «куда перевести задачу»
    (переходы из `jwu_issue_transitions(KEY)` + «не переводить»). «Да» → `jwu_comment(KEY,
-   text, dry_run=False)`, переход. Для SDESK-задач (их читает клиент) — правила jwu-task-comment.
+   text, dry_run=False)`, переход. Для Support-задач (их читает клиент) — правила jwu-task-comment.
 6. **Зафиксировать:** `jwu_note(KEY, "вернули с тестов: …", kind="status")`; если чиним —
    заводи работу (jwu-start-job; закрытую по той же задаче — переоткрой jwu-continue-job).
 7. **Разбор закончен, код не менялся** — предложи закрыть работу меню, как в **jwu-close-job**

@@ -342,7 +342,7 @@ def auth_check(json_out: bool = typer.Option(False, "--json", help="Вывест
     ok = True
     # Jenkins опционален — печатаем, если настроен, но на код выхода не влияет. Confluence и
     # Zephyr — только если настроены в контуре, и тогда их сбой — сбой проверки.
-    for name in ("jira", "sdesk", "bitbucket", "github", "jenkins", "confluence", "zephyr"):
+    for name in ("jira", "support", "bitbucket", "github", "jenkins", "confluence", "zephyr"):
         r = result.get(name)
         if r is None:
             continue
@@ -434,7 +434,7 @@ def _auth_check_report() -> None:
             return  # локальному контуру проверять нечего
         with Service.for_workspace(ws) as svc:
             res = svc.auth_check()
-        for name in ("jira", "sdesk", "bitbucket", "github", "jenkins", "confluence", "zephyr"):
+        for name in ("jira", "support", "bitbucket", "github", "jenkins", "confluence", "zephyr"):
             r = res.get(name)
             if r is None:
                 continue
@@ -461,17 +461,17 @@ def configure_main(
         help="Логин nginx Basic-гейта перед Jira (если есть)."),
     gate_password: Optional[str] = typer.Option(None, "--gate-password",
         help="Пароль nginx-гейта Jira: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной JIRA_GATE_PASSWORD."),
-    sdesk_host: Optional[str] = typer.Option(None, "--sdesk-host",
-        help="Хост второго Jira-инстанса SDESK (Enter/пусто — без SDESK)."),
-    sdesk_project: Optional[str] = typer.Option(None, "--sdesk-project",
-        help="Префикс ключей SDESK (напр. SDESK)."),
-    sdesk_user: Optional[str] = typer.Option(None, "--sdesk-user"),
-    sdesk_token_opt: Optional[str] = typer.Option(None, "--sdesk-token"),
-    sdesk_password: Optional[str] = typer.Option(None, "--sdesk-password",
-        help="Пароль сессионного логина SDESK: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной SDESK_PASSWORD."),
-    sdesk_gate_password: Optional[str] = typer.Option(None, "--sdesk-gate-password",
-        help="Пароль nginx-гейта SDESK: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной SDESK_GATE_PASSWORD."),
-    sdesk_gate_user: Optional[str] = typer.Option(None, "--sdesk-gate-user"),
+    support_host: Optional[str] = typer.Option(None, "--support-host",
+        help="Хост второго Jira-инстанса Support (Enter/пусто — без Support)."),
+    support_project: Optional[str] = typer.Option(None, "--support-project",
+        help="Префикс ключей Support (напр. Support)."),
+    support_user: Optional[str] = typer.Option(None, "--support-user"),
+    support_token_opt: Optional[str] = typer.Option(None, "--support-token"),
+    support_password: Optional[str] = typer.Option(None, "--support-password",
+        help="Пароль сессионного логина Support: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной SUPPORT_PASSWORD."),
+    support_gate_password: Optional[str] = typer.Option(None, "--support-gate-password",
+        help="Пароль nginx-гейта Support: «-» — прочитать из stdin, «?» — спросить скрыто; значением пароль НЕ передаётся (виден в ps и истории). Без флага — из переменной SUPPORT_GATE_PASSWORD."),
+    support_gate_user: Optional[str] = typer.Option(None, "--support-gate-user"),
     bitbucket_host: Optional[str] = typer.Option(None, "--bitbucket-host"),
     bitbucket_project: Optional[str] = typer.Option(None, "--bitbucket-project"),
     bitbucket_repo: Optional[str] = typer.Option(None, "--bitbucket-repo"),
@@ -528,9 +528,9 @@ def configure_main(
     # Пароли — не значением аргумента: «-» (stdin), «?» (скрытый ввод) или переменная окружения.
     jira_password = _password_opt("--jira-password", jira_password, "JIRA_PASSWORD", non_interactive)
     gate_password = _password_opt("--gate-password", gate_password, "JIRA_GATE_PASSWORD", non_interactive)
-    sdesk_password = _password_opt("--sdesk-password", sdesk_password, "SDESK_PASSWORD", non_interactive)
-    sdesk_gate_password = _password_opt("--sdesk-gate-password", sdesk_gate_password,
-                                        "SDESK_GATE_PASSWORD", non_interactive)
+    support_password = _password_opt("--support-password", support_password, "SUPPORT_PASSWORD", non_interactive)
+    support_gate_password = _password_opt("--support-gate-password", support_gate_password,
+                                        "SUPPORT_GATE_PASSWORD", non_interactive)
     if not non_interactive and provider == "local":
         provider = _prompt_default(
             "Провайдер задач и PR (local / jira / github)", provider
@@ -549,13 +549,13 @@ def configure_main(
         if jenkins_host is not None: cfg.jenkins.base_url = jenkins_host.rstrip("/")
         if jenkins_user is not None: cfg.jenkins.username = jenkins_user
         if gate_user is not None: cfg.jira.proxy_basic_user = gate_user
-        if sdesk_host is not None: cfg.sdesk.base_url = sdesk_host.rstrip("/")
-        if sdesk_project is not None: cfg.sdesk.project = sdesk_project
-        if sdesk_user is not None: cfg.sdesk.username = sdesk_user
-        # логин гейта SDESK: явный --sdesk-gate-user, иначе тот же, что у Jira-гейта
-        if sdesk_gate_user is not None: cfg.sdesk.proxy_basic_user = sdesk_gate_user
-        elif gate_user is not None and not cfg.sdesk.proxy_basic_user:
-            cfg.sdesk.proxy_basic_user = gate_user
+        if support_host is not None: cfg.support.base_url = support_host.rstrip("/")
+        if support_project is not None: cfg.support.project = support_project
+        if support_user is not None: cfg.support.username = support_user
+        # логин гейта Support: явный --support-gate-user, иначе тот же, что у Jira-гейта
+        if support_gate_user is not None: cfg.support.proxy_basic_user = support_gate_user
+        elif gate_user is not None and not cfg.support.proxy_basic_user:
+            cfg.support.proxy_basic_user = gate_user
         if github_owner is not None: cfg.github.owner = github_owner
         if github_repos is not None: cfg.github.repos = github_repos
         if github_user is not None: cfg.github.username = github_user
@@ -568,9 +568,9 @@ def configure_main(
             "jira.token": jira_token_opt,
             "jira.password": jira_password,
             "jira.gate_password": gate_password,
-            "sdesk.token": sdesk_token_opt,
-            "sdesk.password": sdesk_password,
-            "sdesk.gate_password": sdesk_gate_password,
+            "support.token": support_token_opt,
+            "support.password": support_password,
+            "support.gate_password": support_gate_password,
             "bitbucket.token": bitbucket_token_opt,
             "github.token": github_token_opt,
             "jenkins.token": jenkins_token_opt,
@@ -613,24 +613,24 @@ def configure_main(
         gpw = gate_password if gate_password is not None else (
             _prompt_default("Пароль nginx-гейта", "", secret=True)
             if cfg.jira.proxy_basic_user else "")
-        # SDESK — второй Jira-инстанс (опционально). Enter на хосте — пропустить целиком.
-        cfg.sdesk.base_url = (sdesk_host or _prompt_default(
-            "SDESK host (Enter — без SDESK)", cfg.sdesk.base_url)).rstrip("/")
-        if cfg.sdesk.base_url:
-            cfg.sdesk.project = sdesk_project or _prompt_default(
-                "SDESK project (префикс ключей)", cfg.sdesk.project or "SDESK")
-            cfg.sdesk.username = sdesk_user or _prompt_default(
-                "SDESK username", cfg.sdesk.username or cfg.jira.username)
-            sdtok = sdesk_token_opt if sdesk_token_opt is not None else _prompt_default(
-                "SDESK PAT-токен", "", secret=True)
-            sdpw = sdesk_password if sdesk_password is not None else _prompt_default(
-                "SDESK пароль (сессия)", "", secret=True)
-            cfg.sdesk.proxy_basic_user = sdesk_gate_user or _prompt_default(
-                "Логин nginx-гейта SDESK (Enter — как у Jira/без гейта)",
-                cfg.sdesk.proxy_basic_user or cfg.jira.proxy_basic_user)
-            sdgpw = sdesk_gate_password if sdesk_gate_password is not None else (
-                _prompt_default("Пароль nginx-гейта SDESK", "", secret=True)
-                if cfg.sdesk.proxy_basic_user else "")
+        # Support — второй Jira-инстанс (опционально). Enter на хосте — пропустить целиком.
+        cfg.support.base_url = (support_host or _prompt_default(
+            "Support host (Enter — без Support)", cfg.support.base_url)).rstrip("/")
+        if cfg.support.base_url:
+            cfg.support.project = support_project or _prompt_default(
+                "Support project (префикс ключей)", cfg.support.project or "SUP")
+            cfg.support.username = support_user or _prompt_default(
+                "Support username", cfg.support.username or cfg.jira.username)
+            sdtok = support_token_opt if support_token_opt is not None else _prompt_default(
+                "Support PAT-токен", "", secret=True)
+            sdpw = support_password if support_password is not None else _prompt_default(
+                "Support пароль (сессия)", "", secret=True)
+            cfg.support.proxy_basic_user = support_gate_user or _prompt_default(
+                "Логин nginx-гейта Support (Enter — как у Jira/без гейта)",
+                cfg.support.proxy_basic_user or cfg.jira.proxy_basic_user)
+            sdgpw = support_gate_password if support_gate_password is not None else (
+                _prompt_default("Пароль nginx-гейта Support", "", secret=True)
+                if cfg.support.proxy_basic_user else "")
         else:
             sdtok = sdpw = sdgpw = ""
         cfg.bitbucket.base_url = (bitbucket_host or _prompt_default(
@@ -657,9 +657,9 @@ def configure_main(
             "jira.token": jtok,
             "jira.password": jpw,
             "jira.gate_password": gpw,
-            "sdesk.token": sdtok,
-            "sdesk.password": sdpw,
-            "sdesk.gate_password": sdgpw,
+            "support.token": sdtok,
+            "support.password": sdpw,
+            "support.gate_password": sdgpw,
             "bitbucket.token": btok,
             "jenkins.token": ktok,
         }
@@ -1196,7 +1196,7 @@ def workspace_show(
 
     # Показываем настройки ТОЛЬКО текущего провайдера: хост Jira в github-контуре
     # ничего не значит (он мог достаться от глобального конфига) и лишь путает.
-    own = {"jira": ("jira.", "sdesk.", "bitbucket.", "jenkins."),
+    own = {"jira": ("jira.", "support.", "bitbucket.", "jenkins."),
            "github": ("github.",)}.get(ws.provider, ())
     settings = {k: v for k, v in store.workspace_settings(ws.id).items()
                 if not k.startswith("features.") and v and k.startswith(own)}
@@ -3381,7 +3381,7 @@ def worklogs(
     """Мои уже залогированные worklog'и за день (проверка двойного трека).
 
     Без ключей отвечает на вопрос «что вообще затрекано за такой-то день»: задачи
-    находятся сами (JQL по worklogAuthor/worklogDate в Jira и SDESK). Ключи, если они
+    находятся сами (JQL по worklogAuthor/worklogDate в Jira и Support). Ключи, если они
     известны, ограничивают выборку ими.
     """
     day = datetime.now().date().isoformat() if on.lower() == "today" else on
@@ -3409,14 +3409,14 @@ def worklogs(
 
 @app.command()
 def comment(
-    key: str = typer.Argument(..., help="Ключ задачи, напр. PROJ-5525 или SDESK-1234."),
+    key: str = typer.Argument(..., help="Ключ задачи, напр. PROJ-5525 или SUP-1234."),
     text: Optional[str] = typer.Option(None, "--text", "-m", help="Текст комментария."),
     text_file: Optional[str] = typer.Option(
         None, "--file", "-F", help="Файл с текстом; «-» — читать из stdin."
     ),
     to_client: bool = typer.Option(
         False, "--to-client",
-        help="Согласие отправить комментарий КЛИЕНТУ (обязательно для задач SDESK)."
+        help="Согласие отправить комментарий КЛИЕНТУ (обязательно для задач Support)."
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Показать текст целиком, ничего не отправляя."
@@ -3427,8 +3427,8 @@ def comment(
     """Написать комментарий в задачу. ВНЕШНЯЯ запись — в отличие от `jwu note`.
 
     `jwu note` пишет в локальную память jwu, эта команда — в саму Jira. Комментарий во
-    внутренней задаче читает команда, а комментарий в SDESK читает КЛИЕНТ, поэтому для
-    ключей SDESK обязателен флаг `--to-client`: случайно отправить клиенту черновик
+    внутренней задаче читает команда, а комментарий в Support читает КЛИЕНТ, поэтому для
+    ключей Support обязателен флаг `--to-client`: случайно отправить клиенту черновик
     так нельзя. Текст длиннее пары строк передавай файлом или через stdin (`-F -`).
     """
     body = _read_description(text, text_file)
@@ -3439,7 +3439,7 @@ def comment(
     try:
         client_facing = svc.key_is_client_facing(key)
         if client_facing and not to_client:
-            message = (f"{key} — задача SDESK, её комментарии читает КЛИЕНТ. "
+            message = (f"{key} — задача Support, её комментарии читает КЛИЕНТ. "
                        f"Подтверди это флагом --to-client.")
             if json_out:
                 _emit_json({"ok": False, "reason": "client_facing_confirmation_required",
@@ -3489,7 +3489,7 @@ def comment(
 def _render_comment_preview(key: str, body: str, client_facing: bool) -> None:
     """Показать текст комментария целиком — до отправки, а не после."""
     if client_facing:
-        console.print(f"[red bold]⚠ {key} — SDESK: этот текст увидит КЛИЕНТ[/red bold]")
+        console.print(f"[red bold]⚠ {key} — Support: этот текст увидит КЛИЕНТ[/red bold]")
     else:
         console.print(f"[b]Комментарий в {key}[/b] [dim](читает команда)[/dim]")
     console.print("[dim]--- текст ---[/dim]")
@@ -3603,7 +3603,7 @@ def issue_create(
     Поля сверяются с `createmeta` проекта ДО отправки: вместо сырой 400-й от Jira видно,
     какого обязательного поля не хватает и какие значения допустимы. `--dry-run`
     показывает итоговый payload и результат проверки, ничего не отправляя, и
-    подтверждения не требует. Инстанс (Jira/SDESK) выбирается по префиксу проекта.
+    подтверждения не требует. Инстанс (Jira/Support) выбирается по префиксу проекта.
     """
     text = _read_description(description, description_file)
     if text is not None and from_job is not None:
@@ -3852,7 +3852,7 @@ def issue_similar(
 
 @issue_app.command("link-types")
 def issue_link_types(
-    key: str = typer.Option("", "--key", help="Ключ задачи — выбрать инстанс (Jira/SDESK)."),
+    key: str = typer.Option("", "--key", help="Ключ задачи — выбрать инстанс (Jira/Support)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Какие типы связей знает инстанс (имена для `jwu issue link --type`)."""
@@ -5549,7 +5549,7 @@ def voice_collect(
     reset: bool = typer.Option(False, "--reset", help="Стереть корпус и собрать заново (профиль не трогается)."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Собрать корпус: твои комменты в PR и Jira/SDESK, описания PR, коммиты. Только чтение."""
+    """Собрать корпус: твои комменты в PR и Jira/Support, описания PR, коммиты. Только чтение."""
     from ..core import voice as voice_mod
 
     ws = _voice_ws()
@@ -5570,7 +5570,7 @@ def voice_collect(
 
 @voice_app.command("examples")
 def voice_examples(
-    channel: str = typer.Argument(..., help="Канал: " + " | ".join(("pr_comment", "pr_reply", "jira_comment", "sdesk_client", "commit", "…"))),
+    channel: str = typer.Argument(..., help="Канал: " + " | ".join(("pr_comment", "pr_reply", "jira_comment", "support_client", "commit", "…"))),
     audience: Optional[str] = typer.Option(None, "--audience", help="colleague | qa | analyst | client"),
     limit: int = typer.Option(8, "--limit"),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
@@ -5731,11 +5731,11 @@ def comment_edit(
     comment_id: str = typer.Argument(..., help="id своего комментария (jwu task KEY --json → comments[].id)."),
     text: Optional[str] = typer.Option(None, "--text", "-m", help="Новый текст."),
     text_file: Optional[str] = typer.Option(None, "--file", "-F", help="Файл с текстом; «-» — stdin."),
-    to_client: bool = typer.Option(False, "--to-client", help="Согласие: SDESK, текст видит КЛИЕНТ."),
+    to_client: bool = typer.Option(False, "--to-client", help="Согласие: Support, текст видит КЛИЕНТ."),
     yes: bool = typer.Option(False, "--yes", "-y"),
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Заменить текст своего комментария в задаче Jira/SDESK."""
+    """Заменить текст своего комментария в задаче Jira/Support."""
     body = _read_description(text, text_file) or ""
     _confirm_external(f"[bold]{key} · коммент {comment_id} → новый текст:[/bold]\n{body}", yes=yes, json_out=json_out)
     with _service_with_jira() as svc:
@@ -5747,11 +5747,11 @@ def comment_edit(
 def comment_delete(
     key: str = typer.Argument(..., help="Ключ задачи."),
     comment_id: str = typer.Argument(..., help="id своего комментария."),
-    to_client: bool = typer.Option(False, "--to-client", help="Согласие для SDESK."),
+    to_client: bool = typer.Option(False, "--to-client", help="Согласие для Support."),
     yes: bool = typer.Option(False, "--yes", "-y"),
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Удалить свой комментарий в задаче Jira/SDESK."""
+    """Удалить свой комментарий в задаче Jira/Support."""
     _confirm_external(f"[bold]Удалить комментарий {comment_id} в {key}?[/bold]", yes=yes, json_out=json_out)
     with _service_with_jira() as svc:
         _run_external(lambda: svc.issue_comment_delete(key, comment_id, client_facing=to_client),

@@ -184,17 +184,17 @@ def latest_end(existing: dict[str, list[dict]], tz_name: str) -> str:
 
 
 def worklog_links(cfg, day: str, keys: Iterable[str] = ()) -> list[dict]:
-    """Ссылки «посмотреть, что затрекано за день»: поиск моих ворклогов в Jira (и в SDESK, если
+    """Ссылки «посмотреть, что затрекано за день»: поиск моих ворклогов в Jira (и в Support, если
     за день трекали его задачи). JQL worklogAuthor/worklogDate есть в Jira Server и Cloud."""
     from urllib.parse import quote
 
     jql = f'worklogAuthor = currentUser() AND worklogDate = "{day}" ORDER BY updated DESC'
     out = []
     bases = [("Jira", (getattr(cfg.jira, "base_url", "") or "").rstrip("/"))]
-    sdesk_prefix = (getattr(cfg.sdesk, "project", "") or "").upper()
-    if (getattr(cfg.sdesk, "base_url", "") or "") and (not keys or any(
-            k.upper().startswith(sdesk_prefix + "-") for k in keys if sdesk_prefix)):
-        bases.append(("SDESK", cfg.sdesk.base_url.rstrip("/")))
+    support_prefix = (getattr(cfg.support, "project", "") or "").upper()
+    if (getattr(cfg.support, "base_url", "") or "") and (not keys or any(
+            k.upper().startswith(support_prefix + "-") for k in keys if support_prefix)):
+        bases.append(("SUP", cfg.support.base_url.rstrip("/")))
     for label, base in bases:
         if base:
             out.append({"label": label, "url": f"{base}/issues/?jql={quote(jql)}"})

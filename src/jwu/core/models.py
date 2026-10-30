@@ -870,7 +870,7 @@ WORKSPACE_PROVIDERS = ["local", "jira", "github"]
 # провайдер -> (подпись, что он даёт)
 PROVIDER_LABELS: dict[str, tuple[str, str]] = {
     "local": ("локальный", "фичи и работы в памяти jwu, без внешних систем"),
-    "jira": ("Jira", "задачи из Jira/SDESK, PR из Bitbucket, сборки из Jenkins"),
+    "jira": ("Jira", "задачи из Jira/Support, PR из Bitbucket, сборки из Jenkins"),
     "github": ("GitHub", "задачи из Issues, PR и сборки из Actions"),
 }
 

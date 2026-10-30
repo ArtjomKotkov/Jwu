@@ -49,5 +49,5 @@ description: Use when the user wants to MOVE a Jira task through its workflow vi
 ## Связанные скиллы
 
 - **jwu-task-create** — завести задачу.
-- **jwu-task-comment** — комментарий (в SDESK его читает клиент).
+- **jwu-task-comment** — комментарий (в Support его читает клиент).
 - **jwu-track-time** — залогировать время по задаче.

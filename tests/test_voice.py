@@ -63,10 +63,10 @@ def test_examples_channel_fallback_audience_and_recency():
         _s(1, "jira_comment", created="2026-01-01T00:00:00+00:00"),
         _s(2, "jira_comment", created="2026-09-01T00:00:00+00:00"),
         _s(3, "jira_comment", created="2026-05-01T00:00:00+00:00", audience="client"),
-        _s(4, "sdesk_client", created="2026-02-01T00:00:00+00:00", audience="client"),
+        _s(4, "support_client", created="2026-02-01T00:00:00+00:00", audience="client"),
         _s(5, "commit", text="коротко"),  # слишком короткий — не пример
     ])
-    got = [e["id"] for e in voice_mod.examples("work", "sdesk_client", audience="client", limit=3)]
+    got = [e["id"] for e in voice_mod.examples("work", "support_client", audience="client", limit=3)]
     assert got == ["x:4", "x:3", "x:2"]  # свой канал → соседний, в нём клиент первым, потом свежее
     assert voice_mod.examples("work", "commit") == []
 
@@ -118,7 +118,7 @@ def _fake_svc(store):
     svc._resolve_username = lambda: "me"
     svc._myself = lambda: {"name": "me", "displayName": "Я"}
     svc._client_for_key = lambda key: svc.tasks_client
-    svc._key_is_sdesk = lambda key: key.startswith("SDESK-")
+    svc._key_is_support = lambda key: key.startswith("Support-")
     return svc
 
 

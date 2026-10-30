@@ -235,10 +235,10 @@ _SETTING_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("jira.username", "jira", "username"),
     ("jira.project", "jira", "project"),
     ("jira.proxy_basic_user", "jira", "proxy_basic_user"),
-    ("sdesk.base_url", "sdesk", "base_url"),
-    ("sdesk.project", "sdesk", "project"),
-    ("sdesk.username", "sdesk", "username"),
-    ("sdesk.proxy_basic_user", "sdesk", "proxy_basic_user"),
+    ("support.base_url", "support", "base_url"),
+    ("support.project", "support", "project"),
+    ("support.username", "support", "username"),
+    ("support.proxy_basic_user", "support", "proxy_basic_user"),
     ("bitbucket.base_url", "bitbucket", "base_url"),
     ("bitbucket.project", "bitbucket", "project"),
     ("bitbucket.repo", "bitbucket", "repo"),
@@ -265,7 +265,7 @@ def _settings_to_raw(settings: dict[str, str]) -> dict:
     raw: dict = {}
     for key, value in settings.items():
         parts = key.split(".")
-        if len(parts) < 2 or parts[0] not in ("jira", "sdesk", "bitbucket", "github", "jenkins",
+        if len(parts) < 2 or parts[0] not in ("jira", "support", "bitbucket", "github", "jenkins",
                                               "telegram", "matrix"):
             continue  # служебные ключи воркспейса (features.seq и пр.) — не конфиг
         node = raw

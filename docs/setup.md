@@ -83,7 +83,7 @@ jwu workspace provider github                  # сменить провайде
 | provider | задачи | PR | сборки | ключ |
 |---|---|---|---|---|
 | `local` | локальные фичи | — | — | `HOME-1` |
-| `jira` | Jira (+ второй инстанс SDESK) | Bitbucket | Jenkins | `ACME-123` |
+| `jira` | Jira (+ второй инстанс Support) | Bitbucket | Jenkins | `ACME-123` |
 | `github` | Issues | PR | Actions | `shop#42` |
 
 **Правила контура** — то, что знает о проекте человек, но не код: запреты (`constraint`),
@@ -125,7 +125,7 @@ jwu job done <id> --summary "что сделано" --cleanup
 jwu configure                    # визард: хосты, логины, токены, Telegram, путь до БД
 jwu configure --non-interactive --jira-host … --jira-user … --jira-token "$JIRA_TOKEN" \
   --bitbucket-host … --bitbucket-token "$BITBUCKET_TOKEN"
-jwu auth check                   # Jira, SDESK, Bitbucket/GitHub, Jenkins, Confluence и Zephyr — что настроено
+jwu auth check                   # Jira, Support, Bitbucket/GitHub, Jenkins, Confluence и Zephyr — что настроено
 jwu doctor [--offline]           # всё разом: БД, папки, конфиг, доступы, демон, MCP, скиллы, версия
 ```
 
@@ -133,7 +133,7 @@ jwu doctor [--offline]           # всё разом: БД, папки, конф
 облачной папке** — `configure --db-path` туда откажет без `--force`, `doctor` считает это ошибкой.
 
 **Пароли — не значением аргумента**: он виден в `ps` и истории шелла, так что
-`--jira-password`, `--gate-password`, `--sdesk-password` и `--sdesk-gate-password` принимают только
+`--jira-password`, `--gate-password`, `--support-password` и `--support-gate-password` принимают только
 `-` (прочитать из stdin) или `?` (спросить скрыто). Без флага `--non-interactive` берёт пароль из
 переменной окружения, а визард спрашивает сам.
 
@@ -142,9 +142,9 @@ printf '%s\n' "$PW" | jwu configure --non-interactive --jira-password -
 ```
 
 **Переменные окружения перекрывают БД** — так контур поднимается без визарда: секреты
-`JIRA_TOKEN`, `JIRA_PASSWORD`, `JIRA_GATE_PASSWORD`, `SDESK_*`, `BITBUCKET_TOKEN`,
+`JIRA_TOKEN`, `JIRA_PASSWORD`, `JIRA_GATE_PASSWORD`, `SUPPORT_*`, `BITBUCKET_TOKEN`,
 `GITHUB_TOKEN`, `JENKINS_TOKEN`, `TELEGRAM_BOT_TOKEN`; настройки `JWU_JIRA_URL/USER/PROJECT/GATE_USER`,
-`JWU_SDESK_URL/PROJECT/USER`, `JWU_BITBUCKET_URL/PROJECT/REPO`, `JWU_GITHUB_API/WEB/OWNER/REPOS/USER`,
+`JWU_SUPPORT_URL/PROJECT/USER`, `JWU_BITBUCKET_URL/PROJECT/REPO`, `JWU_GITHUB_API/WEB/OWNER/REPOS/USER`,
 `JWU_JENKINS_URL/USER`, `JWU_TELEGRAM_CHAT`; сеть — `JWU_HTTP_TIMEOUT` (30 с на ответ),
 `JWU_HTTP_CONNECT_TIMEOUT` (5 с на соединение — недоступный хост не держит минутами),
 `JWU_HTTP_RETRIES` (2 повтора GET при таймауте и 5xx).

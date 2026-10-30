@@ -3,7 +3,7 @@
 Даёт Claude Code структурный доступ к тем же данным/действиям, что и CLI
 (`jwu task/pr/job/...`), но без похода через shell: типизированные вызовы, JSON-ответы
 и — главное — ПЕРЕИСПОЛЬЗУЕМАЯ сессия. Сервис создаётся лениво и живёт на процесс,
-поэтому вход в Jira/SDESK (в т.ч. сессионный за гейтом) выполняется один раз.
+поэтому вход в Jira/Support (в т.ч. сессионный за гейтом) выполняется один раз.
 
 Read: workspaces, workspace_current, workspace_paths, workspace_suggest, rules, tasks, task, changes,
 prs, pr, builds, build, attachments, jobs, features, worklogs, task_branches, issue_create_meta,
@@ -12,7 +12,7 @@ workspace_tag, workspace_use, rule_add, rule_edit, rule_rm, note, worklog, comme
 issue_link, issue_transition, issue_attach, job_start, job_add,
 job_link, job_status, feature_add, feature_status, feature_edit, feature_rm, queue_add, queue_take,
 queue_finish, queue_edit, queue_clear, queue_slots (очередь задач сессии; чтение — queue). Почти все записи — локальные (память работ/заметок/фич); ВНЕШНЯЯ запись
-у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в SDESK его читает КЛИЕНТ),
+у `jwu_worklog` (таймтрекер), `jwu_comment` (комментарий — в Support его читает КЛИЕНТ),
 `jwu_issue_create`, `jwu_issue_link`, `jwu_issue_transition`, `jwu_issue_attach`,
 `jwu_pr_task_add` и `jwu_pr_task_done` (задачи на комментах PR в Bitbucket),
 `jwu_pr_comment` (комментарий/ответ в PR), `jwu_pr_review` (мой статус ревью) и
@@ -22,7 +22,7 @@ queue_finish, queue_edit, queue_clear, queue_slots (очередь задач с
 Всё работает в контексте ВОРКСПЕЙСА. По умолчанию он определяется по рабочей папке
 процесса сервера (в Claude Code это корень проекта); любой инструмент принимает
 `workspace=` для явного выбора. Сервисы кэшируются ПО воркспейсам, поэтому логин в
-Jira/SDESK всё так же выполняется один раз на воркспейс.
+Jira/Support всё так же выполняется один раз на воркспейс.
 
 Соединения живут вместе с процессом: протухшую СЕССИЮ Jira клиент переустанавливает
 сам (см. JiraClient._send), а сменившиеся креды подхватываются только через
@@ -70,7 +70,7 @@ mcp = FastMCP("jwu", instructions=(
     "в фоне с таймаутом и под наблюдением: 5 минут без нового вывода — зависание, останови и разбери."))
 
 # Ленивые кэши ПО воркспейсам — тут и живёт переиспользуемая сессия/соединения.
-_full: dict[int, Service] = {}    # полный сервис (Jira/SDESK + Bitbucket + Jenkins)
+_full: dict[int, Service] = {}    # полный сервис (Jira/Support + Bitbucket + Jenkins)
 _builds: dict[int, Service] = {}  # лёгкий сервис для сборок (Bitbucket + Jenkins, без Jira)
 _stores: dict[int, Store] = {}    # только память (работы/заметки/фичи), без сети
 _base_store: Store | None = None  # без скоупа: нужен, чтобы вообще найти воркспейс
@@ -97,7 +97,7 @@ def _resolve(workspace: Optional[str] = None) -> Workspace:
 
 
 def _full_svc(workspace: Optional[str] = None) -> Service:
-    """Полный сервис воркспейса с логином в Jira/SDESK (создаётся один раз на воркспейс)."""
+    """Полный сервис воркспейса с логином в Jira/Support (создаётся один раз на воркспейс)."""
     ws = _resolve(workspace)
     svc = _full.get(ws.id)
     if svc is None:
@@ -464,7 +464,7 @@ async def jwu_voice_profile(workspace: Optional[str] = None) -> dict:
     только если канала нет в анализе или пользователь сказал «не похоже на меня».
 
     Любой внешний текст от имени пользователя (коммент в PR, ответ ревьюверу, коммент в
-    Jira/SDESK, текст задачи, 4test, коммит) пишет субагент `agent` — вызывающий скилл
+    Jira/Support, текст задачи, 4test, коммит) пишет субагент `agent` — вызывающий скилл
     передаёт ему факты, а не сочиняет сам. Без сети.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
@@ -502,7 +502,7 @@ async def jwu_voice_examples(channel: str, audience: Optional[str] = None, limit
     """Примеры реальных текстов пользователя для канала — few-shot для агента голоса.
 
     channel — pr_comment | pr_reply | pr_review_body | pr_task | pr_description |
-    jira_comment | sdesk_client | task | 4test | commit | message. audience — colleague |
+    jira_comment | support_client | task | 4test | commit | message. audience — colleague |
     qa | analyst | client. Если в канале мало текстов, добираются соседние по жанру.
     Без сети; пустой корпус собирает `jwu voice collect` (или jwu_voice_collect).
     """
@@ -532,7 +532,7 @@ async def jwu_voice_feedback(channel: str, verdict: str, before: str, after: str
 @mcp.tool()
 async def jwu_voice_collect(days: int = 180, workspace: Optional[str] = None) -> dict:
     """Собрать/обновить корпус голоса: мои комменты и описания в PR, мои комменты в
-    Jira/SDESK, мои коммиты за `days` дней. Внешние системы только ЧИТАЮТСЯ; пишется
+    Jira/Support, мои коммиты за `days` дней. Внешние системы только ЧИТАЮТСЯ; пишется
     локальный файл корпуса. Долго (десятки запросов) — звать по просьбе пользователя.
     Переписку с ассистентом в корпус не класть никогда.
     """
@@ -569,7 +569,7 @@ async def jwu_ssh_servers(workspace: Optional[str] = None) -> dict:
 
 @mcp.tool()
 async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
-    """Полная карточка задачи Jira/SDESK по ключу (напр. ACME-123 или SDESK-1234).
+    """Полная карточка задачи Jira/Support по ключу (напр. ACME-123 или SUP-1234).
 
     Инстанс выбирается по префиксу ключа автоматически. Возвращает поля задачи,
     описание, все комментарии, links, dev-панель (ветки/PR), плюс локальные заметки
@@ -822,7 +822,7 @@ async def jwu_pr_task_delete(task_id: int, workspace: Optional[str] = None) -> d
 @mcp.tool()
 async def jwu_comment_edit(key: str, comment_id: str, text: str, client_facing: bool = False,
                            workspace: Optional[str] = None) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: заменить текст своего комментария в задаче Jira/SDESK. Для SDESK
+    """ВНЕШНЯЯ ЗАПИСЬ: заменить текст своего комментария в задаче Jira/Support. Для Support
     (читает КЛИЕНТ) — только с client_facing=True после отдельного подтверждения.
     id коммента — из jwu_task (comments[].id). Ответ — before/after. Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
     svc = _require_jira(_full_svc(workspace))
@@ -833,7 +833,7 @@ async def jwu_comment_edit(key: str, comment_id: str, text: str, client_facing: 
 @mcp.tool()
 async def jwu_comment_delete(key: str, comment_id: str, client_facing: bool = False,
                              workspace: Optional[str] = None) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: удалить свой комментарий в задаче Jira/SDESK (для SDESK —
+    """ВНЕШНЯЯ ЗАПИСЬ: удалить свой комментарий в задаче Jira/Support (для Support —
     client_facing=True). Необратимо: покажи текст удаляемого и дождись «да». Только СВОЁ (иначе отказ): покажи было → стало и дождись «да»."""
     svc = _require_jira(_full_svc(workspace))
     return _stamp(svc.issue_comment_delete(key, comment_id, client_facing=client_facing),
@@ -2666,7 +2666,7 @@ async def jwu_worklog(
     started: Optional[str] = None,
     workspace: Optional[str] = None,
 ) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: залогировать время в таймтрекер Jira/SDESK (worklog).
+    """ВНЕШНЯЯ ЗАПИСЬ: залогировать время в таймтрекер Jira/Support (worklog).
 
     time — в формате Jira: «2h 30m», «45m», «1d 4h». started — ISO 8601 (по умолчанию
     текущий момент). Инстанс выбирается по префиксу ключа. Вызывать ТОЛЬКО по явному
@@ -2683,7 +2683,7 @@ async def jwu_worklog(
 @mcp.tool()
 async def jwu_worklog_links(date: str, keys: Optional[list[str]] = None,
                             workspace: Optional[str] = None) -> dict:
-    """Ссылки на мои ворклоги за день (поиск в Jira; SDESK — если среди keys есть его задачи).
+    """Ссылки на мои ворклоги за день (поиск в Jira; Support — если среди keys есть его задачи).
     Показывай их пользователю ПОСЛЕ трека — чтобы он сам посмотрел, что записалось."""
     from .core import timechain
 
@@ -2737,7 +2737,7 @@ async def jwu_worklog_chain(
 
 @mcp.tool()
 async def jwu_auth_refresh(workspace: Optional[str] = None) -> dict:
-    """Переподключиться к Jira/SDESK/Bitbucket свежими кредами и проверить доступ.
+    """Переподключиться к Jira/Support/Bitbucket свежими кредами и проверить доступ.
 
     Сервер живёт всю сессию Claude Code и держит соединения открытыми, поэтому креды,
     прочитанные при первом обращении, живут вместе с ним. Протухшую СЕССИЮ Jira клиент
@@ -2774,7 +2774,7 @@ async def jwu_worklogs(
     """Мои worklog'и за дату — что уже затрекано. Без записи.
 
     Без `keys` отвечает на вопрос «что вообще затрекано за такой-то день»: задачи
-    находятся сами по JQL (worklogAuthor/worklogDate) в Jira и SDESK. Со списком ключей
+    находятся сами по JQL (worklogAuthor/worklogDate) в Jira и Support. Со списком ключей
     смотрит только их. Обязательная проверка перед jwu_worklog, чтобы не задвоить время.
 
     on — дата YYYY-MM-DD. Ответ: {KEY: [{id, time, seconds, comment, started}, …]};
@@ -2793,14 +2793,14 @@ async def jwu_comment(
     dry_run: bool = True,
     workspace: Optional[str] = None,
 ) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: комментарий в задачу Jira/SDESK. Только по явному подтверждению.
+    """ВНЕШНЯЯ ЗАПИСЬ: комментарий в задачу Jira/Support. Только по явному подтверждению.
 
     Это НЕ локальная заметка (для неё есть jwu_note) — текст уходит в саму Jira и
     править и удалять — jwu_comment_edit / jwu_comment_delete. Порядок обязателен: сначала dry_run=True (по умолчанию)
     — вернётся текст и признак `client_facing`; ПОКАЗАТЬ текст пользователю целиком,
     дождаться явного «да» и только потом повторить с dry_run=False.
 
-    Комментарий во внутренней задаче читает команда. Комментарий в SDESK **читает
+    Комментарий во внутренней задаче читает команда. Комментарий в Support **читает
     КЛИЕНТ** — для таких ключей нужен ещё и client_facing=True, и подтверждение
     пользователя должно быть получено именно на отправку клиенту, а не «вообще».
     """
@@ -2809,7 +2809,7 @@ async def jwu_comment(
     if dry_run:
         return {"ok": False, "dry_run": True, "key": key, "text": text,
                 "client_facing": to_client,
-                "hint": ("Задача SDESK: текст увидит клиент — показать его пользователю "
+                "hint": ("Задача Support: текст увидит клиент — показать его пользователю "
                          "дословно и получить согласие на отправку КЛИЕНТУ"
                          if to_client else
                          "Показать текст пользователю и получить подтверждение")}
@@ -2911,9 +2911,9 @@ async def jwu_issue_create(
     dry_run: bool = True,
     workspace: Optional[str] = None,
 ) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: создать задачу в Jira/SDESK. Только по явному подтверждению.
+    """ВНЕШНЯЯ ЗАПИСЬ: создать задачу в Jira/Support. Только по явному подтверждению.
 
-    Создаёт РЕАЛЬНУЮ задачу, которую увидит команда (а в SDESK — клиент). Порядок
+    Создаёт РЕАЛЬНУЮ задачу, которую увидит команда (а в Support — клиент). Порядок
     обязателен: сначала dry_run=True (по умолчанию) — вернётся итоговый payload и
     результат проверки по createmeta, ничего не отправляя; ПОКАЗАТЬ этот текст
     пользователю целиком, дождаться явного «да» и только потом повторить вызов с
@@ -2997,7 +2997,7 @@ async def jwu_issue_attach(
 ) -> dict:
     """ВНЕШНЯЯ ЗАПИСЬ: приложить файлы к задаче. Только по явному подтверждению.
 
-    Вложение видно всем, у кого есть доступ к задаче (в SDESK — клиенту), и удалить его
+    Вложение видно всем, у кого есть доступ к задаче (в Support — клиенту), и удалить его
     через jwu нельзя. Сначала dry_run=True (по умолчанию) — вернётся список файлов с
     размерами; показать его пользователю, дождаться «да», потом dry_run=False.
 
@@ -3029,7 +3029,7 @@ async def jwu_issue_link(
     Направление как в Jira: link_type применяется от `inward` к `outward`
     («PROJ-2 blocks PROJ-1» — inward=PROJ-2, outward=PROJ-1, link_type=Blocks).
     Неизвестный тип связи вернёт список доступных, а не создаст мусор. Обе задачи
-    должны жить в одном инстансе (Jira ↔ SDESK связать нельзя).
+    должны жить в одном инстансе (Jira ↔ Support связать нельзя).
     """
     svc = _require_jira(_full_svc(workspace))
     return {"ok": True, **svc.link_issues(inward, outward, link_type)}

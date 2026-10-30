@@ -22,7 +22,7 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 `jwu_worklog_chain`, только после «да».
 
 > **MCP-first.** Логирование — MCP-инструментом `jwu_worklog_chain(items, start, on, dry_run)`
-> (цепочкой; одиночный — `jwu_worklog`) вместо bash `jwu worklog-chain …` (инстанс Jira/SDESK выбирается по префиксу ключа; это ВНЕШНЯЯ
+> (цепочкой; одиночный — `jwu_worklog`) вместо bash `jwu worklog-chain …` (инстанс Jira/Support выбирается по префиксу ключа; это ВНЕШНЯЯ
 > запись — только после явного «да»). Сбор списка ревью (`jwu prs --mine-reviews --on`) и
 > проверка двойного трека (`jwu worklogs --on`) MCP-инструментов не имеют — остаются на bash.
 > **Воркспейс = где лежит код.** jwu работает в контексте *воркспейса*: он определяется
@@ -215,7 +215,7 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
 ## После трека
 
 **Всегда — ссылки, чтобы посмотреть, что записалось.** Последним сообщением дай:
-1. `jwu_worklog_links(date, keys=[…затреканные ключи])` → «Jira: <ссылка>» (и «SDESK: …», если вернулась);
+1. `jwu_worklog_links(date, keys=[…затреканные ключи])` → «Jira: <ссылка>» (и «Support: …», если вернулась);
 2. если продолжение аддона отправило отчёт (см. ниже) — его ссылку тоже («Отчёт: <ссылка>»).
 
 

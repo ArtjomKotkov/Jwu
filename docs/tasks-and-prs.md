@@ -46,7 +46,7 @@ jwu notes ACME-1 · jwu note ACME-1 "порт делаем в 2.4" --kind decisi
 | Что | Команды |
 |---|---|
 | задачи Jira | `issue create\|link\|transition\|attach`, `issue edit` (поля; **удаления задач нет**) |
-| комменты в задачах | `comment`, `comment-edit`, `comment-delete` (SDESK — только с `--to-client`) |
+| комменты в задачах | `comment`, `comment-edit`, `comment-delete` (Support — только с `--to-client`) |
 | время | `worklog`, `worklog-chain`, `worklog-edit`, `worklog-delete`, `worklog-tz` |
 | PR | `pr-create`, `pr-edit` (заголовок/описание), `pr-review approve\|needs-work\|unapprove` |
 | комменты в PR | `pr-comment` (общий, ответ в тред, на строку), `pr-comment-edit`, `pr-comment-delete` |
