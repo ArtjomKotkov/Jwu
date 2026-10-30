@@ -159,7 +159,8 @@ Actions; для репозиториев организации Resource owner �
 снапшоты старше 30 дней (`jwu db stats|prune [--apply] [--vacuum]|vacuum`).
 
 ```bash
-jwu backup --out ~/Desktop [--no-secrets]    # tar.gz: БД, config, проектные скиллы/агенты, RESTORE.md
+jwu backup [--out ~/Desktop] [--no-secrets]  # tar.gz: БД, config, проектные скиллы/агенты, RESTORE.md;
+                                             # без --out — в <данные jwu>/backups/ (не в текущую папку)
 jwu restore jwu-backup-<дата>.tar.gz [--force] [--db-only] [--dry-run]
 jwu memory export|import [--dry-run]         # память как JSON без секретов и снапшотов
 jwu memory sync --repo ~/jwu-memory          # pull → импорт → экспорт → commit → push в СВОЙ приватный git

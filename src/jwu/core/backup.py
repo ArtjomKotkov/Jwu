@@ -63,6 +63,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def default_backup_dir() -> Path:
+    """Куда ``jwu backup`` пишет архив без ``--out``: каталог данных jwu, только владельцу."""
+    path = data_dir() / "backups"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
 def default_archive_name() -> str:
     return f"jwu-backup-{date.today().isoformat()}.tar.gz"
 
@@ -172,7 +183,9 @@ class BackupReport:
 def create_backup(dest: Path | None = None, *, with_secrets: bool = True, extras: bool = True,
                   user: str = "") -> BackupReport:
     """Собрать tar.gz: БД (VACUUM INTO), config.toml, проектные субагенты/скиллы, манифест."""
-    dest = Path(dest or (Path.cwd() / default_archive_name())).expanduser()
+    # По умолчанию — в каталог данных jwu, а не в текущую папку: архив несёт секреты, а
+    # запускают его обычно из репозитория — так он однажды уже чуть не уехал в git.
+    dest = Path(dest or (default_backup_dir() / default_archive_name())).expanduser()
     # Путь без .tar.gz — это каталог (существующий или нет), имя архива — по дате.
     if dest.is_dir() or not dest.name.endswith(".tar.gz"):
         dest = dest / default_archive_name()

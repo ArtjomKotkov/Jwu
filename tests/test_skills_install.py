@@ -159,3 +159,20 @@ def test_copyable_texts_in_code_block_and_no_promises():
         text = md.read_text(encoding="utf-8") if md.is_file() else ""
         if "## Текст от имени пользователя (голос)" in text:
             assert "текст целиком **в блоке кода**" in text, d.name
+
+
+def test_voice_agent_rewrites_draft_not_writes_from_facts():
+    """Голос переписывает форму технического черновика; содержание пишет тот, кто разбирался."""
+    from importlib.resources import files
+
+    root = files("jwu")
+    voice = (root / "agents" / "voice-writer-sample.md").read_text(encoding="utf-8")
+    assert "`draft`" in voice and "Что ушло при сжатии" in voice and "Содержание — из черновика" in voice
+    filt = (root / "agents" / "review-filter-sample.md").read_text(encoding="utf-8")
+    assert "Черновик:" in filt
+    for d in (root / "skills").iterdir():
+        md = d / "SKILL.md"
+        text = md.read_text(encoding="utf-8") if md.is_file() else ""
+        if "## Текст от имени пользователя (голос)" in text:
+            assert "технический черновик" in text and "`draft`" in text, d.name
+            assert "`facts`, `context`" not in text, d.name

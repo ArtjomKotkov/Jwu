@@ -141,3 +141,17 @@ def test_cli_backup_and_restore(monkeypatch, tmp_path):
     assert res.exit_code == 1 and "force" in res.output   # БД уже есть (JWU_DB_PATH указывает на неё)
     res = runner.invoke(cli.app, ["restore", archive, "--dry-run", "--force"])
     assert res.exit_code == 0 and "Сухой прогон" in res.output
+
+
+def test_backup_default_goes_to_data_dir_not_cwd(monkeypatch, tmp_path):
+    """Без --out архив (с секретами) — в каталог данных jwu, а не в текущую папку (репозиторий)."""
+    _env(monkeypatch, tmp_path)
+    data = tmp_path / "data"
+    monkeypatch.setattr(bk, "data_dir", lambda: data)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    report = bk.create_backup(extras=False)
+    assert report.archive.parent == data / "backups" and not list(repo.iterdir())
+    assert oct(report.archive.stat().st_mode)[-3:] == "600"
+    assert oct((data / "backups").stat().st_mode)[-3:] == "700"

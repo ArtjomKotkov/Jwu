@@ -2529,7 +2529,7 @@ def doctor(
 @app.command()
 def backup(
     out: Optional[str] = typer.Option(None, "--out", "-o",
-        help="Файл или каталог для архива (по умолчанию jwu-backup-<дата>.tar.gz в текущей папке)."),
+        help="Файл или каталог для архива (по умолчанию jwu-backup-<дата>.tar.gz в каталоге данных jwu: backups/)."),
     no_secrets: bool = typer.Option(False, "--no-secrets", help="Вычистить секреты воркспейсов из копии БД."),
     no_extras: bool = typer.Option(False, "--no-extras", help="Не класть проектные субагенты/скиллы из ~/.claude."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
