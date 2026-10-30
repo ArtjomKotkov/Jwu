@@ -25,7 +25,7 @@ BACKUP_PREFIX = "refs/jwu/backup/"
 MAX_OUT = 60_000
 
 Runner = Callable[[list[str]], tuple[int, str]]
-Notify = Callable[["Store", dict], None]
+Notify = Callable[["Store", dict], bool]
 
 
 class GitOpError(RuntimeError):
@@ -127,6 +127,14 @@ def _record(ctx: Ctx, text: str) -> None:
             pass
 
 
+def _notified(ctx: Ctx, grant_id: int) -> bool:
+    """Запрос допуска уже ушёл в бот (отметка в журнале политики)."""
+    row = ctx.store.conn.execute(
+        "SELECT 1 FROM git_audit WHERE workspace_id = ? AND decision = 'grant:notified' AND detail = ?",
+        (ctx.store.workspace_id, f"запрос #{grant_id}")).fetchone()
+    return row is not None
+
+
 def gate(ctx: Ctx, op: str, *, branch: str = "", user_approved: bool = False, detail: str = "") -> gp.Decision:
     """Решение политики + журнал. Не пустили — :class:`Blocked` (git не трогаем)."""
     branch = branch or ctx.branch
@@ -154,13 +162,17 @@ def gate(ctx: Ctx, op: str, *, branch: str = "", user_approved: bool = False, de
             return d
         req = gp.request_grant(ctx.store, remote=ctx.remote, branch=branch, op=op, head=ctx.head,
                                detail=detail or what, job_id=ctx.job_id)
-        if req.get("new") and ctx.notify is not None:
+        sent = _notified(ctx, int(req["id"]))
+        if not sent and ctx.notify is not None and "telegram" in ctx.policy.grant_via:
             try:
-                ctx.notify(ctx.store, req)
-            except Exception:  # noqa: BLE001 — нет бота: остаётся CLI
-                pass
+                sent = bool(ctx.notify(ctx.store, req))
+            except Exception:  # noqa: BLE001 — бот недоступен: остаётся CLI
+                sent = False
+            if sent:
+                gp.audit(ctx.store, op=op, decision="grant:notified", remote=ctx.remote, branch=branch,
+                         rule=d.rule, detail=f"запрос #{req['id']}", job_id=ctx.job_id)
         via = []
-        if "telegram" in ctx.policy.grant_via:
+        if sent:
             via.append("кнопка в Telegram-боте (запрос отправлен)")
         if "cli" in ctx.policy.grant_via:
             via.append(f"в своём терминале: `! jwu git grant {req['id']}`")

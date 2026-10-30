@@ -301,7 +301,7 @@ def next_pass_delay(store: "Store", interval: int) -> float:
     return max(0.0, interval - age)
 
 
-def start_message(store: "Store", workspaces: list, interval: int) -> str:
+def start_message(store: "Store", workspaces: list, interval: int, local: list = ()) -> str:
     """Стартовое сообщение: где запущен, когда был синк, за чем следим — остальное в меню."""
     from .dates import fmt_ago
 
@@ -310,6 +310,8 @@ def start_message(store: "Store", workspaces: list, interval: int) -> str:
     delay = next_pass_delay(store, interval)
     labels = {"jira": "Jira", "github": "GitHub", "local": "локальный"}
     rows = [f"  • <b>{html.escape(w.name or w.slug)}</b> — {labels.get(w.provider, w.provider)}" for w in workspaces]
+    # локальным синкать нечего, но бот за ними следит так же: допуски git и прочее — сюда
+    rows += [f"  • <b>{html.escape(w.name or w.slug)}</b> — локальный" for w in local]
     sync = f"последний синк {fmt_ago(last)}" if last else "синка ещё не было"
     nxt = f"следующий через {max(1, round(delay / 60))} мин" if delay else "следующий — сейчас"
     return "\n".join([f"🟢 <b>jwu запущен</b> · {html.escape(host)}",
@@ -327,7 +329,7 @@ def announce_start(store: "Store", interval: int) -> int:
     from . import notify
     from .workspaces import config_for_workspace
 
-    todo, _ = syncable(store.list_workspaces())
+    todo, local = syncable(store.list_workspaces())
     seen_chats: set[str] = set()
     sent = 0
     for ws in todo:
@@ -338,7 +340,7 @@ def announce_start(store: "Store", interval: int) -> int:
         if sender is None or sender.chat_id in seen_chats:
             continue
         seen_chats.add(sender.chat_id)
-        text = start_message(store, todo, interval)
+        text = start_message(store, todo, interval, local)
         try:
             sender.set_commands()          # меню на «/» в клиенте
             sender.send(text, keyboard=True)  # и постоянная клавиатура с командами

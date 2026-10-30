@@ -909,11 +909,11 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
     return _stamp(res, _resolve(workspace))
 
 
-def _grant_notify(store: Store, req: dict) -> None:
-    """Запрос допуска — кнопками в Telegram (если бот настроен)."""
+def _grant_notify(store: Store, req: dict) -> bool:
+    """Запрос допуска — кнопками в Telegram. False — бот у воркспейса не настроен."""
     from .core import gitgrant
 
-    gitgrant.notify(store, req)
+    return gitgrant.notify(store, req)
 
 
 def _git_call(path: str, workspace: Optional[str], fn) -> dict:

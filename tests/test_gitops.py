@@ -100,7 +100,7 @@ def test_push_to_develop_needs_grant_not_just_yes(store, repo):
     as_job(store, repo)
     ctx = go.context(store, str(repo))
     sent = []
-    ctx.notify = lambda st, req: sent.append(req)
+    ctx.notify = lambda st, req: sent.append(req) or True
     (repo / "a.txt").write_text("4\n")
     go.commit(ctx, "four", user_approved=True)
     with pytest.raises(go.Blocked) as e:
@@ -212,3 +212,14 @@ def test_status_and_log(store, repo):
     st = go.status(ctx)
     assert st["branch"] == "develop" and st["target"] == "develop" and st["guard"] is True
     assert go.log(ctx, n=5)["commits"][0]["subject"] == "init"
+
+
+def test_grant_without_bot_does_not_claim_sent(store, repo):
+    as_job(store, repo)
+    ctx = go.context(store, str(repo))
+    ctx.notify = lambda st, req: False                   # бот у воркспейса не настроен
+    (repo / "a.txt").write_text("6\n")
+    go.commit(ctx, "six", user_approved=True)
+    with pytest.raises(go.Blocked) as e:
+        go.push(ctx, user_approved=True)
+    assert "Telegram" not in e.value.ask_user and "jwu git grant" in e.value.ask_user

@@ -162,7 +162,7 @@ def test_bot_buttons_answer_grant(store):
     req = gp.request_grant(store, remote="proj/app", branch="develop", op="push", head="h", detail="2 коммита")
     mk = gitgrant.markup(req, 600)
     ok, no = [b["callback_data"] for b in mk["inline_keyboard"][0]]
-    assert ok == f"git:ok:{req['id']}" and no == f"git:no:{req['id']}"
+    assert ok == f"git:ok:{store.workspace_id}:{req['id']}" and no == f"git:no:{store.workspace_id}:{req['id']}"
     assert "Нужен допуск" in gitgrant._text(req) and "2 коммита" in gitgrant._text(req)
     text, _ = gitgrant.handle_callback(store, ok)
     assert text.startswith("✅ Разрешено")
@@ -193,3 +193,29 @@ def test_cli_policy_rules_and_check(tmp_path, monkeypatch):
     r = run("policy", "show", "--toml")
     assert 'remote = "proj/app"' in r.output and 'sync = "rebase"' in r.output
     assert run("grant", "1").exit_code == 2                 # не терминал — допуска нет
+
+
+def test_bot_button_answers_grant_of_other_workspace(store):
+    """Бот одного контура отвечает на запрос из контура без своего бота."""
+    from jwu.core import gitgrant
+
+    other = store.create_workspace("lab", name="Лаборатория")
+    home = store.workspace_id
+    store.use_workspace(other.id)
+    gp.ensure(store)
+    req = gp.request_grant(store, remote="proj/lab", branch="develop", op="push")
+    ok = gitgrant.markup(req, 600)["inline_keyboard"][0][0]["callback_data"]
+    store.use_workspace(home)                       # нажали в боте «чужого» контура
+    text, _ = gitgrant.handle_callback(store, ok)
+    assert text.startswith("✅") and store.workspace_id == home
+    store.use_workspace(other.id)
+    assert gp.consume_grant(store, remote="proj/lab", branch="develop", op="push") is not None
+
+
+def test_bot_start_message_lists_local_contours(store):
+    from jwu.core import daemon
+
+    work = store.get_workspace_by_slug("work")
+    lab = store.create_workspace("lab", name="Лаборатория")
+    text = daemon.start_message(store, [work], 900, [lab])
+    assert "Слежу за контурами:" in text and "Лаборатория</b> — локальный" in text
