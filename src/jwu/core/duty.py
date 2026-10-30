@@ -24,7 +24,7 @@ import html
 from datetime import datetime, timezone
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Optional
 
 from .matrix import Event, MatrixClient, MatrixError, Room, SyncResult, sort_rooms
@@ -494,7 +494,15 @@ def personal_items(result: SyncResult, state: State, dms: set[str], names: _Name
             continue
         theirs = [e for e in upd.events if e.is_message and e.sender != state.me]
         if rid in dms:
-            for ev in theirs[-DM_PER_ROOM:]:
+            sealed = [e for e in theirs if e.encrypted]
+            if sealed:   # текста нет — кто и сколько, по человеку
+                by_who: dict[str, int] = {}
+                for e in sealed:
+                    by_who[e.sender] = by_who.get(e.sender, 0) + 1
+                for who, n in by_who.items():
+                    body = "🔒 новое сообщение" if n == 1 else f"🔒 {n} новых сообщения" if n < 5 else f"🔒 {n} новых сообщений"
+                    items.append(Item(who=names.get(who), body=f"{body} — открой Element", direct=True))
+            for ev in [e for e in theirs if not e.encrypted][-DM_PER_ROOM:]:
                 items.append(Item(who=names.get(ev.sender), body=_short(ev.body, BODY_MAX), direct=True))
             continue
         for ev in theirs:
@@ -504,15 +512,26 @@ def personal_items(result: SyncResult, state: State, dms: set[str], names: _Name
     return items
 
 
+def _lines(items: list[Item]) -> list[str]:
+    """Подряд от того же человека в том же треде — без повтора шапки, только текст."""
+    out: list[str] = []
+    prev: Optional[Item] = None
+    for it in items:
+        same = prev is not None and (it.who, it.thread, it.to_me) == (prev.who, prev.thread, prev.to_me)
+        out.append(f"   <i>{html.escape(it.body)}</i>" if same else it.html())
+        prev = it
+    return out
+
+
 def format_items(state: State, items: list[Item]) -> str:
     room = [i for i in items if not i.direct and not i.room]
     direct = [i for i in items if i.direct]
     mentions = [i for i in items if i.room]
     blocks: list[list[str]] = []
     if room:
-        blocks.append([f"🟢 <b>дежурство · {html.escape(state.title)}</b>"] + [it.html() for it in room])
+        blocks.append([f"🟢 <b>дежурство · {html.escape(state.title)}</b>"] + _lines(room))
     if direct:
-        blocks.append(["💬 <b>личные</b>"] + [it.html() for it in direct])
+        blocks.append(["💬 <b>личные</b>"] + _lines(direct))
     by_room: dict[str, list[Item]] = {}
     for it in mentions:
         by_room.setdefault(it.room, []).append(it)
@@ -568,9 +587,46 @@ def poll(store: "Store", client_factory, sender) -> int:
     with client:
         state, items, end = check(store, client, commit=False)
     if items:
-        sender.send(format_items(state, items))
+        _send_or_append(store, state, items, sender)
     advance(store, state, end)
     return len(items)
+
+
+MERGE_META = "duty:last_tg"      # {"id", "ts", "items": [...]} — последнее уведомление дежурства
+MERGE_MINUTES = 15
+MERGE_MAX_CHARS = 3800           # запас до лимита Telegram 4096
+
+
+def _send_or_append(store: "Store", state: State, items: list[Item], sender) -> None:
+    """Склейка: последнее сообщение бота в чате — наше уведомление, свежее → дописать в него
+    (правкой), а не слать новое. Между ними было что-то ещё (синк, меню) — новое сообщение."""
+    from datetime import datetime, timezone
+
+    from . import notify
+
+    now = datetime.now(timezone.utc)
+    prev = _json_meta(store, MERGE_META, {})
+    merged: list[Item] = []
+    try:
+        age = (now - datetime.fromisoformat(prev.get("ts", ""))).total_seconds() / 60
+    except ValueError:
+        age = 1e9
+    if prev.get("id") and age <= MERGE_MINUTES and notify.last_message_id(sender.chat_id) == int(prev["id"]):
+        merged = [Item(**d) for d in prev.get("items", [])] + items
+        text = format_items(state, merged)
+        if len(text) <= MERGE_MAX_CHARS:
+            try:
+                sender.edit(int(prev["id"]), text)
+                store.set_workspace_meta(MERGE_META, json.dumps(
+                    {"id": prev["id"], "ts": now.isoformat(), "items": [asdict(i) for i in merged]},
+                    ensure_ascii=False))
+                return
+            except Exception:  # noqa: BLE001 — не вышло дописать (сообщение удалили) — шлём новое
+                pass
+    ids = sender.send(format_items(state, items))
+    if ids and ids[-1]:
+        store.set_workspace_meta(MERGE_META, json.dumps(
+            {"id": ids[-1], "ts": now.isoformat(), "items": [asdict(i) for i in items]}, ensure_ascii=False))
 
 
 

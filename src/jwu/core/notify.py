@@ -528,6 +528,39 @@ def split_message(text: str, limit: int = MAX_MESSAGE) -> list[str]:
     return chunks
 
 
+def _last_path():
+    from .config import data_dir
+
+    return data_dir() / "telegram-last.json"
+
+
+def last_message_id(chat_id: str) -> int:
+    """id последнего сообщения бота в чате (по отметке jwu): склейка дописывает только в него."""
+    import json
+
+    try:
+        return int(json.loads(_last_path().read_text(encoding="utf-8")).get(str(chat_id), 0))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def _remember_last(chat_id: str, message_id: int) -> None:
+    import json
+
+    if not message_id:
+        return
+    path = _last_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data[str(chat_id)] = int(message_id)
+    try:
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
 class TelegramNotifier:
     """Отправка в чат через Bot API. ``client`` подменяется в тестах."""
 
@@ -580,6 +613,8 @@ class TelegramNotifier:
                 raise NotifyError(f"Telegram ответил {resp.status_code}: {resp.text[:200]}")
             body = resp.json() if resp.content else {}
             ids.append(int((body.get("result") or {}).get("message_id", 0) or 0))
+        if ids:
+            _remember_last(self.chat_id, ids[-1])
         return ids
 
     def set_commands(self) -> bool:

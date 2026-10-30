@@ -61,11 +61,15 @@ class SyncResult:
         return {rid for rooms in self.direct.values() for rid in (rooms or [])}
 
 
+ENCRYPTED = "m.room.encrypted"
+ENCRYPTED_BODY = "🔒 зашифровано — текст в Element"
+
+
 def _sync_filter(timeline: int) -> str:
     """Фильтр /sync: только лента сообщений и m.direct. Список комнат в фильтр не кладём —
     у дежурного их сотни, и URL не влезает (414); отбор — на нашей стороне."""
     return json.dumps({
-        "room": {"timeline": {"limit": timeline, "types": ["m.room.message"]},
+        "room": {"timeline": {"limit": timeline, "types": ["m.room.message", "m.room.encrypted"]},
                  "state": {"not_types": ["*"]}, "ephemeral": {"not_types": ["*"]},
                  "account_data": {"not_types": ["*"]}},
         "presence": {"not_types": ["*"]},
@@ -90,9 +94,16 @@ class Event:
     replaces: str = ""         # правка: id исправленного сообщения (m.replace)
 
     @property
+    def encrypted(self) -> bool:
+        """Зашифровано (E2E, обычно личка в Element): текста jwu не видит, только кто и когда."""
+        return self.type == ENCRYPTED
+
+    @property
     def is_message(self) -> bool:
         """Новое сообщение. Правка — не новое: об исходном уже сказали, второй раз не шлём."""
-        return self.type == "m.room.message" and bool(self.body) and not self.replaces
+        if self.replaces:
+            return False
+        return self.encrypted or (self.type == "m.room.message" and bool(self.body))
 
 
 def sort_rooms(rooms: list[Room]) -> list[Room]:
@@ -106,6 +117,8 @@ def parse_event(raw: dict) -> Event:
     thread_root = rel.get("event_id", "") if rel.get("rel_type") == "m.thread" else ""
     replaces = rel.get("event_id", "") if rel.get("rel_type") == "m.replace" else ""
     body = content.get("body") or ""
+    if raw.get("type") == ENCRYPTED:
+        body = ENCRYPTED_BODY   # связи (треды, правки) у E2E открыты, текст — нет
     if content.get("msgtype") in ("m.image", "m.file", "m.video", "m.audio") and body:
         body = f"[{content['msgtype'][2:]}] {body}"
     mentions = list((content.get("m.mentions") or {}).get("user_ids") or [])

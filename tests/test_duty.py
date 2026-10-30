@@ -370,3 +370,65 @@ def test_edit_is_not_a_new_message():
     ev = matrix.parse_event(edit)
     assert ev.replaces == "$orig" and not ev.is_message
     assert matrix.parse_event(_ev("$1", "@olga:mx.test", "текст")).is_message
+
+
+def _enc(eid, sender, **rel):
+    content = {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "xx"}
+    if rel:
+        content["m.relates_to"] = rel
+    return {"event_id": eid, "sender": sender, "type": "m.room.encrypted", "origin_server_ts": 1, "content": content}
+
+
+def test_encrypted_event_parsed_as_message_without_text():
+    ev = matrix.parse_event(_enc("$e", "@olga:mx.test"))
+    assert ev.encrypted and ev.is_message and ev.body == matrix.ENCRYPTED_BODY
+    edit = matrix.parse_event(_enc("$e2", "@olga:mx.test", rel_type="m.replace", event_id="$e"))
+    assert not edit.is_message                                  # правка зашифрованного — не новое
+    assert "m.room.encrypted" in matrix._sync_filter(30)
+
+
+@respx.mock
+def test_encrypted_dm_reported_by_sender_and_count(tmp_path):
+    store, ws, cfg = _env(tmp_path)
+    _mock_matrix({DM: ([_enc("$1", "@olga:mx.test"), _enc("$2", "@olga:mx.test"), _enc("$3", ME)], 2)})
+    duty.handle_callback(store, _factory(cfg), "duty:personal")
+    client = matrix.client_from_config(cfg)
+    state, items, _ = duty.check(store, client)
+    client.close()
+    assert [(i.who, i.direct, i.body) for i in items] == [("olga", True, "🔒 2 новых сообщения — открой Element")]
+    store.close()
+
+
+class _Tg:
+    chat_id = "42"
+
+    def __init__(self):
+        self.sent, self.edited, self.next = [], [], 100
+
+    def send(self, text, **kw):
+        self.next += 1
+        self.sent.append(text)
+        notify._remember_last(self.chat_id, self.next)
+        return [self.next]
+
+    def edit(self, mid, text, **kw):
+        self.edited.append((mid, text))
+
+
+def test_consecutive_notifications_are_appended_to_last_message(tmp_path):
+    store, ws, cfg = _env(tmp_path)
+    state = duty.State(room_id=ROOM_A, room_name="Поддержка", enabled=True)
+    tg = _Tg()
+    a = duty.Item(who="Наталья", body="подскажи по тикету")
+    b = duty.Item(who="Наталья", body="[image] 1.png", thread="подскажи по тикету")
+    c = duty.Item(who="Наталья", body="[image] 2.png", thread="подскажи по тикету")
+    duty._send_or_append(store, state, [a], tg)
+    duty._send_or_append(store, state, [b], tg)
+    duty._send_or_append(store, state, [c], tg)
+    assert len(tg.sent) == 1 and [m for m, _ in tg.edited] == [101, 101]
+    text = tg.edited[-1][1]
+    assert text.count("👤 <b>Наталья</b>") == 2 and "2.png" in text    # тот же тред — без повтора шапки
+    notify._remember_last("42", 555)                                   # в чате было что-то ещё
+    duty._send_or_append(store, state, [a], tg)
+    assert len(tg.sent) == 2
+    store.close()
