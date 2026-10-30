@@ -32,6 +32,8 @@ def env(tmp_path):
     "git branch --show-current", "git branch --list 'PROJ-*'", "git remote -v", "git fetch origin",
     "git config --get user.name", "git stash list", "git tag -l", "git worktree list", "git rev-parse HEAD",
     "ls && git status | head", "echo $(git rev-parse --abbrev-ref HEAD)", "git -C . log",
+    "git apply --index /tmp/x.patch", "git -C .claude/worktrees/agent-1 diff --cached --binary HEAD | git apply --index",
+    "git apply --check p.patch", "git apply -R p.patch",
 ])
 def test_reads_allowed(env, cmd):
     store, repo, _, db = env
@@ -47,7 +49,7 @@ def test_reads_allowed(env, cmd):
     ("git -c user.name=x commit -m y", "commit"), ("git branch new-branch", "branch"), ("git branch -D x", "branch"),
     ("git checkout -- a.txt", "checkout"), ("git clean -fdx", "clean"), ("git stash", "stash"),
     ("git tag v1", "tag"), ("git pull", "pull"), ("timeout 30 git push", "push"), ("nohup git push &", "push"),
-    ("git status; git push", "push"), ("git status\ngit push", "push"), ("true || git merge x", "merge"),
+    ("git status; git push", "push"), ("git am p.patch", "am"), ("git apply p.patch && git commit -m x", "commit"), ("git status\ngit push", "push"), ("true || git merge x", "merge"),
     ("git config user.name x", "config"), ("git someunknownalias", "someunknownalias"),
 ])
 def test_writes_blocked_in_workspace(env, cmd, sub):

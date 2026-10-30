@@ -249,8 +249,14 @@ def parse_git(argv: list[str], cwd: str) -> Optional[dict]:
     return {"dir": d, "sub": argv[i], "args": argv[i + 1:]}
 
 
+# Пишут только файлы и индекс, как обычная правка, — ни коммитов, ни веток, ни истории:
+# например, перенос диффа копии субагента в основную папку (`git apply --index patch`).
+FILE_ONLY_SUBCOMMANDS = {"apply"}
+
+
 def is_read(sub: str, args: list[str]) -> bool:
-    if sub in ("", *READ_SUBCOMMANDS):
+    """Пропустить ли подкоманду: чтение или правка только файлов (``apply``)."""
+    if sub in ("", *READ_SUBCOMMANDS, *FILE_ONLY_SUBCOMMANDS):
         return True
     form = _READ_FORMS.get(sub)
     try:
@@ -267,7 +273,7 @@ _INSTEAD = {
     "pull": "jwu_git_sync", "reset": "jwu_git_history (reset) или jwu_git_discard", "restore": "jwu_git_discard",
     "clean": "jwu_git_discard (untracked=True)", "stash": "jwu_git_stash", "branch": "jwu_git_switch / "
     "jwu_git_branch_delete", "tag": "jwu_git_tag", "cherry-pick": "попроси пользователя",
-    "revert": "попроси пользователя", "am": "попроси пользователя", "apply": "правь файлы и jwu_git_commit",
+    "revert": "попроси пользователя", "am": "попроси пользователя",
     "worktree": "jwu_git_worktree_remove(path=<копия>) — убрать копию с бэкапом и её веткой; "
                 "path=<корень репо> — prune. Копии субагентов harness создаёт сам",
 }

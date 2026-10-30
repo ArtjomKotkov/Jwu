@@ -20,7 +20,8 @@ Bash мимо jwu режет хук Claude Code `jwu-git-guard`.
 rebase), `stash`, `discard` (выкинуть несохранённое), `history` (amend, reset — только
 незапушенное), `push`, `force_push` (только `--force-with-lease`), `delete_branch`, `tag`,
 `worktree` (убрать рабочую копию: remove + prune).
-Чтение (`status`, `diff`, `log`, `show`, `fetch`…) политикой не ограничивается.
+Чтение (`status`, `diff`, `log`, `show`, `fetch`…) политикой не ограничивается. `git apply` хук тоже пропускает: он меняет только файлы и индекс, как обычная правка, —
+так основная сессия переносит дифф копии субагента в свою папку; коммит — уже через `jwu_git_commit`.
 
 ## Как решается
 
