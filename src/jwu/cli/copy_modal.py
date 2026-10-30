@@ -12,7 +12,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
 from ..core.clipboard import copy_to_clipboard
-from ..core.models import Issue, Job, PR, parse_github_key
+from ..core.models import Issue, Job, PR, task_url  # noqa: F401 — task_url берут отсюда и дашборд
 
 
 def notify_copied(screen, text: str, *, label: str = "") -> None:
@@ -21,22 +21,6 @@ def notify_copied(screen, text: str, *, label: str = "") -> None:
         screen.notify(f"Скопировано: {label or text}")
     except Exception as exc:  # noqa: BLE001 — pyperclip / системный буфер
         screen.notify(f"Не скопировать: {exc}", severity="error")
-
-
-def task_url(base: str, key: str, owner: str = "") -> str:
-    """Ссылка на задачу по её ключу — форма ключа и говорит, чей это трекер.
-
-    ``PROJ-123`` → ``{base}/browse/PROJ-123`` (Jira), ``repo#42`` → ``{base}/owner/repo/issues/42``
-    (GitHub). Owner берётся из ключа, а если его там нет — из настроек контура.
-    """
-    base = (base or "").rstrip("/")
-    if not base or not key:
-        return ""
-    ref = parse_github_key(key, default_owner=owner)
-    if ref is not None:
-        gh_owner, repo, number = ref
-        return f"{base}/{gh_owner}/{repo}/issues/{number}" if gh_owner else ""
-    return f"{base}/browse/{key}"
 
 
 def _md_link(label: str, url: str) -> str:

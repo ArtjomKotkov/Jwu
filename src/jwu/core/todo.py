@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from .dates import fmt_ago
+from .models import task_url
 
 if TYPE_CHECKING:
     from .models import PR, Issue, Job
@@ -86,12 +87,14 @@ class Board:
     session: str = ""
     syncing_since: str = ""   # синк идёт прямо сейчас — с какого времени
     sessions: dict = field(default_factory=dict)
+    task_base: str = ""       # адрес трекера — ячейки «Задача» ссылками (Jira base_url / github web_url)
+    owner: str = ""           # owner GitHub — для ссылок по ключу repo#42
 
     def to_dict(self) -> dict:
         return {"items": [i.to_dict() for i in self.items], "synced_at": self.synced_at,
                 "synced_ago": self.synced_ago, "stale": self.stale, "session": self.session,
                 "syncing_since": self.syncing_since,
-                "sessions": self.sessions}
+                "sessions": self.sessions, "task_base": self.task_base, "owner": self.owner}
 
 
 def _statuses(store: "Store", workspace_id: int, key: str, default: Iterable[str]) -> set[str]:
@@ -305,6 +308,11 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                               _prio(i.priority), i.key))
     for n, item in enumerate(items, 1):
         item.n = n
+    pr_urls = {(pr.project, pr.repository, pr.id): pr.url
+               for scope in ("mine", "review") for pr in store.latest_prs(scope) if pr.url}
+    for item in items:
+        if item.pr:
+            item.pr["url"] = pr_urls.get((item.pr["project"], item.pr["repo"], item.pr["id"]), "")
     store.set_workspace_meta(f"todo:board:{session or '-'}",
                              json.dumps([{"n": i.n, "key": i.key, "group": i.group} for i in items]))
     last = store.get_meta(LAST_PASS_META) or ""
@@ -318,9 +326,12 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
     from .daemon import pass_in_progress
 
     running = pass_in_progress(store)
+    from .service import _environment
+
+    env = _environment(store, store.get_workspace(workspace_id))
     return Board(items=items, synced_at=last, synced_ago=fmt_ago(last) if last else "ещё не было",
                  stale=stale, session=session, syncing_since=running or "",
-                 sessions=sessions(store))
+                 sessions=sessions(store), task_base=env.get("web_base", ""), owner=env.get("owner", ""))
 
 
 DONE_STATUSES = ("done", "closed", "resolved", "закрыта", "решена")
@@ -714,9 +725,28 @@ def _title(i: Item) -> str:
     return _cell(title, 60)
 
 
+_LINKS = {"base": "", "owner": ""}
+
+
+def _link(label: str, url: str) -> str:
+    return f"[{label}]({url.replace(')', '%29')})" if url else label
+
+
+def _key_cell(key: str) -> str:
+    if not key:
+        return "—"
+    return _link(f"**{_cell(key)}**", task_url(_LINKS["base"], key, _LINKS["owner"]))
+
+
+def _pr_cell(pr: Optional[dict]) -> str:
+    if not pr:
+        return "—"
+    return _link(f"{pr['repo']}#{pr['id']}", pr.get("url", ""))
+
+
 def _row(group: str, i: Item) -> list[str]:
-    key_md = f"**{_cell(i.issue_key)}**" if i.issue_key else "—"
-    pr_md = f"{i.pr['repo']}#{i.pr['id']}" if i.pr else "—"
+    key_md = _key_cell(i.issue_key)
+    pr_md = _pr_cell(i.pr)
     if group == "reply":
         return [str(i.n), key_md, _cell(i.title, 50), _cell(", ".join(i.problems), 80), _taken_cell(i)]
     if group == "move":
@@ -726,8 +756,7 @@ def _row(group: str, i: Item) -> list[str]:
         return [str(i.n), f"**{i.key}**", key_md, _cell(", ".join(i.problems))]
     if group == "duty":
         return [str(i.n), f"**{i.key}** {_cell(i.title, 70)}", _cell(", ".join(i.problems), 50), _taken_cell(i)]
-    pr = f"{i.pr['repo']}#{i.pr['id']}" if i.pr else "—"
-    key = f"**{_cell(i.issue_key)}**" if i.issue_key else "—"
+    pr, key = pr_md, key_md
     problems = _cell(", ".join(p for p in i.problems if not p.startswith("автор ")))
     approvals = _cell((i.pr or {}).get("approvals", "")) or "—"
     if group == "simple":
@@ -755,6 +784,7 @@ def render_md(board: Board, *, disk: str = "") -> str:
         head.append(disk.replace("Диск:", "**Диск:**", 1))
     _SESSIONS_SEEN.clear()
     _SESSIONS_SEEN.update(board.sessions)
+    _LINKS.update(base=board.task_base, owner=board.owner)
     lines = [" · ".join(head)]
     # В строке «Сессии» — только живые: молчащие видны там, где важны, — в ячейке «взято»
     # у их работ (💤), и тогда же подсказка, как эти работы освободить.

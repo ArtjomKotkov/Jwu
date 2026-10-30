@@ -318,3 +318,29 @@ def test_board_demo_group(store):
     store.set_workspace_settings(store.workspace_id, {todo.DEMO_STATUSES_SETTING: "demo"})
     groups = {i.issue_key: i.group for i in todo.build(store, store.workspace_id, "me").items}
     assert groups["AB-2"] == "demo" and "AB-1" not in groups      # Dev at stand больше не демо и не todo
+
+
+def test_board_links_tasks_and_prs(store):
+    """Ключ задачи — ссылка в трекер, PR — ссылка на сам PR; адреса нет — простой текст."""
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-2", summary="готово", status="In Progress"), ["mine"])
+    store.save_pr_snapshot(run, _approved_pr(2, conflicted=True, url="https://git.example/pr/2"), ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 1, "prs:mine": 1})
+    board = todo.build(store, store.workspace_id, "me")
+    [item] = [i for i in board.items if i.pr]
+    assert item.pr["url"] == "https://git.example/pr/2"
+    assert "[r#2](https://git.example/pr/2)" in todo.render_md(board)
+    board.task_base = "https://jira.example/"
+    md = todo.render_md(board)
+    assert "[**AB-2**](https://jira.example/browse/AB-2)" in md
+    board.task_base, item.pr["url"] = "", ""
+    md = todo.render_md(board)
+    assert "| **AB-2** |" in md and "| r#2 |" in md
+
+
+def test_task_url_jira_and_github():
+    from jwu.core.models import task_url
+
+    assert task_url("https://jira.example/", "AB-1") == "https://jira.example/browse/AB-1"
+    assert task_url("https://github.com", "repo#42", "me") == "https://github.com/me/repo/issues/42"
+    assert task_url("", "AB-1") == ""

@@ -798,6 +798,22 @@ def parse_github_key(
     return None
 
 
+def task_url(base: str, key: str, owner: str = "") -> str:
+    """Ссылка на задачу по её ключу — форма ключа и говорит, чей это трекер.
+
+    ``PROJ-123`` → ``{base}/browse/PROJ-123`` (Jira), ``repo#42`` → ``{base}/owner/repo/issues/42``
+    (GitHub). Owner берётся из ключа, а если его там нет — из настроек контура.
+    """
+    base = (base or "").rstrip("/")
+    if not base or not key:
+        return ""
+    ref = parse_github_key(key, default_owner=owner)
+    if ref is not None:
+        gh_owner, repo, number = ref
+        return f"{base}/{gh_owner}/{repo}/issues/{number}" if gh_owner else ""
+    return f"{base}/browse/{key}"
+
+
 # Заключение check-run / состояние commit-status -> состояние сборки в модели jwu.
 _GH_CONCLUSION_STATE = {
     "success": "SUCCESSFUL",

@@ -141,3 +141,21 @@ def test_register_mcp_claude_checks_user_scope(tmp_path, monkeypatch):
     monkeypatch.setattr(_si.shutil, "which", lambda name: "/usr/bin/claude")
     monkeypatch.setattr(_si.subprocess, "run", lambda args, **kw: calls.append(args))
     assert _si.register_mcp_claude(command="/bin/jwu-mcp") == "без изменений" and calls == []
+
+
+def test_copyable_texts_in_code_block_and_no_promises():
+    """Текст для копирования — в блоке кода; обещаний от имени пользователя голос не пишет."""
+    from importlib.resources import files
+
+    root = files("jwu")
+    voice = (root / "agents" / "voice-writer-sample.md").read_text(encoding="utf-8")
+    assert "```text" in voice and "Никаких обещаний от имени пользователя" in voice
+    duty = (root / "agents" / "duty-support-sample.md").read_text(encoding="utf-8")
+    assert "Предлагаю сделать дежурному:" in duty and "каждый в своём блоке кода" in duty
+    skill = (root / "skills" / "jwu-duty" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Обещания — только по решению дежурного" in skill and 'kind="todo"' in skill
+    for d in (root / "skills").iterdir():
+        md = d / "SKILL.md"
+        text = md.read_text(encoding="utf-8") if md.is_file() else ""
+        if "## Текст от имени пользователя (голос)" in text:
+            assert "текст целиком **в блоке кода**" in text, d.name
