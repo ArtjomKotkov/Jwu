@@ -163,7 +163,7 @@
 | Что | Как |
 |---|---|
 | Сколько кругов ревью до остановки (по умолчанию 3) | `jwu workspace setting job.review.max_iterations 3` |
-| Защищённые ветки, маски через запятую | `jwu workspace setting push.protected "develop,master,main,release*,stable*"` |
+| Что агенту можно делать с git (ветки, репозитории, допуски) | `jwu git policy show`, `jwu git policy edit` — см. [git.md](git.md) |
 | Ревьювер для репозитория | `jwu review agents --repo <репозиторий> --reviewer <агент>` |
 | Свой агент голоса для текстов | `jwu voice agent <имя>` |
 

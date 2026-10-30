@@ -123,6 +123,12 @@ def export_memory(store: "Store", dest: Path | None = None) -> ExportReport:
             })
         notes = _all_notes(store)
         _write_json(wdir / "rules.json", rules)
+        from . import gitpolicy
+
+        policy_toml = gitpolicy.export_dict(store, ws.id)
+        if policy_toml is not None:
+            wdir.mkdir(parents=True, exist_ok=True)
+            (wdir / "git-policy.toml").write_text(policy_toml, encoding="utf-8")
         _write_json(wdir / "features.json", features)
         _write_json(wdir / "jobs.json", jobs)
         _write_json(wdir / "notes.json", notes)
@@ -368,6 +374,20 @@ def _import_jobs(store: "Store", jobs: list[dict], report: ImportReport) -> None
         report.bump(report.updated if changed else report.skipped, "jobs")
 
 
+def _import_git_policy(store: "Store", wid: int, path: Path, report: ImportReport) -> None:
+    """Политика git — только если здесь её ещё нет: чужая копия не ослабит местную молча."""
+    from . import gitpolicy
+
+    if not path.exists():
+        return
+    if gitpolicy.has_policy(store, wid):
+        report.bump(report.skipped, "git_policy")
+        return
+    report.bump(report.added, "git_policy")
+    if not report.dry_run:
+        gitpolicy.import_text(store, wid, path.read_text(encoding="utf-8"))
+
+
 def import_memory(store: "Store", src: Path | None = None, *, dry_run: bool = False) -> ImportReport:
     """Слить память из каталога в БД. Ничего не удаляет; ``dry_run`` — только посчитать."""
     src = Path(src or default_dir())
@@ -388,6 +408,7 @@ def import_memory(store: "Store", src: Path | None = None, *, dry_run: bool = Fa
         _import_features(store, _read_json(wdir / "features.json", []), report)
         _import_notes(store, _read_json(wdir / "notes.json", []), report)
         _import_jobs(store, _read_json(wdir / "jobs.json", []), report)
+        _import_git_policy(store, wid, wdir / "git-policy.toml", report)
     for key, raw in (index.get("global_guides") or {}).items():
         if not str(key).startswith("guide."):
             continue

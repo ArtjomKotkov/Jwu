@@ -403,6 +403,10 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
 
         text, markup = brief.handle_callback(store, ws.id, data)
         markup = {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
+    elif data.startswith("git:"):
+        from . import gitgrant
+
+        text, markup = gitgrant.handle_callback(store, data)
     elif data.startswith(duty.CALLBACK_PREFIX):
         text, markup = duty.handle_callback(store, _matrix_factory(cfg), data)
         if data in (duty.CALLBACK_PREFIX + duty.CB_MENU, duty.CALLBACK_PREFIX + duty.CB_ON,

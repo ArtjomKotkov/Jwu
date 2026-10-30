@@ -233,16 +233,6 @@ def worktree_state(path: str, runner: Runner = _run) -> dict:
 # Пуш работы: только своя ветка, без force
 # --------------------------------------------------------------------------- #
 
-PROTECTED_SETTING = "push.protected"
-DEFAULT_PROTECTED = "develop,master,main,release*,stable*"
-
-
-def protected_patterns(store: "Store", workspace_id: int) -> list[str]:
-    raw = store.workspace_settings(workspace_id).get(PROTECTED_SETTING)
-    raw = DEFAULT_PROTECTED if raw is None else raw
-    return [p.strip() for p in raw.split(",") if p.strip()]
-
-
 def _job_worktree(store: "Store", job: "Job", repo: str = "") -> dict:
     trees = [r for r in store.job_resources(job.id) if r["kind"] == "worktree"]
     if repo:
@@ -259,56 +249,28 @@ def _job_worktree(store: "Store", job: "Job", repo: str = "") -> dict:
 
 
 def push_worktree(store: "Store", job: "Job", repo: str = "", *, dry_run: bool = False,
-                  runner: Runner = _run) -> dict:
-    """Запушить ветку рабочей копии работы — безопасно для автономного режима.
+                  user_approved: bool = False, notify=None, runner: Runner = _run) -> dict:
+    """Запушить ветку рабочей копии работы — под политикой git воркспейса (:mod:`gitpolicy`).
 
     Пушит только текущую ветку копии этой работы в одноимённую ветку origin, без force.
-    Отказ: копия в detached HEAD или не на своей ветке; ветка защищена (настройка
-    ``push.protected``, маски через запятую); есть незакоммиченное; ветка на origin ушла
-    вперёд или разошлась с копией (нужен был бы force — это решает человек).
+    Отказ git — :class:`JobSpaceError` (detached HEAD, не своя ветка, незакоммиченное,
+    origin ушёл вперёд); отказ политики — :class:`gitops.Blocked` (что и у кого спросить).
     """
-    import fnmatch
+    from . import gitops
 
     res = _job_worktree(store, job, repo)
     path = res["ref"]
     if not Path(path).exists():
         raise JobSpaceError(f"Копии {path} уже нет")
-    code, branch = runner(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"])
-    branch = branch.strip()
-    if code != 0 or not branch or branch == "HEAD":
-        raise JobSpaceError(f"{path}: не на ветке (detached HEAD) — пушить нечего")
-    expected = (res["meta"].get("branch") or "").strip()
-    if expected and branch != expected:
-        raise JobSpaceError(f"{path}: копия на ветке {branch}, а у работы — {expected}; переключать молча не буду")
-    for pattern in protected_patterns(store, store.workspace_id):
-        if fnmatch.fnmatch(branch, pattern):
-            raise JobSpaceError(f"Ветка {branch} защищена (push.protected: {pattern}) — сюда jwu не пушит")
-    state = worktree_state(path, runner)
-    if state["dirty"]:
-        raise JobSpaceError(f"{path}: есть незакоммиченное ({len(state['dirty'])} файлов) — сначала коммит")
-    code, out = runner(["git", "-C", path, "fetch", "origin", branch])
-    remote_exists = code == 0
-    if not remote_exists and "couldn't find remote ref" not in out.lower():
-        raise JobSpaceError(f"git fetch origin {branch}: {out[-300:]}")
-    if remote_exists:
-        code, _ = runner(["git", "-C", path, "merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"])
-        if code != 0:
-            raise JobSpaceError(f"origin/{branch} ушла вперёд или разошлась с копией — нужен merge/rebase "
-                                f"(force-пуш jwu не делает)")
-        rng = [f"origin/{branch}..HEAD"]
-    else:
-        rng = ["HEAD", "--not", "--remotes=origin"]
-    code, out = runner(["git", "-C", path, "log", "--format=%h %s"] + rng)
-    commits = [line for line in out.splitlines() if line.strip()] if code == 0 else []
-    result = {"repo": res["meta"].get("repo", ""), "path": path, "branch": branch,
-              "new_branch": not remote_exists, "commits": commits, "pushed": False}
-    if not commits or dry_run:
-        return result
-    code, out = runner(["git", "-C", path, "push", "-u", "origin", f"HEAD:refs/heads/{branch}"])
-    if code != 0:
-        raise JobSpaceError(f"git push: {out[-400:]}")
-    result["pushed"] = True
-    return result
+    try:
+        ctx = gitops.context(store, path, notify=notify)
+        if ctx.job_id is None:
+            ctx.job_id, ctx.where = job.id, "job"
+        out = gitops.push(ctx, dry_run=dry_run, user_approved=user_approved,
+                          expected_branch=(res["meta"].get("branch") or "").strip())
+    except gitops.GitOpError as exc:
+        raise JobSpaceError(str(exc)) from exc
+    return {**out, "repo": res["meta"].get("repo", "")}
 
 
 # --------------------------------------------------------------------------- #

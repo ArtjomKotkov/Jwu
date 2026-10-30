@@ -1253,5 +1253,6 @@ def test_workspace_setting_known_keys_only(tmp_path, monkeypatch):
     assert "= 5" in run("job.review.max_iterations").output
     assert run("job.review.max_iterations", "0").exit_code == 2
     assert run("anything.else", "x").exit_code == 2
-    assert run("push.protected", "--unset").exit_code == 0
-    assert "по умолчанию" in run("push.protected").output
+    assert run("todo.build.required", "--unset").exit_code == 0
+    assert "по умолчанию" in run("todo.build.required").output
+    assert run("push.protected", "x").exit_code == 2          # теперь это политика git: jwu git policy

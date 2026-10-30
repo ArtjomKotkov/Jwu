@@ -13,6 +13,7 @@
 | время | `worklog`, `worklog-chain`, `worklog-tz`, `worklog-edit`, `worklog-delete`, `worklogs` |
 | PR | `pr-create`, `pr-edit`, `pr-review`, `pr-comment`, `pr-comment-edit`, `pr-comment-delete`, `pr-task list\|add\|done\|reopen\|edit\|delete` |
 | интеграции | `confluence setup\|page\|children\|search\|create\|update`, `zephyr setup\|projects\|fields\|folders\|case\|search\|for-issue\|create\|update\|link\|folder-create\|rules`, `ssh add\|list\|rm\|config\|install\|uninstall`, `voice show\|collect\|examples\|agent\|analysis\|feedback` |
+| git | `git policy show\|init\|edit\|export\|import\|check`, `git repo list\|set\|rm`, `git rule add\|rm\|move`, `git grant [N] [--deny]`, `git grants`, `git log`, `git hook install\|uninstall\|status` — [git.md](git.md) |
 | воркеры | `worker orchestrator [--name] [--off]`, `worker start <имя> --task\|--task-file [--cwd] [--job]`, `worker list`, `worker report working\|waiting\|stuck\|done [--note]`, `worker stop <имя> [--force]` |
 | фон и данные | `daemon run\|install\|uninstall\|status\|kick`, `notify status\|test\|poll`, `backup`, `restore`, `db stats\|prune\|vacuum`, `dashboard` |
 

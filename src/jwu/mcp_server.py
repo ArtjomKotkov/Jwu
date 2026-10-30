@@ -888,11 +888,12 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
                        workspace: Optional[str] = None) -> dict:
     """ВНЕШНЯЯ ЗАПИСЬ: запушить ветку рабочей копии работы — вместо голого git push.
 
-    Пушит только текущую ветку копии ЭТОЙ работы в одноимённую ветку origin, без force.
-    Откажет: защищённая ветка (develop/master/main/release*… — настройка push.protected),
-    незакоммиченное, origin ушёл вперёд или разошёлся (force решает человек), не та ветка.
-    dry_run=True (по умолчанию) — что уйдёт: ветка, новые коммиты. Реальный пуш —
-    dry_run=False и user_approved=True, только после «да» пользователя на публикацию.
+    Пушит только текущую ветку копии ЭТОЙ работы в одноимённую ветку origin, без force,
+    под политикой git воркспейса (jwu_git_policy): allow — сразу, ask — нужен user_approved
+    («да» пользователя), grant — нужен допуск пользователя из бота/терминала, deny — никогда.
+    Отказ политики — ответ {ok: false, blocked, rule, reason, ask_user, retry}: сделай, что в
+    ask_user, и повтори. Откажет и git: незакоммиченное, origin ушёл вперёд, не та ветка.
+    dry_run=True (по умолчанию) — что уйдёт: ветка, новые коммиты.
     repo — какая копия, если у работы их несколько."""
     from .core import jobspace
 
@@ -900,15 +901,211 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
     job = store.get_job(job_id)
     if job is None:
         raise ValueError(f"Работа #{job_id} не найдена")
-    if not dry_run and not user_approved:
-        raise ValueError("Пуш — только после «да» пользователя (user_approved=True).")
     try:
-        res = jobspace.push_worktree(store, job, repo, dry_run=dry_run)
+        res = jobspace.push_worktree(store, job, repo, dry_run=dry_run, user_approved=user_approved,
+                                     notify=_grant_notify)
     except jobspace.JobSpaceError as exc:
         raise ValueError(str(exc)) from exc
-    if res["pushed"]:
-        store.add_job_record(job_id, f"Запушено в {res['branch']}: {len(res['commits'])} коммит(ов)", kind="note")
     return _stamp(res, _resolve(workspace))
+
+
+def _grant_notify(store: Store, req: dict) -> None:
+    """Запрос допуска — кнопками в Telegram (если бот настроен)."""
+    from .core import gitgrant
+
+    gitgrant.notify(store, req)
+
+
+def _git_call(path: str, workspace: Optional[str], fn) -> dict:
+    """Общая обёртка jwu_git_*: контекст репозитория, отказ политики — ответом, а не ошибкой."""
+    import os
+
+    from .core import gitops
+
+    store = _store_only(workspace)
+    try:
+        ctx = gitops.context(store, path or os.getcwd(), notify=_grant_notify)
+        res = fn(ctx)
+    except gitops.Blocked as b:
+        res = b.to_dict()
+    except (gitops.GitOpError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    return _stamp(res, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_git_status(path: str = "", workspace: Optional[str] = None) -> dict:
+    """Git: состояние репозитория в папке path (по умолчанию — папка сессии): репозиторий
+    (project/repo), копия работы или основная папка, ветка, HEAD, ahead/behind, изменённые
+    файлы, конфликты, идёт ли merge/rebase, целевая ветка. Только чтение.
+
+    Пишущий git — ТОЛЬКО через jwu_git_* (голый git из Bash режет хук политики)."""
+    from .core import gitops
+
+    return _git_call(path, workspace, gitops.status)
+
+
+@mcp.tool()
+async def jwu_git_diff(path: str = "", staged: bool = False, ref: str = "", paths: Optional[list[str]] = None,
+                       stat: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: дифф рабочего дерева (staged — индекса; ref — против коммита/ветки; stat — только
+    сводка). Только чтение; длинный вывод обрезается."""
+    from .core import gitops
+
+    return _git_call(path, workspace, lambda c: gitops.diff(c, staged=staged, ref=ref, paths=paths, stat=stat))
+
+
+@mcp.tool()
+async def jwu_git_log(path: str = "", n: int = 20, ref: str = "", workspace: Optional[str] = None) -> dict:
+    """Git: последние n коммитов (sha, автор, дата, тема). Только чтение."""
+    from .core import gitops
+
+    return _git_call(path, workspace, lambda c: gitops.log(c, n=n, ref=ref))
+
+
+@mcp.tool()
+async def jwu_git_commit(message: str, path: str = "", files: Optional[list[str]] = None,
+                         user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: add + commit (files — только эти, иначе всё). Сообщение — из jwu-commit-message.
+    Под политикой: в копии работы обычно allow, в основной папке и общих ветках — ask
+    (user_approved после «да»), в прод-ветках — deny. Отказ — {blocked, ask_user, retry}."""
+    from .core import gitops
+
+    return _git_call(path, workspace, lambda c: gitops.commit(c, message, files=files, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_switch(branch: str, path: str = "", create: bool = False, base: str = "",
+                         user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: переключиться на ветку (create — создать, base — от чего). Под политикой."""
+    from .core import gitops
+
+    return _git_call(path, workspace,
+                     lambda c: gitops.switch(c, branch, create=create, base=base, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_sync(path: str = "", action: str = "start", target: str = "", mode: str = "",
+                       user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: подтянуть целевую ветку в текущую. action: start (fetch + merge|rebase origin/<target>;
+    target и mode по умолчанию из политики репозитория; перед этим backup-ссылка) | continue
+    (конфликты решены — завершить) | abort (отменить merge/rebase). Конфликт — ok:false и список
+    файлов: реши их правками и вызови continue. Откатить всё — jwu_git_undo(backup)."""
+    from .core import gitops
+
+    def run(c):
+        if action == "continue":
+            return gitops.sync_continue(c)
+        if action == "abort":
+            return gitops.sync_abort(c)
+        if action != "start":
+            raise ValueError("action: start | continue | abort")
+        return gitops.sync(c, target=target, mode=mode, user_approved=user_approved)
+
+    return _git_call(path, workspace, run)
+
+
+@mcp.tool()
+async def jwu_git_stash(path: str = "", action: str = "push", message: str = "", user_approved: bool = False,
+                        workspace: Optional[str] = None) -> dict:
+    """Git: stash push (с неотслеживаемыми) | pop | apply | list. Под политикой."""
+    from .core import gitops
+
+    return _git_call(path, workspace,
+                     lambda c: gitops.stash(c, action, message=message, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_discard(path: str = "", files: Optional[list[str]] = None, untracked: bool = False,
+                          user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: выкинуть несохранённое (files — только эти; untracked — и неотслеживаемые файлы).
+    Перед этим backup-ссылка (неотслеживаемые в неё не попадают). Обычно ask — после «да»."""
+    from .core import gitops
+
+    return _git_call(path, workspace,
+                     lambda c: gitops.discard(c, files=files, untracked=untracked, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_history(action: str, path: str = "", message: str = "", ref: str = "",
+                          keep_changes: bool = True, user_approved: bool = False,
+                          workspace: Optional[str] = None) -> dict:
+    """Git: переписать НЕзапушенную историю. action: amend (последний коммит + текущие правки;
+    message — новое сообщение) | reset (ветку на ref; keep_changes — правки остаются в дереве).
+    Запушенное не переписывает (нужен был бы force) — откажет. Перед этим backup-ссылка."""
+    from .core import gitops
+
+    def run(c):
+        if action == "amend":
+            return gitops.amend(c, message, user_approved=user_approved)
+        if action == "reset":
+            return gitops.reset_to(c, ref, keep_changes=keep_changes, user_approved=user_approved)
+        raise ValueError("action: amend | reset")
+
+    return _git_call(path, workspace, run)
+
+
+@mcp.tool()
+async def jwu_git_push(path: str = "", force: bool = False, dry_run: bool = False, user_approved: bool = False,
+                       workspace: Optional[str] = None) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: пуш текущей ветки в одноимённую на origin. dry_run — что уйдёт.
+    force — только --force-with-lease и только если ветка разошлась (своя, переписанная).
+    Под политикой: ask — user_approved после «да»; grant (develop, release* …) — «да» мало,
+    нужен допуск пользователя (запрос уходит в бот; ask_user скажет как); deny — никогда.
+    Для копии работы удобнее jwu_job_push(job_id)."""
+    from .core import gitops
+
+    return _git_call(path, workspace,
+                     lambda c: gitops.push(c, force=force, dry_run=dry_run, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_branch_delete(branch: str, path: str = "", remote: bool = False, user_approved: bool = False,
+                                workspace: Optional[str] = None) -> dict:
+    """Git: удалить ветку (remote — и на origin, ВНЕШНЯЯ запись). Перед этим backup-ссылка. Под политикой."""
+    from .core import gitops
+
+    return _git_call(path, workspace,
+                     lambda c: gitops.delete_branch(c, branch, remote=remote, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_tag(name: str, path: str = "", message: str = "", push: bool = False,
+                      user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: тег на HEAD (message — аннотированный; push — запушить, ВНЕШНЯЯ запись). Обычно grant."""
+    from .core import gitops
+
+    return _git_call(path, workspace,
+                     lambda c: gitops.tag(c, name, message=message, push_tag=push, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_undo(path: str = "", ref: str = "", user_approved: bool = False,
+                       workspace: Optional[str] = None) -> dict:
+    """Git: откат к backup-ссылке jwu (снимаются перед sync/discard/amend/reset/undo).
+    Без ref — список ссылок. С ref — вернуть ветку и дерево; всегда после «да» (user_approved)."""
+    from .core import gitops
+
+    return _git_call(path, workspace, lambda c: gitops.undo(c, ref, user_approved=user_approved))
+
+
+@mcp.tool()
+async def jwu_git_policy(path: str = "", workspace: Optional[str] = None) -> dict:
+    """Git: политика для репозитория в path и его текущей ветки — какой уровень у каждой
+    операции (allow | ask | grant | deny) и каким правилом решено, плюс ожидающие допуски.
+    Только чтение: менять политику и выдавать допуски агент НЕ может (это делает пользователь
+    сам: jwu git policy edit / jwu git grant)."""
+    from .core import gitops, gitpolicy
+
+    def run(c):
+        table = {op: gitpolicy.decide(c.policy, op, remote=c.remote, branch=c.branch, where=c.where).to_dict()
+                 for op in gitpolicy.OPS}
+        return {"ok": True, "repo": c.remote, "branch": c.branch, "where": c.where,
+                "guard": gitpolicy.guard_on(c.policy, c.remote),
+                "ops": {op: {"level": d["level"], "rule": d["rule"]} for op, d in table.items()},
+                "pending_grants": gitpolicy.pending_grants(c.store)}
+
+    return _git_call(path, workspace, run)
 
 
 @mcp.tool()

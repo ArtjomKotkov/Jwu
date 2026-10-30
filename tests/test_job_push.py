@@ -1,10 +1,10 @@
-"""Пуш работы: только своя ветка копии, без force, не в защищённые, не при грязной копии."""
+"""Пуш работы: только своя ветка копии, без force, под политикой git, не при грязной копии."""
 
 import subprocess
 
 import pytest
 
-from jwu.core import jobspace
+from jwu.core import gitops, gitpolicy, jobspace
 from jwu.core.store import Store
 
 
@@ -49,12 +49,14 @@ def test_push_new_branch_then_nothing(env, monkeypatch):
     _commit(wt, "b.txt")
     plan = jobspace.push_worktree(store, job, dry_run=True)
     assert plan["new_branch"] and len(plan["commits"]) == 1 and not plan["pushed"]
-    res = jobspace.push_worktree(store, job)
+    with pytest.raises(gitops.Blocked):                  # push по умолчанию — ask
+        jobspace.push_worktree(store, job)
+    res = jobspace.push_worktree(store, job, user_approved=True)
     assert res["pushed"] and "APP-1-fix" in git("branch", "--list", "APP-1-fix", cwd=remote)
-    assert jobspace.push_worktree(store, job)["commits"] == []
+    assert jobspace.push_worktree(store, job, user_approved=True)["commits"] == []
     (wt / "c.txt").write_text("dirty")
     with pytest.raises(jobspace.JobSpaceError, match="незакоммиченное"):
-        jobspace.push_worktree(store, job)
+        jobspace.push_worktree(store, job, user_approved=True)
 
 
 def test_refuses_protected_and_diverged(env, monkeypatch, tmp_path):
@@ -64,17 +66,21 @@ def test_refuses_protected_and_diverged(env, monkeypatch, tmp_path):
     tree = jobspace.add_worktree(store, job, str(repo), branch="APP-1-fix", base="develop")
     wt = Path(tree["ref"])
     _commit(wt, "b.txt")
-    jobspace.push_worktree(store, job)
+    jobspace.push_worktree(store, job, user_approved=True)
     other = tmp_path / "other"
     git("clone", "-b", "APP-1-fix", str(remote), str(other), cwd=tmp_path)
     _commit(other, "x.txt")
     git("push", "origin", "APP-1-fix", cwd=other)
     _commit(wt, "y.txt")
     with pytest.raises(jobspace.JobSpaceError, match="разошлась"):
-        jobspace.push_worktree(store, job)
-    store.set_workspace_settings(store.workspace_id, {jobspace.PROTECTED_SETTING: "APP-*"})
-    with pytest.raises(jobspace.JobSpaceError, match="защищена"):
-        jobspace.push_worktree(store, job)
+        jobspace.push_worktree(store, job, user_approved=True)
+    git("pull", "--no-rebase", "-q", "origin", "APP-1-fix", cwd=wt)
+    pol = gitpolicy.ensure(store)
+    pol.rules.insert(0, gitpolicy.Rule(name="наши", key=["APP"], ops={"push": "deny"}))
+    gitpolicy.save(store, pol)
+    with pytest.raises(gitops.Blocked) as e:
+        jobspace.push_worktree(store, job, user_approved=True)
+    assert e.value.level == "deny" and "наши" in e.value.rule
 
 
 def test_no_worktree(env):
@@ -83,9 +89,9 @@ def test_no_worktree(env):
         jobspace.push_worktree(store, job)
 
 
-def test_protected_defaults_cover_main_branches():
-    import fnmatch
-    pats = [p for p in jobspace.DEFAULT_PROTECTED.split(",")]
+def test_default_policy_covers_main_branches(env):
+    store = env[0]
+    pol = gitpolicy.ensure(store)
     for b in ("develop", "master", "main", "release/10.8", "release-10.8"):
-        assert any(fnmatch.fnmatch(b, p) for p in pats)
-    assert not any(fnmatch.fnmatch("APP-1-fix", p) for p in pats)
+        assert gitpolicy.decide(pol, "push", branch=b).level in ("grant", "deny"), b
+    assert gitpolicy.decide(pol, "push", branch="APP-1-fix", where="job").level == "ask"

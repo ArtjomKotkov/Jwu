@@ -75,6 +75,33 @@ description: Use at the START of a session, again after /clear or context compac
 - Цель работы достигнута → **jwu-close-job** (итог для трекинга времени, уборка стенда и копий).
 - Работа без якоря — только если пользователь явно не хочет фичу: `jwu_job_start(title=…)`.
 
+## Git — только через jwu
+
+Пишущий git (commit, push, checkout/switch, merge/rebase/pull, reset, stash, clean, tag,
+удаление веток) — **только** инструментами `jwu_git_*` / `jwu_job_push`. Голый `git` из Bash
+для этого режет хук политики (`jwu-git-guard`); чтение (`git status/diff/log/show`) — можно,
+или `jwu_git_status` / `jwu_git_diff` / `jwu_git_log`.
+
+| нужно | инструмент |
+|---|---|
+| коммит | `jwu_git_commit(message, path=<копия>)` (текст — **jwu-commit-message**) |
+| пуш ветки работы | `jwu_job_push(job_id)` — dry_run, потом `dry_run=False` |
+| подтянуть develop/master | `jwu_git_sync(path)`; конфликт → правки → `action="continue"` |
+| ветка | `jwu_git_switch(branch, create=True, base=…)` |
+| выкинуть правки, amend, reset | `jwu_git_discard` / `jwu_git_history` |
+| откатить сделанное jwu | `jwu_git_undo(path)` — список, потом `ref` |
+| что можно в этой ветке | `jwu_git_policy(path)` |
+
+Ответ `{"ok": false, "blocked": …}` — это **политика**, а не сбой. Не обходи её:
+- `ask` — покажи пользователю, что будет сделано, меню «да / нет»; «да» → тот же вызов с
+  `user_approved=True`;
+- `grant` — «да» в чате **не хватает**: скажи пользователю ровно то, что в `ask_user`
+  (кнопка в боте или `! jwu git grant <N>` в его терминале), дождись и повтори вызов. Сам
+  допуск не выдаёшь и не пытаешься;
+- `deny` — нельзя совсем: скажи, что запрещено политикой (`rule`), и спроси, как быть.
+
+Политику меняет только пользователь (`jwu git policy edit`); тебе это недоступно.
+
 ## Если ты воркер оркестратора
 
 Первое сообщение начинается с «Ты — воркер jwu «…»» — эту сессию поднял оркестратор

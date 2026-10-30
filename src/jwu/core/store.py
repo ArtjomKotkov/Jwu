@@ -390,7 +390,7 @@ def _readiness_detail(sig: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -572,6 +572,13 @@ def _m011_queue(conn: sqlite3.Connection) -> None:
     conn.executescript(QUEUE_SCHEMA)
 
 
+def _m013_git_policy(conn: sqlite3.Connection) -> None:
+    """v12 → v13: политика git (``git_policy``, ``git_repos``, ``git_rules``), допуски и журнал."""
+    from .gitpolicy import ensure_schema
+
+    ensure_schema(conn)
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
@@ -584,6 +591,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (10, _m010_mention_archive),
     (11, _m011_queue),
     (12, _m012_job_resources),
+    (13, _m013_git_policy),
 ]
 
 

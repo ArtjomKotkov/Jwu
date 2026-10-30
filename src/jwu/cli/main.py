@@ -747,8 +747,10 @@ def install(
                                help="Куда ставить: Claude Code, Cursor, Codex; both — Claude Code и Cursor; "
                                     "all — все три."),
     skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Не регистрировать MCP-сервер jwu."),
+    git_guard: bool = typer.Option(True, "--git-guard/--no-git-guard",
+                                   help="Хук Claude Code: пишущий git из Bash — только через jwu_git_* (политика)."),
 ) -> None:
-    """Поставить jwu в агента: скиллы, субагенты и MCP-сервер (Claude Code, Cursor, Codex)."""
+    """Поставить jwu в агента: скиллы, субагенты, MCP-сервер и хук политики git (Claude Code, Cursor, Codex)."""
     from .. import skills_install as si
 
     targets = {"both": ("claude", "cursor"), "all": ("claude", "cursor", "codex")}.get(target, (target,))
@@ -777,6 +779,13 @@ def install(
         where = {"claude": "claude mcp (user)", "cursor": str(si.cursor_mcp_path()),
                  "codex": str(si.codex_config_path())}[tgt]
         console.print(f"  MCP jwu: {status} [dim]({where})[/dim]")
+        if tgt == "claude" and git_guard:
+            from ..core import gitguard
+
+            try:
+                console.print(f"  {gitguard.install()}")
+            except ValueError as exc:
+                err.print(f"[yellow]  хук git-guard не поставлен:[/yellow] {exc}")
     console.print("[dim]Перезапусти сессию агента, чтобы он увидел новые инструменты. "
                   "Дальше: jwu init в папке проекта.[/dim]")
 
@@ -4170,8 +4179,10 @@ def job_ports(
 @job_app.command("push")
 def job_push(job_id: int = typer.Argument(...), repo: str = typer.Option("", "--repo", help="Какая копия, если их несколько."),
              yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения.")) -> None:
-    """Запушить ветку рабочей копии работы: только своя ветка, без force, не в защищённые."""
-    from ..core import jobspace
+    """Запушить ветку рабочей копии работы: только своя ветка, без force, под политикой git."""
+    import sys
+
+    from ..core import gitops, gitpolicy, jobspace
 
     with _store() as store:
         job = store.get_job(job_id)
@@ -4189,12 +4200,23 @@ def job_push(job_id: int = typer.Argument(...), repo: str = typer.Option("", "--
                 console.print(f"  {c}", highlight=False)
             if not yes and not typer.confirm("Пушим?"):
                 raise typer.Exit(code=1)
-            res = jobspace.push_worktree(store, job, repo)
-        except jobspace.JobSpaceError as exc:
+            try:
+                res = jobspace.push_worktree(store, job, repo, user_approved=True)
+            except gitops.Blocked as b:
+                # допуск выдаёт только человек за терминалом: у агента в Bash нет TTY (и хук режет)
+                if b.level != "grant" or not b.grant_id or not sys.stdin.isatty():
+                    raise
+                if not typer.confirm(f"{b.reason}\nВыдать допуск на этот пуш?"):
+                    raise typer.Exit(code=1)
+                gitpolicy.answer_grant(store, b.grant_id, allow=True, via="cli")
+                res = jobspace.push_worktree(store, job, repo, user_approved=True)
+        except gitops.Blocked as b:
+            err.print(f"[red]{b.reason}[/red]\n{b.ask_user}", highlight=False)
+            raise typer.Exit(code=1)
+        except (jobspace.JobSpaceError, gitpolicy.PolicyError) as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1)
-        store.add_job_record(job_id, f"Запушено в {res['branch']}: {len(res['commits'])} коммит(ов)", kind="note")
-    console.print("Запушено.")
+    console.print(f"Запушено: {res['branch']}, {len(res['commits'])} коммит(ов).")
 
 
 @job_app.command("cleanup")
@@ -4253,8 +4275,6 @@ def disk_cmd(
 # Настройки потока работы, которые задаются руками (остальные — своими командами).
 EDITABLE_SETTINGS = {
     "job.review.max_iterations": "сколько кругов ревью подряд до вопроса пользователю (по умолчанию 3)",
-    "push.protected": "ветки, куда jwu job push не пушит: маски через запятую "
-                      "(по умолчанию develop,master,main,release*,stable*)",
     "todo.build.required": "где без зелёной сборки на последнем коммите PR не двигать: репозитории "
                            "через запятую, * — все, - — нигде (по умолчанию — где CI присылает сборки)",
 }
@@ -4408,6 +4428,401 @@ def worker_stop(name: str = typer.Argument(...),
     paused = res["paused_jobs"]
     console.print(f"Воркер «{name}» остановлен" + (f"; на паузе: {', '.join(f'#{j}' for j in paused)}" if paused else ""),
                   highlight=False)
+
+
+# --------------------------------------------------------------------------- #
+# jwu git — политика git воркспейса, допуски, журнал, хук
+# --------------------------------------------------------------------------- #
+
+git_app = typer.Typer(help="Политика git: что агенту можно делать с git, где и с чьего разрешения; допуски; хук.")
+app.add_typer(git_app, name="git")
+git_policy_app = typer.Typer(help="Политика git воркспейса: показать, править, проверить.")
+git_app.add_typer(git_policy_app, name="policy")
+git_repo_app = typer.Typer(help="Репозитории в политике: настройки поверх воркспейса.")
+git_app.add_typer(git_repo_app, name="repo")
+git_rule_app = typer.Typer(help="Правила политики: по веткам, префиксам задач, месту (копия работы / основная папка).")
+git_app.add_typer(git_rule_app, name="rule")
+git_hook_app = typer.Typer(help="Хук Claude Code: пишущий git из Bash — только через jwu_git_*.")
+git_app.add_typer(git_hook_app, name="hook")
+
+_LEVEL_STYLE = {"allow": "green", "ask": "yellow", "grant": "magenta", "deny": "red"}
+
+
+def _level(level: str) -> str:
+    return f"[{_LEVEL_STYLE.get(level, 'white')}]{level}[/]"
+
+
+def _parse_ops(values: list[str]) -> dict:
+    out = {}
+    for v in values or []:
+        op, sep, level = v.partition("=")
+        if not sep:
+            err.print(f"[red]--op {v}: нужен вид операция=уровень (push=grant)[/red]")
+            raise typer.Exit(code=2)
+        out[op.strip()] = level.strip()
+    return out
+
+
+def _policy_fail(exc: Exception) -> None:
+    err.print(f"[red]{exc}[/red]")
+    raise typer.Exit(code=2)
+
+
+@git_policy_app.command("show")
+def git_policy_show(as_toml: bool = typer.Option(False, "--toml", help="В виде TOML (как для правки).")) -> None:
+    """Итоговая политика: уровни операций, правила воркспейса и репозиториев."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        known = gp.has_policy(store, store.workspace_id)
+        pol = gp.load(store)
+    if as_toml:
+        typer.echo(gp.to_toml(pol))
+        return
+    console.print(f"[b]Политика git[/b]{'' if known else ' [dim](встроенная — ещё не записана)[/dim]'}: "
+                  f"guard={'вкл' if pol.guard else 'выкл'}, sync={pol.sync}, допуск {pol.grant_ttl // 60} мин через "
+                  f"{', '.join(pol.grant_via)}", highlight=False)
+    console.print("Операции: " + ", ".join(f"{op} {_level(lv)}" for op, lv in pol.ops.items()))
+
+    def rules(title: str, items) -> None:
+        for i, r in enumerate(items, 1):
+            console.print(f"  {title}{i}. {r.label()}: " + ", ".join(f"{op} {_level(lv)}" for op, lv in r.ops.items())
+                          + ("" if r.enabled else " [dim](выкл)[/dim]"), highlight=False)
+
+    rules("", pol.rules)
+    for repo in pol.repos:
+        extra = [f"target {repo.target}"] if repo.target else []
+        extra += [f"sync {repo.sync}"] if repo.sync else []
+        extra += [f"guard {'вкл' if repo.guard else 'выкл'}"] if repo.guard is not None else []
+        extra += [f"{op} {_level(lv)}" for op, lv in repo.ops.items()]
+        console.print(f"[b]{repo.remote}[/b]" + (f": {', '.join(extra)}" if extra else ""), highlight=False)
+        rules("  ", repo.rules)
+
+
+@git_policy_app.command("init")
+def git_policy_init(discover: bool = typer.Option(True, "--discover/--no-discover",
+                                                  help="Найти репозитории по папкам воркспейса.")) -> None:
+    """Записать встроенную политику (если её нет) и завести репозитории папок воркспейса."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        was = gp.has_policy(store, store.workspace_id)
+        gp.ensure(store)
+        added = gp.discover(store) if discover else []
+    console.print(("Политика уже была." if was else "Политика записана (встроенные значения).")
+                  + (f" Репозитории: {', '.join(r.remote for r in added)}." if added else ""))
+
+
+@git_policy_app.command("edit")
+def git_policy_edit() -> None:
+    """Открыть политику как TOML в $EDITOR; при сохранении — проверка и запись."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        text = gp.to_toml(gp.ensure(store))
+        while True:
+            new = click.edit(text, extension=".toml")
+            if new is None or new == text:
+                console.print("Без изменений.")
+                return
+            try:
+                gp.save(store, gp.from_toml(new))
+            except gp.PolicyError as exc:
+                err.print(f"[red]{exc}[/red]")
+                if not typer.confirm("Поправить ещё раз?", default=True):
+                    raise typer.Exit(code=2)
+                text = new
+                continue
+            break
+    console.print("Политика сохранена.")
+
+
+@git_policy_app.command("export")
+def git_policy_export(path: Optional[Path] = typer.Argument(None, help="Файл; без него — в stdout.")) -> None:
+    """Выгрузить политику в TOML (перенос, бэкап)."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        text = gp.to_toml(gp.load(store))
+    if path:
+        path.write_text(text, encoding="utf-8")
+        console.print(f"→ {path}")
+    else:
+        typer.echo(text)
+
+
+@git_policy_app.command("import")
+def git_policy_import(path: Path = typer.Argument(..., help="TOML-файл политики."),
+                      yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения.")) -> None:
+    """Заменить политику воркспейса политикой из TOML."""
+    from ..core import gitpolicy as gp
+
+    try:
+        pol = gp.from_toml(path.read_text(encoding="utf-8"))
+    except (OSError, gp.PolicyError) as exc:
+        _policy_fail(exc)
+    if not yes and not typer.confirm("Заменить текущую политику?"):
+        raise typer.Exit(code=1)
+    with _store() as store:
+        gp.save(store, pol)
+    console.print("Политика заменена.")
+
+
+@git_policy_app.command("check")
+def git_policy_check(op: str = typer.Argument(..., help="Операция: " + ", ".join(
+                         ("commit", "switch", "sync", "stash", "discard", "history", "push", "force_push",
+                          "delete_branch", "tag"))),
+                     branch: str = typer.Option("", "--branch", "-b", help="Ветка (по умолчанию — текущая в папке)."),
+                     repo: str = typer.Option("", "--repo", "-r", help="project/repo (по умолчанию — из папки)."),
+                     where: str = typer.Option("", "--where", help="job | main (по умолчанию — по папке)."),
+                     path: str = typer.Option(".", "--path", help="Папка репозитория.")) -> None:
+    """Какой уровень у операции и каким правилом решено."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        pol = gp.load(store)
+        info = gp.repo_of(path) if (not repo or not branch or not where) else {}
+        repo = repo or info.get("remote", "")
+        branch = branch or info.get("branch", "")
+        where = where or (gp.where_of(store, info["root"]) if info.get("root") else "any")
+        try:
+            d = gp.decide(pol, op, remote=repo, branch=branch, where=where)
+        except gp.PolicyError as exc:
+            _policy_fail(exc)
+    console.print(f"{op} → {repo or '?'}:{branch or '?'} ({where}): {_level(d.level)} — {d.rule}", highlight=False)
+    if repo and not pol.repo(repo):
+        console.print(f"[dim]{repo} в политике не описан — действуют правила воркспейса.[/dim]")
+
+
+@git_repo_app.command("list")
+def git_repo_list() -> None:
+    """Репозитории политики и их настройки поверх воркспейса."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        pol = gp.load(store)
+    if not pol.repos:
+        console.print("Репозиториев в политике нет — jwu git policy init заведёт их по папкам воркспейса.")
+    for r in pol.repos:
+        console.print(f"[b]{r.remote}[/b] target={r.target or '?'} sync={r.sync or pol.sync}"
+                      f" guard={'вкл' if gp.guard_on(pol, r.remote) else 'выкл'} правил {len(r.rules)}"
+                      + (" " + ", ".join(f"{op} {_level(lv)}" for op, lv in r.ops.items()) if r.ops else ""),
+                      highlight=False)
+
+
+@git_repo_app.command("set")
+def git_repo_set(remote: str = typer.Argument(..., help="project/repo."),
+                 target: Optional[str] = typer.Option(None, "--target", help="Главная ветка (develop/master)."),
+                 sync: Optional[str] = typer.Option(None, "--sync", help="merge | rebase | - (как у воркспейса)."),
+                 guard: Optional[str] = typer.Option(None, "--guard", help="on | off | - (как у воркспейса)."),
+                 ops: list[str] = typer.Option([], "--op", help="операция=уровень; уровень «-» — снять."),
+                 ) -> None:
+    """Завести репозиторий в политике или поменять его настройки."""
+    from ..core import gitpolicy as gp
+
+    remote = remote.lower()
+    with _store() as store:
+        pol = gp.ensure(store)
+        repo = pol.repo(remote)
+        if repo is None:
+            repo = gp.Repo(remote=remote, name=remote.split("/")[-1])
+            pol.repos.append(repo)
+        if target is not None:
+            repo.target = target
+        if sync is not None:
+            repo.sync = "" if sync == "-" else sync
+        if guard is not None:
+            repo.guard = None if guard == "-" else guard in ("on", "1", "true", "да")
+        for op, lv in _parse_ops(ops).items():
+            if lv == "-":
+                repo.ops.pop(op, None)
+            else:
+                repo.ops[op] = lv
+        try:
+            gp.save(store, pol)
+        except gp.PolicyError as exc:
+            _policy_fail(exc)
+    console.print(f"{remote}: сохранено.")
+
+
+@git_repo_app.command("rm")
+def git_repo_rm(remote: str = typer.Argument(...)) -> None:
+    """Убрать репозиторий из политики (с его правилами) — дальше он живёт по правилам воркспейса."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        pol = gp.ensure(store)
+        before = len(pol.repos)
+        pol.repos = [r for r in pol.repos if r.remote != remote.lower()]
+        if len(pol.repos) == before:
+            _policy_fail(gp.PolicyError(f"{remote} в политике нет"))
+        gp.save(store, pol)
+    console.print(f"{remote}: убран.")
+
+
+def _rules_of(pol, repo: str):
+    from ..core import gitpolicy as gp
+
+    if not repo:
+        return pol.rules
+    r = pol.repo(repo.lower())
+    if r is None:
+        raise gp.PolicyError(f"{repo} в политике нет — jwu git repo set {repo}")
+    return r.rules
+
+
+@git_rule_app.command("add")
+def git_rule_add(ops: list[str] = typer.Option(..., "--op", help="операция=уровень (можно несколько)."),
+                 repo: str = typer.Option("", "--repo", "-r", help="Правило репозитория; без — воркспейса."),
+                 branch: list[str] = typer.Option([], "--branch", "-b", help="Маска ветки (можно несколько)."),
+                 key: list[str] = typer.Option([], "--key", "-k", help="Префикс задачи в ветке; * — любой."),
+                 where: str = typer.Option("any", "--where", help="any | job | main."),
+                 name: str = typer.Option("", "--name", help="Имя правила."),
+                 position: int = typer.Option(0, "--at", help="Номер (1 — первым); 0 — в конец.")) -> None:
+    """Добавить правило (идут по порядку, первое совпадение выигрывает)."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        pol = gp.ensure(store)
+        try:
+            rules = _rules_of(pol, repo)
+            rule = gp.Rule(name=name, branch=list(branch), key=list(key), where=where, ops=_parse_ops(ops)).validate()
+            rules.insert(position - 1 if position > 0 else len(rules), rule)
+            gp.save(store, pol)
+        except gp.PolicyError as exc:
+            _policy_fail(exc)
+    console.print("Правило добавлено. jwu git policy show — итог.")
+
+
+@git_rule_app.command("rm")
+def git_rule_rm(number: int = typer.Argument(..., help="Номер из jwu git policy show."),
+                repo: str = typer.Option("", "--repo", "-r", help="Правило репозитория; без — воркспейса.")) -> None:
+    """Удалить правило по номеру."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        pol = gp.ensure(store)
+        try:
+            rules = _rules_of(pol, repo)
+            if not 1 <= number <= len(rules):
+                raise gp.PolicyError(f"Правила №{number} нет (их {len(rules)})")
+            rules.pop(number - 1)
+            gp.save(store, pol)
+        except gp.PolicyError as exc:
+            _policy_fail(exc)
+    console.print("Правило удалено.")
+
+
+@git_rule_app.command("move")
+def git_rule_move(number: int = typer.Argument(...), to: int = typer.Argument(..., help="Новый номер."),
+                  repo: str = typer.Option("", "--repo", "-r")) -> None:
+    """Переставить правило: порядок решает, какое сработает первым."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        pol = gp.ensure(store)
+        try:
+            rules = _rules_of(pol, repo)
+            if not (1 <= number <= len(rules) and 1 <= to <= len(rules)):
+                raise gp.PolicyError(f"Номера — от 1 до {len(rules)}")
+            rules.insert(to - 1, rules.pop(number - 1))
+            gp.save(store, pol)
+        except gp.PolicyError as exc:
+            _policy_fail(exc)
+    console.print("Порядок сохранён.")
+
+
+@git_app.command("grant")
+def git_grant(request: Optional[int] = typer.Argument(None, help="Номер запроса допуска (из ответа агенту или "
+                                                                 "jwu git grants)."),
+              deny: bool = typer.Option(False, "--deny", help="Отказать."),
+              repo: str = typer.Option("", "--repo", "-r", help="Без запроса: project/repo."),
+              branch: str = typer.Option("", "--branch", "-b", help="Без запроса: ветка."),
+              op: str = typer.Option("push", "--op", help="Без запроса: операция.")) -> None:
+    """Выдать допуск на git-операцию уровня grant (только ты, в своём терминале)."""
+    import sys
+
+    from ..core import gitpolicy as gp
+
+    if not sys.stdin.isatty():
+        err.print("[red]Допуск выдаётся только из терминала пользователя.[/red]")
+        raise typer.Exit(code=2)
+    with _store() as store:
+        try:
+            if request is not None:
+                row = gp.answer_grant(store, request, allow=not deny, via="cli")
+            elif repo and branch:
+                if not typer.confirm(f"Допуск: {op} → {repo}:{branch}?"):
+                    raise typer.Exit(code=1)
+                row = gp.grant_direct(store, remote=repo.lower(), branch=branch, op=op, via="cli")
+            else:
+                pending = gp.pending_grants(store)
+                if len(pending) != 1:
+                    raise gp.PolicyError("Укажи номер запроса (jwu git grants) или --repo и --branch"
+                                         if pending else "Запросов нет — укажи --repo и --branch")
+                row = pending[0]
+                if not typer.confirm(f"#{row['id']}: {row['op']} → {row['remote']}:{row['branch']} "
+                                     f"({row['detail']}). Разрешить?"):
+                    raise typer.Exit(code=1)
+                row = gp.answer_grant(store, row["id"], allow=True, via="cli")
+        except gp.PolicyError as exc:
+            _policy_fail(exc)
+    if row["status"] == "granted":
+        console.print(f"✅ Допуск #{row['id']}: {row['op']} → {row['remote']}:{row['branch']} до "
+                      f"{row['expires_at'][11:16]} UTC, один раз.", highlight=False)
+    else:
+        console.print(f"⛔ Отказано #{row['id']}.")
+
+
+@git_app.command("grants")
+def git_grants() -> None:
+    """Ожидающие запросы допуска."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        rows = gp.pending_grants(store)
+    if not rows:
+        console.print("Запросов допуска нет.")
+    for r in rows:
+        console.print(f"#{r['id']} {r['op']} → {r['remote']}:{r['branch']} — {r['detail']} ({r['created_at'][:16]})",
+                      highlight=False)
+
+
+@git_app.command("log")
+def git_log(limit: int = typer.Option(30, "--limit", "-n")) -> None:
+    """Журнал политики: разрешено, заблокировано, допуски."""
+    from ..core import gitpolicy as gp
+
+    with _store() as store:
+        rows = gp.audit_log(store, limit)
+    for r in reversed(rows):
+        console.print(f"{r['ts'][:16]} {r['decision']:<16} {r['op']:<13} {r['remote']}:{r['branch']}"
+                      + (f" #{r['job_id']}" if r["job_id"] else "") + (f" — {r['detail']}" if r["detail"] else ""),
+                      highlight=False)
+
+
+@git_hook_app.command("install")
+def git_hook_install() -> None:
+    """Поставить хук git-guard в settings.json Claude Code."""
+    from ..core import gitguard
+
+    console.print(gitguard.install())
+
+
+@git_hook_app.command("uninstall")
+def git_hook_uninstall() -> None:
+    """Убрать хук git-guard."""
+    from ..core import gitguard
+
+    console.print(gitguard.uninstall())
+
+
+@git_hook_app.command("status")
+def git_hook_status() -> None:
+    """Стоит ли хук git-guard."""
+    from ..core import gitguard
+
+    console.print("хук git-guard стоит" if gitguard.installed() else "хука git-guard нет — jwu git hook install")
 
 
 @app.command("sweep")
