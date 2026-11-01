@@ -672,10 +672,15 @@ def run_loop(
 
         def run_job(workspace_id: int, upd: dict) -> None:
             try:
+                t0 = time.monotonic()
                 item = handle_bot_update(open_store, workspace_id, upd, on_sync=on_sync)
+                if time.monotonic() - t0 > 2:
+                    log(f"бот: обработка заняла {time.monotonic() - t0:.1f} с")
                 if item:
+                    import html as _html
+
                     log(f"бот: {item.get('kind')} {str(item.get('text', ''))[:40]}"
-                        + (f" → {item.get('reply', '')[:120]}" if item.get("kind") == "error" else ""))
+                        + (f" → {_html.unescape(str(item.get('reply', '')))[:400]}" if item.get("kind") == "error" else ""))
             except Exception as exc:  # noqa: BLE001 — даже без БД/конфига: сказать в чат
                 log(f"бот: обработка не удалась: {exc}")
                 report_bot_failure(open_store, workspace_id, exc)
@@ -695,8 +700,11 @@ def run_loop(
                 try:
                     store = open_store()
                     try:
-                        poll_bots(store, long_poll=max(1, poll_interval) if fresh[0] else 0,
-                                  dispatch=dispatch)
+                        t0 = time.monotonic()
+                        got = poll_bots(store, long_poll=max(1, poll_interval) if fresh[0] else 0,
+                                        dispatch=dispatch)
+                        if got:
+                            log(f"бот: опрос вернул {len(got)} за {time.monotonic() - t0:.1f} с")
                         fresh[0] = True
                     finally:
                         store.close()

@@ -561,6 +561,25 @@ def _remember_last(chat_id: str, message_id: int) -> None:
         pass
 
 
+_SHARED: dict[str, httpx.Client] = {}
+_SHARED_LOCK = __import__("threading").Lock()
+
+
+def _shared_client(token: str, timeout: float) -> httpx.Client:
+    """Одно постоянное соединение на бота на весь процесс. Новое TLS-соединение до Telegram
+    стоит ~1 с и временами виснет на 10+ с — каждое нажатие кнопки ждало бы его заново."""
+    with _SHARED_LOCK:
+        client = _SHARED.get(token)
+        if client is None or client.is_closed:
+            client = httpx.Client(
+                timeout=httpx.Timeout(timeout, connect=3.0),
+                transport=httpx.HTTPTransport(retries=2),       # завис коннект — быстро ещё раз
+                limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=300),
+            )
+            _SHARED[token] = client
+        return client
+
+
 class TelegramNotifier:
     """Отправка в чат через Bot API. ``client`` подменяется в тестах."""
 
@@ -570,8 +589,8 @@ class TelegramNotifier:
             raise NotifyError("Telegram не настроен: нужны токен бота и chat_id")
         self.token = token
         self.chat_id = chat_id
-        self._owns_client = client is None
-        self._client = client or httpx.Client(timeout=timeout)
+        self._owns_client = False    # общий клиент процесса не закрываем вместе с отправщиком
+        self._client = client or _shared_client(token, timeout)
         self._api = api.rstrip("/")
 
     def close(self) -> None:
