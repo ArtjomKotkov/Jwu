@@ -587,7 +587,14 @@ def poll(store: "Store", client_factory, sender) -> int:
     with client:
         state, items, end = check(store, client, commit=False)
     if items:
-        _send_or_append(store, state, items, sender)
+        from . import notifyprefs
+
+        prefs = notifyprefs.load(store)
+        if prefs.is_quiet():
+            notifyprefs.deliver(store, sender, format_items(state, items), prefs=prefs)
+        else:
+            notifyprefs.flush(store, sender, prefs=prefs)
+            _send_or_append(store, state, items, sender)
     advance(store, state, end)
     return len(items)
 

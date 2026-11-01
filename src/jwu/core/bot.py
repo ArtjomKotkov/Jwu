@@ -269,7 +269,7 @@ MENU_ROWS = [
     [("📋 Мои задачи", "tasks"), ("🕒 Что сделал сегодня", "today")],
     [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
     [("📡 Matrix: дежурство и личное", "matrix")],
-    [("⏰ Утренняя сводка", "brief")],
+    [("⏰ Утренняя сводка", "brief"), ("🔔 Уведомления", "notify")],
 ]
 
 
@@ -312,6 +312,11 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
                     text, markup = res
                     return text, {"inline_keyboard": list((markup or {}).get("inline_keyboard") or []) + [BACK_TO_MENU]}
         return "Аддон не ответил.", {"inline_keyboard": [BACK_TO_MENU]}
+    if action == "notify":
+        from . import notifyprefs
+
+        text, markup = notifyprefs.workspaces_menu(store)
+        return text, {"inline_keyboard": list(markup["inline_keyboard"]) + [BACK_TO_MENU]}
     if action == "board":
         from . import brief, todo
 
@@ -403,6 +408,11 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
 
         text, markup = brief.handle_callback(store, ws.id, data)
         markup = {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
+    elif data.startswith("np:"):
+        from . import notifyprefs
+
+        text, markup = notifyprefs.handle_callback(store, data)
+        markup = {"inline_keyboard": list((markup or {}).get("inline_keyboard") or []) + [BACK_TO_MENU]}
     elif data.startswith("git:"):
         from . import gitgrant
 

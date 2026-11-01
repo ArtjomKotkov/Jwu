@@ -2088,11 +2088,17 @@ class Service:
                 return
             deltas = [Delta(**d) for d in backlog.get("deltas", [])] + list(result.deltas)
             mentions = [Mention(**m) for m in backlog.get("mentions", [])] + list(result.new_mentions)
+            from . import notifyprefs
+
             slug = self.workspace.slug if self.workspace else ""
-            note = notify.build_notification(slug, deltas, mentions)
+            prefs = notifyprefs.load(self.store)
+            note = notify.build_notification(slug, deltas, mentions, kinds=prefs.kinds())
             note.roles = self._notification_roles(note)
-            result.notified = notify.send_after_sync(sender, note,
-                                                     links=notify.links_from_config(self.cfg))
+            note = notifyprefs.filter_note(note, prefs)
+            texts = notify.format_messages(note, links=notify.links_from_config(self.cfg)) if note else []
+            for text in texts:      # в тихие часы — копится и уйдёт сводкой
+                notifyprefs.deliver(self.store, sender, text, prefs=prefs)
+            result.notified = bool(texts)
             if backlog:
                 self.store.set_workspace_meta(self.NOTIFY_BACKLOG_META, "")
         except Exception as exc:  # noqa: BLE001

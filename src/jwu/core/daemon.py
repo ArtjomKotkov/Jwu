@@ -524,7 +524,9 @@ def disk_alert(store: "Store") -> int:
                     + (f"Не убрано у закрытых работ: {', '.join(f'#{j}' for j in jobs)} — "
                        "<code>jwu job cleanup &lt;id&gt;</code>\n" if jobs else "")
                     + "Docker и агент виснут на полном диске — освободи место.")
-            sender.send(text)
+            from . import notifyprefs
+
+            notifyprefs.deliver(store, sender, text)
             store.set_workspace_meta(DISK_ALERT_META, str(time.time()))
             sent += 1
         except Exception as exc:  # noqa: BLE001
@@ -572,6 +574,21 @@ def send_briefs(store: "Store") -> int:
                 sent += 1
         except Exception as exc:  # noqa: BLE001
             log(f"[{ws.slug}] утренняя сводка не ушла: {exc}")
+        finally:
+            sender.close()
+    return sent
+
+
+def flush_quiet(store: "Store") -> int:
+    """Тихие часы кончились — отложенное по каждому контуру одной сводкой."""
+    from . import notifyprefs
+
+    sent = 0
+    for ws, _cfg, sender, _login in _bot_senders(store):
+        try:
+            sent += notifyprefs.flush(store, sender)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[{ws.slug}] сводка тихих часов не ушла: {exc}")
         finally:
             sender.close()
     return sent
@@ -688,6 +705,8 @@ def run_loop(
                                 log("предупреждение о месте на диске отправлено")
                         if send_briefs(store):
                             log("утренняя сводка отправлена")
+                        if flush_quiet(store):
+                            log("отложенное за тихие часы отправлено")
                     finally:
                         store.close()
                     if handled:

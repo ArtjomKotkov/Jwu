@@ -2320,6 +2320,60 @@ notify_app = typer.Typer(
 app.add_typer(notify_app, name="notify")
 
 
+@notify_app.command("settings")
+def notify_settings(
+    off: list[str] = typer.Option([], "--off", help="Выключить группу: builds, my_prs, review, tasks, qa, mentions, participate."),
+    on: list[str] = typer.Option([], "--on", help="Включить группу обратно."),
+    kind_off: list[str] = typer.Option([], "--kind-off", help="Выключить отдельный вид события (new_pr_commit и т.п.)."),
+    kind_on: list[str] = typer.Option([], "--kind-on", help="Включить вид события обратно."),
+    quiet: Optional[str] = typer.Option(None, "--quiet", help="Тихие часы ЧЧ:ММ-ЧЧ:ММ (22:00-09:00) или off."),
+    quiet_days: Optional[str] = typer.Option(None, "--quiet-days", help="Дни тишины целиком: sat,sun или off."),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Какие уведомления слать в этом воркспейсе и когда не беспокоить (в тихие часы — сводкой потом)."""
+    from ..core import notify, notifyprefs as np
+
+    with _store() as store:
+        p = np.load(store)
+        try:
+            for name in off:
+                if p.on(name):
+                    np.toggle(p, name)
+            for name in on:
+                if not p.on(name):
+                    np.toggle(p, name)
+            bad = [k for k in kind_off + kind_on if k not in notify.NOTABLE_KINDS]
+            if bad:
+                raise np.PrefsError(f"Нет таких видов: {', '.join(bad)}. Есть: {', '.join(notify.DEFAULT_KINDS)}")
+            p.kinds_off = (p.kinds_off | set(kind_off)) - set(kind_on)
+            if quiet is not None:
+                p.quiet = np.parse_quiet(quiet)
+            if quiet_days is not None:
+                days = set() if quiet_days.strip().lower() in ("off", "-", "") else {d.strip().lower() for d in quiet_days.split(",")}
+                if days - set(np.DAYS):
+                    raise np.PrefsError(f"Дни: {', '.join(np.DAYS)}")
+                p.quiet_days = days
+        except np.PrefsError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2)
+        if off or on or kind_off or kind_on or quiet is not None or quiet_days is not None:
+            p = np.save(store, p)
+        held = len(np.held(store))
+    if as_json:
+        _emit_json({"groups": {g: p.on(g) for g in list(np.GROUPS) + list(np.TOGGLES)},
+                    "kinds": p.kinds(), "kinds_off": sorted(p.kinds_off), "quiet": p.quiet_label(),
+                    "quiet_now": p.is_quiet(), "held": held})
+        return
+    for g, (title, _) in np.GROUPS.items():
+        console.print(f"{'✅' if p.on(g) else '🔕'} {title} [dim]({g})[/dim]", highlight=False)
+    for t, title in np.TOGGLES.items():
+        console.print(f"{'✅' if p.on(t) else '🔕'} {title} [dim]({t})[/dim]", highlight=False)
+    if p.kinds_off:
+        console.print(f"Выключены виды: {', '.join(sorted(p.kinds_off))}", highlight=False)
+    console.print(f"🌙 Не беспокоить: {p.quiet_label()}" + (" · сейчас тихо" if p.is_quiet() else "")
+                  + (f" · отложено {held}" if held else ""), highlight=False)
+
+
 @notify_app.command("status")
 def notify_status(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
     """Настроены ли уведомления в этом воркспейсе и какие события уходят."""

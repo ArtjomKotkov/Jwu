@@ -84,7 +84,9 @@ def send_if_due(store: "Store", workspace, cfg, sender, login: str) -> bool:
     if not due(store, workspace.id):
         return False
     board = todo.build(store, workspace.id, login, session="brief")
-    sender.send(render(board, workspace.slug, notify.links_from_config(cfg)))
+    from . import notifyprefs
+
+    notifyprefs.deliver(store, sender, render(board, workspace.slug, notify.links_from_config(cfg)))
     store.set_workspace_meta(LAST_META, datetime.now(_tz(store, workspace.id)).date().isoformat())
     return True
 
