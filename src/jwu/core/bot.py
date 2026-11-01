@@ -315,7 +315,7 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
     if action == "notify":
         from . import notifyprefs
 
-        text, markup = notifyprefs.workspaces_menu(store)
+        text, markup = notifyprefs.home(store)
         return text, {"inline_keyboard": list(markup["inline_keyboard"]) + [BACK_TO_MENU]}
     if action == "board":
         from . import brief, todo
@@ -499,6 +499,12 @@ def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
         reply = handle_command(text, store=store, ws=ws, login=login, links=links, on_sync=on_sync)
         item = {"kind": "command", "text": text, "reply": reply}
     else:
+        from . import notifyprefs
+
+        awaited = notifyprefs.take_text_input(store, text)   # ждём часы тишины текстом
+        if awaited is not None:
+            sender.send(awaited[0], markup=awaited[1])
+            return {"kind": "settings", "text": text, "reply": awaited[0]}
         addon_reply = _addon_text(store, ws, cfg, text)
         if addon_reply:
             sender.send(addon_reply, reply_to=reply_to)

@@ -2038,8 +2038,15 @@ class Service:
         Логика — в ``core.bot``; здесь только сборка контекста. Вне демона «/sync»
         будит демон сигналом, если он запущен.
         """
-        from . import bot, daemon
+        import os
 
+        from . import bot, daemon, notify
+
+        holder = daemon.SingleInstance().holder_pid()
+        if holder and holder != os.getpid():
+            # Бота уже читает демон: второй getUpdates даёт Telegram 409 и рвёт его опрос.
+            raise notify.NotifyError(f"Бота читает демон jwu (pid {holder}) — ответы он забирает сам; "
+                                     "второй читатель сломал бы ему опрос.")
         sender = self.notifier()
         if sender is None:
             return []

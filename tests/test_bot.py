@@ -3,6 +3,7 @@
 import json
 
 import httpx
+import pytest
 import respx
 
 from jwu.core import bot, daemon, notify, workspaces
@@ -109,6 +110,27 @@ def test_daemon_poll_bots_iterates_configured_workspaces(tmp_path, monkeypatch):
 
 
 @respx.mock
+def test_shared_bot_is_polled_once(tmp_path, monkeypatch):
+    """Один бот у нескольких контуров — один опрос: нажатие не приходит дважды."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    store = Store(tmp_path / "s.db")
+    work = store.get_workspace_by_slug("work")
+    store.set_workspace_settings(work.id, {"telegram.chat_id": "42"})
+    gh = workspaces.create(store, "gh", provider="github")
+    store.set_workspace_settings(gh.id, {"telegram.chat_id": "42"})
+    route = respx.get(f"{TG}/bottok/getUpdates").mock(return_value=httpx.Response(200, json={"ok": True, "result": [
+        _msg(1, "PROJ-1 ждём QA")]}))
+    respx.post(f"{TG}/bottok/sendMessage").mock(return_value=httpx.Response(200, json={"ok": True, "result": {}}))
+    handled = daemon.poll_bots(store)
+    assert route.call_count == 1 and [h["workspace"] for h in handled] == ["work"]
+    store.close()
+
+
+def test_daemon_sync_hook_does_not_touch_telegram():
+    assert daemon.no_telegram_after_sync(None, None) is None
+
+
+@respx.mock
 def test_get_updates_long_poll_passes_timeout():
     route = respx.get(f"{TG}/bottok/getUpdates").mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
     sender = notify.TelegramNotifier("tok", "42")
@@ -148,3 +170,16 @@ def test_today_shows_only_latest_summary_of_a_job(tmp_path):
     assert "бэкенд и PR" not in text
     assert text.count("✍️") == 2
     assert "PR и 4test" in text and "починил возврат" in text
+
+
+def test_poll_replies_refused_while_daemon_reads_bot(tmp_path, monkeypatch):
+    """Пока демон жив, другой процесс бота не читает — иначе Telegram 409 рвёт опрос демона."""
+    from jwu.core.service import Service
+
+    monkeypatch.setattr(daemon.SingleInstance, "holder_pid", lambda self: 999999)
+    store = Store(tmp_path / "s.db")
+    svc = Service.__new__(Service)
+    svc.store = store
+    with pytest.raises(notify.NotifyError, match="демон jwu"):
+        Service.poll_telegram_replies(svc)
+    store.close()

@@ -2326,12 +2326,20 @@ def notify_settings(
     on: list[str] = typer.Option([], "--on", help="Включить группу обратно."),
     kind_off: list[str] = typer.Option([], "--kind-off", help="Выключить отдельный вид события (new_pr_commit и т.п.)."),
     kind_on: list[str] = typer.Option([], "--kind-on", help="Включить вид события обратно."),
-    quiet: Optional[str] = typer.Option(None, "--quiet", help="Тихие часы ЧЧ:ММ-ЧЧ:ММ (22:00-09:00) или off."),
+    quiet: Optional[str] = typer.Option(None, "--quiet", help="Не беспокоить: «10-16, 22-08» (сколько угодно диапазонов) или off."),
     quiet_days: Optional[str] = typer.Option(None, "--quiet-days", help="Дни тишины целиком: sat,sun или off."),
+    global_: bool = typer.Option(False, "--global", help="Тихие часы — общие для всех воркспейсов."),
+    inherit: bool = typer.Option(False, "--inherit", help="Тихие часы воркспейса — как в общих."),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Какие уведомления слать в этом воркспейсе и когда не беспокоить (в тихие часы — сводкой потом)."""
+    """Какие уведомления слать в этом воркспейсе и когда не беспокоить (в тишину — копятся, потом сводкой)."""
     from ..core import notify, notifyprefs as np
+
+    def days_of(raw: str) -> set:
+        days = set() if raw.strip().lower() in ("off", "-", "") else {d.strip().lower() for d in raw.split(",")}
+        if days - set(np.DAYS):
+            raise np.PrefsError(f"Дни: {', '.join(np.DAYS)}")
+        return days
 
     with _store() as store:
         p = np.load(store)
@@ -2346,32 +2354,43 @@ def notify_settings(
             if bad:
                 raise np.PrefsError(f"Нет таких видов: {', '.join(bad)}. Есть: {', '.join(notify.DEFAULT_KINDS)}")
             p.kinds_off = (p.kinds_off | set(kind_off)) - set(kind_on)
-            if quiet is not None:
-                p.quiet = np.parse_quiet(quiet)
-            if quiet_days is not None:
-                days = set() if quiet_days.strip().lower() in ("off", "-", "") else {d.strip().lower() for d in quiet_days.split(",")}
-                if days - set(np.DAYS):
-                    raise np.PrefsError(f"Дни: {', '.join(np.DAYS)}")
-                p.quiet_days = days
+            if global_:
+                g = np.load_global(store)
+                if quiet is not None:
+                    g.ranges = np.parse_ranges(quiet)
+                if quiet_days is not None:
+                    g.days = days_of(quiet_days)
+                np.save_global(store, g)
+            elif quiet is not None or quiet_days is not None:
+                if quiet is not None:
+                    p.quiet.ranges = np.parse_ranges(quiet)
+                if quiet_days is not None:
+                    p.quiet.days = days_of(quiet_days)
+                p.own_quiet = True
+            if inherit:
+                p.own_quiet = False
         except np.PrefsError as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=2)
-        if off or on or kind_off or kind_on or quiet is not None or quiet_days is not None:
-            p = np.save(store, p)
+        if off or on or kind_off or kind_on or inherit or (not global_ and (quiet is not None or quiet_days is not None)):
+            np.save(store, p)
+        p = np.load(store)
+        g = np.load_global(store)
         held = len(np.held(store))
     if as_json:
-        _emit_json({"groups": {g: p.on(g) for g in list(np.GROUPS) + list(np.TOGGLES)},
+        _emit_json({"groups": {x: p.on(x) for x in list(np.GROUPS) + list(np.TOGGLES)},
                     "kinds": p.kinds(), "kinds_off": sorted(p.kinds_off), "quiet": p.quiet_label(),
-                    "quiet_now": p.is_quiet(), "held": held})
+                    "quiet_own": p.own_quiet, "quiet_global": g.label(), "quiet_now": p.is_quiet(), "held": held})
         return
-    for g, (title, _) in np.GROUPS.items():
-        console.print(f"{'✅' if p.on(g) else '🔕'} {title} [dim]({g})[/dim]", highlight=False)
-    for t, title in np.TOGGLES.items():
-        console.print(f"{'✅' if p.on(t) else '🔕'} {title} [dim]({t})[/dim]", highlight=False)
+    for x, (title, _) in np.GROUPS.items():
+        console.print(f"{'✅' if p.on(x) else '🔕'} {title} [dim]({x})[/dim]", highlight=False)
+    for x, title in np.TOGGLES.items():
+        console.print(f"{'✅' if p.on(x) else '🔕'} {title} [dim]({x})[/dim]", highlight=False)
     if p.kinds_off:
-        console.print(f"Выключены виды: {', '.join(sorted(p.kinds_off))}", highlight=False)
-    console.print(f"🌙 Не беспокоить: {p.quiet_label()}" + (" · сейчас тихо" if p.is_quiet() else "")
-                  + (f" · отложено {held}" if held else ""), highlight=False)
+        console.print(f"Выключены события: {', '.join(sorted(p.kinds_off))}", highlight=False)
+    console.print(f"🌙 Не беспокоить: {p.quiet_label()}" + ("" if p.own_quiet else " (как в общих)")
+                  + (" · сейчас тихо" if p.is_quiet() else "") + (f" · отложено {held}" if held else ""), highlight=False)
+    console.print(f"🌐 Общие: {g.label()}", highlight=False)
 
 
 @notify_app.command("status")

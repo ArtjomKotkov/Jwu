@@ -181,6 +181,10 @@ def default_after_sync(svc: "Service", result: "SyncResult") -> None:
         log(f"[{svc.workspace.slug if svc.workspace else '?'}] заметок из Telegram: {len(written)}")
 
 
+def no_telegram_after_sync(svc: "Service", result: "SyncResult") -> None:
+    """Хук демона с живым потоком бота: Telegram не опрашиваем — это делает поток бота."""
+
+
 def syncable(workspaces: Iterable["Workspace"]) -> tuple[list["Workspace"], list["Workspace"]]:
     """Разделить контуры на те, что есть чем синкать, и локальные."""
     todo: list["Workspace"] = []
@@ -467,7 +471,15 @@ def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
     from . import bot
 
     handled: list[dict] = []
+    polled: set[str] = set()
     for ws, cfg, sender, login in _bot_senders(store):
+        # Один бот (токен) у нескольких контуров опрашивается ОДИН раз и от первого контура:
+        # иначе каждый со своим смещением получал бы те же нажатия ещё раз, а длинные опросы
+        # шли бы по очереди.
+        if sender.token in polled:
+            sender.close()
+            continue
+        polled.add(sender.token)
         try:
             per_ws = (lambda upd, wid=ws.id: dispatch(wid, upd)) if dispatch else None
             for item in bot.process_updates(store, ws, cfg, sender, login=login, on_sync=on_sync,
@@ -715,6 +727,10 @@ def run_loop(
                     log(f"Matrix: проверка не удалась: {exc}")
 
         if sleep is None and not once:
+            # Telegram читает поток бота; хук синка его не трогает: второй getUpdates даёт 409
+            # и обрывает основной опрос, а нажатия, забранные хуком, терялись бы.
+            if after_sync is None:
+                after_sync = no_telegram_after_sync
             threading.Thread(target=bot_loop, name="jwu-bot", daemon=True).start()
             threading.Thread(target=duty_loop, name="jwu-matrix", daemon=True).start()
             # Без синка на старте: продолжаем расписание от прошлого прохода (kick и /sync будят раньше).
