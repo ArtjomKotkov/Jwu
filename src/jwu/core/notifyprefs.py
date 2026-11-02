@@ -123,7 +123,6 @@ class Prefs:
     kinds_off: set[str] = field(default_factory=set)
     quiet: Quiet = field(default_factory=Quiet)
     own_quiet: bool = False     # у воркспейса свои тихие часы (иначе — общие)
-    tz: object = None
 
     def on(self, name: str) -> bool:
         return name not in self.off
@@ -143,9 +142,8 @@ class Prefs:
         return self.quiet.label()
 
     def is_quiet(self, now: Optional[datetime] = None) -> bool:
-        if now is None:
-            now = datetime.now(self.tz) if self.tz else datetime.now()
-        return self.quiet.active(now)
+        # местное время компьютера: пояс ворклогов воркспейса к тишине отношения не имеет
+        return self.quiet.active(now or datetime.now())
 
 
 # --------------------------------------------------------------------------- #
@@ -172,19 +170,13 @@ def save_global(store: "Store", quiet: Quiet) -> Quiet:
 
 
 def load(store: "Store", workspace_id: Optional[int] = None) -> Prefs:
-    from .brief import _tz
-
     ws = workspace_id or store.workspace_id
     s = store.workspace_settings(ws)
     raw_q, raw_d = s.get(QUIET_SETTING, INHERIT), s.get(QUIET_DAYS_SETTING, INHERIT)
     own = raw_q != INHERIT or raw_d != INHERIT
     quiet = _read_quiet("" if raw_q == NONE else raw_q, "" if raw_d == NONE else raw_d) if own else load_global(store)
-    try:
-        tz = _tz(store, ws)
-    except Exception:  # noqa: BLE001
-        tz = None
     return Prefs(off=_csv(s.get(OFF_SETTING, "")), kinds_off=_csv(s.get(KINDS_OFF_SETTING, "")),
-                 quiet=quiet, own_quiet=own, tz=tz)
+                 quiet=quiet, own_quiet=own)
 
 
 def save(store: "Store", prefs: Prefs, workspace_id: Optional[int] = None) -> Prefs:

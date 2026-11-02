@@ -163,3 +163,12 @@ def test_cli_settings(tmp_path, monkeypatch):
     assert run("--quiet", "25-01").exit_code == 2
     assert run("--kind-off", "nope").exit_code == 2
     assert "(как в общих)" in " ".join(run("--inherit").output.split())
+
+
+def test_quiet_uses_local_time_not_worklog_tz(store, monkeypatch):
+    from jwu.core import timechain
+
+    timechain.set_timezone(store, store.workspace_id, "Pacific/Kiritimati")    # +14 — далеко от любого местного
+    h = datetime.now().hour                                                   # тихо ровно этот местный час
+    np.save_global(store, np.Quiet(ranges=[(time(h), time((h + 1) % 24))]))
+    assert np.load(store).is_quiet()
