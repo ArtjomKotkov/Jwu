@@ -911,3 +911,33 @@ def test_sync_stores_builds_and_reports_red_build(tmp_path):
         assert latest[0].build_state == "FAILED"
     finally:
         svc.close()
+
+
+def test_http_deadline_caps_total_time(monkeypatch):
+    """Общий бюджет: медленный сервер с повторами не вешает операцию дольше бюджета."""
+    import time as _time
+
+    from jwu.core import http
+
+    calls = []
+
+    def slow(request):
+        calls.append(request.extensions.get("timeout"))
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = http.RetryingClient(transport=httpx.MockTransport(slow), retries=5, sleep=lambda s: None)
+    clock = [1000.0]
+    monkeypatch.setattr(http.time, "monotonic", lambda: clock[0])
+    def tick(s):
+        clock[0] += 10
+    client._sleep = tick
+    with http.deadline(25, "План ворклогов: Jira"):
+        with pytest.raises((http.DeadlineExceeded, httpx.ReadTimeout)):
+            client.get("https://jira.example/rest/x")
+    assert len(calls) <= 3 and all(t["read"] <= 25 for t in calls)
+    clock[0] += 100
+    with http.deadline(1, "План ворклогов: Jira"):
+        clock[0] += 5
+        with pytest.raises(http.DeadlineExceeded, match="не ответил за 1 с"):
+            client.get("https://jira.example/rest/x")
+    client.close()

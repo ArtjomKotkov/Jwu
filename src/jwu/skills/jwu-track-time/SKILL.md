@@ -75,14 +75,16 @@ description: Use when the user wants to actually LOG/track spent time into Jira'
    комментарий worklog. Дату можно передать аргументом (`/jwu-track-time 2026-05-21`), иначе
    сегодня. Источник — локальная БД jwu, без сети:
 
+   MCP: `jwu_jobs(on="2026-05-21")` (или `on="today"`); bash:
+
    ```bash
-   today=${1:-$(date +%F)}
-   jwu jobs --json | jq --arg d "$today" '
-     map(select(any(.records[]?; .ts[0:10] == $d)))
-     | map({id, task_key, status, title,
-            summary: ([.records[]? | select(.kind == "summary") | .text] | last),
-            today: [.records[]? | select(.ts[0:10] == $d) | "[\(.kind)] \(.text)"]})'
+   jwu jobs --on "${1:-today}" --json
    ```
+
+   День считается по **местному времени компьютера**, а не по UTC: ночная работа не уезжает
+   на вчера (записи в БД — в UTC, `ts[0:10]` вручную не режь). Другой пояс — `--tz МСК`
+   (`tz=` в MCP). В ответе у каждой работы — `summary` (последний итог) и `today` (записи дня
+   «ЧЧ:ММ [kind] текст»).
 
    - **Есть `summary`** — описание worklog = итог (можно чуть сократить, смысл не меняй).
    - **Нет `summary`, работа открыта** — скорее всего, её не закрыли. Посмотри записи дня

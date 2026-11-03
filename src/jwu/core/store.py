@@ -2431,6 +2431,35 @@ class Store:
         ).fetchone()
         return int(row[0])
 
+    def jobs_on(self, day: str, tz=None) -> list[dict]:
+        """Работы с записями за день ``day`` (YYYY-MM-DD) — по МЕСТНОМУ времени, не по UTC.
+
+        Записи хранятся в UTC: ночная работа в UTC+7 по ``ts[:10]`` уезжала бы на вчера.
+        ``tz`` — пояс дня (по умолчанию пояс компьютера). → [{id, task_key, status, title,
+        summary (последний итог работы), today: ["ЧЧ:ММ [kind] текст", …]}].
+        """
+        from .dates import _to_dt
+
+        zone = tz or datetime.now().astimezone().tzinfo
+        out: list[dict] = []
+        for job in self.list_jobs():
+            today: list[str] = []
+            for rec in job.records:
+                ts = _to_dt(rec.ts)
+                if ts is None:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                local = ts.astimezone(zone)
+                if local.date().isoformat() == day:
+                    today.append(f"{local:%H:%M} [{rec.kind}] {rec.text}")
+            if today:
+                summary = [r.text for r in job.records if r.kind == "summary"]
+                out.append({"id": job.id, "task_key": job.task_key, "status": job.status, "title": job.title,
+                            "anchor": getattr(job, "anchor", "") or job.task_key,
+                            "summary": summary[-1] if summary else "", "today": today})
+        return out
+
     def list_jobs(self, *, task_key: str | None = None, pr_id: int | None = None,
                   status: str | None = None, project: str | None = None,
                   repo: str | None = None, feature_id: int | None = None) -> list[Job]:

@@ -452,3 +452,18 @@ def test_fresh_marker_shown_until_next_sync(store):
     store.set_meta("daemon:last_pass", "2026-11-03T07:00:00+00:00")             # синк прошёл позже
     item = next(i for i in todo.build(store, store.workspace_id, "me").items if i.key == "AB-5")
     assert item.fresh == ""
+
+
+def test_jobs_on_uses_local_day_not_utc(store):
+    """Запись в 01:30 по UTC+7 — это 18:30 UTC прошлого дня: по местному она «сегодня»."""
+    from zoneinfo import ZoneInfo
+
+    job = store.create_job("AB-1", "ночная работа")
+    store.add_job_record(job.id, "сделал ночью", "phase")
+    store.conn.execute("UPDATE job_records SET ts = ? WHERE job_id = ?", ("2026-11-01T18:30:00+00:00", job.id))
+    store.conn.commit()
+    plus7 = ZoneInfo("Asia/Bangkok")
+    rows = store.jobs_on("2026-11-02", plus7)
+    assert [r["id"] for r in rows] == [job.id] and rows[0]["today"][0].startswith("01:30 [phase]")
+    assert store.jobs_on("2026-11-01", plus7) == []
+    assert [r["id"] for r in store.jobs_on("2026-11-01", ZoneInfo("Europe/Moscow"))] == [job.id]   # 21:30 МСК

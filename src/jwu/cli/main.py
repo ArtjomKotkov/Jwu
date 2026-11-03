@@ -3411,9 +3411,12 @@ def worklog_chain(
         parsed.append({"key": parts[0], "time": parts[1], "comment": "|".join(parts[2:])})
     day = datetime.now().date().isoformat() if on.lower() == "today" else on
     with _service_with_jira() as svc:
+        from ..core import http as _http
+
         try:
-            plan = svc.worklog_chain(parsed, start=start, day=day, tz=tz or "", dry_run=True)
-        except timechain.ChainError as exc:
+            with _http.deadline(60, "План ворклогов: Jira"):
+                plan = svc.worklog_chain(parsed, start=start, day=day, tz=tz or "", dry_run=True)
+        except (timechain.ChainError, _http.DeadlineExceeded) as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
         if not json_out:
@@ -5048,9 +5051,38 @@ def jobs(
     ),
     pr: Optional[int] = typer.Option(None, "--pr", help="Фильтр по id PR."),
     status: Optional[str] = typer.Option(None, "--status", help="active | done | paused."),
+    on: Optional[str] = typer.Option(None, "--on",
+        help="YYYY-MM-DD или today: работы с записями за день по местному времени (итог и записи дня)."),
+    tz: Optional[str] = typer.Option(None, "--tz", help="Пояс дня для --on (по умолчанию — компьютера), напр. МСК."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Список работ текущего воркспейса (по задаче / фиче / PR / статусу)."""
+    """Список работ текущего воркспейса (по задаче / фиче / PR / статусу или за день)."""
+    if on:
+        from datetime import date as _date
+
+        from ..core import timechain
+
+        day = _date.today().isoformat() if on in ("today", "сегодня") else on
+        try:
+            day = _date.fromisoformat(day).isoformat()
+            zone = timechain.resolve_tz(tz) if tz else None
+        except (ValueError, timechain.ChainError) as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2)
+        with _store() as store:
+            rows = store.jobs_on(day, zone)
+        if json_out:
+            _emit_json(rows)
+            return
+        for r in rows:
+            console.print(f"[bold]#{r['id']}[/bold] {r['anchor'] or ''} [{r['status']}] {r['title']}", highlight=False)
+            if r["summary"]:
+                console.print(f"  итог: {r['summary']}", highlight=False)
+            for line in r["today"]:
+                console.print(f"  {line}", highlight=False)
+        if not rows:
+            console.print(f"[dim]За {day} записей в работах нет.[/dim]")
+        return
     with _store() as store:
         feature_id = None
         if feature:

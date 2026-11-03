@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import time
-from typing import Callable, Optional
+from contextlib import contextmanager
+from typing import Callable, Iterator, Optional
 
 import httpx
 
@@ -60,6 +62,37 @@ def default_retries() -> int:
     return max(0, int(_env_float("JWU_HTTP_RETRIES", DEFAULT_RETRIES)))
 
 
+class DeadlineExceeded(RuntimeError):
+    """Общий бюджет времени на операцию кончился (см. :func:`deadline`)."""
+
+
+_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("jwu_http_deadline", default=None)
+
+
+@contextmanager
+def deadline(seconds: float, what: str) -> Iterator[None]:
+    """Общий бюджет на все запросы внутри блока: таймаут на запрос, повторы и число запросов
+    больше не складываются в минуты. Кончился — :class:`DeadlineExceeded` с понятным текстом."""
+    token = _DEADLINE.set((time.monotonic() + float(seconds), float(seconds), what))
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def _budget(request: httpx.Request) -> None:
+    dl = _DEADLINE.get()
+    if dl is None:
+        return
+    until, total, what = dl
+    left = until - time.monotonic()
+    if left <= 0.5:
+        raise DeadlineExceeded(f"{what}: сервер не ответил за {total:.0f} с — попробуй позже или проверь сеть/VPN")
+    current = request.extensions.get("timeout") or {}
+    request.extensions["timeout"] = {k: min(v, left) if v is not None else left
+                                     for k, v in (current or httpx.Timeout(left).as_dict()).items()}
+
+
 class RetryingClient(httpx.Client):
     """httpx.Client, который повторяет идемпотентные запросы при сетевых сбоях и 5xx."""
 
@@ -75,6 +108,7 @@ class RetryingClient(httpx.Client):
         delay = BACKOFF_BASE
         last_exc: Optional[Exception] = None
         for attempt in range(attempts):
+            _budget(request)
             try:
                 resp = super().send(request, **kwargs)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
@@ -82,7 +116,7 @@ class RetryingClient(httpx.Client):
                 resp = None
             if resp is not None and resp.status_code not in RETRY_STATUSES:
                 return resp
-            if attempt == attempts - 1:
+            if attempt == attempts - 1 or _DEADLINE.get() is not None and _DEADLINE.get()[0] - time.monotonic() < delay:
                 if resp is not None:
                     return resp  # последний 5xx отдаём как есть — вызывающий сформулирует ошибку
                 raise last_exc  # type: ignore[misc]

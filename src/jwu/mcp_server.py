@@ -96,6 +96,18 @@ def _resolve(workspace: Optional[str] = None) -> Workspace:
     return ws_mod.resolve_workspace(store, explicit=workspace)
 
 
+def _date_arg(value: str) -> str:
+    from datetime import date as _date
+
+    value = (value or "").strip()
+    if value in ("", "today", "сегодня"):
+        return _date.today().isoformat()
+    try:
+        return _date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"Дата {value!r}: нужна YYYY-MM-DD") from exc
+
+
 def _full_svc(workspace: Optional[str] = None) -> Service:
     """Полный сервис воркспейса с логином в Jira/Support (создаётся один раз на воркспейс)."""
     ws = _resolve(workspace)
@@ -1649,12 +1661,21 @@ async def jwu_jobs(
     pr: Optional[int] = None,
     status: Optional[str] = None,
     feature: Optional[str] = None,
+    on: Optional[str] = None,
+    tz: Optional[str] = None,
     workspace: Optional[str] = None,
 ) -> list[dict]:
     """Список работ (jobs) воркспейса — по задаче / PR / статусу / локальной фиче. Без сети.
 
-    feature — id или ключ локальной фичи (HOMEJWU-1); нужен там, где Jira не подключена."""
+    feature — id или ключ локальной фичи (HOMEJWU-1); нужен там, где Jira не подключена.
+    on — YYYY-MM-DD («today» — сегодня): работы с записями за этот день по МЕСТНОМУ времени
+    (tz — другой пояс, напр. МСК), с итогом и записями дня — для трекинга и итогов дня."""
     store = _store_only(workspace)
+    if on:
+        from .core import timechain
+
+        day = _date_arg(on)
+        return store.jobs_on(day, timechain.resolve_tz(tz) if tz else None)
     feature_id = None
     if feature:
         row = store.get_feature(feature)
@@ -2744,10 +2765,23 @@ async def jwu_worklog_chain(
     """
     from datetime import date as _date
 
+    from .core import http
+
     svc = _require_jira(_full_svc(workspace))
     day = on or _date.today().isoformat()
-    return _stamp(svc.worklog_chain(items, start=start, day=day, tz=tz or "", dry_run=dry_run),
-                  _resolve(workspace))
+    try:
+        # план — только чтение: общий бюджет, чтобы медленная Jira не вешала сессию минутами
+        if dry_run:
+            with http.deadline(WORKLOG_PLAN_BUDGET, "План ворклогов: Jira"):
+                res = svc.worklog_chain(items, start=start, day=day, tz=tz or "", dry_run=True)
+        else:
+            res = svc.worklog_chain(items, start=start, day=day, tz=tz or "", dry_run=False)
+    except http.DeadlineExceeded as exc:
+        raise ValueError(str(exc)) from exc
+    return _stamp(res, _resolve(workspace))
+
+
+WORKLOG_PLAN_BUDGET = 60   # секунд на все запросы плана jwu_worklog_chain(dry_run=True)
 
 
 @mcp.tool()
