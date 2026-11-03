@@ -45,7 +45,9 @@ GROUP_TITLES = {
 TODO_STATUSES_SETTING = "todo.statuses.todo"
 QA_STATUSES_SETTING = "todo.statuses.qa_failed"
 DEMO_STATUSES_SETTING = "todo.statuses.demo"
-DEFAULT_TODO_STATUSES = ("open", "to do", "selected for development", "in progress")
+DEFAULT_TODO_STATUSES = ("open", "backlog", "to do", "selected for development", "in progress")
+# Задача уже сделана мной и ждёт других (ревью, тесты) — на доске её ведут PR и «двигать дальше»
+AFTER_WORK_MARKERS = ("REVIEW", "РЕВЬЮ", "TEST", "ТЕСТ", "QA")
 # Задача на стенде разработки или ждёт показа — своя группа: подготовить и провести демо.
 DEFAULT_DEMO_STATUSES = ("dev at stand", "demo")
 DEFAULT_QA_STATUSES = ("defect", "need update", "qa failed", "reopened", "failed")
@@ -87,6 +89,7 @@ class Board:
     session: str = ""
     syncing_since: str = ""   # синк идёт прямо сейчас — с какого времени
     sessions: dict = field(default_factory=dict)
+    statuses: dict = field(default_factory=dict)   # какие статусы задач в какие группы — видно, почему задачи нет
     task_base: str = ""       # адрес трекера — ячейки «Задача» ссылками (Jira base_url / github web_url)
     owner: str = ""           # owner GitHub — для ссылок по ключу repo#42
 
@@ -94,7 +97,8 @@ class Board:
         return {"items": [i.to_dict() for i in self.items], "synced_at": self.synced_at,
                 "synced_ago": self.synced_ago, "stale": self.stale, "session": self.session,
                 "syncing_since": self.syncing_since,
-                "sessions": self.sessions, "task_base": self.task_base, "owner": self.owner}
+                "sessions": self.sessions, "statuses": self.statuses,
+                "task_base": self.task_base, "owner": self.owner}
 
 
 def _statuses(store: "Store", workspace_id: int, key: str, default: Iterable[str]) -> set[str]:
@@ -275,9 +279,16 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                               problems=[f"{pr.repository}#{pr.id} · апрувы {approvals_cell(pr)}" for pr in demo_prs],
                               pr={"id": pr0.id, "project": pr0.project, "repo": pr0.repository, "title": pr0.title,
                                   "approvals": approvals_cell(pr0)} if pr0 else None))
-        elif status in todo_st and key not in open_pr_keys:
+        elif key in open_pr_keys:
+            continue
+        elif status in todo_st:
             items.append(Item(n=0, group="todo", key=key, title=issue.summary, status=issue.status,
                               priority=issue.priority, problems=[], issue_key=key, taken=_taken(by_key.get(key))))
+        elif not _finished(issue):
+            # статус вне настроек доски: не теряем задачу молча — в «сделать» с пометкой
+            items.append(Item(n=0, group="todo", key=key, title=issue.summary, status=issue.status,
+                              priority=issue.priority, issue_key=key, taken=_taken(by_key.get(key)),
+                              problems=[f"статус «{issue.status or '—'}» не из настроек доски ({TODO_STATUSES_SETTING})"]))
 
     for pr in store.latest_prs("review"):
         if pr.state and pr.state.upper() != "OPEN":
@@ -337,10 +348,21 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
     env = _environment(store, store.get_workspace(workspace_id))
     return Board(items=items, synced_at=last, synced_ago=fmt_ago(last) if last else "ещё не было",
                  stale=stale, session=session, syncing_since=running or "",
-                 sessions=sessions(store), task_base=env.get("web_base", ""), owner=env.get("owner", ""))
+                 sessions=sessions(store), task_base=env.get("web_base", ""), owner=env.get("owner", ""),
+                 statuses={"todo": sorted(todo_st), "demo": sorted(demo_st), "qa_failed": sorted(qa_st),
+                           "skipped": "сделано / на ревью / на тестах: " + ", ".join(DONE_STATUSES)
+                           + ", resolution, *review*, *test*, *qa*",
+                           "other": "прочие незакрытые — в todo с пометкой"})
 
 
 DONE_STATUSES = ("done", "closed", "resolved", "закрыта", "решена")
+
+
+def _finished(issue: "Issue") -> bool:
+    """Сделано или ждёт не меня: закрыта, решена, на ревью или тестах."""
+    status = (issue.status or "").strip()
+    return (status.casefold() in DONE_STATUSES or bool(issue.resolution)
+            or any(m in status.upper() for m in AFTER_WORK_MARKERS))
 
 
 def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, listed: set,

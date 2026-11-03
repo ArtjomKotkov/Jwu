@@ -316,8 +316,10 @@ def test_board_demo_group(store):
     assert [i for i in board.items if i.group in ("move", "build")] == []
     assert todo.GROUP_TITLES["demo"] in todo.render_md(board)
     store.set_workspace_settings(store.workspace_id, {todo.DEMO_STATUSES_SETTING: "demo"})
-    groups = {i.issue_key: i.group for i in todo.build(store, store.workspace_id, "me").items}
-    assert groups["AB-2"] == "demo" and "AB-1" not in groups      # Dev at stand больше не демо и не todo
+    groups = {i.issue_key: i for i in todo.build(store, store.workspace_id, "me").items}
+    # Dev at stand больше не демо — но и не пропадает: в «сделать» с пометкой про статус
+    assert groups["AB-2"].group == "demo" and groups["AB-1"].group == "todo"
+    assert "не из настроек доски" in groups["AB-1"].problems[0]
 
 
 def test_board_links_tasks_and_prs(store):
@@ -389,3 +391,20 @@ def test_review_job_not_closed_as_gone_task(store):
     store.finish_sync_run(run, {"prs:review": 0})
     close = [i for i in todo.build(store, store.workspace_id, "me", session="S").items if i.group == "close"]
     assert [i.key for i in close] == [f"#{job_id}"] and "смержен" in close[0].problems[0]
+
+
+def test_task_in_unknown_status_not_lost(store):
+    """Задача на мне в статусе вне настроек (Backlog, свой статус) — на доске, не пропадает."""
+    run = store.start_sync_run(["mine"])
+    for issue in (Issue(key="AB-20", summary="Блокер в бэклоге", status="Backlog", priority="Blocker"),
+                  Issue(key="AB-21", summary="Свой статус", status="Waiting for spec", priority="Major"),
+                  Issue(key="AB-22", summary="На тестах", status="Ready for Test"),
+                  Issue(key="AB-23", summary="Готово", status="Done"),
+                  Issue(key="AB-24", summary="Ревью", status="Code Review")):
+        store.save_issue_snapshot(run, issue, ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 5})
+    board = todo.build(store, store.workspace_id, "me", session="S")
+    todo_items = {i.key: i for i in board.items if i.group == "todo"}
+    assert set(todo_items) == {"AB-20", "AB-21"}
+    assert todo_items["AB-20"].problems == [] and "не из настроек доски" in todo_items["AB-21"].problems[0]
+    assert "backlog" in board.to_dict()["statuses"]["todo"]
