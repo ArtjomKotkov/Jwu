@@ -282,3 +282,17 @@ def test_notifier_from_config_with_backup(monkeypatch):
     assert isinstance(sender, notify.FallbackNotifier) and sender.second.token == "spare"
     monkeypatch.setattr(config_mod, "telegram_backup_token", lambda c: "")
     assert isinstance(notify.notifier_from_config(cfg), notify.TelegramNotifier)
+
+
+def test_split_message_keeps_html_tags_balanced():
+    """Разрез внутри цитаты: каждый кусок — валидный HTML для Telegram."""
+    text = "🌙 <b>Пока было тихо</b>\n" + "\n".join(
+        f"<i>02.11 {i:02d}:00</i>\n<blockquote>" + "\n".join(f"событие {i}.{j} " + "x" * 30 for j in range(6))
+        + "</blockquote>" for i in range(12))
+    chunks = notify.split_message(text, limit=400)
+    assert len(chunks) > 3
+    for chunk in chunks:
+        stack: list = []
+        notify._open_tags(chunk.replace("\n", " "), stack)
+        assert stack == [], chunk
+    assert "событие 11.5" in chunks[-1] and all(len(c) <= 400 + 40 for c in chunks)

@@ -511,19 +511,48 @@ def format_message(note: Notification, *, links: Optional[Links] = None) -> str:
     return "\n\n".join(format_messages(note, links=links))
 
 
+_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)(\s[^>]*)?>")
+
+
+def _open_tags(line: str, stack: list[str]) -> None:
+    """Пройти теги строки: открытые — в стек (целиком, с атрибутами), закрытые — снять."""
+    for m in _TAG_RE.finditer(line):
+        closing, name = m.group(1), m.group(2).lower()
+        if not closing:
+            stack.append(m.group(0))
+            continue
+        for i in range(len(stack) - 1, -1, -1):
+            if _TAG_RE.match(stack[i]).group(2).lower() == name:
+                del stack[i]
+                break
+
+
 def split_message(text: str, limit: int = MAX_MESSAGE) -> list[str]:
-    """Порезать длинный текст по строкам, чтобы не упереться в лимит Telegram."""
+    """Порезать длинный текст по строкам, чтобы не упереться в лимит Telegram.
+
+    HTML-теги не рвутся: открытый на месте разреза (цитата, жирный) закрывается в конце куска
+    и открывается заново в начале следующего — иначе Telegram отвечает «can't parse entities».
+    """
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
     current: list[str] = []
     size = 0
+    stack: list[str] = []
     for line in text.split("\n"):
         if current and size + len(line) + 1 > limit:
-            chunks.append("\n".join(current))
-            current, size = [], 0
+            closers = "".join(f"</{_TAG_RE.match(t).group(2)}>" for t in reversed(stack))
+            chunks.append("\n".join(current) + closers)
+            reopen = "".join(stack)
+            current, size = ([reopen] if reopen else []), len(reopen)
+            if reopen:
+                current[0] = reopen + line
+                size += len(line) + 1
+                _open_tags(line, stack)
+                continue
         current.append(line)
         size += len(line) + 1
+        _open_tags(line, stack)
     if current:
         chunks.append("\n".join(current))
     return chunks
