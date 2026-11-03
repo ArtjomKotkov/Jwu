@@ -102,7 +102,7 @@ def test_default_policy_covers_main_branches(env):
 
 
 def test_mcp_job_push_returns_refusal_not_empty_error(env, monkeypatch):
-    """jwu_job_push: отказ политики — ответ с причиной (как у jwu_git_push), а не исключение без текста."""
+    """jwu_git_push(job_id=…): копия работы по номеру; отказ политики — ответ с причиной, а не пустая ошибка."""
     import asyncio
     from pathlib import Path
 
@@ -115,5 +115,13 @@ def test_mcp_job_push_returns_refusal_not_empty_error(env, monkeypatch):
     monkeypatch.setattr(mcp_server, "_store_only", lambda ws=None: store)
     monkeypatch.setattr(mcp_server, "_stamp", lambda res, ws: res)
     monkeypatch.setattr(mcp_server, "_resolve", lambda ws=None: None)
-    res = asyncio.run(mcp_server.jwu_job_push(job.id, dry_run=False))
+    res = asyncio.run(mcp_server.jwu_git_push(job_id=job.id))
     assert res["ok"] is False and res["blocked"] == "ask" and res["reason"]
+    plan = asyncio.run(mcp_server.jwu_git_push(job_id=job.id, dry_run=True))
+    assert plan["branch"] == "APP-1-mcp" and len(plan["commits"]) == 1 and not plan["pushed"]
+    assert asyncio.run(mcp_server.jwu_git_push(job_id=job.id, user_approved=True))["pushed"]
+    # старое имя — тонкий алиас: тот же ответ
+    res = asyncio.run(mcp_server.jwu_job_push(job.id, dry_run=True))
+    assert res["branch"] == "APP-1-mcp" and res["commits"] == []
+    with pytest.raises(ValueError, match="не найдена"):
+        asyncio.run(mcp_server.jwu_git_push(job_id=99999))

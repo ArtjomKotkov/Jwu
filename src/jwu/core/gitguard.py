@@ -267,7 +267,7 @@ def is_read(sub: str, args: list[str]) -> bool:
 
 # Подсказка, чем заменить пишущую подкоманду.
 _INSTEAD = {
-    "commit": "jwu_git_commit", "add": "jwu_git_commit (files=…)", "push": "jwu_git_push / jwu_job_push",
+    "commit": "jwu_git_commit", "add": "jwu_git_commit (files=…)", "push": "jwu_git_push (ветка работы — job_id=…)",
     "checkout": "jwu_git_switch (ветка) или jwu_git_discard (файлы)", "switch": "jwu_git_switch",
     "merge": "jwu_git_sync", "rebase": "jwu_git_sync (mode=rebase) / jwu_git_history",
     "pull": "jwu_git_sync", "reset": "jwu_git_history (reset) или jwu_git_discard", "restore": "jwu_git_discard",
@@ -293,7 +293,7 @@ def _jwu_verdict(argv: list[str]) -> Optional[Verdict]:
         return Verdict(False, "Политику git и допуски меняет только пользователь в своём терминале "
                               f"(`jwu git {' '.join(words[1:3])}` из сессии агента запрещён). Спроси пользователя.")
     if words[:2] == ["job", "push"]:
-        return Verdict(False, "Пуш работы — через MCP jwu_job_push (под политикой и с вопросом), не через CLI.")
+        return Verdict(False, "Пуш работы — через MCP jwu_git_push(job_id=…) (под политикой и с вопросом), не через CLI.")
     if words[:2] == ["workspace", "setting"] and len(words) > 2 and words[2].startswith(("git.", "push.")):
         return Verdict(False, "Настройки git воркспейса меняет только пользователь.")
     return Verdict(True)

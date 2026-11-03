@@ -66,7 +66,7 @@ mcp = FastMCP("jwu", instructions=(
     "перед записью наружу, коммитом или пушем, и выбор следующего шага после разбора: «разобрался — "
     "делаем по плану, от какой базы, или иначе?». Варианты — 2–4 конкретных действия, рекомендуемый "
     "первым; так же — «закрыть работу?». Нет такого инструмента (Cursor, Codex) — обычным текстом. "
-    "Пуш ветки работы — только jwu_job_push, не git push. Тесты, сборки и прочие долгие прогоны — "
+    "Пуш — только jwu_git_push (ветка работы — jwu_git_push(job_id=…)), не git push. Тесты, сборки и прочие долгие прогоны — "
     "в фоне с таймаутом и под наблюдением: 5 минут без нового вывода — зависание, останови и разбери."))
 
 # Ленивые кэши ПО воркспейсам — тут и живёт переиспользуемая сессия/соединения.
@@ -898,15 +898,16 @@ def _zephyr(workspace: Optional[str], project: Optional[str] = None, *, require:
 @mcp.tool()
 async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_approved: bool = False,
                        workspace: Optional[str] = None) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: запушить ветку рабочей копии работы — вместо голого git push.
+    """УСТАРЕЛ — то же, что jwu_git_push(job_id=…, repo=…): зови его. Оставлен, чтобы не ломать
+    сессии на старых скиллах. ВНЕШНЯЯ ЗАПИСЬ: пуш ветки рабочей копии работы, dry_run=True
+    по умолчанию."""
+    return _push_job(job_id, repo, dry_run=dry_run, user_approved=user_approved, force=False,
+                     workspace=workspace)
 
-    Пушит только текущую ветку копии ЭТОЙ работы в одноимённую ветку origin, без force,
-    под политикой git воркспейса (jwu_git_policy): allow — сразу, ask — нужен user_approved
-    («да» пользователя), grant — нужен допуск пользователя из бота/терминала, deny — никогда.
-    Отказ политики — ответ {ok: false, blocked, rule, reason, ask_user, retry}: сделай, что в
-    ask_user, и повтори. Откажет и git: незакоммиченное, origin ушёл вперёд, не та ветка.
-    dry_run=True (по умолчанию) — что уйдёт: ветка, новые коммиты.
-    repo — какая копия, если у работы их несколько."""
+
+def _push_job(job_id: int, repo: str, *, dry_run: bool, user_approved: bool, force: bool,
+              workspace: Optional[str]) -> dict:
+    """Пуш копии работы: папка — по работе, ветка обязана быть веткой работы. Отказ — ответом."""
     from .core import gitops, jobspace
 
     store = _store_only(workspace)
@@ -915,8 +916,8 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
         raise ValueError(f"Работа #{job_id} не найдена")
     try:
         res = jobspace.push_worktree(store, job, repo, dry_run=dry_run, user_approved=user_approved,
-                                     notify=_grant_notify)
-    except gitops.Blocked as b:   # отказ политики — ответом с причиной, как у jwu_git_push
+                                     force=force, notify=_grant_notify)
+    except gitops.Blocked as b:   # отказ политики — ответом с причиной
         res = b.to_dict()
     except jobspace.JobSpaceError as exc:
         raise ValueError(str(exc)) from exc
@@ -1061,14 +1062,21 @@ async def jwu_git_history(action: str, path: str = "", message: str = "", ref: s
 
 @mcp.tool()
 async def jwu_git_push(path: str = "", force: bool = False, dry_run: bool = False, user_approved: bool = False,
+                       job_id: Optional[int] = None, repo: str = "",
                        workspace: Optional[str] = None) -> dict:
-    """ВНЕШНЯЯ ЗАПИСЬ: пуш текущей ветки в одноимённую на origin. dry_run — что уйдёт.
+    """ВНЕШНЯЯ ЗАПИСЬ: пуш текущей ветки в одноимённую на origin — единственный инструмент пуша.
+    dry_run — что уйдёт (ветка, новые коммиты); показать и спросить «да», потом dry_run=False.
+    job_id — пуш ветки рабочей копии работы: папку jwu найдёт сам и проверит, что ветка — та,
+    что у работы (repo — какая копия, если их несколько); path тогда не нужен.
     force — только --force-with-lease и только если ветка разошлась (своя, переписанная).
     Под политикой: ask — user_approved после «да»; grant (develop, release* …) — «да» мало,
     нужен допуск пользователя (запрос уходит в бот; ask_user скажет как); deny — никогда.
-    Для копии работы удобнее jwu_job_push(job_id)."""
+    Отказ — ответ {ok: false, blocked, reason, ask_user, retry}: сделай, что в ask_user."""
     from .core import gitops
 
+    if job_id is not None:
+        return _push_job(int(job_id), repo, dry_run=dry_run, user_approved=user_approved, force=force,
+                         workspace=workspace)
     return _git_call(path, workspace,
                      lambda c: gitops.push(c, force=force, dry_run=dry_run, user_approved=user_approved))
 

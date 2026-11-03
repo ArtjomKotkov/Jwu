@@ -1,6 +1,6 @@
 # Политика git
 
-Агент работает с git через jwu: инструменты MCP `jwu_git_*` и `jwu_job_push`. Перед каждой
+Агент работает с git через jwu: инструменты MCP `jwu_git_*`. Перед каждой
 пишущей операцией jwu сверяется с **политикой воркспейса**, и решает код, а не инструкция:
 если нельзя, git не запускается, а агент получает ответ, что делать дальше. Голый `git` из
 Bash мимо jwu режет хук Claude Code `jwu-git-guard`.
@@ -117,7 +117,7 @@ ops = { push = "deny", commit = "deny" }   # только читать
 | stash | `jwu_git_stash(path, action=push\|pop\|apply\|list)` |
 | выкинуть правки | `jwu_git_discard(path, files, untracked)` |
 | amend, reset незапушенного | `jwu_git_history(action=amend\|reset, path, message, ref)` |
-| пуш | `jwu_git_push(path, force, dry_run)`; ветка работы — `jwu_job_push(job_id)` |
+| пуш | `jwu_git_push(path, force, dry_run)`; ветка работы — `jwu_git_push(job_id=…)` (старое `jwu_job_push` — алиас) |
 | удалить ветку, тег | `jwu_git_branch_delete(branch, path, remote)`, `jwu_git_tag(name, path, push)` |
 | убрать рабочую копию | `jwu_git_worktree_remove(path, delete_branch)` |
 | откат к бэкапу | `jwu_git_undo(path, ref)` — без `ref` список |

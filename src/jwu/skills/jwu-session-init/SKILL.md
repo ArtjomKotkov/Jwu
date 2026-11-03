@@ -78,14 +78,14 @@ description: Use at the START of a session, again after /clear or context compac
 ## Git — только через jwu
 
 Пишущий git (commit, push, checkout/switch, merge/rebase/pull, reset, stash, clean, tag,
-удаление веток) — **только** инструментами `jwu_git_*` / `jwu_job_push`. Голый `git` из Bash
+удаление веток) — **только** инструментами `jwu_git_*`. Голый `git` из Bash
 для этого режет хук политики (`jwu-git-guard`); чтение (`git status/diff/log/show`) — можно,
 или `jwu_git_status` / `jwu_git_diff` / `jwu_git_log`.
 
 | нужно | инструмент |
 |---|---|
 | коммит | `jwu_git_commit(message, path=<копия>)` (текст — **jwu-commit-message**) |
-| пуш ветки работы | `jwu_job_push(job_id)` — dry_run, потом `dry_run=False` |
+| пуш ветки работы | `jwu_git_push(job_id=…, dry_run=True)`, после «да» — `jwu_git_push(job_id=…, user_approved=True)` |
 | подтянуть develop/master | `jwu_git_sync(path)`; конфликт → правки → `action="continue"` |
 | ветка | `jwu_git_switch(branch, create=True, base=…)` |
 | выкинуть правки, amend, reset | `jwu_git_discard` / `jwu_git_history` |

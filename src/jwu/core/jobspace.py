@@ -249,7 +249,7 @@ def _job_worktree(store: "Store", job: "Job", repo: str = "") -> dict:
 
 
 def push_worktree(store: "Store", job: "Job", repo: str = "", *, dry_run: bool = False,
-                  user_approved: bool = False, notify=None, runner: Runner = _run) -> dict:
+                  user_approved: bool = False, force: bool = False, notify=None, runner: Runner = _run) -> dict:
     """Запушить ветку рабочей копии работы — под политикой git воркспейса (:mod:`gitpolicy`).
 
     Пушит только текущую ветку копии этой работы в одноимённую ветку origin, без force.
@@ -266,7 +266,7 @@ def push_worktree(store: "Store", job: "Job", repo: str = "", *, dry_run: bool =
         ctx = gitops.context(store, path, notify=notify)
         if ctx.job_id is None:
             ctx.job_id, ctx.where = job.id, "job"
-        out = gitops.push(ctx, dry_run=dry_run, user_approved=user_approved,
+        out = gitops.push(ctx, dry_run=dry_run, user_approved=user_approved, force=force,
                           expected_branch=(res["meta"].get("branch") or "").strip())
     except gitops.GitOpError as exc:
         raise JobSpaceError(str(exc)) from exc
