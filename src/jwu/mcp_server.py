@@ -895,7 +895,7 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
     ask_user, и повтори. Откажет и git: незакоммиченное, origin ушёл вперёд, не та ветка.
     dry_run=True (по умолчанию) — что уйдёт: ветка, новые коммиты.
     repo — какая копия, если у работы их несколько."""
-    from .core import jobspace
+    from .core import gitops, jobspace
 
     store = _store_only(workspace)
     job = store.get_job(job_id)
@@ -904,6 +904,8 @@ async def jwu_job_push(job_id: int, repo: str = "", dry_run: bool = True, user_a
     try:
         res = jobspace.push_worktree(store, job, repo, dry_run=dry_run, user_approved=user_approved,
                                      notify=_grant_notify)
+    except gitops.Blocked as b:   # отказ политики — ответом с причиной, как у jwu_git_push
+        res = b.to_dict()
     except jobspace.JobSpaceError as exc:
         raise ValueError(str(exc)) from exc
     return _stamp(res, _resolve(workspace))

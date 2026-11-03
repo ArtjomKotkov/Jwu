@@ -49,8 +49,9 @@ def test_push_new_branch_then_nothing(env, monkeypatch):
     _commit(wt, "b.txt")
     plan = jobspace.push_worktree(store, job, dry_run=True)
     assert plan["new_branch"] and len(plan["commits"]) == 1 and not plan["pushed"]
-    with pytest.raises(gitops.Blocked):                  # push по умолчанию — ask
+    with pytest.raises(gitops.Blocked) as e:             # push по умолчанию — ask
         jobspace.push_worktree(store, job)
+    assert str(e.value) == e.value.reason and str(e.value)   # не пустая ошибка, если отказ всплывёт
     res = jobspace.push_worktree(store, job, user_approved=True)
     assert res["pushed"] and "APP-1-fix" in git("branch", "--list", "APP-1-fix", cwd=remote)
     assert jobspace.push_worktree(store, job, user_approved=True)["commits"] == []
@@ -95,3 +96,21 @@ def test_default_policy_covers_main_branches(env):
     for b in ("develop", "master", "main", "release/10.8", "release-10.8"):
         assert gitpolicy.decide(pol, "push", branch=b).level in ("grant", "deny"), b
     assert gitpolicy.decide(pol, "push", branch="APP-1-fix", where="job").level == "ask"
+
+
+def test_mcp_job_push_returns_refusal_not_empty_error(env, monkeypatch):
+    """jwu_job_push: отказ политики — ответ с причиной (как у jwu_git_push), а не исключение без текста."""
+    import asyncio
+    from pathlib import Path
+
+    from jwu import mcp_server
+
+    store, job, repo, remote = env
+    monkeypatch.setattr(jobspace, "require_space", lambda *a, **k: None)
+    tree = jobspace.add_worktree(store, job, str(repo), branch="APP-1-mcp", base="develop")
+    _commit(Path(tree["ref"]), "m.txt")
+    monkeypatch.setattr(mcp_server, "_store_only", lambda ws=None: store)
+    monkeypatch.setattr(mcp_server, "_stamp", lambda res, ws: res)
+    monkeypatch.setattr(mcp_server, "_resolve", lambda ws=None: None)
+    res = asyncio.run(mcp_server.jwu_job_push(job.id, dry_run=False))
+    assert res["ok"] is False and res["blocked"] == "ask" and res["reason"]

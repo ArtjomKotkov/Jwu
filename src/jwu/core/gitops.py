@@ -83,6 +83,9 @@ class Blocked(Exception):
     grant_id: Optional[int] = None
     extra: dict = field(default_factory=dict)
 
+    def __str__(self) -> str:      # исключение-dataclass без args: иначе str() пустой
+        return self.reason
+
     def to_dict(self) -> dict:
         out = {"ok": False, "blocked": self.level, "op": self.op, "rule": self.rule, "reason": self.reason,
                "ask_user": self.ask_user, "retry": self.retry}
