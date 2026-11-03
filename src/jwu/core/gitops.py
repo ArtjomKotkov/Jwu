@@ -127,11 +127,14 @@ def _record(ctx: Ctx, text: str) -> None:
             pass
 
 
+NOTIFIED = "grant:notified"
+
+
 def _notified(ctx: Ctx, grant_id: int) -> bool:
     """Запрос допуска уже ушёл в бот (отметка в журнале политики)."""
     row = ctx.store.conn.execute(
-        "SELECT 1 FROM git_audit WHERE workspace_id = ? AND decision = 'grant:notified' AND detail = ?",
-        (ctx.store.workspace_id, f"запрос #{grant_id}")).fetchone()
+        "SELECT 1 FROM git_audit WHERE workspace_id = ? AND decision = ? AND detail = ?",
+        (ctx.store.workspace_id, NOTIFIED, f"запрос #{grant_id}")).fetchone()
     return row is not None
 
 
@@ -163,17 +166,22 @@ def gate(ctx: Ctx, op: str, *, branch: str = "", user_approved: bool = False, de
         req = gp.request_grant(ctx.store, remote=ctx.remote, branch=branch, op=op, head=ctx.head,
                                detail=detail or what, job_id=ctx.job_id)
         sent = _notified(ctx, int(req["id"]))
+        failed = False
         if not sent and ctx.notify is not None and "telegram" in ctx.policy.grant_via:
             try:
                 sent = bool(ctx.notify(ctx.store, req))
-            except Exception:  # noqa: BLE001 — бот недоступен: остаётся CLI
-                sent = False
+            except Exception as exc:  # noqa: BLE001 — бот недоступен: дошлёт демон, остаётся CLI
+                sent, failed = False, True
+                gp.audit(ctx.store, op=op, decision="grant:notify_failed", remote=ctx.remote, branch=branch,
+                         rule=d.rule, detail=f"запрос #{req['id']}: {exc}"[:500], job_id=ctx.job_id)
             if sent:
-                gp.audit(ctx.store, op=op, decision="grant:notified", remote=ctx.remote, branch=branch,
+                gp.audit(ctx.store, op=op, decision=NOTIFIED, remote=ctx.remote, branch=branch,
                          rule=d.rule, detail=f"запрос #{req['id']}", job_id=ctx.job_id)
         via = []
         if sent:
             via.append("кнопка в Telegram-боте (запрос отправлен)")
+        elif failed:
+            via.append("кнопка в Telegram-боте (сразу не ушло — демон jwu дошлёт в течение минуты)")
         if "cli" in ctx.policy.grant_via:
             via.append(f"в своём терминале: `! jwu git grant {req['id']}`")
         raise block(f"{what} — нужен допуск пользователя, «да» в чате не хватает ({d.rule})",

@@ -223,3 +223,30 @@ def test_grant_without_bot_does_not_claim_sent(store, repo):
     with pytest.raises(go.Blocked) as e:
         go.push(ctx, user_approved=True)
     assert "Telegram" not in e.value.ask_user and "jwu git grant" in e.value.ask_user
+
+
+def test_grant_notify_failure_logged_and_resent_by_daemon(store, repo, monkeypatch):
+    """Бот не ответил из сессии — ошибка в журнале, запрос досылает демон, один раз."""
+    from jwu.core import gitgrant
+
+    as_job(store, repo)
+    ctx = go.context(store, str(repo))
+
+    def boom(st, req):
+        raise RuntimeError("Telegram недоступен: timed out")
+
+    ctx.notify = boom
+    (repo / "a.txt").write_text("7\n")
+    go.commit(ctx, "seven", user_approved=True)
+    with pytest.raises(go.Blocked) as e:
+        go.push(ctx, user_approved=True)
+    assert "демон jwu дошлёт" in e.value.ask_user
+    log = gp.audit_log(store)
+    assert any(r["decision"] == "grant:notify_failed" and "timed out" in r["detail"] for r in log)
+    sent = []
+    monkeypatch.setattr(gitgrant, "notify", lambda st, req: sent.append(req["id"]) or True)
+    assert gitgrant.resend_pending(store) == 1 and sent == [e.value.grant_id]
+    assert gitgrant.resend_pending(store) == 0                  # отметка «отправлено» — второй раз не шлём
+    with pytest.raises(go.Blocked):                             # и сессия при повторе не шлёт сама
+        go.push(ctx, user_approved=True)
+    assert sent == [e.value.grant_id]

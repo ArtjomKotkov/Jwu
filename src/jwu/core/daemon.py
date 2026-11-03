@@ -591,6 +591,20 @@ def send_briefs(store: "Store") -> int:
     return sent
 
 
+def resend_grants(store: "Store") -> int:
+    """Запросы допуска git, не дошедшие до бота из сессии, — дослать."""
+    from . import gitgrant
+
+    try:
+        sent = gitgrant.resend_pending(store)
+    except Exception as exc:  # noqa: BLE001
+        log(f"запрос допуска git не дослан: {exc}")
+        return 0
+    if sent:
+        log(f"запросов допуска git дослано в бот: {sent}")
+    return sent
+
+
 def flush_quiet(store: "Store") -> int:
     """Тихие часы кончились — отложенное по каждому контуру одной сводкой."""
     from . import notifyprefs
@@ -727,6 +741,7 @@ def run_loop(
                             log("утренняя сводка отправлена")
                         if flush_quiet(store):
                             log("отложенное за тихие часы отправлено")
+                        resend_grants(store)
                     finally:
                         store.close()
                     if handled:

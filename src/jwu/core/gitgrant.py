@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import html
-from typing import TYPE_CHECKING
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Optional
 
 from . import gitpolicy as gp
 
@@ -69,6 +70,41 @@ def notify(store: "Store", req: dict) -> bool:
     head = f"<i>воркспейс {html.escape(ws.slug)}</i>\n" if ws else ""
     sender.send(head + _text(req), markup=markup(req, policy.grant_ttl))
     return True
+
+
+RESEND_HOURS = 12   # старше — агент давно не ждёт, в бот не дошлём
+
+
+def resend_pending(store: "Store", *, now: Optional[datetime] = None) -> int:
+    """Дослать в бот запросы допуска без отметки «отправлено» — по всем контурам.
+
+    Запрос заводит MCP-сервер сессии; бот мог не ответить, сессия — жить на старой версии
+    jwu. Демон держит связь с ботом постоянно и досылает такие запросы сам.
+    """
+    from .gitops import NOTIFIED
+
+    original = store.workspace_id
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=RESEND_HOURS)
+    sent = 0
+    try:
+        for ws in store.list_workspaces():
+            store.use_workspace(ws.id)
+            for req in gp.pending_grants(store):
+                try:
+                    created = datetime.fromisoformat(req["created_at"].replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if created < cutoff or store.conn.execute(
+                        "SELECT 1 FROM git_audit WHERE workspace_id = ? AND decision = ? AND detail = ?",
+                        (ws.id, NOTIFIED, f"запрос #{req['id']}")).fetchone():
+                    continue
+                if notify(store, req):
+                    gp.audit(store, op=req["op"], decision=NOTIFIED, remote=req["remote"], branch=req["branch"],
+                             detail=f"запрос #{req['id']}", job_id=req.get("job_id"))
+                    sent += 1
+    finally:
+        store.use_workspace(original)
+    return sent
 
 
 def handle_callback(store: "Store", data: str) -> tuple[str, dict]:
