@@ -427,12 +427,39 @@ def test_my_worklogs_on_filters_author_and_date(tmp_path):
     svc.close()
 
 
+def _recent(days: int = 1) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+
+@respx.mock
+def test_collect_mentions_old_comment_not_new(tmp_path):
+    """Задача впервые попала в кандидаты, а упоминанию полгода: помним, но «новым» не считаем."""
+    issue = jira_issue_raw(comments=[
+        {"id": 1, "author": "Боб", "body": "[~alice] давнее", "created": "2026-04-06T14:44:53.446+0300"},
+        {"id": 2, "author": "Кэрол", "body": "[~alice] свежее", "created": _recent()},
+    ])
+    respx.get(f"{JIRA}/rest/api/2/search").mock(return_value=httpx.Response(200, json=jira_search_raw([issue])))
+    respx.get(f"{JIRA}/rest/api/2/issue/PROJ-1").mock(return_value=httpx.Response(200, json=issue))
+    svc = _service(tmp_path)
+    svc.cfg.jira.username = "alice"
+    try:
+        assert [m.comment_id for m in svc.collect_mentions()] == ["2"]
+        assert [m.comment_id for m in svc.store.unseen_mentions()] == ["2"]
+        assert [m.comment_id for m in svc.store.list_mentions()] == ["2"]      # давнее — в архиве
+        svc.store.set_mention_scan("PROJ-1", "раньше")                          # пересканировать — не воскресает
+        assert svc.collect_mentions() == []
+    finally:
+        svc.close()
+
+
 @respx.mock
 def test_collect_mentions_records_event_once(tmp_path):
     """Упоминание — событие: запись создаётся один раз и не пересоздаётся на каждом синке."""
     issue = jira_issue_raw(comments=[
         {"id": 1, "author": "Боб", "body": "обычный коммент"},
-        {"id": 2, "author": "Кэрол", "body": "глянь [~alice] плиз"},
+        {"id": 2, "author": "Кэрол", "body": "глянь [~alice] плиз", "created": _recent()},
     ])
     respx.get(f"{JIRA}/rest/api/2/search").mock(
         return_value=httpx.Response(200, json=jira_search_raw([issue]))
@@ -463,10 +490,10 @@ def test_collect_mentions_records_event_once(tmp_path):
 @respx.mock
 def test_collect_mentions_rescans_changed_issue(tmp_path):
     """Задача обновилась → карточку перечитываем и подхватываем новое упоминание."""
-    first = jira_issue_raw(comments=[{"id": 1, "author": "Кэрол", "body": "[~alice] раз"}])
+    first = jira_issue_raw(comments=[{"id": 1, "author": "Кэрол", "body": "[~alice] раз", "created": _recent()}])
     second = jira_issue_raw(comments=[
-        {"id": 1, "author": "Кэрол", "body": "[~alice] раз"},
-        {"id": 2, "author": "Дэйв", "body": "[~alice] два"},
+        {"id": 1, "author": "Кэрол", "body": "[~alice] раз", "created": _recent()},
+        {"id": 2, "author": "Дэйв", "body": "[~alice] два", "created": _recent()},
     ])
     second["fields"]["updated"] = "2026-05-21T10:00:00.000+0300"
 

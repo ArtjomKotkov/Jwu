@@ -20,7 +20,7 @@ import json
 import logging
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,6 +188,22 @@ class PRDetail:
 # информационное, а апрувы/коммиты/комменты на ЧУЖИХ PR (где я ревьювер) — не моя работа.
 _BRIEF_DROP_KINDS = {"gone", "pr_gone"}
 _BRIEF_DROP_ON_REVIEW_PRS = {"reviewer_approved", "new_pr_commit", "new_pr_comment", "reviewer_needs_work"}
+
+
+MENTION_MAX_AGE_DAYS = 14   # упоминание старше — уже не «ответить», даже если нашлось впервые
+
+
+def _split_by_age(mentions: list[Mention], days: int, now: datetime | None = None) -> tuple[list, list]:
+    from .dates import _to_dt
+
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=days)
+    fresh, old = [], []
+    for m in mentions:
+        ts = _to_dt(m.created)
+        if ts is not None and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        (old if ts is not None and ts < cutoff else fresh).append(m)
+    return fresh, old
 
 
 def _brief_dashboard(d: "DashboardData", user: str, *, mention_days: int) -> "DashboardData":
@@ -838,7 +854,11 @@ class Service:
                     ))
             seen_versions.append((full.key, full.updated or issue.updated))
         self.store.set_mention_scans(seen_versions)
-        return self.store.add_mentions(found)
+        # задача попала в кандидаты по свежему изменению, а комменты в ней — за всю жизнь:
+        # старые упоминания запоминаем прочитанными, чтобы не всплывали «новыми»
+        fresh, old = _split_by_age(found, MENTION_MAX_AGE_DAYS)
+        self.store.add_mentions(old, archived=True)
+        return self.store.add_mentions(fresh)
 
     def issue(self, key: str) -> Issue:
         self._require_tasks()

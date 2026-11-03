@@ -7,6 +7,7 @@ ISO-строк наружу. Принимаем все ходовые входн
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Union
 
@@ -25,8 +26,11 @@ def _to_dt(value: TimeLike) -> "datetime | None":
         seconds = float(value) / 1000.0 if float(value) > 1e12 else float(value)
         ts = datetime.fromtimestamp(seconds, tz=timezone.utc)
     else:
+        raw = str(value).replace("Z", "+00:00")
+        # Jira: «…000+0300»; fromisoformat до 3.11 понимает только «+03:00»
+        raw = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", raw)
         try:
-            ts = datetime.fromisoformat(str(value))
+            ts = datetime.fromisoformat(raw)
         except ValueError:
             return None
     if ts.tzinfo is not None:

@@ -1820,21 +1820,23 @@ class Store:
             summary=row["summary"], seen=bool(row["seen"]), added_at=row["added_at"],
         )
 
-    def add_mentions(self, mentions: list[Mention]) -> list[Mention]:
+    def add_mentions(self, mentions: list[Mention], *, archived: bool = False) -> list[Mention]:
         """Дописать упоминания, пропуская уже известные. Возвращает только новые.
 
         Повтор определяется парой (задача, комментарий): один и тот же комментарий,
-        увиденный в десяти синках подряд, остаётся одной записью.
+        увиденный в десяти синках подряд, остаётся одной записью. ``archived`` — записать
+        сразу прочитанными и в архиве (старые комменты: помнить, но не всплывать).
         """
         added: list[Mention] = []
         ts = _now()
+        flag = 1 if archived else 0
         for m in mentions:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO mentions"
                 " (workspace_id, task_key, comment_id, author, text, created, summary,"
-                "  seen, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                "  seen, added_at, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (self.workspace_id, m.task_key, m.comment_id, m.author, m.text,
-                 m.created, m.summary, ts),
+                 m.created, m.summary, flag, ts, flag),
             )
             if cur.rowcount:
                 added.append(m.model_copy(update={"id": int(cur.lastrowid), "added_at": ts}))
