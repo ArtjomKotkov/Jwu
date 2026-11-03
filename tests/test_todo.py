@@ -344,3 +344,48 @@ def test_task_url_jira_and_github():
     assert task_url("https://jira.example/", "AB-1") == "https://jira.example/browse/AB-1"
     assert task_url("https://github.com", "repo#42", "me") == "https://github.com/me/repo/issues/42"
     assert task_url("", "AB-1") == ""
+
+
+def test_take_resolves_by_shown_board_not_rebuilt(store):
+    """Состав доски сменился между показом и взятием: номер берёт показанное или отказ."""
+    _seed(store)
+    shown = todo.build(store, store.workspace_id, "me", session="Orc")
+    n = {i.key: i.n for i in shown.items}
+    assert n["AB-3"] < n["P/r#2"]                       # обе в «правках», AB-3 выше
+    # взяли AB-3 для воркера — взятое уезжает вниз группы, свежая доска поменяла бы номера местами
+    res = todo.take(store, store.workspace_id, "me", numbers=[n["AB-3"]], session="Worker-A", shown_by="Orc",
+                    keys=["AB-3"])
+    assert [t["key"] for t in res["taken"]] == ["AB-3"]
+    # следующее взятие по тому же показу: номер P/r#2 — это P/r#2, а не AB-3
+    res = todo.take(store, store.workspace_id, "me", numbers=[n["P/r#2"]], session="Orc")
+    assert [t["key"] for t in res["taken"]] == ["P/r#2"]
+    # работа по пункту закрыта, пункт снова свободен — номер всё равно значит показанное
+    store.set_job_status(res["taken"][0]["job_id"], "done")
+    res = todo.take(store, store.workspace_id, "me", numbers=[n["AB-5"]], session="Worker-B", shown_by="Orc",
+                    keys=["AB-5"])
+    assert [t["key"] for t in res["taken"]] == ["AB-5"]
+    # ожидаемый ключ разошёлся с показанным — отказ, ничего не взято
+    res = todo.take(store, store.workspace_id, "me", numbers=[n["AB-6"]], session="Worker-C", shown_by="Orc",
+                    keys=["AB-999"])
+    assert res["taken"] == [] and "покажи доску заново" in res["skipped"][0]["reason"]
+    # взятие не перезаписало показанную доску
+    rows = json.loads(store.get_workspace_meta("todo:board:Orc"))
+    assert [r["key"] for r in rows] == [i.key for i in shown.items]
+    with pytest.raises(ValueError):
+        todo.take(store, store.workspace_id, "me", numbers=[1, 2], session="X", keys=["AB-1"])
+
+
+def test_review_job_not_closed_as_gone_task(store):
+    """Работа ревью чужого PR: задача не моя — это не повод «закрыть работу»."""
+    _seed(store)
+    board = todo.build(store, store.workspace_id, "me", session="S")
+    n = next(i.n for i in board.items if i.key == "P/r#9")
+    job_id = todo.take(store, store.workspace_id, "me", numbers=[n], session="S")["taken"][0]["job_id"]
+    board = todo.build(store, store.workspace_id, "me", session="S")
+    assert not [i for i in board.items if i.group == "close"]
+    # PR смержили — ревью больше не нужно
+    run = store.start_sync_run(["prs:review"])
+    store.save_pr_snapshot(run, _pr(9, "B-1: чужой", author="alice").model_copy(update={"state": "MERGED"}), ["review"])
+    store.finish_sync_run(run, {"prs:review": 0})
+    close = [i for i in todo.build(store, store.workspace_id, "me", session="S").items if i.group == "close"]
+    assert [i.key for i in close] == [f"#{job_id}"] and "смержен" in close[0].problems[0]

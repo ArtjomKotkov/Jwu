@@ -190,8 +190,12 @@ def build_cell(pr: "PR", expected: bool) -> str:
 
 
 def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
-          now: Optional[datetime] = None) -> Board:
-    """Собрать доску из кеша и запомнить её номера за сессией."""
+          now: Optional[datetime] = None, remember: bool = True) -> Board:
+    """Собрать доску из кеша и запомнить её номера за сессией.
+
+    remember=False — только собрать: так делает take, чтобы номера по-прежнему значили то,
+    что сессии последний раз показали, а не нумерацию на момент взятия.
+    """
     from .daemon import LAST_PASS_META
 
     todo_st = _statuses(store, workspace_id, TODO_STATUSES_SETTING, DEFAULT_TODO_STATUSES)
@@ -313,8 +317,10 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
     for item in items:
         if item.pr:
             item.pr["url"] = pr_urls.get((item.pr["project"], item.pr["repo"], item.pr["id"]), "")
-    store.set_workspace_meta(f"todo:board:{session or '-'}",
-                             json.dumps([{"n": i.n, "key": i.key, "group": i.group} for i in items]))
+    if remember:
+        store.set_workspace_meta(_shown_meta(session),
+                                 json.dumps([{"n": i.n, "key": i.key, "group": i.group, "issue_key": i.issue_key}
+                                             for i in items]))
     last = store.get_meta(LAST_PASS_META) or ""
     stale = True
     if last:
@@ -394,8 +400,20 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
                           taken=_taken(by_key.get(task_key))))
 
     # 🧹 работа открыта, а задача закрыта или ушла от меня
+    all_prs = {(pr.project, pr.repository, pr.id): pr for pr in store.latest_prs()}
+    in_review = {(pr.project, pr.repository, pr.id) for pr in store.latest_prs("review")}
     for job in store.list_jobs(status="active"):
-        if not job.task_key or job.title.startswith(QUESTION_PREFIX):
+        if job.title.startswith(QUESTION_PREFIX):
+            continue
+        review_prs = _review_prs(job, all_prs, login)
+        if review_prs:
+            # ревью чужого PR: задача по определению не моя — «ушло» значит PR закрыт или я не ревьюер
+            reason = _review_gone(review_prs, all_prs, in_review)
+            if reason:
+                items.append(Item(n=0, group="close", key=f"#{job.id}", title=job.title,
+                                  issue_key=job.task_key, problems=[reason]))
+            continue
+        if not job.task_key:
             continue
         issue = issues.get(job.task_key)
         if issue is None:
@@ -406,6 +424,28 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
             continue
         items.append(Item(n=0, group="close", key=f"#{job.id}", title=job.title, issue_key=job.task_key,
                           problems=[reason]))
+
+
+def _review_prs(job: "Job", all_prs: dict, login: str) -> list[tuple]:
+    """PR работы ревью (чужие): по цели «Ревью…» или по автору PR — не я."""
+    refs = [(link.project, link.repo, link.pr_id) for link in job.prs]
+    if not refs:
+        return []
+    if job.title.startswith("Ревью"):
+        return refs
+    return [ref for ref in refs if ref in all_prs and login and all_prs[ref].author
+            and all_prs[ref].author.casefold() != login.casefold()]
+
+
+def _review_gone(refs: list[tuple], all_prs: dict, in_review: set) -> str:
+    for ref in refs:
+        pr = all_prs.get(ref)
+        label = f"PR #{ref[2]}"
+        if pr is not None and pr.state and pr.state.upper() != "OPEN":
+            return f"{label} {'смержен' if pr.state.upper() == 'MERGED' else 'закрыт'} — ревью больше не нужно"
+        if pr is not None and ref not in in_review:
+            return f"{label} больше не ждёт моего ревью (сняли с ревьюеров или закрыт)"
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -564,28 +604,49 @@ def _goal(item: Item) -> str:
     return "Сделать задачу"
 
 
+def _shown_meta(session: str) -> str:
+    return f"todo:board:{session or '-'}"
+
+
 def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int] = (),
-         group: str = "", session: str = "") -> dict:
-    """Взять пункты в работу этой сессией: по номерам из её последней доски или всю группу.
+         group: str = "", session: str = "", shown_by: str = "",
+         keys: Iterable[str] = ()) -> dict:
+    """Взять пункты в работу сессией ``session``: по номерам последней показанной доски или всю группу.
+
+    Номера разрешаются по доске, которую последний раз показали сессии ``shown_by`` (по
+    умолчанию — самой ``session``); оркестратор берёт для воркера по своей доске. Доску take
+    не перезаписывает: несколько взятий подряд по одному показу берут ровно показанное.
+    ``keys`` — ожидаемые ключи по тем же номерам (по порядку): разошлось — отказ, а не
+    взятие соседнего пункта.
 
     Атомарно: под BEGIN IMMEDIATE проверяем, что по задаче/PR нет активной работы, и
     заводим её. Уже взятое другой сессией — в ``skipped`` с тем, кем и когда.
     """
-    board = build(store, workspace_id, login, session=session)
-    shown = json.loads(store.get_workspace_meta(f"todo:board:{session or '-'}") or "[]")
+    board = build(store, workspace_id, login, session=session, remember=False)
+    shown = json.loads(store.get_workspace_meta(_shown_meta(shown_by or session)) or "[]")
     wanted_keys: list[str] = []
     numbers = [int(n) for n in numbers]
+    expected = [str(k).strip() for k in keys]
+    if expected and len(expected) != len(numbers):
+        raise ValueError(f"keys: нужно столько же ключей, сколько номеров ({len(numbers)})")
+    skipped: list[dict] = []
     if numbers:
-        by_n = {row["n"]: row["key"] for row in shown}
-        wanted_keys = [by_n[n] for n in numbers if n in by_n]
-        unknown = [n for n in numbers if n not in by_n]
-    else:
-        unknown = []
+        by_n = {row["n"]: row for row in shown}
+        for idx, n in enumerate(numbers):
+            row = by_n.get(n)
+            if row is None:
+                skipped.append({"n": n, "reason": "нет такого номера в показанном списке"})
+                continue
+            want = expected[idx] if expected else ""
+            if want and want not in (row["key"], row.get("issue_key", "")):
+                skipped.append({"n": n, "key": row["key"], "reason":
+                                f"№{n} на показанной доске — {row['key']}, а не {want}: покажи доску заново"})
+                continue
+            wanted_keys.append(row["key"])
     if group:
         wanted_keys += [i.key for i in board.items if i.group == group and i.taken is None]
     items = {i.key: i for i in board.items}
     taken: list[dict] = []
-    skipped: list[dict] = [{"n": n, "reason": "нет такого номера в показанном списке"} for n in unknown]
     # Вопросы дежурства берутся отдельно: работа у них заводится только сейчас
     from .duty import question_take
 

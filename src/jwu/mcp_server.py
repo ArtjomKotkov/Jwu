@@ -2525,7 +2525,8 @@ async def jwu_todo_release(session: str, workspace: Optional[str] = None) -> dic
 
 @mcp.tool()
 async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", session: str = "",
-                        for_worker: str = "", workspace: Optional[str] = None) -> dict:
+                        for_worker: str = "", keys: Optional[list[str]] = None,
+                        workspace: Optional[str] = None) -> dict:
     """Взять пункты доски в работу этой сессией: по номерам из её последнего jwu_todo или всю группу.
 
     Заводит работы атомарно (две сессии одно не возьмут): цель в заголовке («Конфликт и
@@ -2534,7 +2535,10 @@ async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", se
     group: simple | build | fixes | demo | todo | review — свободные пункты группы целиком.
     Дальше по каждой взятой работе — jwu-continue-job (работа уже есть), по очереди.
     for_worker — оркестратор берёт пункты для воркера с этим именем (работы помечаются им,
-    имя самой сессии не меняется).
+    имя самой сессии не меняется; номера — по доске, показанной этой сессии).
+    keys — ключи пунктов по тем же номерам, как их видел пользователь (["PROJ-1", "P/r#42"]):
+    передавай всегда, когда берёшь по номерам. Номер теперь значит другое — пункт в skipped
+    с причиной, ничего не берётся вместо него.
     """
     from .core import todo as todo_mod
     from .core.service import _read_identity
@@ -2542,9 +2546,11 @@ async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", se
     if group and group not in todo_mod.GROUPS:
         raise ValueError(f"group: {', '.join(todo_mod.GROUPS)}")
     store = _store_only(workspace)
-    session = for_worker.strip() or _session_name(store, session)
+    caller = _session_name(store, session)
+    session = for_worker.strip() or caller
     result = todo_mod.take(store, store.workspace_id, _read_identity(store).get("user", ""),
-                           numbers=numbers or [], group=group, session=session)
+                           numbers=numbers or [], group=group, session=session, shown_by=caller,
+                           keys=keys or [])
     return _stamp({**result, "session": session}, _resolve(workspace))
 
 
