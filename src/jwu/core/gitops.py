@@ -169,22 +169,27 @@ def gate(ctx: Ctx, op: str, *, branch: str = "", user_approved: bool = False, de
         req = gp.request_grant(ctx.store, remote=ctx.remote, branch=branch, op=op, head=ctx.head,
                                detail=detail or what, job_id=ctx.job_id)
         sent = _notified(ctx, int(req["id"]))
-        failed = False
+        failed = dropped = False
         if not sent and ctx.notify is not None and "telegram" in ctx.policy.grant_via:
             try:
                 sent = bool(ctx.notify(ctx.store, req))
             except Exception as exc:  # noqa: BLE001 — бот недоступен: дошлёт демон, остаётся CLI
-                sent, failed = False, True
-                gp.audit(ctx.store, op=op, decision="grant:notify_failed", remote=ctx.remote, branch=branch,
-                         rule=d.rule, detail=f"запрос #{req['id']}: {exc}"[:500], job_id=ctx.job_id)
+                failed = True
+                dropped = gp.notify_failed(ctx.store, req, exc)
             if sent:
                 gp.audit(ctx.store, op=op, decision=NOTIFIED, remote=ctx.remote, branch=branch,
                          rule=d.rule, detail=f"запрос #{req['id']}", job_id=ctx.job_id)
+        if dropped:
+            raise block(f"{what} — нужен допуск, но бот не ответил {gp.NOTIFY_ATTEMPTS} раза: запрос #{req['id']} снят",
+                        "Скажи пользователю, что Telegram не отвечает и запрос допуска снят. Повтори вызов позже "
+                        "(будет новый запрос) или пусть пользователь даст допуск в терминале после повтора.",
+                        "повтори тот же вызов позже — заведётся новый запрос")
         via = []
         if sent:
             via.append("кнопка в Telegram-боте (запрос отправлен)")
         elif failed:
-            via.append("кнопка в Telegram-боте (сразу не ушло — демон jwu дошлёт в течение минуты)")
+            via.append("кнопка в Telegram-боте (сразу не ушло — демон jwu попробует ещё, "
+                       f"всего {gp.NOTIFY_ATTEMPTS} попытки)")
         if "cli" in ctx.policy.grant_via:
             via.append(f"в своём терминале: `! jwu git grant {req['id']}`")
         raise block(f"{what} — нужен допуск пользователя, «да» в чате не хватает ({d.rule})",

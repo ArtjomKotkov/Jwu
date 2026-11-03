@@ -240,7 +240,7 @@ def test_grant_notify_failure_logged_and_resent_by_daemon(store, repo, monkeypat
     go.commit(ctx, "seven", user_approved=True)
     with pytest.raises(go.Blocked) as e:
         go.push(ctx, user_approved=True)
-    assert "демон jwu дошлёт" in e.value.ask_user
+    assert "демон jwu попробует ещё" in e.value.ask_user
     log = gp.audit_log(store)
     assert any(r["decision"] == "grant:notify_failed" and "timed out" in r["detail"] for r in log)
     sent = []
@@ -250,3 +250,31 @@ def test_grant_notify_failure_logged_and_resent_by_daemon(store, repo, monkeypat
     with pytest.raises(go.Blocked):                             # и сессия при повторе не шлёт сама
         go.push(ctx, user_approved=True)
     assert sent == [e.value.grant_id]
+
+
+def test_grant_request_dropped_after_three_failed_sends(store, repo, monkeypatch):
+    """Бот не отвечает: три попытки (сессия + демон), дальше запрос снят — копии в чате не множатся."""
+    from jwu.core import gitgrant
+
+    as_job(store, repo)
+    ctx = go.context(store, str(repo))
+
+    def boom(st, req):
+        raise RuntimeError("timed out")
+
+    ctx.notify = boom
+    (repo / "a.txt").write_text("8\n")
+    go.commit(ctx, "eight", user_approved=True)
+    with pytest.raises(go.Blocked) as e:
+        go.push(ctx, user_approved=True)                       # попытка 1
+    gid = e.value.grant_id
+    monkeypatch.setattr(gitgrant, "notify", boom)
+    gitgrant.resend_pending(store)                              # попытка 2
+    assert [r["id"] for r in gp.pending_grants(store)] == [gid]
+    gitgrant.resend_pending(store)                              # попытка 3 — снят
+    assert gp.pending_grants(store) == []
+    assert any(r["decision"] == "grant:dropped" for r in gp.audit_log(store))
+    assert gitgrant.resend_pending(store) == 0
+    with pytest.raises(go.Blocked) as e2:                       # повтор — новый запрос
+        go.push(ctx, user_approved=True)
+    assert e2.value.grant_id != gid

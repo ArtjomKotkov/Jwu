@@ -581,6 +581,35 @@ def request_grant(store: "Store", *, remote: str, branch: str, op: str, head: st
             "new": True}
 
 
+NOTIFY_ATTEMPTS = 3   # столько раз пробуем отправить запрос в бот; не вышло — запрос снимается
+
+
+def notify_failures(store: "Store", grant_id: int) -> int:
+    """Сколько раз запрос не ушёл в бот (отметки grant:notify_failed)."""
+    ensure_schema(store.conn)
+    return int(store.conn.execute(
+        "SELECT COUNT(*) FROM git_audit WHERE workspace_id = ? AND decision = 'grant:notify_failed' AND detail LIKE ?",
+        (store.workspace_id, f"запрос #{grant_id}:%")).fetchone()[0])
+
+
+def notify_failed(store: "Store", req: dict, exc: Exception) -> bool:
+    """Отметить неудачную отправку запроса в бот. Попытки кончились — снять запрос (True).
+
+    Таймаут не значит «не дошло»: Telegram иногда доставляет позже, и каждая повторная
+    попытка — ещё одна копия в чате. Поэтому попыток немного, дальше агент спрашивает заново.
+    """
+    audit(store, op=req["op"], decision="grant:notify_failed", remote=req["remote"], branch=req["branch"],
+          detail=f"запрос #{req['id']}: {exc}"[:500], job_id=req.get("job_id"))
+    if notify_failures(store, int(req["id"])) < NOTIFY_ATTEMPTS:
+        return False
+    store.conn.execute("UPDATE git_grants SET status = 'dropped' WHERE id = ? AND status = 'requested'",
+                       (req["id"],))
+    store.conn.commit()
+    audit(store, op=req["op"], decision="grant:dropped", remote=req["remote"], branch=req["branch"],
+          detail=f"запрос #{req['id']}: бот не ответил {NOTIFY_ATTEMPTS} раза", job_id=req.get("job_id"))
+    return True
+
+
 def pending_grants(store: "Store") -> list[dict]:
     ensure_schema(store.conn)
     return [dict(r) for r in store.conn.execute(

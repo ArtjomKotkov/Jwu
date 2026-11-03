@@ -98,7 +98,12 @@ def resend_pending(store: "Store", *, now: Optional[datetime] = None) -> int:
                         "SELECT 1 FROM git_audit WHERE workspace_id = ? AND decision = ? AND detail = ?",
                         (ws.id, NOTIFIED, f"запрос #{req['id']}")).fetchone():
                     continue
-                if notify(store, req):
+                try:
+                    ok = notify(store, req)
+                except Exception as exc:  # noqa: BLE001 — попытка не удалась: считаем, после третьей — снят
+                    gp.notify_failed(store, req, exc)
+                    continue
+                if ok:
                     gp.audit(store, op=req["op"], decision=NOTIFIED, remote=req["remote"], branch=req["branch"],
                              detail=f"запрос #{req['id']}", job_id=req.get("job_id"))
                     sent += 1
