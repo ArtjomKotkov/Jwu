@@ -204,7 +204,8 @@ def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
     elif section == "jenkins":
         pairs = {"token": (cfg.jenkins.token_service, cfg.jenkins.username)}
     elif section == "telegram":
-        pairs = {"token": (cfg.telegram.token_service, "bot")}
+        pairs = {"token": (cfg.telegram.token_service, "bot"),
+                 "backup_token": (cfg.telegram.token_service, "backup-bot")}
     elif section == "matrix":
         pairs = {"token": (cfg.matrix.token_service, cfg.matrix.user_id or "me")}
     else:
@@ -493,6 +494,11 @@ def bitbucket_token(cfg: Config) -> str:
 def telegram_token(cfg: Config) -> str:
     """Токен бота Telegram (пусто — не настроен). Не бросает: уведомления опциональны."""
     return get_slot(cfg, "telegram.token") or ""
+
+
+def telegram_backup_token(cfg: Config) -> str:
+    """Токен резервного бота: основной не отвечает — шлём через него (пусто — резерва нет)."""
+    return get_slot(cfg, "telegram.backup_token") or ""
 
 
 def matrix_token(cfg: Config) -> str:

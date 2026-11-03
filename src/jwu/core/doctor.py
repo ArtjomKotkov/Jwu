@@ -275,6 +275,16 @@ def check_access(ws, cfg) -> list[Check]:
                 out.append(Check("Доступ telegram", "ok", f"бот @{me.get('username', '?')}"))
             except Exception as exc:  # noqa: BLE001
                 out.append(Check("Доступ telegram", "fail", str(exc), "токен от @BotFather, chat_id — id чата с ботом"))
+            from .config import telegram_backup_token
+
+            if telegram_backup_token(cfg):
+                try:
+                    from .notify import TelegramNotifier
+
+                    me = TelegramNotifier(telegram_backup_token(cfg), cfg.telegram.chat_id, role="backup").get_me()
+                    out.append(Check("Резервный бот telegram", "ok", f"бот @{me.get('username', '?')}"))
+                except Exception as exc:  # noqa: BLE001
+                    out.append(Check("Резервный бот telegram", "fail", str(exc), "jwu configure --telegram-backup-token …"))
     finally:
         svc.close()
     return out

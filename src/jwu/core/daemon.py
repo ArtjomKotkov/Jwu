@@ -461,18 +461,34 @@ def _bot_senders(store: "Store"):
         yield ws, cfg, sender, _read_identity(store).get("user", "")
 
 
+def _as_role(sender, role: str):
+    """Отправщик, у которого главный — бот этой роли (main | backup); резерва нет — None."""
+    from .notify import FallbackNotifier
+
+    if role == "main":
+        return sender
+    return sender.swapped() if isinstance(sender, FallbackNotifier) else None
+
+
 def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
-              long_poll: int = 0, dispatch: Callable[[int, dict], None] | None = None) -> list[dict]:
+              long_poll: int = 0, dispatch: Callable[[int, dict], None] | None = None,
+              role: str = "main") -> list[dict]:
     """Опросить бота по каждому контуру с настроенным Telegram — без сети к трекеру.
 
     Команды, кнопки и ответы-заметки обрабатывает ``core.bot``. ``dispatch(ws_id, update)``
     — отдать входящее исполнителю (демон: пул потоков), тогда здесь только приём.
+    ``role`` — какой бот опрашивать: основной или резервный (у демона — по потоку на каждый,
+    чтобы лежащий основной не задерживал нажатия в резервном). Отвечает тот же бот.
     """
     from . import bot
 
     handled: list[dict] = []
     polled: set[str] = set()
-    for ws, cfg, sender, login in _bot_senders(store):
+    for ws, cfg, base, login in _bot_senders(store):
+        sender = _as_role(base, role)
+        if sender is None:
+            base.close()
+            continue
         # Один бот (токен) у нескольких контуров опрашивается ОДИН раз и от первого контура:
         # иначе каждый со своим смещением получал бы те же нажатия ещё раз, а длинные опросы
         # шли бы по очереди.
@@ -481,7 +497,7 @@ def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
             continue
         polled.add(sender.token)
         try:
-            per_ws = (lambda upd, wid=ws.id: dispatch(wid, upd)) if dispatch else None
+            per_ws = (lambda upd, wid=ws.id: dispatch(wid, {**upd, BOT_ROLE_KEY: role})) if dispatch else None
             for item in bot.process_updates(store, ws, cfg, sender, login=login, on_sync=on_sync,
                                             long_poll=long_poll, dispatch=per_ws):
                 handled.append({"workspace": ws.slug, **item})
@@ -492,17 +508,32 @@ def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
     return handled
 
 
+BOT_ROLE_KEY = "_jwu_bot"   # в каком боте (main | backup) пришло входящее — тот и отвечает
+
+
+def has_backup_bot(store: "Store") -> bool:
+    from .notify import FallbackNotifier
+
+    found = False
+    for _ws, _cfg, sender, _login in _bot_senders(store):
+        found = found or isinstance(sender, FallbackNotifier)
+        sender.close()
+    return found
+
+
 def handle_bot_update(open_store: Callable[[], "Store"], workspace_id: int, upd: dict, *,
                       on_sync: Callable[[], bool] | None = None) -> dict | None:
     """Обработать одно входящее в своём потоке: своё соединение с БД, свой отправщик."""
     from . import bot
 
     store = open_store()
+    role = upd.pop(BOT_ROLE_KEY, "main")
     try:
-        for ws, cfg, sender, login in _bot_senders(store):
+        for ws, cfg, base, login in _bot_senders(store):
             if ws.id != workspace_id:
-                sender.close()
+                base.close()
                 continue
+            sender = _as_role(base, role) or base
             try:
                 return bot.handle_update(upd, store=store, ws=ws, cfg=cfg, sender=sender,
                                          login=login, on_sync=on_sync)
@@ -699,7 +730,7 @@ def run_loop(
                 log(f"бот: обработка не удалась: {exc}")
                 report_bot_failure(open_store, workspace_id, exc)
 
-        def bot_loop() -> None:
+        def bot_loop(role: str = "main") -> None:
             # Первый опрос — без ожидания: всё, что накопилось, пока демон лежал. Кнопки и
             # команды оттуда устарели — не исполняем (иначе после рестарта посыплются ответы
             # на давние нажатия); заметки («PROJ-1 текст») не теряем.
@@ -715,10 +746,14 @@ def run_loop(
                     store = open_store()
                     try:
                         t0 = time.monotonic()
+                        if role != "main" and not has_backup_bot(store):
+                            stop.wait(60)          # резерв не настроен — проверим позже, вдруг добавят
+                            continue
                         got = poll_bots(store, long_poll=max(1, poll_interval) if fresh[0] else 0,
-                                        dispatch=dispatch)
+                                        dispatch=dispatch, role=role)
                         if got:
-                            log(f"бот: опрос вернул {len(got)} за {time.monotonic() - t0:.1f} с")
+                            log(f"бот{'' if role == 'main' else ' (резерв)'}: опрос вернул {len(got)}"
+                                f" за {time.monotonic() - t0:.1f} с")
                         fresh[0] = True
                     finally:
                         store.close()
@@ -755,6 +790,7 @@ def run_loop(
             if after_sync is None:
                 after_sync = no_telegram_after_sync
             threading.Thread(target=bot_loop, name="jwu-bot", daemon=True).start()
+            threading.Thread(target=bot_loop, args=("backup",), name="jwu-bot-backup", daemon=True).start()
             threading.Thread(target=duty_loop, name="jwu-matrix", daemon=True).start()
             # Без синка на старте: продолжаем расписание от прошлого прохода (kick и /sync будят раньше).
             store = open_store()

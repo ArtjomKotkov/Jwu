@@ -496,6 +496,9 @@ def configure_main(
         help="chat_id Telegram для уведомлений после синка (пусто — выключить)."),
     telegram_token_opt: Optional[str] = typer.Option(None, "--telegram-token",
         help="Токен бота Telegram (от @BotFather)."),
+    telegram_backup_opt: Optional[str] = typer.Option(None, "--telegram-backup-token",
+        help="Токен резервного бота: основной не отвечает — уведомления и кнопки идут через него "
+             "(тот же chat_id; резервному боту один раз напиши /start). Пусто — убрать резерв."),
     matrix_host: Optional[str] = typer.Option(None, "--matrix-host",
         help="Homeserver Matrix для дежурства в боте (пусто — брать из конфига matrix-mcp)."),
     matrix_user: Optional[str] = typer.Option(None, "--matrix-user",
@@ -565,6 +568,7 @@ def configure_main(
         if telegram_chat is not None: cfg.telegram.chat_id = telegram_chat.strip()
         new_secrets = {
             "telegram.token": telegram_token_opt,
+            "telegram.backup_token": telegram_backup_opt,
             "jira.token": jira_token_opt,
             "jira.password": jira_password,
             "jira.gate_password": gate_password,

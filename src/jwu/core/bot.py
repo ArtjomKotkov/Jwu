@@ -287,20 +287,46 @@ def _addon_buttons() -> list[tuple[str, str]]:
     return out
 
 
-def main_menu() -> tuple[str, dict]:
+def _is_backup(sender) -> bool:
+    return getattr(sender, "role", "main") == "backup"
+
+
+def main_menu(sender=None) -> tuple[str, dict]:
     rows = [[_menu_btn(label, action) for label, action in row] for row in MENU_ROWS]
     rows += [[_menu_btn(label, action)] for label, action in _addon_buttons()]
-    return ("📋 <b>Меню jwu</b>", {"inline_keyboard": rows})
+    title = "📋 <b>Меню jwu</b>"
+    if _is_backup(sender):
+        # меню пришло из резервного бота: видно, что основной сейчас не на связи
+        title += " · 🛟 <b>резервный бот</b>\n<i>Основной не ответил — пишу отсюда. Проверь, ожил ли он.</i>"
+        rows.insert(0, [_menu_btn("🩺 Проверить основной бот", "checkmain")])
+    return (title, {"inline_keyboard": rows})
+
+
+def check_main_bot(sender) -> str:
+    """Кнопка резервного бота: отвечает ли основной. Ожил — снимаем отметку «лежит»."""
+    main = getattr(sender, "second", None)
+    if not _is_backup(sender) or main is None:
+        return "Это и есть основной бот — он отвечает."
+    try:
+        me = main.get_me()
+    except notify.NotifyError as exc:
+        notify.mark_down(main.token)
+        return f"❌ Основной бот не отвечает: {html.escape(str(exc))}\nПишу через резервный, проверю ещё раз сам."
+    notify._DOWN.pop(main.token, None)
+    return (f"✅ Основной бот @{html.escape(me.get('username', '?'))} отвечает — "
+            "уведомления снова идут через него. Кнопки и команды — тоже в нём.")
 
 
 BACK_TO_MENU = [_menu_btn("← меню", "main")]
 
 
 def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", login: str,
-                on_sync: Optional[Callable[[], bool]]) -> tuple[str, dict]:
+                on_sync: Optional[Callable[[], bool]], sender=None) -> tuple[str, dict]:
     """Кнопка меню → (текст, клавиатура) для того же сообщения. Под ответом — «← меню»."""
     if action == "main":
-        return main_menu()
+        return main_menu(sender)
+    if action == "checkmain":
+        return check_main_bot(sender), {"inline_keyboard": [BACK_TO_MENU]}
     if action.startswith("addon:"):
         from . import addons
 
@@ -396,13 +422,13 @@ def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
         return {"kind": "error", "text": data, "reply": text}
 
 
-SLOW_ACTIONS = {"sync", "tasks", "today", "mentions", "status", "board"}
+SLOW_ACTIONS = {"sync", "tasks", "today", "mentions", "status", "board", "checkmain"}
 
 
 def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on_sync) -> dict:
     if data.startswith(MENU_PREFIX) and ws is not None:
         text, markup = handle_menu(data[len(MENU_PREFIX):], store=store, ws=ws, cfg=cfg,
-                                   login=login, on_sync=on_sync)
+                                   login=login, on_sync=on_sync, sender=sender)
     elif data.startswith("brief:") and ws is not None:
         from . import brief
 
@@ -449,7 +475,7 @@ def show_menu(store: "Store", sender: notify.TelegramNotifier, *, pressed: Optio
     for mid in (pressed, store.get_workspace_meta(notify.MENU_META)):
         if mid:
             sender.delete(int(mid))
-    body, markup = main_menu()
+    body, markup = main_menu(sender)
     ids = sender.send(body, markup=markup)
     if ids and ids[-1]:
         store.set_workspace_meta(notify.MENU_META, str(ids[-1]))
@@ -541,12 +567,13 @@ def process_updates(
     Смещение сдвигается и для пропущенных сообщений, чтобы чужие не крутились вечно.
     """
     store.use_workspace(ws.id)
-    offset = int(store.get_workspace_meta(notify.OFFSET_META) or 0)
+    meta = getattr(sender, "offset_meta", notify.OFFSET_META)   # у резервного бота своё смещение
+    offset = int(store.get_workspace_meta(meta) or 0)
     updates = sender.get_updates(offset + 1 if offset else None, timeout=long_poll)
     last = max([offset] + [int(u.get("update_id", 0) or 0) for u in updates])
     if dispatch is not None:
         if last != offset:
-            store.set_workspace_meta(notify.OFFSET_META, str(last))
+            store.set_workspace_meta(meta, str(last))
         for upd in updates:
             dispatch(upd)
         return [{"kind": "dispatched", "text": ""} for _ in updates]
@@ -556,5 +583,5 @@ def process_updates(
         if item:
             handled.append(item)
     if last != offset:
-        store.set_workspace_meta(notify.OFFSET_META, str(last))
+        store.set_workspace_meta(meta, str(last))
     return handled

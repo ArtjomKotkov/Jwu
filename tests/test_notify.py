@@ -243,3 +243,42 @@ def test_all_sync_events_have_titles_and_default_set():
     text = plain(notify.format_message(note))
     assert "🆕 новая задача" in text and "👀 новый PR на ревью автор Иванов" in text
     assert text.index("PROJ-5") < text.index("P/r#9") < text.index("PROJ-6")   # по важности
+
+
+@respx.mock
+def test_backup_bot_takes_over_when_main_is_down(monkeypatch):
+    """Основной бот не отвечает — сообщение уходит через резервный; лежащий не ждём заново."""
+    notify._DOWN.clear()
+    main = respx.post(f"{TG}/botmain/sendMessage").mock(side_effect=httpx.ReadTimeout("timed out"))
+    backup = respx.post(f"{TG}/botspare/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 9}}))
+    sender = notify.FallbackNotifier(notify.TelegramNotifier("main", "42"),
+                                     notify.TelegramNotifier("spare", "42", role="backup"))
+    assert sender.send("привет") == [9] and main.call_count == 1 and backup.call_count == 1
+    assert sender.send("ещё") == [9] and main.call_count == 1           # основной помечен лежащим
+    clock = [notify.time.monotonic() + notify.DOWN_FOR + 1]
+    monkeypatch.setattr(notify.time, "monotonic", lambda: clock[0])
+    main.mock(return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 5}}))
+    assert sender.send("ожил") == [5]                                   # через 5 минут — снова основной
+    # 4xx основного (не сбой связи) — ошибка как есть, без молчаливого ухода в резерв
+    main.mock(return_value=httpx.Response(400, json={"ok": False, "description": "bad"}))
+    with pytest.raises(notify.NotifyError):
+        sender.send("x")
+    # резервный — главный для ответа на нажатие в нём: answer_callback через него
+    cb = respx.post(f"{TG}/botspare/answerCallbackQuery").mock(return_value=httpx.Response(200, json={"ok": True}))
+    sender.swapped().answer_callback("c1")
+    assert cb.call_count == 1 and sender.swapped().offset_meta != sender.offset_meta
+    notify._DOWN.clear()
+
+
+def test_notifier_from_config_with_backup(monkeypatch):
+    from jwu.core import config as config_mod
+
+    cfg = Config()
+    cfg.telegram.chat_id = "42"
+    monkeypatch.setattr(config_mod, "telegram_token", lambda c: "main")
+    monkeypatch.setattr(config_mod, "telegram_backup_token", lambda c: "spare")
+    sender = notify.notifier_from_config(cfg)
+    assert isinstance(sender, notify.FallbackNotifier) and sender.second.token == "spare"
+    monkeypatch.setattr(config_mod, "telegram_backup_token", lambda c: "")
+    assert isinstance(notify.notifier_from_config(cfg), notify.TelegramNotifier)

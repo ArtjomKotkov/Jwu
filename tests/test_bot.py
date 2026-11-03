@@ -183,3 +183,43 @@ def test_poll_replies_refused_while_daemon_reads_bot(tmp_path, monkeypatch):
     with pytest.raises(notify.NotifyError, match="демон jwu"):
         Service.poll_telegram_replies(svc)
     store.close()
+
+
+@respx.mock
+def test_backup_bot_polled_separately_and_replies_itself(tmp_path, monkeypatch):
+    """Резервный бот: свой опрос и своё смещение; ответ на сообщение в нём — через него же."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_BACKUP_BOT_TOKEN", "spare")
+    store = Store(tmp_path / "s.db")
+    work = store.get_workspace_by_slug("work")
+    store.set_workspace_settings(work.id, {"telegram.chat_id": "42"})
+    main_poll = respx.get(f"{TG}/bottok/getUpdates").mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
+    respx.get(f"{TG}/botspare/getUpdates").mock(return_value=httpx.Response(200, json={"ok": True, "result": [
+        _msg(5, "PROJ-2 из резерва")]}))
+    main_send = respx.post(f"{TG}/bottok/sendMessage").mock(return_value=httpx.Response(200, json={"ok": True, "result": {}}))
+    spare_send = respx.post(f"{TG}/botspare/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 3}}))
+    assert daemon.has_backup_bot(store)
+    got: list = []
+    daemon.poll_bots(store, role="backup", dispatch=lambda wid, upd: got.append((wid, upd)))
+    assert main_poll.call_count == 0 and len(got) == 1 and got[0][1][daemon.BOT_ROLE_KEY] == "backup"
+    store.use_workspace(work.id)
+    assert store.get_workspace_meta(f"{notify.OFFSET_META}:backup") == "5" and not store.get_workspace_meta(notify.OFFSET_META)
+    daemon.handle_bot_update(lambda: Store(tmp_path / "s.db"), work.id, got[0][1])
+    assert spare_send.call_count == 1 and main_send.call_count == 0
+    store.close()
+
+
+@respx.mock
+def test_backup_menu_marked_and_checks_main(monkeypatch):
+    """Меню резервного бота помечено «резервный» и умеет проверить основной."""
+    notify._DOWN.clear()
+    pair = notify.FallbackNotifier(notify.TelegramNotifier("tok", "42"),
+                                   notify.TelegramNotifier("spare", "42", role="backup"))
+    title, kb = bot.main_menu(pair.swapped())
+    assert "резервный бот" in title and "menu:checkmain" in str(kb)
+    assert "резервный" not in bot.main_menu(pair)[0] and "checkmain" not in str(bot.main_menu(pair)[1])
+    respx.get(f"{TG}/bottok/getMe").mock(side_effect=httpx.ReadTimeout("timed out"))
+    assert bot.check_main_bot(pair.swapped()).startswith("❌") and notify.is_down("tok")
+    respx.get(f"{TG}/bottok/getMe").mock(return_value=httpx.Response(200, json={"ok": True, "result": {"username": "main_bot"}}))
+    assert "@main_bot отвечает" in bot.check_main_bot(pair.swapped()) and not notify.is_down("tok")
