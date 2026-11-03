@@ -408,3 +408,47 @@ def test_task_in_unknown_status_not_lost(store):
     assert set(todo_items) == {"AB-20", "AB-21"}
     assert todo_items["AB-20"].problems == [] and "не из настроек доски" in todo_items["AB-21"].problems[0]
     assert "backlog" in board.to_dict()["statuses"]["todo"]
+
+
+def test_point_refresh_after_jwu_action(store):
+    """jwu запушил мерж — PR с конфликтом дотягивается точечно: доска видит снятый конфликт сразу,
+    пункт помечен «обновлено jwu», а дельта следующего синка считается от настоящего синка."""
+    from types import SimpleNamespace
+
+    from jwu.core.service import Service
+
+    _seed(store)
+    store.set_meta("daemon:last_pass", "2026-11-03T05:00:00+00:00")
+    assert any(i.key == "P/r#1" for i in todo.build(store, store.workspace_id, "me").items)
+    todo.mark_dirty(store, branch=("P/r", "AB-1-fix"))
+    todo.mark_dirty(store, pr=("P", "r", 1))
+    todo.mark_dirty(store, pr=("P", "r", 1))                                # без дублей
+    assert len(todo.dirty(store)) == 2
+    fixed = _pr(1, "AB-1: конфликт")                                        # конфликт снят, сборка зелёная
+    fixed.builds = [BuildStatus(state="SUCCESSFUL", key="b", name="b", url="")]
+    fake = SimpleNamespace(store=store, tasks_client=None,
+                           _require_prs=lambda: SimpleNamespace(pr=lambda p, r, i: fixed.model_copy()),
+                           _fill_builds=lambda pr: None, _fill_tasks=lambda pr: None)
+    res = todo.refresh_dirty(store, SimpleNamespace(refresh_points=lambda items: Service.refresh_points(fake, items)))
+    assert res["refreshed"] == ["P/r#1"] and todo.dirty(store) == []
+    board = todo.build(store, store.workspace_id, "me")
+    assert not any(i.key == "P/r#1" and i.group == "simple" for i in board.items)
+    # PR больше не на доске как проблема — но в составе «моих» остался (состав не трогаем)
+    assert any(p.id == 1 for p in store.latest_prs("mine"))
+    # дельты: следующий синк сравнивает с прошлым НАСТОЯЩИМ снапшотом, а не с точечным
+    run = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run, fixed, ["mine"])
+    store.finish_sync_run(run, {"prs:mine": 1})
+    kinds = {d.kind for d in store.compute_changes(run)}
+    assert "build_fixed" in kinds, kinds          # от точечного снапшота дельты бы не было
+
+
+def test_fresh_marker_shown_until_next_sync(store):
+    _seed(store)
+    store.set_meta("daemon:last_pass", "2026-11-03T05:00:00+00:00")
+    store.set_workspace_meta(todo.FRESH_META, json.dumps({"AB-5": "2026-11-03T06:00:00+00:00"}))
+    item = next(i for i in todo.build(store, store.workspace_id, "me").items if i.key == "AB-5")
+    assert item.fresh and "обновлено jwu" in todo.render_md(todo.build(store, store.workspace_id, "me"))
+    store.set_meta("daemon:last_pass", "2026-11-03T07:00:00+00:00")             # синк прошёл позже
+    item = next(i for i in todo.build(store, store.workspace_id, "me").items if i.key == "AB-5")
+    assert item.fresh == ""

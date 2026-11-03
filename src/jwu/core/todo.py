@@ -75,6 +75,7 @@ class Item:
     issue_key: str = ""
     taken: Optional[dict] = None    # {"job_id", "since", "ago", "session"}
     priority: str = ""
+    fresh: str = ""                 # данные пункта обновлены jwu после синка — когда (ЧЧ:ММ)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -323,6 +324,7 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                               _prio(i.priority), i.key))
     for n, item in enumerate(items, 1):
         item.n = n
+    _mark_fresh(store, items, last_pass=store.get_meta(LAST_PASS_META) or "")
     pr_urls = {(pr.project, pr.repository, pr.id): pr.url
                for scope in ("mine", "review") for pr in store.latest_prs(scope) if pr.url}
     for item in items:
@@ -356,6 +358,26 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
 
 
 DONE_STATUSES = ("done", "closed", "resolved", "закрыта", "решена")
+
+
+def _mark_fresh(store: "Store", items: list, *, last_pass: str) -> None:
+    """Пункт, дотянутый jwu после последнего синка, — пометка «обновлено jwu ЧЧ:ММ»."""
+    try:
+        fresh = json.loads(store.get_workspace_meta(FRESH_META) or "{}")
+    except ValueError:
+        return
+    if not fresh:
+        return
+    keep = {ref: ts for ref, ts in fresh.items() if not last_pass or ts > last_pass}
+    if keep != fresh:
+        store.set_workspace_meta(FRESH_META, json.dumps(keep))   # синк прошёл позже — пометка не нужна
+    for item in items:
+        ts = keep.get(item.key) or keep.get(item.issue_key)
+        if ts:
+            try:
+                item.fresh = datetime.fromisoformat(ts).astimezone().strftime("%H:%M")
+            except ValueError:
+                pass
 
 
 def _finished(issue: "Issue") -> bool:
@@ -468,6 +490,69 @@ def _review_gone(refs: list[tuple], all_prs: dict, in_review: set) -> str:
         if pr is not None and ref not in in_review:
             return f"{label} больше не ждёт моего ревью (сняли с ревьюеров или закрыт)"
     return ""
+
+
+# --------------------------------------------------------------------------- #
+# Грязное: jwu сам поменял PR/задачу — доска дотягивает их точечно, не ждёт синка
+# --------------------------------------------------------------------------- #
+
+DIRTY_META = "todo:dirty"          # [{"kind": "pr"|"branch"|"issue", ...}] — что обновить
+FRESH_META = "todo:fresh"          # {ключ пункта: время точечного обновления}
+DIRTY_ATTEMPTS = 3
+
+
+def mark_dirty(store: "Store", **what) -> None:
+    """Отметить затронутое действием jwu: pr=(project, repo, id) | branch=(remote, branch) | issue=key.
+
+    Без сети и без ошибок: не вышло записать — доска просто дождётся синка.
+    """
+    try:
+        items = json.loads(store.get_workspace_meta(DIRTY_META) or "[]")
+        if what.get("pr"):
+            project, repo, pr_id = what["pr"]
+            entry = {"kind": "pr", "project": project, "repo": repo, "id": int(pr_id)}
+        elif what.get("branch"):
+            remote, branch = what["branch"]
+            entry = {"kind": "branch", "remote": remote, "branch": branch}
+        elif what.get("issue"):
+            entry = {"kind": "issue", "key": what["issue"]}
+        else:
+            return
+        if not any({k: v for k, v in i.items() if k != "tries"} == entry for i in items):
+            items.append(entry)
+        store.set_workspace_meta(DIRTY_META, json.dumps(items[-30:]))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dirty(store: "Store") -> list[dict]:
+    try:
+        return json.loads(store.get_workspace_meta(DIRTY_META) or "[]")
+    except ValueError:
+        return []
+
+
+def refresh_dirty(store: "Store", svc) -> dict:
+    """Дотянуть отмеченное: несколько запросов вместо полного синка. Не вышло — ещё попытки."""
+    items = dirty(store)
+    if not items:
+        return {"refreshed": [], "failed": []}
+    res = svc.refresh_points(items)
+    left = []
+    for entry in res["failed"]:
+        entry["tries"] = int(entry.get("tries", 0)) + 1
+        if entry["tries"] < DIRTY_ATTEMPTS:
+            left.append(entry)
+    store.set_workspace_meta(DIRTY_META, json.dumps(left))
+    try:
+        fresh = json.loads(store.get_workspace_meta(FRESH_META) or "{}")
+    except ValueError:
+        fresh = {}
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for ref in res["refreshed"]:
+        fresh[ref] = stamp
+    store.set_workspace_meta(FRESH_META, json.dumps(fresh))
+    return res
 
 
 # --------------------------------------------------------------------------- #
@@ -805,7 +890,8 @@ def _title(i: Item) -> str:
     title = i.title or ""
     if i.issue_key and title.startswith(i.issue_key):
         title = title[len(i.issue_key):].lstrip(" :—-")
-    return _cell(title, 60)
+    fresh = f" · 🔄 обновлено jwu {i.fresh}" if i.fresh else ""
+    return _cell(title, 60) + fresh
 
 
 _LINKS = {"base": "", "owner": ""}
@@ -849,7 +935,8 @@ def _row(group: str, i: Item) -> list[str]:
     if group == "fixes":
         return [str(i.n), pr, key, _title(i), _prio_cell(i), _cell(i.status), problems, _taken_cell(i)]
     if group == "todo":
-        return [str(i.n), key, _title(i), _prio_cell(i), _cell(i.status), _taken_cell(i)]
+        status = _cell(i.status) + (" ⚠️ нет в настройках доски" if i.problems else "")
+        return [str(i.n), key, _title(i), _prio_cell(i), status, _taken_cell(i)]
     if group == "demo":
         return [str(i.n), key, _title(i), _prio_cell(i), _cell(i.status), _cell("; ".join(i.problems)) or "—", _taken_cell(i)]
     author = next((p[len("автор "):] for p in i.problems if p.startswith("автор ")), "")

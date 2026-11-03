@@ -2488,6 +2488,13 @@ async def jwu_todo(session: str = "", refresh: Optional[bool] = None,
     store = _store_only(workspace)
     login = _read_identity(store).get("user", "")
     session = _session_name(store, session)
+    points = None
+    if refresh is not False and todo_mod.dirty(store):
+        # jwu сам менял PR/задачи (пуш, переход, правки PR) — дотянуть только их, без синка
+        try:
+            points = todo_mod.refresh_dirty(store, _full_svc(workspace))
+        except Exception as exc:  # noqa: BLE001 — нет сети/кредов: доска из кеша, как раньше
+            points = {"refreshed": [], "failed": [], "error": str(exc)}
     board = todo_mod.build(store, store.workspace_id, login, session=session)
     refreshed = None
     if refresh or (refresh is None and board.stale):
@@ -2506,7 +2513,7 @@ async def jwu_todo(session: str = "", refresh: Optional[bool] = None,
         disk = jobspace.check_space(store, store.workspace_id, with_docker=False).summary()
     except OSError:
         disk = ""
-    return _stamp({**board.to_dict(), "disk": disk, "refreshed": refreshed,
+    return _stamp({**board.to_dict(), "disk": disk, "refreshed": refreshed, "points": points,
                    "markdown": todo_mod.render_md(board, disk=f"Диск: {disk}" if disk else "")},
                   _resolve(workspace))
 

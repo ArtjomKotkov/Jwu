@@ -484,6 +484,9 @@ def push(ctx: Ctx, *, force: bool = False, dry_run: bool = False, user_approved:
         cmd.insert(1, f"--force-with-lease=refs/heads/{branch}")
     ctx.git(*cmd)
     _record(ctx, f"{'force-' if op == 'force_push' else ''}пуш {branch}: {len(commits)} коммитов")
+    from . import todo
+
+    todo.mark_dirty(ctx.store, branch=(ctx.remote, branch))   # доска дотянет PR ветки, не дожидаясь синка
     return {**result, "pushed": True}
 
 

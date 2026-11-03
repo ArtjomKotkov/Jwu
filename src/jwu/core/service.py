@@ -193,6 +193,26 @@ _BRIEF_DROP_ON_REVIEW_PRS = {"reviewer_approved", "new_pr_commit", "new_pr_comme
 MENTION_MAX_AGE_DAYS = 14   # упоминание старше — уже не «ответить», даже если нашлось впервые
 
 
+def _marks_pr(fn):
+    """После удачной записи в PR (коммент, ревью, задача, правка) — пометить его для доски."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(self, project, repo, pr_id, *args, **kwargs):
+        result = fn(self, project, repo, pr_id, *args, **kwargs)
+        if self.store is not None:
+            try:
+                from . import todo
+
+                default_project, default_repo = self.default_pr_ref()
+                todo.mark_dirty(self.store, pr=(project or default_project, repo or default_repo, pr_id))
+            except Exception:  # noqa: BLE001 — пометка для доски не повод ронять запись
+                pass
+        return result
+
+    return wrapper
+
+
 def _split_by_age(mentions: list[Mention], days: int, now: datetime | None = None) -> tuple[list, list]:
     from .dates import _to_dt
 
@@ -1321,6 +1341,14 @@ class Service:
         return self._client_for_key(key).transitions(key)
 
     def transition(self, key: str, target: str) -> dict:
+        result = self._transition(key, target)
+        if self.store is not None:
+            from . import todo
+
+            todo.mark_dirty(self.store, issue=key)
+        return result
+
+    def _transition(self, key: str, target: str) -> dict:
         """Перевести задачу по имени перехода (или по его id).
 
         Имя сверяется с тем, что инстанс отдаёт для ТЕКУЩЕГО статуса: набор переходов
@@ -1569,6 +1597,7 @@ class Service:
             return cut + note
         return text
 
+    @_marks_pr
     def pr_comment_add(
         self, project: str | None, repo: str | None, pr_id: int, text: str, *,
         parent_id: int | str | None = None, path: str | None = None, line: int | None = None,
@@ -1646,6 +1675,7 @@ class Service:
             client.pr_comment_update(project, repo, pr_id, comment_id, text, int(raw.get("version", 0) or 0))
         return {"id": str(comment_id), "before": before, "after": text}
 
+    @_marks_pr
     def pr_update(self, project: str | None, repo: str | None, pr_id: int, *,
                   title: str | None = None, description: str | None = None) -> dict:
         """Поправить заголовок/описание СВОЕГО PR. ВНЕШНЯЯ запись — после подтверждения."""
@@ -1703,6 +1733,7 @@ class Service:
             client.pr_comment_delete(project, repo, pr_id, comment_id, int(raw.get("version", 0) or 0))
         return {"id": str(comment_id), "deleted": True, "text": text or ""}
 
+    @_marks_pr
     def pr_review(self, project: str | None, repo: str | None, pr_id: int, status: str,
                   body: str = "") -> dict:
         """Мой статус ревью на PR: APPROVED | NEEDS_WORK | UNAPPROVED. ВНЕШНЯЯ запись."""
@@ -1791,6 +1822,7 @@ class Service:
         default_project, default_repo = self.default_pr_ref()
         return client.pr_tasks(project or default_project, repo or default_repo, pr_id)
 
+    @_marks_pr
     def pr_task_add(
         self, project: str | None, repo: str | None, pr_id: int, text: str, *,
         comment_id: int | str | None = None, comment_text: str | None = None,
@@ -1974,6 +2006,52 @@ class Service:
                 changed = True
         if changed:
             self.store.set_workspace_meta(_PR_TASK_ALIAS_META, json.dumps(aliases, ensure_ascii=False))
+
+    def refresh_points(self, items: list[dict]) -> dict:
+        """Точечно перечитать PR/задачи, которые поменял сам jwu (пуш, переход, правка PR).
+
+        Снапшоты — в отдельный прогон ``point``: свежие поля видны доске сразу, а база для
+        дельт следующего синка остаётся прежней (см. ``Store._NOT_POINT``). Состав вкладок
+        не меняется — только данные уже известных PR и задач. → {"refreshed": [ключи пунктов],
+        "failed": [записи, что не вышло]}.
+        """
+        refreshed: list[str] = []
+        failed: list[dict] = []
+        known = {(pr.project, pr.repository, pr.id): pr for pr in self.store.latest_prs()}
+        run_id = self.store.start_sync_run(["point"])
+        count = 0
+
+        def one_pr(ref: tuple) -> None:
+            nonlocal count
+            pr = self._require_prs().pr(ref[0], ref[1], ref[2])
+            if pr.project and pr.repository:
+                self._fill_builds(pr)
+                self._fill_tasks(pr)
+            views = self.store.latest_views(pr=ref)
+            self.store.save_pr_snapshot(run_id, pr, views)
+            refreshed.append(f"{pr.project}/{pr.repository}#{pr.id}")
+            count += 1
+
+        for entry in items:
+            try:
+                if entry.get("kind") == "pr":
+                    one_pr((entry["project"], entry["repo"], int(entry["id"])))
+                elif entry.get("kind") == "branch":
+                    slug = (entry.get("remote") or "").casefold()
+                    refs = [ref for ref, pr in known.items()
+                            if f"{ref[0]}/{ref[1]}".casefold() == slug and pr.source_branch == entry.get("branch")
+                            and (not pr.state or pr.state.upper() == "OPEN")]
+                    for ref in refs:
+                        one_pr(ref)
+                elif entry.get("kind") == "issue" and self.tasks_client is not None:
+                    issue = self.issue(entry["key"])
+                    self.store.save_issue_snapshot(run_id, issue, self.store.latest_views(key=entry["key"]))
+                    refreshed.append(issue.key)
+                    count += 1
+            except Exception:  # noqa: BLE001 — сеть/доступ: попробуем при следующей доске
+                failed.append(dict(entry))
+        self.store.finish_sync_run(run_id, {"point": count})
+        return {"refreshed": refreshed, "failed": failed}
 
     def sync(self) -> SyncResult:
         """Полный синк всех секций в одном прогоне (для `jwu sync`).

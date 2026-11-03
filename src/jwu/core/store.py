@@ -595,6 +595,11 @@ _MIGRATIONS: list[tuple[int, object]] = [
 ]
 
 
+# Снимок точечного обновления (после действий jwu) — свежие поля для доски, но не база для
+# дельт: иначе следующий синк не заметил бы чужой апрув, случившийся до обновления.
+_NOT_POINT = " AND sync_run_id NOT IN (SELECT id FROM sync_runs WHERE views = '[\"point\"]')"
+
+
 class Store:
     def __init__(self, path: str | Path, workspace_id: int | None = None) -> None:
         self.path = str(path)
@@ -995,6 +1000,8 @@ class Store:
 
     # --- запись синка --------------------------------------------------- #
 
+    POINT_VIEWS = '["point"]'   # точечное обновление после действий jwu: не синк, дельт не даёт
+
     def start_sync_run(self, views: list[str]) -> int:
         cur = self.conn.execute(
             "INSERT INTO sync_runs (started_at, views, workspace_id) VALUES (?, ?, ?)",
@@ -1053,7 +1060,8 @@ class Store:
 
     def latest_run_id(self) -> int | None:
         row = self.conn.execute(
-            "SELECT MAX(id) AS m FROM sync_runs WHERE workspace_id = ?", (self.workspace_id,)
+            "SELECT MAX(id) AS m FROM sync_runs WHERE workspace_id = ? AND views != ?",
+            (self.workspace_id, self.POINT_VIEWS),
         ).fetchone()
         return row["m"] if row and row["m"] is not None else None
 
@@ -1061,8 +1069,9 @@ class Store:
         """Время последнего синка; с token — последнего синка секции (значение в views)."""
         if token is None:
             row = self.conn.execute(
-                "SELECT started_at FROM sync_runs WHERE workspace_id = ? ORDER BY id DESC LIMIT 1",
-                (self.workspace_id,),
+                "SELECT started_at FROM sync_runs WHERE workspace_id = ? AND views != ?"
+                " ORDER BY id DESC LIMIT 1",
+                (self.workspace_id, self.POINT_VIEWS),
             ).fetchone()
             return row["started_at"] if row else None
         for row in self.conn.execute(
@@ -1167,6 +1176,18 @@ class Store:
                 rows.append(row)
         return rows
 
+    def latest_views(self, *, key: str = "", pr: tuple | None = None) -> list[str]:
+        """Вкладки свежайшего снапшота задачи или PR — точечный снапшот наследует их."""
+        if pr is not None:
+            row = self.conn.execute(
+                "SELECT views FROM pr_snapshots WHERE project = ? AND repo = ? AND pr_id = ? AND workspace_id = ?"
+                " ORDER BY sync_run_id DESC LIMIT 1", (pr[0], pr[1], pr[2], self.workspace_id)).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT views FROM issue_snapshots WHERE key = ? AND workspace_id = ?"
+                " ORDER BY sync_run_id DESC LIMIT 1", (key, self.workspace_id)).fetchone()
+        return json.loads(row["views"]) if row else []
+
     def latest_issues(self, view: str | None = None) -> list[Issue]:
         """Свежайший снапшот по каждой задаче (опц. фильтр по вью), updated DESC.
 
@@ -1227,7 +1248,7 @@ class Store:
     def _prev_issue_signature(self, key: str, before_run: int) -> dict | None:
         row = self.conn.execute(
             "SELECT signature FROM issue_snapshots WHERE key = ? AND sync_run_id < ?"
-            " AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
+            " AND workspace_id = ?" + _NOT_POINT + " ORDER BY sync_run_id DESC LIMIT 1",
             (key, before_run, self.workspace_id),
         ).fetchone()
         return json.loads(row["signature"]) if row else None
@@ -1241,7 +1262,7 @@ class Store:
         row = self.conn.execute(
             "SELECT signature FROM issue_snapshots WHERE key = ? AND sync_run_id < ?"
             " AND workspace_id = ?"
-            " AND COALESCE(json_extract(signature, '$.dev_ok'), 1) = 1"
+            " AND COALESCE(json_extract(signature, '$.dev_ok'), 1) = 1" + _NOT_POINT +
             " ORDER BY sync_run_id DESC LIMIT 1",
             (key, before_run, self.workspace_id),
         ).fetchone()
@@ -1253,7 +1274,7 @@ class Store:
         project, repo, pr_id = ref
         row = self.conn.execute(
             "SELECT signature FROM pr_snapshots WHERE pr_id = ? AND project = ? AND repo = ?"
-            " AND sync_run_id < ? AND workspace_id = ? ORDER BY sync_run_id DESC LIMIT 1",
+            " AND sync_run_id < ? AND workspace_id = ?" + _NOT_POINT + " ORDER BY sync_run_id DESC LIMIT 1",
             (pr_id, project, repo, before_run, self.workspace_id),
         ).fetchone()
         if not row:

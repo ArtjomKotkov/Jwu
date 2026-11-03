@@ -6658,6 +6658,16 @@ def todo_cmd(
             for s_ in result["skipped"]:
                 err.print(f"[yellow]Пропущено[/yellow] {s_.get('n', '')} {s_.get('key', '')}: {s_['reason']}", highlight=False)
             return
+        if refresh_opt is not False and todo_mod.dirty(store):
+            # jwu сам менял PR/задачи — дотянуть только их, без синка
+            try:
+                svc = _service()
+                try:
+                    todo_mod.refresh_dirty(store, svc)
+                finally:
+                    svc.close()
+            except Exception as exc:  # noqa: BLE001
+                err.print(f"[dim]Точечно не обновилось: {exc}[/dim]")
         board = todo_mod.build(store, ws_id, login, session=session)
         if refresh_opt or (refresh_opt is None and board.stale):
             err.print("[dim]Обновляю данные (синк через демон)…[/dim]")

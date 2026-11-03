@@ -54,6 +54,9 @@ def test_push_new_branch_then_nothing(env, monkeypatch):
     assert str(e.value) == e.value.reason and str(e.value)   # не пустая ошибка, если отказ всплывёт
     res = jobspace.push_worktree(store, job, user_approved=True)
     assert res["pushed"] and "APP-1-fix" in git("branch", "--list", "APP-1-fix", cwd=remote)
+    from jwu.core import todo
+
+    assert any(d["kind"] == "branch" and d["branch"] == "APP-1-fix" for d in todo.dirty(store))   # доска дотянет PR
     assert jobspace.push_worktree(store, job, user_approved=True)["commits"] == []
     (wt / "c.txt").write_text("dirty")
     with pytest.raises(jobspace.JobSpaceError, match="незакоммиченное"):
