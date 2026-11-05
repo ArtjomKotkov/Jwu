@@ -467,3 +467,45 @@ def test_jobs_on_uses_local_day_not_utc(store):
     assert [r["id"] for r in rows] == [job.id] and rows[0]["today"][0].startswith("01:30 [phase]")
     assert store.jobs_on("2026-11-01", plus7) == []
     assert [r["id"] for r in store.jobs_on("2026-11-01", ZoneInfo("Europe/Moscow"))] == [job.id]   # 21:30 МСК
+
+
+def test_mention_merged_into_task_item_and_goal(store):
+    """Упоминание по задаче, которая уже на доске, — не второй пункт, а коммент к её пункту;
+    вернули в работу + ждут ответа — цель «Разбор возврата QA»."""
+    from jwu.core.models import Mention
+
+    run = store.start_sync_run(["mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-16", summary="Вернули", status="Selected for Development"), ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 1})
+    store.add_mentions([
+        Mention(task_key="AB-16", comment_id="9", author="QA", text="[~me] не работает", created="2026-11-05T05:00:00+00:00"),
+        Mention(task_key="AB-99", comment_id="7", author="PM", text="[~me] глянь", created="2026-11-05T05:00:00+00:00",
+                summary="Чужая")])
+    board = todo.build(store, store.workspace_id, "me", session="A")
+    rows = [(i.group, i.key) for i in board.items]
+    assert rows.count(("todo", "AB-16")) == 1 and ("reply", "AB-16 ↩") not in rows
+    assert ("reply", "AB-99 ↩") in rows                                  # задачи нет на доске — своя строка
+    item = next(i for i in board.items if i.key == "AB-16")
+    assert item.reply.startswith("QA:") and "↩ QA" in todo.render_md(board)
+    res = todo.take(store, store.workspace_id, "me", numbers=[item.n], session="A", keys=["AB-16"])
+    assert res["taken"][0]["goal"] == "Разбор возврата QA"
+
+
+def test_taken_via_other_item_and_asked_number(store):
+    """Два пункта одной задачи (два PR): взят один — у второго «через №N»; в ответе — запрошенный номер."""
+    _seed(store)
+    run = store.start_sync_run(["prs:mine"])
+    store.save_pr_snapshot(run, _pr(1, "AB-1: конфликт", conflicted=True, failed=True), ["mine"])
+    store.save_pr_snapshot(run, _pr(5, "AB-1: вторая ветка", needs_work=True), ["mine"])
+    store.finish_sync_run(run, {"prs:mine": 2})
+    shown = todo.build(store, store.workspace_id, "me", session="A")
+    n = {i.key: i.n for i in shown.items}
+    # пока смотрели, доска поменялась: AB-3 взяли и он уехал вниз «правок» — P/r#5 на свежей доске выше
+    todo.take(store, store.workspace_id, "me", numbers=[n["AB-3"]], session="Other", shown_by="A")
+    res = todo.take(store, store.workspace_id, "me", numbers=[n["P/r#5"]], session="A", keys=["P/r#5"])
+    assert res["taken"][0]["n"] == n["P/r#5"]
+    fresh = todo.build(store, store.workspace_id, "me", session="B")
+    first = next(i for i in fresh.items if i.key == "P/r#1")
+    second = next(i for i in fresh.items if i.key == "P/r#5")
+    assert first.taken["via"] == second.n and "через №" in todo.render_md(fresh)
+    assert "via" not in second.taken

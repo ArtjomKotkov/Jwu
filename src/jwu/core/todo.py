@@ -76,6 +76,7 @@ class Item:
     taken: Optional[dict] = None    # {"job_id", "since", "ago", "session"}
     priority: str = ""
     fresh: str = ""                 # данные пункта обновлены jwu после синка — когда (ЧЧ:ММ)
+    reply: str = ""                 # к пункту приклеено непрочитанное упоминание по той же задаче
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -138,13 +139,14 @@ def _taken_index(store: "Store") -> tuple[dict[str, "Job"], dict[tuple, "Job"]]:
 def _taken(job: Optional["Job"]) -> Optional[dict]:
     if job is None:
         return None
-    session = ""
+    session = via = ""
     for rec in job.records:
         if rec.text.startswith(SESSION_MARK):
-            m = re.match(rf"{SESSION_MARK}\s*«([^»]*)»", rec.text)
+            m = re.match(rf"{SESSION_MARK}\s*«([^»]*)»(?::\s*(.+?)\s+—)?", rec.text)
             session = m.group(1) if m else ""
+            via = (m.group(2) or "") if m else ""
     return {"job_id": job.id, "since": job.created_at, "ago": fmt_ago(job.created_at),
-            "session": session, "title": job.title}
+            "session": session, "title": job.title, "via_key": via}
 
 
 BUILD_REQUIRED_SETTING = "todo.build.required"
@@ -324,6 +326,11 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                               _prio(i.priority), i.key))
     for n, item in enumerate(items, 1):
         item.n = n
+    by_item_key = {i.key: i.n for i in items}
+    for item in items:
+        via = (item.taken or {}).get("via_key", "")
+        if via and via != item.key and via in by_item_key:
+            item.taken["via"] = by_item_key[via]      # взято другим пунктом той же задачи
     _mark_fresh(store, items, last_pass=store.get_meta(LAST_PASS_META) or "")
     pr_urls = {(pr.project, pr.repository, pr.id): pr.url
                for scope in ("mine", "review") for pr in store.latest_prs(scope) if pr.url}
@@ -438,10 +445,16 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
     for task_key, ms in seen_keys.items():
         last = ms[-1]
         text = " ".join((last.text or "").split())
+        said = f"{last.author}: {text[:70]}" + (f" (+{len(ms) - 1})" if len(ms) > 1 else "")
+        same = [i for i in items if i.issue_key == task_key and i.group not in ("duty", "close")]
+        if same:
+            # задача уже на доске — коммент к её пункту, а не второй пункт той же задачи
+            for item in same:
+                item.problems.append(f"↩ {said}")
+                item.reply = said
+            continue
         items.append(Item(n=0, group="reply", key=f"{task_key} ↩", title=last.summary or task_key,
-                          issue_key=task_key,
-                          problems=[f"{last.author}: {text[:70]}" + (f" (+{len(ms) - 1})" if len(ms) > 1 else "")],
-                          taken=_taken(by_key.get(task_key))))
+                          issue_key=task_key, problems=[said], taken=_taken(by_key.get(task_key))))
 
     # 🧹 работа открыта, а задача закрыта или ушла от меня
     all_prs = {(pr.project, pr.repository, pr.id): pr for pr in store.latest_prs()}
@@ -708,6 +721,8 @@ def _goal(item: Item) -> str:
         return f"Довести{pr}: апрувы собраны"
     if item.group == "reply":
         return "Ответить на упоминание"
+    if item.group == "todo" and item.reply:
+        return "Разбор возврата QA"      # вернули в работу и ждут ответа — jwu-qa-triage
     return "Сделать задачу"
 
 
@@ -737,6 +752,7 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
     if expected and len(expected) != len(numbers):
         raise ValueError(f"keys: нужно столько же ключей, сколько номеров ({len(numbers)})")
     skipped: list[dict] = []
+    asked_n: dict[str, int] = {}      # ключ → номер, которым его попросили (в ответе — он, а не новый)
     if numbers:
         by_n = {row["n"]: row for row in shown}
         for idx, n in enumerate(numbers):
@@ -750,6 +766,7 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
                                 f"№{n} на показанной доске — {row['key']}, а не {want}: покажи доску заново"})
                 continue
             wanted_keys.append(row["key"])
+            asked_n.setdefault(row["key"], n)
     if group:
         wanted_keys += [i.key for i in board.items if i.group == group and i.taken is None]
     items = {i.key: i for i in board.items}
@@ -760,10 +777,10 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
     for key in [k for k in dict.fromkeys(wanted_keys) if items.get(k) and items[k].group == "duty"]:
         item = items[key]
         if item.taken:
-            skipped.append({"key": key, "n": item.n, "reason": f"уже взято сессией «{item.taken['session']}», {item.taken['ago']}"})
+            skipped.append({"key": key, "n": asked_n.get(key, item.n), "reason": f"уже взято сессией «{item.taken['session']}», {item.taken['ago']}"})
             continue
         q = question_take(store, key, session=session)
-        taken.append({"n": item.n, "key": key, "group": "duty", "job_id": q["job_id"],
+        taken.append({"n": asked_n.get(key, item.n), "key": key, "group": "duty", "job_id": q["job_id"],
                       "goal": item.title, "issue_key": "", "pr": None})
     wanted_keys = [k for k in wanted_keys if not (items.get(k) and items[k].group == "duty")]
     conn = store.conn
@@ -777,16 +794,16 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
                 skipped.append({"key": key, "reason": "больше не требует действия (синк обновился)"})
                 continue
             if item.group == "close":
-                skipped.append({"key": key, "n": item.n, "reason": f"это закрытие работы {key}: «закрой работу {key}» (jwu-close-job)"})
+                skipped.append({"key": key, "n": asked_n.get(key, item.n), "reason": f"это закрытие работы {key}: «закрой работу {key}» (jwu-close-job)"})
                 continue
             job = (by_pr.get((item.pr["project"], item.pr["repo"], item.pr["id"])) if item.pr else None) \
                 or (by_key.get(item.issue_key) if item.issue_key else None)
             if item.issue_key and item.issue_key in claimed:
-                skipped.append({"key": key, "n": item.n, "reason": "та же задача уже взята этим запуском"})
+                skipped.append({"key": key, "n": asked_n.get(key, item.n), "reason": "та же задача уже взята этим запуском"})
                 continue
             if job is not None:
                 info = _taken(job)
-                skipped.append({"key": key, "n": item.n, "reason": "уже взято"
+                skipped.append({"key": key, "n": asked_n.get(key, item.n), "reason": "уже взято"
                                 + (f" сессией «{info['session']}»" if info["session"] else "")
                                 + f", {info['ago']}", "job_id": job.id})
                 continue
@@ -809,7 +826,7 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
                 (job_id, f"{SESSION_MARK} «{session or 'без имени'}»: {item.key} — {', '.join(item.problems)}", _iso()))
             if item.issue_key:
                 claimed.add(item.issue_key)
-            taken.append({"n": item.n, "key": key, "group": item.group, "job_id": job_id,
+            taken.append({"n": asked_n.get(key, item.n), "key": key, "group": item.group, "job_id": job_id,
                           "goal": _goal(item), "issue_key": item.issue_key, "pr": item.pr})
         conn.commit()
     except Exception:
@@ -852,7 +869,8 @@ def _taken_cell(item: Item) -> str:
     if not item.taken:
         return "свободно"
     who = f"«{item.taken['session']}»" if item.taken["session"] else f"работа #{item.taken['job_id']}"
-    cell = f"⏳ {who}, {item.taken['ago']}"
+    via = f" (через №{item.taken['via']})" if item.taken.get("via") else ""
+    cell = f"⏳ {who}{via}, {item.taken['ago']}"
     state = _SESSIONS_SEEN.get(item.taken["session"]) if item.taken["session"] else None
     if state is not None and not state.get("alive"):
         cell += f" 💤 сессия молчит ({state.get('seen_ago', '')})"
@@ -920,7 +938,9 @@ def _row(group: str, i: Item) -> list[str]:
         return [str(i.n), key_md, _cell(i.title, 50), _cell(", ".join(i.problems), 80), _taken_cell(i)]
     if group == "move":
         build = next((p[len("сборка: "):] for p in i.problems if p.startswith("сборка: ")), "—")
-        return [str(i.n), pr_md, key_md, _title(i), _cell(i.status), _cell(build), _cell(i.problems[-1]), _taken_cell(i)]
+        nxt = next((p for p in reversed(i.problems) if not p.startswith("↩ ")), "")
+        nxt += f" · ↩ {i.reply}" if i.reply else ""
+        return [str(i.n), pr_md, key_md, _title(i), _cell(i.status), _cell(build), _cell(nxt), _taken_cell(i)]
     if group == "close":
         return [str(i.n), f"**{i.key}**", key_md, _cell(", ".join(i.problems))]
     if group == "duty":
@@ -935,7 +955,8 @@ def _row(group: str, i: Item) -> list[str]:
     if group == "fixes":
         return [str(i.n), pr, key, _title(i), _prio_cell(i), _cell(i.status), problems, _taken_cell(i)]
     if group == "todo":
-        status = _cell(i.status) + (" ⚠️ нет в настройках доски" if i.problems else "")
+        status = _cell(i.status) + (" ⚠️ нет в настройках доски" if any("не из настроек доски" in p for p in i.problems) else "")
+        status += f" · ↩ {_cell(i.reply, 60)}" if i.reply else ""
         return [str(i.n), key, _title(i), _prio_cell(i), status, _taken_cell(i)]
     if group == "demo":
         return [str(i.n), key, _title(i), _prio_cell(i), _cell(i.status), _cell("; ".join(i.problems)) or "—", _taken_cell(i)]
