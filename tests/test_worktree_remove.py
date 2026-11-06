@@ -208,3 +208,51 @@ def test_cli_rule_with_worktree_op(env, monkeypatch):
     r = run("policy", "check", "worktree", "--repo", "dndeck/dndeck", "--branch", "main", "--where", "main")
     text = " ".join(r.output.split())
     assert "allow" in text and "main владельца" in text
+
+
+def test_removes_tree_locked_by_claude_code(env):
+    store, repo, _ = env
+    path = agent_tree(repo, "agent-locked")
+    reason = "claude agent agent-locked (pid 1 start Thu Nov  5 08:39:28 2026)"
+    sh(repo, "worktree", "lock", "--reason", reason, str(path))
+    res = go.worktree_remove(store, str(path), user_approved=True)
+    assert res["ok"] and not path.exists() and res["unlocked"] == reason
+    assert "agent-locked" not in sh(repo, "worktree", "list") and res["backup"]["files"] == 3
+
+
+def test_harness_tree_locked_without_reason_is_unlocked(env):
+    store, repo, _ = env
+    path = agent_tree(repo, "agent-bare")
+    sh(repo, "worktree", "lock", str(path))
+    res = go.worktree_remove(store, str(path), user_approved=True)
+    assert res["ok"] and not path.exists() and res["unlocked"] == "без причины"
+
+
+def test_foreign_lock_refused_before_backup(env):
+    store, repo, _ = env
+    path = agent_tree(repo, "agent-held")
+    sh(repo, "worktree", "lock", "--reason", "на флешке", str(path))
+    with pytest.raises(go.GitOpError, match="не Claude Code.*на флешке"):
+        go.worktree_remove(store, str(path), user_approved=True)
+    assert path.exists() and "agent-held" in sh(repo, "worktree", "list")
+    assert not sh(repo, "for-each-ref", "refs/jwu/backup/")
+
+
+def test_job_cleanup_unlocks_claude_lock_only(env):
+    from jwu.core import jobspace
+
+    store, repo, tmp = env
+    held, ours = tmp / "jobs" / "app-job8", tmp / "jobs" / "app-job9"
+    jobs = {}
+    for p, b in ((held, "PROJ-8"), (ours, "PROJ-9")):
+        sh(repo, "worktree", "add", "-q", "-b", b, str(p))
+        jobs[p] = store.create_job(b).id
+        store.add_job_resource(jobs[p], "worktree", str(p), {"repo": str(repo), "branch": b})
+    sh(repo, "worktree", "lock", "--reason", "claude agent agent-y (pid 1 start x)", str(ours))
+    sh(repo, "worktree", "lock", "--reason", "держу", str(held))
+    runner = lambda cmd: (1, "") if cmd[0] == "docker" else go._run(cmd)  # noqa: E731
+    rep = jobspace.cleanup(store, jobs[ours], force=True, runner=runner)
+    assert not ours.exists() and not rep.errors
+    rep = jobspace.cleanup(store, jobs[held], force=True, runner=runner)
+    assert held.exists() and go.tree_lock(str(repo), str(held)) == "держу"
+    assert any("не Claude Code" in e and "держу" in e for e in rep.errors)

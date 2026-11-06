@@ -437,6 +437,13 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
         if dry_run:
             done(None, f"копия {path}" + (f" (с потерей: {', '.join(reasons)})" if reasons else ""))
             continue
+        from . import gitops
+
+        try:
+            gitops.release_claude_lock(repo or path, path, runner)
+        except gitops.GitOpError as exc:
+            report.errors.append(f"копия {exc}")
+            continue
         cmd = ["git", "-C", repo or path, "worktree", "remove"] + (["--force"] if force else []) + [path]
         code, out = runner(cmd)
         if code == 0:

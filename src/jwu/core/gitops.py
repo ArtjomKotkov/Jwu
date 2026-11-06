@@ -586,6 +586,61 @@ def _linked_trees(ctx: Ctx) -> dict[str, str]:
     return out
 
 
+CLAUDE_LOCK = re.compile(r"^claude agent\b")      # замок harness: «claude agent agent-<id> (pid … start …)»
+
+
+def tree_lock(repo: str, path: str, runner: Runner = _run) -> Optional[str]:
+    """Причина git-замка копии (``''`` — замок без причины); ``None`` — не заблокирована."""
+    want = str(Path(path).resolve())
+    cur, lock = "", None
+    code, out = runner(["git", "-C", repo, "worktree", "list", "--porcelain"])
+    for line in out.splitlines() if code == 0 else []:
+        if line.startswith("worktree "):
+            if cur == want:
+                break
+            cur, lock = str(Path(line[9:]).resolve()), None
+        elif cur and (line == "locked" or line.startswith("locked ")):
+            lock = _unquote(line[7:].strip())
+    return lock if cur == want else None
+
+
+def _unquote(text: str) -> str:
+    """Строка porcelain в C-кавычках (git так пишет не-ASCII: ``"\\320\\264…"``) → как есть."""
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    import codecs
+
+    return codecs.escape_decode(text[1:-1].encode())[0].decode("utf-8", "replace")
+
+
+def claude_lock(repo: str, path: str, runner: Runner = _run) -> Optional[str]:
+    """Замок, который jwu вправе снять перед уборкой копии; ``None`` — замка нет.
+
+    Claude Code вешает на копию субагента замок «claude agent …» с pid своей сессии и не
+    снимает его, пока сессия жива (днями), — ``worktree remove --force`` на нём падает.
+    Снимаем замок harness (по причине) и замок без причины на копии в ``.claude/worktrees/``;
+    чужой замок с иной причиной — отказ: копию кто-то держит намеренно.
+    """
+    lock = tree_lock(repo, path, runner)
+    if lock is None:
+        return None
+    harness_place = str(Path(path).resolve()).startswith(str(Path(repo).resolve() / AGENT_TREES) + "/")
+    if CLAUDE_LOCK.match(lock) or (not lock and harness_place):
+        return lock
+    raise GitOpError(f"{path}: копия заблокирована не Claude Code (git worktree lock: «{lock or 'без причины'}») — "
+                     "не трогаю; сними замок сам (git worktree unlock), если копия больше не нужна")
+
+
+def release_claude_lock(repo: str, path: str, runner: Runner = _run) -> Optional[str]:
+    """Снять замок Claude Code с копии (см. ``claude_lock``); вернуть его причину или ``None``."""
+    lock = claude_lock(repo, path, runner)
+    if lock is not None:
+        code, out = runner(["git", "-C", repo, "worktree", "unlock", str(path)])
+        if code != 0:
+            raise GitOpError(f"{path}: git worktree unlock: {out.strip()[-300:]}")
+    return lock
+
+
 def allowed_place(store: "Store", repo_root: str, path: Path) -> bool:
     """Копия лежит там, где jwu может её убирать: ``.claude/worktrees/`` репо или каталог работ."""
     from . import jobspace
@@ -639,6 +694,7 @@ def worktree_remove(store: "Store", path: str, *, delete_branch: bool = True, us
     if not allowed_place(store, ctx.root, real):
         raise GitOpError(f"{path}: убираю только копии в {AGENT_TREES}/ репозитория и в каталоге работ jwu")
     branch = trees[str(real)]
+    lock = claude_lock(ctx.root, str(real), runner)     # чужой замок — отказ до бэкапа и вопроса
     gate(ctx, "worktree", user_approved=user_approved, detail=f"убрать копию {real.name}"
          + (f" и ветку {branch}" if delete_branch and branch else ""))
 
@@ -664,6 +720,8 @@ def worktree_remove(store: "Store", path: str, *, delete_branch: bool = True, us
     _prune_backups(ctx)
     _prune_patches(ctx.policy.backup_days)
 
+    if lock is not None:
+        ctx.git("worktree", "unlock", str(real))
     ctx.git("worktree", "remove", "--force", str(real))
     ctx.git("worktree", "prune", check=False)
     files = len([ln for ln in patch_text.splitlines() if ln.startswith("diff --git")])
@@ -671,6 +729,8 @@ def worktree_remove(store: "Store", path: str, *, delete_branch: bool = True, us
               "backup": {"ref": ref, "patch": patch, "files": files, "keep_days": ctx.policy.backup_days,
                          "restore": (f"git apply --index {patch}" if patch else "")
                          or (f"git stash apply {ref}" if ref else "")}}
+    if lock is not None:
+        result["unlocked"] = lock or "без причины"
     if delete_branch and branch and branch != ctx.branch:
         try:
             if not HARNESS_BRANCH.match(branch):
@@ -682,5 +742,6 @@ def worktree_remove(store: "Store", path: str, *, delete_branch: bool = True, us
         except GitOpError as exc:
             result["branch_error"] = str(exc)
     _record(ctx, f"убрал копию {real.name}" + (f" и ветку {branch}" if result["branch_deleted"] else "")
+            + (f"; снял замок Claude Code ({result['unlocked']})" if lock is not None else "")
             + (f"; бэкап {ref}" if ref else ""))
     return result

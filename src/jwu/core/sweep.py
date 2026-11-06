@@ -271,6 +271,13 @@ def apply(store: "Store", groups: Iterable[str], *, force: bool = False,
             code, common = runner(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"])
             if code == 0 and common.strip():
                 main_repo = str(Path(common.strip().splitlines()[-1]).parent)
+                from . import gitops
+
+                try:
+                    gitops.release_claude_lock(main_repo, path, runner)
+                except gitops.GitOpError as exc:
+                    errors.append(str(exc))
+                    continue
                 code, out = runner(["git", "-C", main_repo, "worktree", "remove"] + (["--force"] if force else []) + [path])
                 runner(["git", "-C", main_repo, "worktree", "prune"])
                 if code != 0:

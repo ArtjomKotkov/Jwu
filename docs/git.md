@@ -157,8 +157,12 @@ ops = { push = "deny", commit = "deny" }   # только читать
    неотслеживаемое) в `<данные jwu>/git-backups/<репо>/` и ссылка
    `refs/jwu/backup/<время>-worktree-<имя>`, хранятся `backup_days`; вернуть —
    `git apply --index <патч>` или `git stash apply <ссылка>`;
-4. `git worktree remove --force`, `git worktree prune`;
-5. ветка копии: служебная `worktree-*` уходит вместе с копией; другая (ветка работы) — только
+4. замок копии: Claude Code вешает на копию субагента замок «claude agent … (pid …)» и не
+   снимает его, пока жива сессия, — jwu снимает его (`git worktree unlock`, в ответе — `unlocked`).
+   Замок без причины на копии в `.claude/worktrees/` снимается так же. Чужой замок (с другой
+   причиной) — отказ с причиной, копия и бэкап не трогаются. Так же — `jwu_sweep` и `jwu_job_cleanup`;
+5. `git worktree remove --force`, `git worktree prune`;
+6. ветка копии: служебная `worktree-*` уходит вместе с копией; другая (ветка работы) — только
    по решению `delete_branch` для неё самой (не пустили — копия убрана, ветка осталась).
 
 `path` = корень репозитория — только `prune`. `jwu_sweep` находит копии субагентов, не
