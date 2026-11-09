@@ -155,8 +155,9 @@ Actions; для репозиториев организации Resource owner �
 
 ## Данные: БД, бэкап, память
 
-БД раз в день бэкапится в `~/.local/share/jwu/backups/` и, если файл больше 256 МБ, чистит
-снапшоты старше 30 дней (`jwu db stats|prune [--apply] [--vacuum]|vacuum`).
+БД раз в день бэкапится в `~/.local/share/jwu/backups/` и, если файл больше 64 МБ, чистит
+снапшоты старше 3 дней (`jwu db stats|prune [--apply] [--vacuum]|vacuum`). Читаются только
+последний снапшот каждой задачи и PR и прогоны, на которых держатся дельты, — их чистка не трогает.
 
 ```bash
 jwu backup [--out ~/Desktop] [--no-secrets]  # tar.gz: БД, config, проектные скиллы/агенты, RESTORE.md;

@@ -179,8 +179,11 @@ def _sqlite_copy(db_file: Path, dest: Path) -> None:
 
 # Порог, ниже которого чистку не запускаем вовсе: на маленькой базе снапшоты никому
 # не мешают, а необратимая операция без нужды — плохой размен.
-AUTO_PRUNE_MIN_BYTES = 256 * 1024 * 1024
-AUTO_PRUNE_DAYS = 30
+AUTO_PRUNE_MIN_BYTES = 64 * 1024 * 1024
+# Синк пишет полный снапшот каждой задачи и PR на каждом проходе, а читаются только
+# свежайший по сущности и защищённые прогоны (их чистка не трогает): история старше пары
+# дней никому не нужна, а за 30 дней набегал гигабайт.
+AUTO_PRUNE_DAYS = 3
 # VACUUM пересобирает файл целиком (для гигабайта — десятки секунд и двойной объём
 # на диске), поэтому только когда освободилось действительно много.
 VACUUM_MIN_FREE_RATIO = 0.25
@@ -219,14 +222,15 @@ def run_daily_prune(
     if store.db_size() < min_bytes:
         return []
     today = date.today().isoformat()
-    if store.get_meta(_PRUNE_META_KEY) == today:
+    stamp = f"{today}:{days}"                   # срок поменялся — сегодня чистим ещё раз
+    if store.get_meta(_PRUNE_META_KEY) == stamp:
         return []
     bdir = backups_dir or (data_dir() / "backups")
     if not (bdir / f"{db_file.name}.bak-{today}").exists():
         return ["чистку снапшотов пропустил: сегодняшнего бэкапа БД нет"]
 
     reports = store.prune_all_workspaces(days=days, dry_run=False)
-    store.set_meta(_PRUNE_META_KEY, today)
+    store.set_meta(_PRUNE_META_KEY, stamp)
     removed = sum(r.total for r in reports.values())
     if not removed:
         return []

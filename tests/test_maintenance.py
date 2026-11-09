@@ -215,3 +215,24 @@ def test_backup_includes_wal_content(tmp_path):
         live.close()
     bak = next((tmp_path / "backups").glob("state.db.bak-*"))
     assert sqlite3.connect(bak).execute("SELECT x FROM t").fetchall() == [(42,)]
+
+
+def test_daily_prune_keeps_three_days_and_reruns_on_new_term(tmp_path):
+    """По умолчанию — 3 дня; отметка «сегодня чистили» со старым сроком не мешает новому."""
+    from jwu.core import maintenance
+    from jwu.core.maintenance import run_daily_prune
+
+    assert maintenance.AUTO_PRUNE_DAYS == 3
+    db = tmp_path / "state.db"
+    store = _store_with_old_snapshots(db)
+    store.conn.execute("UPDATE issue_snapshots SET fetched_at = datetime('now', '-4 days')")
+    store.conn.commit()
+    bdir = tmp_path / "backups"
+    bdir.mkdir()
+    (bdir / f"state.db.bak-{date.today().isoformat()}").write_text("x")
+    store.set_meta("last_prune", date.today().isoformat())     # сегодня уже чистили со сроком 30
+    msgs = run_daily_prune(store, db, backups_dir=bdir, min_bytes=0)
+    assert msgs and "старше 3 дн." in msgs[0]
+    assert store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == 1   # свежайший остался
+    assert run_daily_prune(store, db, backups_dir=bdir, min_bytes=0) == []
+    store.close()
