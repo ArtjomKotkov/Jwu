@@ -622,3 +622,32 @@ def test_needs_work_and_no_reviewers_are_not_approved(store):
 def test_review_prs_do_not_fire_readiness(store):
     _run(store, _pr_state({"a": False}), views=("review",))
     assert _run(store, _pr_state({"a": True}), views=("review",)) == []                 # чужой PR — не моё событие
+
+
+def test_store_uses_wal(tmp_path):
+    s = Store(tmp_path / "w.db")
+    try:
+        assert s.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        s.close()
+
+
+def test_settle_releases_stuck_transaction(tmp_path):
+    """Запись, упавшая посреди транзакции, не держит БД: settle_all откатывает её."""
+    import sqlite3 as _sq
+
+    db = tmp_path / "s.db"
+    stuck = Store(db)
+    stuck.conn.execute("INSERT INTO meta (key, value) VALUES ('x', '1')")    # без commit
+    other = _sq.connect(db, timeout=0.1)
+    with pytest.raises(_sq.OperationalError, match="locked"):
+        other.execute("INSERT INTO meta (key, value) VALUES ('y', '2')")
+    assert Store.settle_all(ok=False) >= 1 and not stuck.conn.in_transaction
+    other.execute("INSERT INTO meta (key, value) VALUES ('y', '2')")
+    other.commit()
+    assert stuck.get_meta("x") is None and stuck.get_meta("y") == "2"
+    stuck.conn.execute("INSERT INTO meta (key, value) VALUES ('z', '3')")
+    Store.settle_all(ok=True)                                # вызов прошёл — дописываем
+    assert other.execute("SELECT value FROM meta WHERE key='z'").fetchone() == ("3",)
+    other.close()
+    stuck.close()

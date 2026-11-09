@@ -165,3 +165,53 @@ def test_backups_keep_three_and_prune_even_without_new_backup(tmp_path):
     assert maintenance.run_daily_maintenance(db, backups_dir=bdir) == []
     left = sorted(p.name for p in bdir.iterdir())
     assert len(left) == maintenance.DAILY_BACKUPS_KEEP == 3 and today.name in left
+
+
+def test_leaked_pages_do_not_block_backup(tmp_path):
+    """«Page N: never used» — потерянные пустые страницы, не данные: копию делаем, предупреждаем."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE t (x BLOB)")
+    con.executemany("INSERT INTO t VALUES (?)", [(b"x" * 3000,) for _ in range(20)])
+    con.commit()
+    con.execute("DELETE FROM t")
+    con.commit()
+    con.close()
+    raw = bytearray(db.read_bytes())
+    assert int.from_bytes(raw[36:40], "big") > 0          # есть свободные страницы
+    raw[32:40] = bytes(8)                                  # «забыть» список свободных → never used
+    db.write_bytes(bytes(raw))
+    bdir = tmp_path / "backups"
+    msgs = run_daily_maintenance(db, backups_dir=bdir)
+    assert any("потерянных пустых страниц" in m for m in msgs) and any("бэкап БД" in m for m in msgs)
+    assert len(list(bdir.glob("state.db.bak-*"))) == 1
+
+
+def test_locked_db_is_busy_not_corrupt(tmp_path):
+    db = tmp_path / "state.db"
+    _make_db(db)
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        msgs = run_daily_maintenance(db, backups_dir=tmp_path / "backups")
+    finally:
+        holder.rollback()
+        holder.close()
+    assert any("занята другим процессом" in m for m in msgs)
+    assert not any("поврежден" in m for m in msgs)
+
+
+def test_backup_includes_wal_content(tmp_path):
+    db = tmp_path / "state.db"
+    _make_db(db)
+    live = sqlite3.connect(db)
+    live.execute("PRAGMA journal_mode=WAL")
+    live.execute("PRAGMA wal_autocheckpoint=0")
+    live.execute("INSERT INTO t VALUES (42)")
+    live.commit()                                          # строка пока только в -wal
+    try:
+        run_daily_maintenance(db, backups_dir=tmp_path / "backups")
+    finally:
+        live.close()
+    bak = next((tmp_path / "backups").glob("state.db.bak-*"))
+    assert sqlite3.connect(bak).execute("SELECT x FROM t").fetchall() == [(42,)]

@@ -15,6 +15,8 @@ import json
 import re
 import sqlite3
 import sys
+import threading
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -601,17 +603,69 @@ _NOT_POINT = " AND sync_run_id NOT IN (SELECT id FROM sync_runs WHERE views = '[
 
 
 class Store:
+    # Все открытые Store процесса — чтобы долгоживущий процесс (MCP-сервер) мог закрыть
+    # незавершённую транзакцию после каждого вызова (см. ``settle_all``).
+    _open: "weakref.WeakSet[Store]" = weakref.WeakSet()
+
     def __init__(self, path: str | Path, workspace_id: int | None = None) -> None:
         self.path = str(path)
         self.migration_notes: list[str] = []
         # timeout: демон пишет из двух потоков (синк и бот) — ждём блокировку, а не падаем
         self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
+        self._thread = threading.get_ident()
+        self._use_wal()
         self.conn.executescript(SCHEMA)
         self._restrict_permissions()
         self._migrate()
         self.conn.commit()
         self.workspace_id = workspace_id or self._default_workspace_id()
+        Store._open.add(self)
+
+    def _use_wal(self) -> None:
+        """Журнал WAL: чтение не ждёт запись, а запись — чтение.
+
+        В режиме rollback запись, застрявшая на коммите, держит блокировку, при которой не
+        читает никто — ни демон, ни другие сессии. Переключение разовое (режим хранится
+        в файле); не вышло (БД занята, ФС без shared memory) — работаем как раньше.
+        """
+        if self.path == ":memory:":
+            return
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
+
+    def settle(self, ok: bool = True) -> bool:
+        """Закрыть незавершённую транзакцию: ``ok`` — дописать, иначе (или коммит не прошёл) — откатить.
+
+        Запись, упавшая посреди транзакции (исключение до ``commit`` или сам ``commit`` на
+        «database is locked»), иначе держит блокировку БД, пока жив процесс, — у MCP-сервера
+        это дни. Вернёт True, если транзакция была.
+        """
+        if threading.get_ident() != self._thread:
+            return False                       # соединение чужого потока не трогаем
+        try:
+            if not self.conn.in_transaction:
+                return False
+        except sqlite3.ProgrammingError:       # уже закрыто
+            return False
+        if ok:
+            try:
+                self.conn.commit()
+                return True
+            except sqlite3.Error:
+                pass
+        try:
+            self.conn.rollback()
+        except sqlite3.Error:
+            pass
+        return True
+
+    @classmethod
+    def settle_all(cls, ok: bool = True) -> int:
+        """``settle`` у всех открытых Store этого потока; вернёт, у скольких была транзакция."""
+        return sum(1 for store in list(cls._open) if store.settle(ok))
 
     def _restrict_permissions(self) -> None:
         """0600 на файлы БД: в ней лежат секреты воркспейсов в открытом виде.
@@ -696,6 +750,7 @@ class Store:
             print(note, file=sys.stderr)
 
     def close(self) -> None:
+        Store._open.discard(self)
         self.conn.close()
 
     def __enter__(self) -> "Store":
@@ -1681,6 +1736,7 @@ class Store:
         self.conn.isolation_level = None  # VACUUM нельзя выполнить внутри транзакции
         try:
             self.conn.execute("VACUUM")
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # в WAL новое лежит в -wal — сбросить в файл
         finally:
             self.conn.isolation_level = previous
         return max(0, before - self.db_size())

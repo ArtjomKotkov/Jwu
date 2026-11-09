@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
 import os
 from pathlib import Path
 from typing import Optional
@@ -68,6 +69,36 @@ mcp = FastMCP("jwu", instructions=(
     "первым; так же — «закрыть работу?». Нет такого инструмента (Cursor, Codex) — обычным текстом. "
     "Пуш — только jwu_git_push (ветка работы — jwu_git_push(job_id=…)), не git push. Тесты, сборки и прочие долгие прогоны — "
     "в фоне с таймаутом и под наблюдением: 5 минут без нового вывода — зависание, останови и разбери."))
+
+_mcp_tool = mcp.tool
+
+
+def _settled_tool(*args, **kwargs):
+    """``mcp.tool``, после которого ни одно соединение с БД не остаётся в транзакции.
+
+    Сервер живёт днями на одних и тех же соединениях: запись, упавшая посреди транзакции,
+    без этого держала блокировку БД до конца сессии — демон и другие сессии получали
+    «database is locked». Вызов прошёл — недописанное дописываем, упал — откатываем.
+    """
+    register = _mcp_tool(*args, **kwargs)
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def tool(*a, **kw):
+            ok = False
+            try:
+                result = await fn(*a, **kw)
+                ok = True
+                return result
+            finally:
+                Store.settle_all(ok)
+
+        return register(tool)
+
+    return wrap
+
+
+mcp.tool = _settled_tool
 
 # Ленивые кэши ПО воркспейсам — тут и живёт переиспользуемая сессия/соединения.
 _full: dict[int, Service] = {}    # полный сервис (Jira/Support + Bitbucket + Jenkins)

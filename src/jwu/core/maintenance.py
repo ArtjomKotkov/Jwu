@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 from datetime import date
@@ -133,18 +134,47 @@ def run_daily_maintenance(
     try:
         con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
         try:
-            row = con.execute("PRAGMA quick_check").fetchone()
+            rows = [ln for r in con.execute("PRAGMA quick_check").fetchall() for ln in str(r[0]).splitlines()]
         finally:
             con.close()
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc) or "busy" in str(exc):
+            return [f"⚠ БД занята другим процессом ({exc}); бэкап — в следующий проход"]
+        return [f"⚠ БД не читается ({exc}); бэкап не делаю — проверь iCloud-синк"]
     except sqlite3.DatabaseError as exc:
         return [f"⚠ БД повреждена ({exc}); бэкап не делаю — проверь iCloud-синк"]
-    if not row or row[0] != "ok":
-        return [f"⚠ integrity_check: {row[0] if row else '?'}; бэкап пропущен"]
+    notes = []
+    problems = [r for r in rows if r != "ok" and not _HEADER.match(r)]
+    if problems and all(_LEAKED.match(r) for r in problems):
+        # страницы, которые никто не использует, — место, а не данные: копия годная
+        notes.append(f"⚠ в БД {len(problems)} потерянных пустых страниц (не данные); "
+                     "уберёт jwu db vacuum")
+    elif problems or not rows:
+        return [f"⚠ integrity_check: {'; '.join(problems[:5]) or '?'}; бэкап пропущен"]
 
-    shutil.copy2(db_file, marker)
+    _sqlite_copy(db_file, marker)
     _restrict(marker, 0o600)
     _prune_backups(bdir, db_file.name, keep)
-    return [f"бэкап БД: {marker.name}"]
+    return notes + [f"бэкап БД: {marker.name}"]
+
+
+_HEADER = re.compile(r"^\*\*\* in database \w+ \*\*\*$")
+_LEAKED = re.compile(r"^Page \d+: never used$")
+
+
+def _sqlite_copy(db_file: Path, dest: Path) -> None:
+    """Консистентная копия БД через API бэкапа SQLite (в WAL свежее лежит в ``-wal``,
+    копия одного файла его бы потеряла)."""
+    src = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(str(dest))
+        try:
+            src.backup(dst)
+            dst.execute("PRAGMA journal_mode=DELETE")     # копия — один самодостаточный файл
+        finally:
+            dst.close()
+    finally:
+        src.close()
 
 
 # Порог, ниже которого чистку не запускаем вовсе: на маленькой базе снапшоты никому

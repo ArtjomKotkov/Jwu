@@ -543,3 +543,22 @@ def test_job_reviewer_from_settings_with_iteration_cap(fresh_server):
     assert (r["reviewer"], r["max_iterations"], r["voice_agent"]) == ("reviewer-app", 2, "voice-writer-sample")
     r = _run(srv.jwu_job_reviewer("other", workspace="work"))
     assert r["reviewer"] == "reviewer-jwu-sample"
+
+
+def test_failed_tool_does_not_leave_db_locked(fresh_server, monkeypatch):
+    """Инструмент упал посреди записи — блокировка БД не переживает вызов (раньше — до конца сессии)."""
+    import sqlite3
+
+    def broken() -> str:
+        srv._registry().conn.execute("INSERT INTO meta (key, value) VALUES ('half', '1')")
+        raise RuntimeError("упало посреди записи")
+
+    monkeypatch.setattr(srv, "_installed_version", broken)
+    with pytest.raises(RuntimeError):
+        _run(srv.jwu_version())
+    assert not srv._registry().conn.in_transaction
+    other = sqlite3.connect(fresh_server, timeout=0.1)
+    other.execute("INSERT INTO meta (key, value) VALUES ('after', '1')")
+    other.commit()
+    assert other.execute("SELECT key FROM meta WHERE key = 'half'").fetchone() is None   # откатили
+    other.close()

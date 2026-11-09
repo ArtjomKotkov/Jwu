@@ -335,7 +335,9 @@ def restore_backup(archive: Path, *, db_only: bool = False, force: bool = False,
             target_db.parent.mkdir(parents=True, exist_ok=True)
             if target_db.exists() and target_db.stat().st_size > 0:
                 keep = target_db.with_name(f"{target_db.name}.pre-restore-{date.today().isoformat()}")
-                shutil.copy2(target_db, keep)
+                from .maintenance import _sqlite_copy
+
+                _sqlite_copy(target_db, keep)          # с тем, что ещё в -wal
                 report.db_backup = str(keep)
             for suffix in ("-wal", "-shm"):
                 stale = Path(f"{target_db}{suffix}")
