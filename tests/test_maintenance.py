@@ -213,8 +213,9 @@ def test_backup_includes_wal_content(tmp_path):
         run_daily_maintenance(db, backups_dir=tmp_path / "backups")
     finally:
         live.close()
-    bak = next((tmp_path / "backups").glob("state.db.bak-*"))
-    assert sqlite3.connect(bak).execute("SELECT x FROM t").fetchall() == [(42,)]
+    baks = list((tmp_path / "backups").glob("state.db.bak-*"))
+    assert len(baks) == 1                                  # без хвостов -wal/-shm рядом
+    assert sqlite3.connect(baks[0]).execute("SELECT x FROM t").fetchall() == [(42,)]
 
 
 def test_daily_prune_keeps_three_days_and_reruns_on_new_term(tmp_path):
@@ -236,3 +237,16 @@ def test_daily_prune_keeps_three_days_and_reruns_on_new_term(tmp_path):
     assert store.conn.execute("SELECT COUNT(*) FROM issue_snapshots").fetchone()[0] == 1   # свежайший остался
     assert run_daily_prune(store, db, backups_dir=bdir, min_bytes=0) == []
     store.close()
+
+
+def test_prune_drops_sidecars_and_keeps_real_copies(tmp_path):
+    from jwu.core import maintenance
+
+    bdir = tmp_path / "b"
+    bdir.mkdir()
+    for day in ("2026-09-01", "2026-09-02", "2026-09-03"):
+        (bdir / f"state.db.bak-{day}").write_text("x")
+        (bdir / f"state.db.bak-{day}-shm").write_text("x")
+    maintenance._prune_backups(bdir, "state.db", 3)
+    assert sorted(p.name for p in bdir.iterdir()) == [
+        "state.db.bak-2026-09-01", "state.db.bak-2026-09-02", "state.db.bak-2026-09-03"]

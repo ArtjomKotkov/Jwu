@@ -172,6 +172,21 @@ def test_today_shows_only_latest_summary_of_a_job(tmp_path):
     assert "PR и 4test" in text and "починил возврат" in text
 
 
+def test_today_uses_local_day_not_worklog_tz(tmp_path):
+    """Пояс трекинга далеко от местного — «Сегодня» всё равно по часам Мака."""
+    from datetime import datetime
+
+    from jwu.core import timechain
+
+    store, ws, _ = _env(tmp_path)
+    timechain.set_timezone(store, ws.id, "Pacific/Kiritimati")       # +14 — там уже другой день
+    job = store.create_job("PROJ-1", "задача")
+    store.add_job_record(job.id, "сделал сегодня", kind="summary")
+    text = bot._cmd_today(store, ws, None)
+    assert datetime.now().strftime("%d.%m") in text and "сделал сегодня" in text
+    store.close()
+
+
 def test_poll_replies_refused_while_daemon_reads_bot(tmp_path, monkeypatch):
     """Пока демон жив, другой процесс бота не читает — иначе Telegram 409 рвёт опрос демона."""
     from jwu.core.service import Service

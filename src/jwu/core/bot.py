@@ -130,21 +130,13 @@ SUMMARY_MAX = 160
 def _cmd_today(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -> str:
     """Что делал сегодня: задачи с заголовком, текущим статусом и итогом простыми словами.
 
-    Задачи — из работ jwu с записями за сегодня (в поясе ворклогов контура). «Что делалось»
+    Задачи — из работ jwu с записями за сегодня. «Сегодня» — по поясу Мака, а не по поясу
+    ворклогов контура: тот — для Jira, а день пользователя там, где он сам. «Что делалось»
     — последний ``summary`` за сегодня у каждой работы задачи; их нет — заголовок работы.
     """
     from datetime import datetime
-    from zoneinfo import ZoneInfo
 
-    from . import timechain
-
-    tz = datetime.now().astimezone().tzinfo or ZoneInfo("UTC")   # пояс не настроен — системный
-    name = timechain.get_timezone(store, ws.id) or ""
-    if name:
-        try:
-            tz = timechain.resolve_tz(name)
-        except Exception:  # noqa: BLE001
-            pass
+    tz = datetime.now().astimezone().tzinfo
     today = datetime.now(tz).date()
 
     def local(ts: str):

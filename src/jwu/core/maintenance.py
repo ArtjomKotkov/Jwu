@@ -103,6 +103,8 @@ DAILY_BACKUPS_KEEP = 3
 
 
 def _prune_backups(bdir: Path, name: str, keep: int) -> int:
+    for stray in [*bdir.glob(f"{name}.bak-*-wal"), *bdir.glob(f"{name}.bak-*-shm")]:
+        stray.unlink(missing_ok=True)                    # хвосты копий — не копии
     old = sorted(bdir.glob(f"{name}.bak-*"))[:-keep] if keep > 0 else []
     for path in old:
         path.unlink(missing_ok=True)
@@ -175,6 +177,10 @@ def _sqlite_copy(db_file: Path, dest: Path) -> None:
             dst.close()
     finally:
         src.close()
+    # свежие SQLite оставляют пустой «-shm» и после перехода в DELETE — копии он не нужен,
+    # а чистка бэкапов приняла бы его за ещё одну копию
+    for suffix in ("-wal", "-shm"):
+        Path(f"{dest}{suffix}").unlink(missing_ok=True)
 
 
 # Порог, ниже которого чистку не запускаем вовсе: на маленькой базе снапшоты никому
