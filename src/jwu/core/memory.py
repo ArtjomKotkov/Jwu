@@ -341,7 +341,7 @@ def _import_jobs(store: "Store", jobs: list[dict], report: ImportReport) -> None
                     store.conn.execute("UPDATE job_records SET ts = ? WHERE id = ?", (rec["ts"], r.id))
             store.conn.execute(
                 "UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?",
-                (raw.get("created_at") or job.created_at, raw.get("updated_at") or job.updated_at, job.id),
+                (raw.get("created_at") or job.created_at, raw.get("updated_at") or job.updated_at, job.uid),
             )
             store.conn.commit()
             report.bump(report.added, "jobs")

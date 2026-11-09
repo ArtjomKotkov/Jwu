@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status       TEXT NOT NULL DEFAULT 'active',
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    num          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_key);
 CREATE TABLE IF NOT EXISTS local_features (
@@ -392,7 +393,7 @@ def _readiness_detail(sig: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -581,6 +582,48 @@ def _m013_git_policy(conn: sqlite3.Connection) -> None:
     ensure_schema(conn)
 
 
+def _m014_job_numbers(conn: sqlite3.Connection) -> None:
+    """v13 → v14: номер работы внутри воркспейса (``jobs.num``) вместо сквозного id.
+
+    Номер выдаёт триггер — так его получают и работы, созданные старым кодом (MCP-сервер
+    сессии живёт днями на прежней версии), и вставки мимо ``create_job``. Существующим —
+    по порядку создания в своём воркспейсе. Ссылки на работу вне её собственных таблиц
+    (очередь, допуски и журнал git) хранят номер — переводим их; журнал, PR и ресурсы
+    работы держатся за внутренний id и не меняются.
+    """
+    _add_column(conn, "jobs", "num", "INTEGER")
+    conn.execute(
+        "UPDATE jobs SET num = (SELECT COUNT(*) FROM jobs j2"
+        " WHERE j2.workspace_id = jobs.workspace_id AND j2.id <= jobs.id) WHERE num IS NULL")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_num ON jobs(workspace_id, num)")
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS jobs_num AFTER INSERT ON jobs WHEN NEW.num IS NULL BEGIN"
+        " UPDATE jobs SET num = (SELECT COALESCE(MAX(num), 0) + 1 FROM jobs"
+        " WHERE workspace_id = NEW.workspace_id) WHERE id = NEW.id; END")
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    for table in ("queue_items", "git_grants", "git_audit"):
+        if table in tables and "job_id" in _columns(conn, table):
+            conn.execute(f"UPDATE {table} SET job_id = (SELECT num FROM jobs WHERE jobs.id = {table}.job_id)"
+                         " WHERE job_id IS NOT NULL")
+    nums = {int(r[0]): int(r[1]) for r in conn.execute("SELECT id, num FROM jobs")}
+    # вопросы дежурства (meta воркспейса) и воркеры оркестратора помнят работы по id
+    for key, value in conn.execute("SELECT key, value FROM meta WHERE key LIKE 'w%:duty:questions_v2'"
+                                   " OR key LIKE 'worker:%'").fetchall():
+        try:
+            data = json.loads(value)
+        except ValueError:
+            continue
+        if key.startswith("worker:") and isinstance(data, dict):
+            data["jobs"] = [nums.get(int(j), int(j)) for j in data.get("jobs", []) if str(j).isdigit()]
+        elif isinstance(data, dict):
+            for q in data.get("items", []):
+                if str(q.get("job_id", "")).isdigit():
+                    q["job_id"] = nums.get(int(q["job_id"]), q["job_id"])
+        conn.execute("UPDATE meta SET value = ? WHERE key = ?", (json.dumps(data, ensure_ascii=False), key))
+    # показанные доски держат «#id» пунктов закрытия — пусть доску покажут заново
+    conn.execute("DELETE FROM meta WHERE key LIKE 'w%:todo:board:%'")
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (2, _m002_workspaces),
     (3, _m003_features),
@@ -594,6 +637,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (11, _m011_queue),
     (12, _m012_job_resources),
     (13, _m013_git_policy),
+    (14, _m014_job_numbers),
 ]
 
 
@@ -2318,8 +2362,10 @@ class Store:
             (task_key, title, ts, ts, self.workspace_id, feature_id),
         )
         self.conn.commit()
+        uid = int(cur.lastrowid)
+        num = self.conn.execute("SELECT num FROM jobs WHERE id = ?", (uid,)).fetchone()[0]
         feature = self.get_feature(feature_id) if feature_id else None
-        return Job(id=int(cur.lastrowid), task_key=task_key, title=title,
+        return Job(id=int(num), uid=uid, task_key=task_key, title=title,
                    status="active", created_at=ts, updated_at=ts,
                    feature_id=feature_id, feature_key=feature.key if feature else "")
 
@@ -2327,65 +2373,78 @@ class Store:
         """Обновить updated_at. БЕЗ commit — вызывающий коммитит сам."""
         self.conn.execute("UPDATE jobs SET updated_at = ? WHERE id = ?", (_now(), job_id))
 
-    def _require_own_job(self, job_id: int) -> None:
-        """Не дать писать в работу чужого воркспейса (id работ сквозные по всей БД)."""
+    def job_uid(self, job_id: int) -> int | None:
+        """Внутренний id работы по её номеру в текущем воркспейсе (None — такой нет).
+
+        Наружу (инструменты, CLI, бот, доска) работа видна номером внутри воркспейса
+        (``Job.id``); внутренний сквозной id (``Job.uid``) держит связи журнала, PR и
+        ресурсов работы и имена её папок и контейнеров.
+        """
         row = self.conn.execute(
-            "SELECT 1 FROM jobs WHERE id = ? AND workspace_id = ?", (job_id, self.workspace_id)
+            "SELECT id FROM jobs WHERE num = ? AND workspace_id = ?", (job_id, self.workspace_id)
         ).fetchone()
-        if not row:
-            slug = self.job_workspace_slug(job_id)
-            hint = f" (она в воркспейсе «{slug}»)" if slug else ""
-            raise ValueError(f"Работа #{job_id} не найдена в текущем воркспейсе{hint}.")
+        return int(row[0]) if row else None
+
+    def job_num(self, uid: int) -> int | None:
+        """Номер работы в её воркспейсе по внутреннему id."""
+        row = self.conn.execute("SELECT num FROM jobs WHERE id = ?", (uid,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def _require_own_job(self, job_id: int) -> int:
+        """Внутренний id работы с номером ``job_id`` в текущем воркспейсе — или отказ."""
+        uid = self.job_uid(job_id)
+        if uid is None:
+            raise ValueError(f"Работа #{job_id} не найдена в текущем воркспейсе.")
+        return uid
 
     def add_job_record(self, job_id: int, text: str, kind: str = "note",
                        status: str | None = None, *, branch: str = "",
                        commit: str = "") -> JobRecord:
-        self._require_own_job(job_id)
+        uid = self._require_own_job(job_id)
         ts = _now()
         cur = self.conn.execute(
             "INSERT INTO job_records (job_id, kind, text, status, ts, branch, commit_sha)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (job_id, kind, text, status, ts, branch or "", commit or ""),
+            (uid, kind, text, status, ts, branch or "", commit or ""),
         )
-        self._touch_job(job_id)
+        self._touch_job(uid)
         self.conn.commit()
         return JobRecord(id=int(cur.lastrowid), job_id=job_id, kind=kind,
                          text=text, status=status, ts=ts, branch=branch or "",
                          commit=commit or "")
 
     def link_job_pr(self, job_id: int, pr_id: int, project: str = "", repo: str = "") -> None:
-        self._require_own_job(job_id)
+        uid = self._require_own_job(job_id)
         self.conn.execute(
             "INSERT OR IGNORE INTO job_prs (job_id, pr_id, project, repo) VALUES (?, ?, ?, ?)",
-            (job_id, pr_id, project, repo),
+            (uid, pr_id, project, repo),
         )
-        self._touch_job(job_id)
+        self._touch_job(uid)
         self.conn.commit()
 
     def set_job_status(self, job_id: int, status: str) -> None:
         self.conn.execute(
-            "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?",
+            "UPDATE jobs SET status = ?, updated_at = ? WHERE num = ? AND workspace_id = ?",
             (status, _now(), job_id, self.workspace_id),
         )
         self.conn.commit()
 
     def delete_job(self, job_id: int) -> None:
         """Удалить работу вместе с записями и связями с PR (в пределах воркспейса)."""
-        row = self.conn.execute(
-            "SELECT id FROM jobs WHERE id = ? AND workspace_id = ?", (job_id, self.workspace_id)
-        ).fetchone()
-        if not row:
+        uid = self.job_uid(job_id)
+        if uid is None:
             return
-        self.conn.execute("DELETE FROM job_records WHERE job_id = ?", (job_id,))
-        self.conn.execute("DELETE FROM job_prs WHERE job_id = ?", (job_id,))
-        self.conn.execute("DELETE FROM job_resources WHERE job_id = ?", (job_id,))
-        self.conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        self.conn.execute("DELETE FROM job_records WHERE job_id = ?", (uid,))
+        self.conn.execute("DELETE FROM job_prs WHERE job_id = ?", (uid,))
+        self.conn.execute("DELETE FROM job_resources WHERE job_id = ?", (uid,))
+        self.conn.execute("DELETE FROM jobs WHERE id = ?", (uid,))
         self.conn.commit()
 
     # --- ресурсы работы ------------------------------------------------- #
 
     def add_job_resource(self, job_id: int, kind: str, ref: str, meta: dict | None = None) -> int:
         """Запомнить, что создала работа. Повтор того же (kind, ref) — не дублируется."""
+        job_id = self._require_own_job(job_id)
         row = self.conn.execute(
             "SELECT id FROM job_resources WHERE job_id = ? AND kind = ? AND ref = ? AND removed_at = ''",
             (job_id, kind, ref),
@@ -2401,11 +2460,14 @@ class Store:
         return int(cur.lastrowid)
 
     def job_resources(self, job_id: int, *, include_removed: bool = False) -> list[dict]:
+        uid = self.job_uid(job_id)
+        if uid is None:
+            return []
         sql = "SELECT * FROM job_resources WHERE job_id = ? AND workspace_id = ?"
         if not include_removed:
             sql += " AND removed_at = ''"
-        rows = self.conn.execute(sql + " ORDER BY id", (job_id, self.workspace_id)).fetchall()
-        return [{"id": int(r["id"]), "job_id": int(r["job_id"]), "kind": r["kind"], "ref": r["ref"],
+        rows = self.conn.execute(sql + " ORDER BY id", (uid, self.workspace_id)).fetchall()
+        return [{"id": int(r["id"]), "job_id": job_id, "kind": r["kind"], "ref": r["ref"],
                  "meta": json.loads(r["meta"] or "{}"), "created_at": r["created_at"],
                  "removed_at": r["removed_at"]} for r in rows]
 
@@ -2416,29 +2478,21 @@ class Store:
     def all_open_job_resources(self) -> list[dict]:
         """Неубранные ресурсы всех работ воркспейса — для подсказки, что чистить при нехватке места."""
         rows = self.conn.execute(
-            "SELECT r.*, j.status AS job_status FROM job_resources r JOIN jobs j ON j.id = r.job_id"
-            " WHERE r.workspace_id = ? AND r.removed_at = '' ORDER BY r.job_id, r.id",
+            "SELECT r.*, j.status AS job_status, j.num AS job_num FROM job_resources r"
+            " JOIN jobs j ON j.id = r.job_id"
+            " WHERE r.workspace_id = ? AND r.removed_at = '' ORDER BY j.num, r.id",
             (self.workspace_id,),
         ).fetchall()
-        return [{"id": int(r["id"]), "job_id": int(r["job_id"]), "kind": r["kind"], "ref": r["ref"],
+        return [{"id": int(r["id"]), "job_id": int(r["job_num"]), "kind": r["kind"], "ref": r["ref"],
                  "job_status": r["job_status"]} for r in rows]
 
-    def job_workspace_slug(self, job_id: int) -> str | None:
-        """В каком воркспейсе живёт работа (для подсказки «работа #N в воркспейсе X»)."""
-        row = self.conn.execute(
-            "SELECT w.slug AS slug FROM jobs j JOIN workspaces w ON w.id = j.workspace_id"
-            " WHERE j.id = ?",
-            (job_id,),
-        ).fetchone()
-        return row["slug"] if row else None
-
-    def _job_records(self, job_id: int) -> list[JobRecord]:
+    def _job_records(self, uid: int, num: int) -> list[JobRecord]:
         rows = self.conn.execute(
             "SELECT id, job_id, kind, text, status, ts, branch, commit_sha"
             " FROM job_records WHERE job_id = ? ORDER BY id",
-            (job_id,),
+            (uid,),
         ).fetchall()
-        return [JobRecord(id=r["id"], job_id=r["job_id"], kind=r["kind"], text=r["text"],
+        return [JobRecord(id=r["id"], job_id=num, kind=r["kind"], text=r["text"],
                           status=r["status"], ts=r["ts"], branch=r["branch"] or "",
                           commit=r["commit_sha"] or "") for r in rows]
 
@@ -2451,17 +2505,17 @@ class Store:
 
     def _job_from_row(self, row, *, with_records: bool) -> Job:
         keys = row.keys()
-        job = Job(id=row["id"], task_key=row["task_key"], title=row["title"],
+        job = Job(id=row["num"], uid=row["id"], task_key=row["task_key"], title=row["title"],
                   status=row["status"], created_at=row["created_at"], updated_at=row["updated_at"],
                   feature_id=row["feature_id"] if "feature_id" in keys else None,
                   feature_key=(row["feature_key"] or "") if "feature_key" in keys else "")
-        job.prs = self._job_prs(job.id)
+        job.prs = self._job_prs(job.uid)
         if with_records:
-            job.records = self._job_records(job.id)
+            job.records = self._job_records(job.uid, job.id)
         return job
 
     _JOB_COLUMNS = (
-        "j.id, j.task_key, j.title, j.status, j.created_at, j.updated_at, j.feature_id,"
+        "j.id, j.num, j.task_key, j.title, j.status, j.created_at, j.updated_at, j.feature_id,"
         " f.key AS feature_key"
     )
     _JOB_FEATURE_JOIN = " LEFT JOIN local_features f ON f.id = j.feature_id"
@@ -2469,7 +2523,7 @@ class Store:
     def get_job(self, job_id: int) -> Job | None:
         row = self.conn.execute(
             f"SELECT {self._JOB_COLUMNS} FROM jobs j{self._JOB_FEATURE_JOIN}"
-            " WHERE j.id = ? AND j.workspace_id = ?",
+            " WHERE j.num = ? AND j.workspace_id = ?",
             (job_id, self.workspace_id),
         ).fetchone()
         return self._job_from_row(row, with_records=True) if row else None

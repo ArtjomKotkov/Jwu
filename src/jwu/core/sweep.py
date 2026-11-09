@@ -58,8 +58,14 @@ def temp_root() -> Path:
 
 
 def _job_status(store: "Store") -> dict[int, str]:
-    """Статусы всех работ во всех воркспейсах (номера работ общие)."""
+    """Статусы всех работ во всех воркспейсах — по внутреннему id: им помечены docker и папки копий."""
     return {int(r["id"]): r["status"] for r in store.conn.execute("SELECT id, status FROM jobs").fetchall()}
+
+
+def _job_nums(store: "Store") -> dict[int, int]:
+    """Внутренний id → номер работы в её воркспейсе (для показа)."""
+    return {int(r["id"]): int(r["num"]) for r in store.conn.execute("SELECT id, num FROM jobs").fetchall()
+            if r["num"] is not None}
 
 
 def _docker_job_ids(runner: jobspace.Runner) -> set[int]:
@@ -133,6 +139,7 @@ def scan(store: "Store", *, runner: jobspace.Runner = jobspace._run, now: Option
     """Что можно убрать — по группам, ничего не трогая."""
     now = now or time.time()
     status = _job_status(store)
+    nums = _job_nums(store)
     original_ws = store.workspace_id
     out: dict = {g: [] for g in GROUPS}
     out["kept"] = []
@@ -143,8 +150,8 @@ def scan(store: "Store", *, runner: jobspace.Runner = jobspace._run, now: Option
             store.use_workspace(ws.id)
             for job_id in sorted({r["job_id"] for r in store.all_open_job_resources() if r["job_status"] in CLOSED}):
                 rep = jobspace.cleanup(store, job_id, dry_run=True, runner=runner)
-                out["closed_jobs"].append({"job_id": job_id, "workspace": ws.slug, "items": rep.removed,
-                                           "kept": rep.kept})
+                out["closed_jobs"].append({"job_id": job_id, "uid": store.job_uid(job_id), "workspace": ws.slug,
+                                           "items": rep.removed, "kept": rep.kept})
                 out["kept"] += [{"group": "closed_jobs", "job_id": job_id, "why": k} for k in rep.kept]
 
             # 3. рабочие копии без живой работы
@@ -158,7 +165,7 @@ def scan(store: "Store", *, runner: jobspace.Runner = jobspace._run, now: Option
                 if status.get(jid) not in (None, *CLOSED):
                     continue  # работа открыта — не трогаем
                 state = jobspace.worktree_state(str(path), runner)
-                item = {"path": str(path), "job_id": jid, "workspace": ws.slug,
+                item = {"path": str(path), "job_id": nums.get(jid), "uid": jid, "workspace": ws.slug,
                         "job": status.get(jid, "нет такой работы"),
                         "dirty": len(state["dirty"]), "unpushed": state["unpushed"]}
                 if state["dirty"] or state["unpushed"]:
@@ -173,12 +180,13 @@ def scan(store: "Store", *, runner: jobspace.Runner = jobspace._run, now: Option
 
     # 2. docker без живой работы (закрытые с записанными ресурсами уже в группе 1)
     if runner(["docker", "info", "--format", "{{.ServerVersion}}"])[0] == 0:
-        in_closed = {j["job_id"] for j in out["closed_jobs"]}
+        in_closed = {j["uid"] for j in out["closed_jobs"]}
         for jid in sorted(_docker_job_ids(runner)):
             if status.get(jid) in (None, *CLOSED) and jid not in in_closed:
-                rep = jobspace.cleanup(store, jid, dry_run=True, runner=runner)
+                rep = jobspace.cleanup(store, 0, dry_run=True, runner=runner, uid=jid)
                 if rep.removed:
-                    out["orphan_docker"].append({"job_id": jid, "job": status.get(jid, "нет такой работы"),
+                    out["orphan_docker"].append({"job_id": nums.get(jid), "uid": jid,
+                                                 "job": status.get(jid, "нет такой работы"),
                                                  "items": rep.removed})
 
     # 4. старые скачанные вложения
@@ -235,9 +243,10 @@ def apply(store: "Store", groups: Iterable[str], *, force: bool = False,
         store.use_workspace(original_ws)
 
     for job in plan["orphan_docker"] if "orphan_docker" in groups else []:
-        rep = jobspace.cleanup(store, job["job_id"], runner=runner)
-        done["orphan_docker"] += [f"#{job['job_id']}: {x}" for x in rep.removed]
-        errors += [f"#{job['job_id']}: {e}" for e in rep.errors]
+        rep = jobspace.cleanup(store, 0, runner=runner, uid=job["uid"])
+        name = jobspace.compose_project(job["uid"])
+        done["orphan_docker"] += [f"{name}: {x}" for x in rep.removed]
+        errors += [f"{name}: {e}" for e in rep.errors]
 
     if "orphan_worktrees" in groups:
         trees = list(plan["orphan_worktrees"])

@@ -562,3 +562,21 @@ def test_failed_tool_does_not_leave_db_locked(fresh_server, monkeypatch):
     other.commit()
     assert other.execute("SELECT key FROM meta WHERE key = 'half'").fetchone() is None   # откатили
     other.close()
+
+
+def test_job_number_is_per_workspace_in_tools(fresh_server):
+    """#1 в каждом воркспейсе свой: запись по номеру уходит в работу своего контура."""
+    store = Store(fresh_server)
+    workspaces.create(store, "home")
+    store.close()
+
+    work = _run(srv.jwu_job_start(task_key="PROJ-1", title="рабочая", workspace="work"))
+    home = _run(srv.jwu_job_start(title="домашняя", workspace="home"))
+    assert work["id"] == home["id"] == 1 and "uid" not in work
+    assert work["docker"] != home["docker"]                              # имена стенда не путаются
+    assert work["docker"]["compose_project"].startswith("jwu-job")
+    _run(srv.jwu_job_add(job_id=1, text="дома", workspace="home"))
+    texts = lambda ws: [r["text"] for j in _run(srv.jwu_jobs(workspace=ws)) for r in j["records"]]  # noqa: E731
+    assert "дома" in texts("home") and "дома" not in texts("work")
+    res = _run(srv.jwu_job_resources(job_id=1, workspace="home"))
+    assert res["label"] == "jwu.job=" + home["docker"]["label"].split("=", 1)[1]

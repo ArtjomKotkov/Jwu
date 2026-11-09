@@ -95,13 +95,16 @@ class Blocked(Exception):
 
 
 def _job_of(store: "Store", root: str) -> Optional[int]:
+    """Номер работы (в текущем воркспейсе), чья рабочая копия — ``root``."""
     try:
         rows = store.conn.execute(
-            "SELECT job_id, ref FROM job_resources WHERE kind = 'worktree' AND removed_at = ''").fetchall()
+            "SELECT j.num AS num, r.ref AS ref FROM job_resources r JOIN jobs j ON j.id = r.job_id"
+            " WHERE r.kind = 'worktree' AND r.removed_at = '' AND r.workspace_id = ?",
+            (store.workspace_id,)).fetchall()
     except Exception:  # noqa: BLE001
         return None
     real = str(Path(root).resolve())
-    return next((int(r["job_id"]) for r in rows if str(Path(r["ref"]).resolve()) == real), None)
+    return next((int(r["num"]) for r in rows if r["num"] is not None and str(Path(r["ref"]).resolve()) == real), None)
 
 
 def context(store: "Store", path: str, *, runner: Runner = _run, notify: Optional[Notify] = None) -> Ctx:

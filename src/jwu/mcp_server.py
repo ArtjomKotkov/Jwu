@@ -2215,7 +2215,10 @@ async def jwu_job_start(
                 else store.list_jobs(feature_id=feature_row.id) if feature_row else [])
     job = store.create_job(task_key, title,
                            feature_id=feature_row.id if feature_row else None)
+    from .core import jobspace
+
     payload = job.model_dump()
+    payload["docker"] = jobspace.docker_names(job)    # метка и compose-проект стенда — брать как есть
     payload["existing_jobs"] = [
         {"id": j.id, "status": j.status, "title": j.title} for j in existing
     ]
@@ -2396,7 +2399,7 @@ async def jwu_job_worktree(job_id: int, repo: str, branch: str = "", base: str =
         raise ValueError(str(exc)) from exc
     if res.get("created"):
         store.add_job_record(job_id, f"Рабочая копия: {res['ref']} (ветка {res['meta']['branch']})", kind="note")
-    return _stamp(res, _resolve(workspace))
+    return _stamp({**res, "docker": jobspace.docker_names(job)}, _resolve(workspace))
 
 
 @mcp.tool()
@@ -2404,19 +2407,21 @@ async def jwu_job_resource(job_id: int, kind: str, ref: str, workspace: Optional
     """Запомнить, что создала работа, чтобы уборка снесла и это.
 
     kind: container | volume | network | image | compose | path | worktree. Docker-ресурсы
-    ВСЕГДА создавай с меткой jwu.job=<id> (compose: -p jwu-job<id>) — их уборка найдёт и
-    без записи; записывай то, что метку не несёт (образ, собранный без --label, каталог кеша).
+    ВСЕГДА создавай с меткой ``label`` (compose: ``-p <compose_project>``) из ответа
+    jwu_job_start / jwu_job_resources — строки бери как есть, из номера работы их не собирай
+    (они по внутреннему id). С меткой уборка найдёт и без записи; записывай то, что метку не
+    несёт (образ, собранный без --label, каталог кеша).
     """
     from .core import jobspace
 
     if kind not in jobspace.RESOURCE_KINDS:
         raise ValueError(f"kind: {', '.join(jobspace.RESOURCE_KINDS)}")
     store = _store_only(workspace)
-    if store.get_job(job_id) is None:
+    job = store.get_job(job_id)
+    if job is None:
         raise ValueError(f"Работа #{job_id} не найдена")
     rid = store.add_job_resource(job_id, kind, ref)
-    return _stamp({"ok": True, "id": rid, "label": jobspace.label(job_id),
-                   "compose_project": jobspace.compose_project(job_id)}, _resolve(workspace))
+    return _stamp({"ok": True, "id": rid, **jobspace.docker_names(job)}, _resolve(workspace))
 
 
 @mcp.tool()
@@ -2425,8 +2430,10 @@ async def jwu_job_resources(job_id: int, workspace: Optional[str] = None) -> dic
     from .core import jobspace
 
     store = _store_only(workspace)
-    return _stamp({"label": jobspace.label(job_id), "compose_project": jobspace.compose_project(job_id),
-                   "items": store.job_resources(job_id)}, _resolve(workspace))
+    job = store.get_job(job_id)
+    if job is None:
+        raise ValueError(f"Работа #{job_id} не найдена")
+    return _stamp({**jobspace.docker_names(job), "items": store.job_resources(job_id)}, _resolve(workspace))
 
 
 
@@ -2441,13 +2448,14 @@ async def jwu_job_ports(job_id: int, names: list[str], workspace: Optional[str] 
     from .core import jobspace
 
     store = _store_only(workspace)
-    if store.get_job(job_id) is None:
+    job = store.get_job(job_id)
+    if job is None:
         raise ValueError(f"Работа #{job_id} не найдена")
     try:
         ports = jobspace.allocate_ports(store, job_id, names)
     except jobspace.JobSpaceError as exc:
         raise ValueError(str(exc)) from exc
-    return _stamp({"ports": ports}, _resolve(workspace))
+    return _stamp({"ports": ports, "docker": jobspace.docker_names(job)}, _resolve(workspace))
 
 
 @mcp.tool()

@@ -1043,7 +1043,8 @@ class JobPRLink(BaseModel):
 
 
 class Job(BaseModel):
-    id: int = 0
+    id: int = 0                 # номер работы внутри воркспейса — так её видят и называют
+    uid: int = Field(default=0, exclude=True)   # внутренний сквозной id: связи и имена ресурсов
     task_key: str = ""          # ключ Jira; пусто — работа без задачи Jira
     title: str = ""
     status: str = "active"      # active | done | paused

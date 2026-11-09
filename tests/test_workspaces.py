@@ -213,7 +213,7 @@ def test_job_of_other_workspace_is_not_writable(two_workspaces):
 
     store.use_workspace(home_id)
     assert store.get_job(job.id) is None
-    with pytest.raises(ValueError, match="work"):
+    with pytest.raises(ValueError, match="не найдена в текущем"):
         store.add_job_record(job.id, "не должно записаться")
     store.delete_job(job.id)  # чужую работу не удаляем молча
 
@@ -553,3 +553,68 @@ def test_job_counters_do_not_read_other_workspaces_journals(tmp_path):
         assert store.workspace_id == current.id
     finally:
         store.close()
+
+
+def test_job_numbers_are_per_workspace(two_workspaces):
+    """У каждого воркспейса своя нумерация работ; номер ведёт в работу своего контура."""
+    store, work_id, home_id = two_workspaces
+    store.use_workspace(work_id)
+    w1, w2 = store.create_job("PROJ-1", "раз"), store.create_job("PROJ-2", "два")
+    store.use_workspace(home_id)
+    h1 = store.create_job("", "домашняя")
+    assert (w1.id, w2.id, h1.id) == (1, 2, 1) and h1.uid not in (w1.uid, w2.uid)
+    store.add_job_record(1, "дома")
+    store.link_job_pr(1, 7)
+    assert [r.text for r in store.get_job(1).records] == ["дома"] and store.get_job(1).title == "домашняя"
+    store.use_workspace(work_id)
+    job = store.get_job(1)
+    assert job.title == "раз" and not job.records and not job.prs
+    assert {j.id for j in store.list_jobs()} == {1, 2}
+    store.set_job_status(2, "done")
+    assert store.get_job(2).status == "done"
+    store.use_workspace(home_id)
+    assert store.get_job(1).status == "active"
+    # вставка мимо create_job (старый код, взятие с доски) тоже получает номер
+    store.conn.execute("INSERT INTO jobs (task_key, title, status, created_at, updated_at, workspace_id)"
+                       " VALUES ('', 'сырая', 'active', 'x', 'x', ?)", (home_id,))
+    assert store.get_job(2).title == "сырая"
+    assert "uid" not in store.get_job(2).model_dump()
+
+
+def test_migration_numbers_existing_jobs_and_references(tmp_path):
+    """Старая БД: работы получают номера по порядку в своём воркспейсе, ссылки очереди — номер."""
+    from jwu.core import store as store_mod
+
+    db = tmp_path / "old.db"
+    s = Store(db)
+    work = s.get_workspace_by_slug("work").id
+    home = s.get_workspace_by_slug("home").id if s.get_workspace_by_slug("home") else None
+    if home is None:
+        s.conn.execute("INSERT INTO workspaces (slug, name, created_at, updated_at) VALUES ('home', 'home', 'x', 'x')")
+        home = s.get_workspace_by_slug("home").id
+    s.conn.execute("DROP TRIGGER jobs_num")
+    s.conn.execute("DROP INDEX idx_jobs_num")
+    for ws in (work, home, work):
+        s.conn.execute("INSERT INTO jobs (task_key, title, status, created_at, updated_at, workspace_id)"
+                       " VALUES ('', ?, 'active', 'x', 'x', ?)", (f"w{ws}", ws))
+    s.conn.execute("UPDATE jobs SET num = NULL")
+    uid3 = s.conn.execute("SELECT MAX(id) FROM jobs").fetchone()[0]
+    s.conn.execute("INSERT INTO queue_items (workspace_id, text, mode, status, position, job_id, created_at)"
+                   " VALUES (?, 't', 'main', 'pending', 1, ?, 'x')", (work, uid3))
+    import json as _json
+
+    s.set_meta(f"w{work}:duty:questions_v2", _json.dumps({"seq": 1, "items": [{"id": "q1", "job_id": uid3}]}))
+    s.set_meta("worker:A", _json.dumps({"name": "A", "jobs": [uid3]}))
+    s.set_meta(f"w{work}:todo:board:sess", "[]")
+    s.set_meta("schema_version", "13")
+    s.conn.commit()
+    s.close()
+    s = Store(db)
+    rows = s.conn.execute("SELECT workspace_id, num FROM jobs ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [(work, 1), (home, 1), (work, 2)]
+    assert s.conn.execute("SELECT job_id FROM queue_items").fetchone()[0] == 2
+    assert _json.loads(s.get_meta(f"w{work}:duty:questions_v2"))["items"][0]["job_id"] == 2
+    assert _json.loads(s.get_meta("worker:A"))["jobs"] == [2]
+    assert s.get_meta(f"w{work}:todo:board:sess") is None
+    assert int(s.get_meta("schema_version")) == store_mod.SCHEMA_VERSION
+    s.close()

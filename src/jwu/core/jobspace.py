@@ -54,12 +54,21 @@ def _run(cmd: list[str], cwd: Optional[str] = None) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
-def label(job_id: int) -> str:
-    return f"{LABEL}={job_id}"
+# Метка docker, compose-проект и папка копии держатся за ВНУТРЕННИЙ id работы (``Job.uid``):
+# номер работы свой в каждом воркспейсе, а уборка (sweep) разбирает эти имена по всем сразу.
 
 
-def compose_project(job_id: int) -> str:
-    return f"jwu-job{job_id}"
+def label(uid: int) -> str:
+    return f"{LABEL}={uid}"
+
+
+def compose_project(uid: int) -> str:
+    return f"jwu-job{uid}"
+
+
+def docker_names(job: "Job") -> dict:
+    """Готовые имена для стенда работы — агент берёт их как есть, а не собирает из номера."""
+    return {"label": label(job.uid), "compose_project": compose_project(job.uid)}
 
 
 # --------------------------------------------------------------------------- #
@@ -173,7 +182,7 @@ def _slug(text: str) -> str:
 
 def worktree_name(repo: Path, job: "Job") -> str:
     anchor = job.task_key or job.feature_key
-    return _slug(f"{repo.name}-job{job.id}" + (f"-{anchor}" if anchor else ""))
+    return _slug(f"{repo.name}-job{job.uid}" + (f"-{anchor}" if anchor else ""))
 
 
 def _repo_root(path: str, runner: Runner) -> Path:
@@ -358,7 +367,7 @@ _DOCKER_RM = {"container": ["docker", "rm", "-f"], "volume": ["docker", "volume"
 
 
 def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool = False,
-            runner: Runner = _run) -> CleanupReport:
+            runner: Runner = _run, uid: Optional[int] = None) -> CleanupReport:
     """Снести всё, что создала работа: стенд, контейнеры, вольюмы, сети, образы, кеш, копии.
 
     Порядок: контейнеры → сети → вольюмы → образы (иначе занятое не удалится), потом
@@ -366,7 +375,9 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
     — она попадает в ``kept`` с причиной. ``dry_run`` — только показать, что будет удалено.
     """
     report = CleanupReport(dry_run=dry_run)
-    resources = store.job_resources(job_id)
+    # uid без номера — docker работы, которой уже нет (sweep: orphan_docker)
+    uid = uid if uid is not None else (store.job_uid(job_id) or 0)
+    resources = store.job_resources(job_id) if job_id else []
     docker_ok = runner(["docker", "info", "--format", "{{.ServerVersion}}"])[0] == 0
 
     def done(res_id: Optional[int], text: str) -> None:
@@ -390,7 +401,7 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
 
     if docker_ok:
         for kind in ("container", "network", "volume", "image"):
-            ids = set(_docker_ids(kind, job_id, runner))
+            ids = set(_docker_ids(kind, uid, runner)) if uid else set()
             named = {r["ref"]: r for r in resources if r["kind"] == kind}
             for ref in list(ids) + [n for n in named if n not in ids]:
                 if dry_run:

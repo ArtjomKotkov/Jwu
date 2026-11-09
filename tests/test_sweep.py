@@ -52,8 +52,8 @@ def test_scan_finds_orphans_and_keeps_open_and_unsaved(env):
     closed = store.create_job("APP-2", "закрытая")
     store.set_job_status(closed.id, "done")
     jobs = tmp / "jobs"
-    _tree(repo, jobs / f"repo-job{open_job.id}-APP-1", "b1")       # открытая — не трогаем
-    _tree(repo, jobs / f"repo-job{closed.id}-APP-2", "b2")         # закрытая — убрать
+    _tree(repo, jobs / f"repo-job{open_job.uid}-APP-1", "b1")       # открытая — не трогаем
+    _tree(repo, jobs / f"repo-job{closed.uid}-APP-2", "b2")         # закрытая — убрать
     _tree(repo, jobs / "repo-job999-APP-9", "b9")                  # работы нет — убрать, но тут незакоммиченное
     (jobs / "repo-job999-APP-9" / "x").write_text("dirty")
     old = tmp / "tmpjwu" / "APP-5"
@@ -63,13 +63,13 @@ def test_scan_finds_orphans_and_keeps_open_and_unsaved(env):
 
     plan = sweep.scan(store, runner=no_docker)
     assert [i["job_id"] for i in plan["orphan_worktrees"]] == [closed.id]
-    assert [k["job_id"] for k in plan["kept"]] == [999]
+    assert [(k["job_id"], k["uid"]) for k in plan["kept"]] == [(None, 999)]   # папки — по внутреннему id
     assert [i["path"] for i in plan["temp"]] == [str(old)]
 
     res = sweep.apply(store, sweep.GROUPS, runner=no_docker, plan=plan)
     assert not res["errors"]
-    assert not (jobs / f"repo-job{closed.id}-APP-2").exists() and not old.exists()
-    assert (jobs / f"repo-job{open_job.id}-APP-1").exists() and (jobs / "repo-job999-APP-9").exists()
+    assert not (jobs / f"repo-job{closed.uid}-APP-2").exists() and not old.exists()
+    assert (jobs / f"repo-job{open_job.uid}-APP-1").exists() and (jobs / "repo-job999-APP-9").exists()
 
     res = sweep.apply(store, ["orphan_worktrees"], force=True, runner=no_docker)
     assert not (jobs / "repo-job999-APP-9").exists()

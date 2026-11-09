@@ -4220,11 +4220,16 @@ def job_resources_cmd(
     from ..core import jobspace
 
     with _store() as store:
+        job = store.get_job(job_id)
+        if job is None:
+            err.print(f"[red]Работа #{job_id} не найдена[/red]")
+            raise typer.Exit(code=1)
         items = store.job_resources(job_id)
+    names = jobspace.docker_names(job)
     if as_json:
-        _emit_json({"label": jobspace.label(job_id), "compose_project": jobspace.compose_project(job_id), "items": items})
+        _emit_json({**names, "items": items})
         return
-    console.print(f"[dim]docker: метка {jobspace.label(job_id)}, compose-проект {jobspace.compose_project(job_id)}[/dim]")
+    console.print(f"[dim]docker: метка {names['label']}, compose-проект {names['compose_project']}[/dim]")
     for r in items:
         console.print(f"  {r['kind']:<9} {r['ref']}", markup=False, highlight=False)
     if not items:
@@ -4927,7 +4932,8 @@ def sweep_cmd(only: Optional[str] = typer.Option(None, "--only", help="Груп�
             total += len(items)
             console.print(f"[b]{_SWEEP_TITLES.get(g, g)}[/b] · {len(items)}")
             for it in items:
-                what = it.get("path") or it.get("session") or f"работа #{it.get('job_id')}"
+                what = it.get("path") or it.get("session") or (
+                    f"работа #{it['job_id']}" if it.get("job_id") else f"docker jwu-job{it.get('uid')} (работы нет)")
                 extra = it.get("items") or it.get("jobs") or ""
                 console.print(f"  {what}" + (f" — {extra}" if extra else ""), highlight=False)
         for k in plan["kept"]:

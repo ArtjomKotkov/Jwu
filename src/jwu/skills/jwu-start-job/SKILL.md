@@ -193,8 +193,10 @@ description: Use when the user wants to START a new jwu «работа (job)» �
 только чтение.
 
 1. `jwu_disk()` перед подъёмом и перед сборкой образов — мало места → стоп и вопрос.
-2. **Всё помечай работой:** compose — `docker compose -p jwu-job<id> …`; `docker run/build/
-   volume create/network create` — с `--label jwu.job=<id>`. **Порты** — не из compose по
+2. **Всё помечай работой:** имена — из ответа `jwu_job_start` (`docker.compose_project`,
+   `docker.label`; ещё их отдают `jwu_job_resources` и `jwu_job_ports`), бери как есть — из номера
+   работы их не собирай: compose — `docker compose -p <compose_project> …`; `docker run/build/
+   volume create/network create` — с `--label <label>`. **Порты** — не из compose по
    умолчанию, а `jwu_job_ports(job_id, ["db", "redis", "web", …])`: jwu выдаст свободные и
    запишет за работой (иначе два стенда подерутся); подставь их переменными или override.
 3. Что метку не несёт (образ, собранный чужим скриптом, каталог кеша, дамп БД) —

@@ -811,7 +811,7 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
                 "INSERT INTO jobs (task_key, title, status, created_at, updated_at, workspace_id)"
                 " VALUES (?, ?, 'active', ?, ?, ?)",
                 (item.issue_key, _goal(item), _iso(), _iso(), store.workspace_id))
-            job_id = int(cur.lastrowid)
+            uid = job_id = int(cur.lastrowid)       # связи — по внутреннему id, наружу — номер
             if item.pr:
                 conn.execute("INSERT OR IGNORE INTO job_prs (job_id, pr_id, project, repo) VALUES (?, ?, ?, ?)",
                              (job_id, item.pr["id"], item.pr["project"], item.pr["repo"]))
@@ -826,6 +826,7 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
                 (job_id, f"{SESSION_MARK} «{session or 'без имени'}»: {item.key} — {', '.join(item.problems)}", _iso()))
             if item.issue_key:
                 claimed.add(item.issue_key)
+            job_id = conn.execute("SELECT num FROM jobs WHERE id = ?", (uid,)).fetchone()[0] or uid
             taken.append({"n": asked_n.get(key, item.n), "key": key, "group": item.group, "job_id": job_id,
                           "goal": _goal(item), "issue_key": item.issue_key, "pr": item.pr})
         conn.commit()
