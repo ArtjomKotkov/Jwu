@@ -1,6 +1,6 @@
 [project]
 name = "jwu"
-version = "2.14.1"
+version = "2.14.2"
 description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
 authors = [
     {name = "Artem Kotkov", email = "ArtjomKotkov@users.noreply.github.com"}
@@ -10,7 +10,7 @@ requires-python = ">=3.10,<4.0"
 dependencies = [
     "httpx>=0.27",
     "click>=8.0",
-    "typer>=0.12",
+    "typer>=0.12,<0.29",   # 0.29 убрал click_type у Option/Argument
     "rich>=13.7",
     "pydantic>=2.7",
     "textual>=0.80",
