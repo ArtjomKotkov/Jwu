@@ -550,6 +550,79 @@ def undo(ctx: Ctx, ref: str = "", *, user_approved: bool = False) -> dict:
     return {"ok": True, "head": ctx.head[:12], "restored": ref, "backup": before}
 
 
+def _squash_base(ctx: Ctx, onto: str) -> str:
+    """База сквоша: onto или точка ответвления от целевой ветки (после её мержей — сдвигается вперёд)."""
+    if onto:
+        if not ctx.ok("rev-parse", "--verify", "--quiet", f"{onto}^{{commit}}"):
+            raise GitOpError(f"Нет такого коммита: {onto}")
+        if not ctx.ok("merge-base", "--is-ancestor", onto, "HEAD"):
+            raise GitOpError(f"{onto} не предок HEAD — сквошить не на что")
+        return ctx.git("rev-parse", f"{onto}^{{commit}}").strip()
+    target = gp.target_branch(ctx.policy, ctx.remote)
+    if not target:
+        raise GitOpError("Не знаю целевую ветку: укажи onto или задай её репозиторию (jwu git repo set --target)")
+    if ctx.branch == target:
+        raise GitOpError(f"{ctx.branch} — сама целевая ветка, её не сквошат")
+    ctx.git("fetch", "origin", target)
+    base = ctx.git("merge-base", "HEAD", f"origin/{target}", check=False).strip()
+    if not base:
+        raise GitOpError(f"У {ctx.branch} нет общей истории с origin/{target} — укажи onto")
+    return base
+
+
+def _backup_branch(ctx: Ctx) -> str:
+    """Видимая копия ветки до сквоша: backup/<ветка>-<время> — в IDE и git branch, удаляется руками."""
+    name = f"backup/{ctx.branch}-{datetime.now():%Y%m%d-%H%M%S}"
+    candidate, n = name, 1
+    while ctx.ok("rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}"):
+        n += 1
+        candidate = f"{name}-{n}"
+    return candidate if ctx.ok("branch", candidate, "HEAD") else ""
+
+
+def squash(ctx: Ctx, message: str = "", *, onto: str = "", dry_run: bool = False,
+           user_approved: bool = False) -> dict:
+    """Склеить коммиты ветки после базы в один. Перед этим — backup-ссылка и видимая ветка backup/…;
+    после — сверка дерева с бэкапом (разошлось — откат и ошибка)."""
+    _need_branch(ctx)
+    if ctx.git("status", "--porcelain", check=False).strip():
+        raise GitOpError("Есть несохранённое — сначала коммит (jwu_git_commit) или stash")
+    base = _squash_base(ctx, onto)
+    commits = [ln for ln in ctx.git("log", "--reverse", "--format=%h %s", f"{base}..HEAD",
+                                    check=False).splitlines() if ln.strip()]
+    result = {"ok": True, "branch": ctx.branch, "base": base[:12], "commits": commits,
+              "files": ctx.git("diff", "--name-status", base, "HEAD", check=False).splitlines(),
+              "pushed": _pushed(ctx, base), "squashed": False}
+    if len(commits) < 2:
+        return {**result, "reason": "сквошить нечего — после базы меньше двух коммитов"}
+    if dry_run:
+        return result
+    if not (message or "").strip():
+        raise GitOpError("Пустое сообщение коммита — его пишет jwu-commit-message")
+    gate(ctx, "history", user_approved=user_approved,
+         detail=f"сквош {len(commits)} коммитов {ctx.branch} на {base[:8]}")
+    old = ctx.head
+    ref = backup(ctx, "squash")
+    keep = _backup_branch(ctx)
+    try:
+        ctx.git("reset", "-q", "--soft", base)
+        ctx.git("commit", "-q", "-m", message)
+        if not ctx.ok("diff", "--quiet", old, "HEAD"):
+            raise GitOpError("после сквоша дерево разошлось с исходным")
+    except GitOpError as exc:
+        ctx.git("reset", "-q", "--hard", old, check=False)
+        ctx.refresh()
+        raise GitOpError(f"Сквош не удался, ветка возвращена на {old[:8]}: {exc}") from exc
+    ctx.refresh()
+    _record(ctx, f"сквош {len(commits)} коммитов → {ctx.head[:8]} «{message.splitlines()[0][:80]}» "
+                 f"(backup {ref}{', ветка ' + keep if keep else ''})")
+    out = {**result, "squashed": True, "sha": ctx.head[:12], "backup": ref, "backup_branch": keep}
+    if result["pushed"]:
+        out["next"] = ("часть коммитов уже на origin — пуш только force: "
+                       "jwu_git_push(force=True) после «да»")
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Рабочие копии (git worktree): убрать копию агента или работы
 # --------------------------------------------------------------------------- #

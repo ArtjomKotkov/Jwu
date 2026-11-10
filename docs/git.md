@@ -24,7 +24,7 @@ jwu) — ошибка пишется в журнал (`jwu git log`, `grant:noti
 
 `commit`, `switch` (переключить/создать ветку), `sync` (подтянуть целевую ветку merge или
 rebase), `stash`, `discard` (выкинуть несохранённое), `history` (amend, reset — только
-незапушенное), `push`, `force_push` (только `--force-with-lease`), `delete_branch`, `tag`,
+незапушенное; сквош ветки), `push`, `force_push` (только `--force-with-lease`), `delete_branch`, `tag`,
 `worktree` (убрать рабочую копию: remove + prune).
 Чтение (`status`, `diff`, `log`, `show`, `fetch`…) политикой не ограничивается. `git apply` хук тоже пропускает: он меняет только файлы и индекс, как обычная правка, —
 так основная сессия переносит дифф копии субагента в свою папку; коммит — уже через `jwu_git_commit`.
@@ -117,6 +117,7 @@ ops = { push = "deny", commit = "deny" }   # только читать
 | stash | `jwu_git_stash(path, action=push\|pop\|apply\|list)` |
 | выкинуть правки | `jwu_git_discard(path, files, untracked)` |
 | amend, reset незапушенного | `jwu_git_history(action=amend\|reset, path, message, ref)` |
+| сквош ветки в один коммит | `jwu_git_squash(message, path, onto, dry_run)` — сначала `dry_run`, потом «да» |
 | пуш | `jwu_git_push(path, force, dry_run)`; ветка работы — `jwu_git_push(job_id=…)` (старое `jwu_job_push` — алиас) |
 | удалить ветку, тег | `jwu_git_branch_delete(branch, path, remote)`, `jwu_git_tag(name, path, push)` |
 | убрать рабочую копию | `jwu_git_worktree_remove(path, delete_branch)` |
@@ -192,6 +193,11 @@ jwu git rule add --repo proj/app --branch main --at 1 --name "main владел�
 - Перед `sync`, `discard`, `history`, удалением ветки и откатом jwu снимает backup-ссылку
   `refs/jwu/backup/<время>-<операция>` (вместе с несохранёнными правками); `jwu_git_undo`
   возвращает к ней.
+- Сквош (`jwu_git_squash`) вдобавок оставляет видимую ветку `backup/<ветка>-<время>` со старой
+  историей — её видно в IDE и `git branch`, сама не чистится. База по умолчанию — точка
+  ответвления от целевой ветки (после мержей целевой сдвигается, чужие коммиты не склеятся).
+  После сквоша jwu сверяет дерево с исходным; разошлось — возвращает ветку и падает с ошибкой.
+  Если коммиты уже были на origin, пуш — только `jwu_git_push(force=True)` после отдельного «да».
 - Агент не может поменять политику и выдать себе допуск: у MCP таких инструментов нет, а хук
   режет из Bash агента `jwu git policy edit/init/import`, `jwu git grant`, `jwu git repo/rule …`,
   `jwu workspace setting git.*`, `jwu job push` и `sqlite3` по базе jwu. `jwu git grant`

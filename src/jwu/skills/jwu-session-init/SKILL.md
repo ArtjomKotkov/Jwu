@@ -89,6 +89,7 @@ description: Use at the START of a session, again after /clear or context compac
 | подтянуть develop/master | `jwu_git_sync(path)`; конфликт → правки → `action="continue"` |
 | ветка | `jwu_git_switch(branch, create=True, base=…)` |
 | выкинуть правки, amend, reset | `jwu_git_discard` / `jwu_git_history` |
+| сквош ветки в один коммит | `jwu_git_squash(dry_run=True)` → показать коммиты и сообщение → «да» → `jwu_git_squash(message, user_approved=True)` |
 | откатить сделанное jwu | `jwu_git_undo(path)` — список, потом `ref` |
 | убрать копию (субагента `.claude/worktrees/…`, работы) | `jwu_git_worktree_remove(path)` — бэкап несохранённого, remove, prune, ветка копии |
 | что можно в этой ветке | `jwu_git_policy(path)` |

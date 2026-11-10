@@ -1092,6 +1092,22 @@ async def jwu_git_history(action: str, path: str = "", message: str = "", ref: s
 
 
 @mcp.tool()
+async def jwu_git_squash(message: str = "", path: str = "", onto: str = "", dry_run: bool = False,
+                         user_approved: bool = False, workspace: Optional[str] = None) -> dict:
+    """Git: склеить коммиты ветки в один. База — точка ответвления от целевой ветки репозитория
+    (после мержей целевой — сдвигается, чужое не попадёт) или onto. Сначала dry_run: база,
+    коммиты, файлы, сколько уже на origin — покажи пользователю вместе с черновиком сообщения
+    (jwu-commit-message) и спроси «да»; потом message + user_approved=True. Под политикой как
+    history. Перед сквошем — backup-ссылка и видимая ветка backup/<ветка>-<время> (её удаляет
+    пользователь); после — сверка дерева, разошлось — откат и ошибка. Было на origin — пуш
+    только jwu_git_push(force=True) после отдельного «да». Вернуть как было — jwu_git_undo(backup)."""
+    from .core import gitops
+
+    return _git_call(path, workspace, lambda c: gitops.squash(c, message, onto=onto, dry_run=dry_run,
+                                                              user_approved=user_approved))
+
+
+@mcp.tool()
 async def jwu_git_push(path: str = "", force: bool = False, dry_run: bool = False, user_approved: bool = False,
                        job_id: Optional[int] = None, repo: str = "",
                        workspace: Optional[str] = None) -> dict:
@@ -1164,7 +1180,7 @@ async def jwu_git_tag(name: str, path: str = "", message: str = "", push: bool =
 @mcp.tool()
 async def jwu_git_undo(path: str = "", ref: str = "", user_approved: bool = False,
                        workspace: Optional[str] = None) -> dict:
-    """Git: откат к backup-ссылке jwu (снимаются перед sync/discard/amend/reset/undo).
+    """Git: откат к backup-ссылке jwu (снимаются перед sync/discard/amend/reset/squash/undo).
     Без ref — список ссылок. С ref — вернуть ветку и дерево; всегда после «да» (user_approved)."""
     from .core import gitops
 

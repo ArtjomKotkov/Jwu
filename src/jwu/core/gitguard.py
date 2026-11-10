@@ -269,7 +269,7 @@ def is_read(sub: str, args: list[str]) -> bool:
 _INSTEAD = {
     "commit": "jwu_git_commit", "add": "jwu_git_commit (files=…)", "push": "jwu_git_push (ветка работы — job_id=…)",
     "checkout": "jwu_git_switch (ветка) или jwu_git_discard (файлы)", "switch": "jwu_git_switch",
-    "merge": "jwu_git_sync", "rebase": "jwu_git_sync (mode=rebase) / jwu_git_history",
+    "merge": "jwu_git_sync", "rebase": "jwu_git_sync (mode=rebase) / jwu_git_squash / jwu_git_history",
     "pull": "jwu_git_sync", "reset": "jwu_git_history (reset) или jwu_git_discard", "restore": "jwu_git_discard",
     "clean": "jwu_git_discard (untracked=True)", "stash": "jwu_git_stash", "branch": "jwu_git_switch / "
     "jwu_git_branch_delete", "tag": "jwu_git_tag", "cherry-pick": "попроси пользователя",

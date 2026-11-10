@@ -278,3 +278,72 @@ def test_grant_request_dropped_after_three_failed_sends(store, repo, monkeypatch
     with pytest.raises(go.Blocked) as e2:                       # повтор — новый запрос
         go.push(ctx, user_approved=True)
     assert e2.value.grant_id != gid
+
+
+# --- сквош ------------------------------------------------------------------ #
+
+
+def _branch_with_commits(store, repo, n=3):
+    as_job(store, repo)
+    ctx = go.context(store, str(repo))
+    go.switch(ctx, "PROJ-1-fix", create=True)
+    for i in range(n):
+        (repo / f"f{i}.txt").write_text(str(i))
+        go.commit(ctx, f"шаг {i}")
+    return ctx
+
+
+def test_squash_dry_run_shows_commits_and_changes_nothing(store, repo):
+    ctx = _branch_with_commits(store, repo)
+    head = ctx.head
+    res = go.squash(ctx, dry_run=True)
+    assert not res["squashed"] and [c.split(" ", 1)[1] for c in res["commits"]] == ["шаг 0", "шаг 1", "шаг 2"]
+    assert len(res["files"]) == 3 and res["pushed"] == 0
+    assert sh(repo, "rev-parse", "HEAD") == head and go.backups(ctx) == []
+
+
+def test_squash_needs_yes_then_keeps_tree_and_backups(store, repo):
+    ctx = _branch_with_commits(store, repo)
+    old = ctx.head
+    with pytest.raises(go.Blocked):                       # history в копии работы — «да»
+        go.squash(ctx, "PROJ-1: всё сразу")
+    res = go.squash(ctx, "PROJ-1: всё сразу", user_approved=True)
+    assert res["squashed"] and sh(repo, "rev-list", "--count", "origin/develop..HEAD") == "1"
+    assert sh(repo, "log", "-1", "--format=%s") == "PROJ-1: всё сразу"
+    assert sh(repo, "diff", old, "HEAD") == ""            # содержимое то же
+    assert res["backup_branch"].startswith("backup/PROJ-1-fix-")
+    assert sh(repo, "rev-parse", res["backup_branch"]) == old
+    assert "next" not in res                              # ничего не было на origin
+    assert any("сквош 3 коммитов" in r.text for r in store.get_job(ctx.job_id).records)
+    go.undo(ctx, res["backup"], user_approved=True)
+    assert sh(repo, "rev-parse", "HEAD") == old
+
+
+def test_squash_skips_merged_target_and_warns_about_force(store, repo, tmp_path):
+    ctx = _branch_with_commits(store, repo, n=2)
+    sh(repo, "push", "-q", "origin", "PROJ-1-fix")
+    other = tmp_path / "other"
+    sh(tmp_path, "clone", "-q", "-b", "develop", str(tmp_path / "proj" / "app.git"), str(other))
+    for k, v in (("user.email", "o@o"), ("user.name", "o")):
+        sh(other, "config", k, v)
+    (other / "theirs.txt").write_text("t")
+    sh(other, "add", "-A")
+    sh(other, "commit", "-qm", "theirs")
+    sh(other, "push", "-q", "origin", "develop")
+    go.sync(ctx)                                          # merge develop в ветку
+    (repo / "late.txt").write_text("l")
+    go.commit(ctx, "после мержа")
+    res = go.squash(ctx, "PROJ-1: итог", user_approved=True)
+    assert "theirs" not in " ".join(res["commits"]) and res["pushed"] >= 2 and "force" in res["next"]
+    assert sh(repo, "diff", "--name-only", "origin/develop", "HEAD").split() == ["f0.txt", "f1.txt", "late.txt"]
+
+
+def test_squash_refuses_dirty_tree_target_and_single_commit(store, repo):
+    ctx = go.context(store, str(repo))
+    with pytest.raises(go.GitOpError, match="целевая ветка"):
+        go.squash(ctx, "x", user_approved=True)
+    ctx = _branch_with_commits(store, repo, n=1)
+    assert "нечего" in go.squash(ctx, "x", user_approved=True)["reason"]
+    (repo / "dirty.txt").write_text("d")
+    with pytest.raises(go.GitOpError, match="несохранённое"):
+        go.squash(ctx, "x", user_approved=True)
