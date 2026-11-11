@@ -32,7 +32,7 @@ SECRET_SLOTS: tuple[str, ...] = (
     "jira.token", "jira.password", "jira.gate_password",
     "support.token", "support.password", "support.gate_password",
     "bitbucket.token", "github.token", "jenkins.token",
-    "telegram.token", "telegram.backup_token", "matrix.token",
+    "telegram.token", "telegram.backup_token",
 )
 
 # Слоты, которые можно перебить переменной окружения (как и раньше).
@@ -46,7 +46,6 @@ SLOT_ENV: dict[str, str] = {
     "jenkins.token": "JENKINS_TOKEN",
     "telegram.token": "TELEGRAM_BOT_TOKEN",
     "telegram.backup_token": "TELEGRAM_BACKUP_BOT_TOKEN",
-    "matrix.token": "MATRIX_TOKEN",
     # Пароли для сессионного логина и nginx-гейта — чтобы контур поднимался из одних
     # переменных окружения, без keyring и визарда (облачная сессия, CI).
     "jira.password": "JIRA_PASSWORD",
@@ -54,6 +53,27 @@ SLOT_ENV: dict[str, str] = {
     "support.password": "SUPPORT_PASSWORD",
     "support.gate_password": "SUPPORT_GATE_PASSWORD",
 }
+
+
+def _addon_slots() -> dict[str, str]:
+    """Слоты секретов аддонов (хук ``secret_slots() -> {слот: env}``)."""
+    from . import addons
+
+    out: dict[str, str] = {}
+    for addon in addons.active():
+        for slot, env in (addon.call("secret_slots", default={}) or {}).items():
+            out[str(slot)] = str(env or "")
+    return out
+
+
+def all_slots() -> tuple[str, ...]:
+    """Свои слоты и слоты аддонов."""
+    return SECRET_SLOTS + tuple(s for s in _addon_slots() if s not in SECRET_SLOTS)
+
+
+def slot_env(slot: str) -> str | None:
+    """Переменная окружения, которой можно перебить слот (своя или объявленная аддоном)."""
+    return SLOT_ENV.get(slot) or _addon_slots().get(slot) or None
 
 KeyringRef = Optional[Tuple[str, str]]  # (service, account) в системном keyring
 

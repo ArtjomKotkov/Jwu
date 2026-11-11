@@ -5,11 +5,10 @@
 - **ответ на уведомление** или сообщение вида ``PROJ-1 текст`` → заметка-контекст по ключу
   (см. ``notify.parse_incoming``), в чат уходит подтверждение «записал»;
 - **команда**: ``/sync`` — внеплановый проход демона, ``/status`` — когда был последний
-  проход и что накопилось, ``/mentions`` —
-  непрочитанные упоминания, ``/duty`` — тумблер дежурства за комнатой Matrix, ``/personal`` —
-  тумблер личного (1:1 и упоминания), ``/matrix`` — их настройка кнопками (``core.duty``), ``/help``;
-- **нажатие inline-кнопки** (callback_query) настройки дежурства → меню перерисовывается
-  на месте.
+  проход и что накопилось, ``/mentions`` — непрочитанные упоминания, ``/help``; свои
+  команды добавляют аддоны (хук ``bot_commands``);
+- **нажатие inline-кнопки** (callback_query) → меню перерисовывается на месте; кнопки с
+  префиксом аддона уходят ему (``callback_prefixes``).
 
 Всё считается из памяти jwu (без сети и без логина в трекер), поэтому демон может
 опрашивать бота часто — раз в минуту — независимо от интервала синка. Сообщения не из
@@ -21,7 +20,7 @@ from __future__ import annotations
 import html
 from typing import TYPE_CHECKING, Callable, Optional
 
-from . import duty, notify
+from . import notify
 from .dates import fmt_ago
 
 if TYPE_CHECKING:
@@ -37,9 +36,7 @@ HELP = (
     "/today — что сделал сегодня: задачи, их статус и итог\n"
     "/mentions — непрочитанные упоминания\n"
     "/seen — пометить все упоминания прочитанными\n"
-    "/duty — дежурство за комнатой Matrix: вкл / выкл\n"
-    "/personal — личное: непрочитанное 1:1 и упоминания, вкл / выкл\n"
-    "/matrix — настройка Matrix кнопками\n"
+    "{addons}"
     "/help — это сообщение\n\n"
     "Ответ на уведомление → заметка по его ключу. "
     "Сообщение вида <code>PROJ-1 текст</code> → заметка по PROJ-1."
@@ -55,7 +52,6 @@ def _cmd_status(store: "Store", ws: "Workspace") -> str:
     running = pass_in_progress(store)
     last = store.get_meta(LAST_PASS_META)
     summary = (store.get_meta(LAST_PASS_SUMMARY_META) or "").removeprefix("синк: ")
-    state = duty.load(store)
     lines = [
         f"ℹ️ <b>{html.escape(ws.slug)}</b>",
         "",
@@ -64,10 +60,16 @@ def _cmd_status(store: "Store", ws: "Workspace") -> str:
         f"🔄 синк: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}"
         + (f" · {html.escape(summary)}" if summary else ""),
     ]
-    if state.configured:
-        lines.append(f"🔔 дежурство: {'вкл' if state.active else 'выкл'} · {html.escape(state.title)}")
-    lines.append(f"💬 личное в Matrix: {'вкл' if state.personal else 'выкл'}")
+    from . import addons
+
+    for addon in addons.active():
+        lines += [str(x) for x in addon.call("status_lines", {"store": store, "workspace": ws}, default=[]) or []]
     return "\n".join(lines)
+
+
+def help_text() -> str:
+    extra = "".join(f"{html.escape(c)} — {html.escape(d)}\n" for c, d in addon_commands())
+    return HELP.replace("{addons}", extra)
 
 
 TASKS_LIMIT = 40
@@ -133,17 +135,18 @@ def render_board(board, slug: str, links: Optional[notify.Links]) -> str:
     from . import todo
 
     lines = [f"🗂 <b>Что делать · {html.escape(slug)}</b> · {datetime.now().strftime('%d.%m')}"]
-    for group in todo.GROUPS:
+    titles = todo.group_titles()
+    for group in todo.groups():
         part = [i for i in board.items if i.group == group]
         if not part:
             continue
         free = [i for i in part if not i.taken]
-        lines += ["", f"<b>{todo.GROUP_TITLES[group]}</b> — {len(part)}, свободно {len(free)}"]
+        lines += ["", f"<b>{titles[group]}</b> — {len(part)}, свободно {len(free)}"]
         for i in free[:BOARD_TOP]:
             prio = todo.PRIORITY_ICON.get(todo._prio(i.priority), "") if i.priority else ""
             key = i.issue_key or i.key
-            if group == "duty":
-                lines.append(f"🛟 {html.escape(key)} — {html.escape(notify._short(i.title, 70))}")
+            if todo.is_addon_group(group):
+                lines.append(f"🔹 {html.escape(key)} — {html.escape(notify._short(i.title, 70))}")
                 continue
             what = ", ".join(p for p in i.problems if not p.startswith("автор ")) or i.status
             title = i.title[len(i.issue_key):].lstrip(" :—-") if i.issue_key and i.title.startswith(i.issue_key) else i.title
@@ -292,8 +295,8 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
         store.mark_mentions_seen(None)
         return f"✅ Помечено прочитанными: {n}." if n else "✅ Непрочитанных и не было."
     if cmd in ("/help", "/start"):
-        return HELP
-    return f"Не знаю команду {html.escape(cmd)}.\n\n{HELP}"
+        return help_text()
+    return f"Не знаю команду {html.escape(cmd)}.\n\n{help_text()}"
 
 
 MENU_PREFIX = "menu:"
@@ -303,7 +306,6 @@ MENU_ROWS = [
     [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
     [("📋 Мои задачи", "tasks"), ("🕒 Что сделал сегодня", "today")],
     [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
-    [("📡 Matrix: дежурство и личное", "matrix")],
     [("🔔 Уведомления", "notify")],
 ]
 
@@ -377,34 +379,11 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
         text = render_board(todo.build(store, ws.id, login, session="telegram"), ws.slug,
                             notify.links_from_config(cfg))
         return text, {"inline_keyboard": [BACK_TO_MENU]}
-    if action == "matrix":
-        text, markup = duty.menu(duty.load(store))
-        return text, {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
     reply = handle_command(f"/{action}", store=store, ws=ws, login=login,
                            links=notify.links_from_config(cfg), on_sync=on_sync)
     if len(reply) > notify.MAX_MESSAGE:
         reply = reply[:notify.MAX_MESSAGE].rsplit("\n", 1)[0] + "\n…"
     return reply, {"inline_keyboard": [BACK_TO_MENU]}
-
-
-DUTY_COMMANDS = ("/duty", "/personal", "/matrix", "/duty_settings")
-
-
-def _matrix_factory(cfg: "Config"):
-    """Ленивый конструктор источника чатов дежурства: сеть нужна не каждой кнопке."""
-    from . import chats
-
-    return chats.factory("matrix", cfg)
-
-
-def handle_duty_command(cmd: str, *, store: "Store", cfg: "Config") -> tuple[str, dict]:
-    """/duty, /personal → тумблеры; /matrix → меню настройки кнопками."""
-    factory = _matrix_factory(cfg)
-    if cmd in ("/matrix", "/duty_settings"):
-        return duty.menu(duty.load(store))
-    if cmd == "/personal":
-        return duty.toggle_personal(store, factory)
-    return duty.toggle(store, factory)
 
 
 def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
@@ -423,7 +402,7 @@ def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
     mid = msg.get("message_id")
     # «⏳ делаю…» — на любой кнопке, кроме мгновенных (вернуться в меню): аддоны и сеть
     # бывают небыстрыми, а молчание выглядит как «бот умер».
-    instant = {MENU_PREFIX + "main", duty.CALLBACK_PREFIX + duty.CB_MENU}
+    instant = {MENU_PREFIX + "main"}
     if mid and data not in instant:
         try:   # долгое — сразу видно, что бот жив и работает
             sender.edit(int(mid), "⏳ делаю…")
@@ -464,12 +443,6 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
         from . import update
 
         text, markup = update.handle_callback(store, data)
-    elif data.startswith(duty.CALLBACK_PREFIX):
-        text, markup = duty.handle_callback(store, _matrix_factory(cfg), data)
-        if data in (duty.CALLBACK_PREFIX + duty.CB_MENU, duty.CALLBACK_PREFIX + duty.CB_ON,
-                    duty.CALLBACK_PREFIX + duty.CB_OFF, duty.CALLBACK_PREFIX + duty.CB_PERSONAL) \
-                or data.startswith(duty.CALLBACK_PREFIX + duty.CB_ROOM):
-            markup = {"inline_keyboard": list((markup or {}).get("inline_keyboard") or []) + [BACK_TO_MENU]}
     else:
         res = _addon_callback(data, store=store, ws=ws, cfg=cfg)
         if res is not None:
@@ -584,9 +557,6 @@ def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
     if addon_cmd is not None:
         reply, markup = addon_cmd
         item = {"kind": "command", "text": text, "reply": reply}
-    elif cmd in DUTY_COMMANDS:
-        reply, markup = handle_duty_command(cmd, store=store, cfg=cfg)
-        item = {"kind": "command", "text": text, "reply": reply}
     elif text.startswith("/"):
         reply = handle_command(text, store=store, ws=ws, login=login, links=links, on_sync=on_sync)
         item = {"kind": "command", "text": text, "reply": reply}
@@ -628,7 +598,7 @@ def process_updates(
 
     ``long_poll`` — сколько секунд Telegram может держать запрос в ожидании сообщения.
     ``dispatch`` — отдать каждое входящее исполнителю (демон: пул потоков, чтобы слушатель
-    кнопок не ждал синка, Matrix и прочих долгих ответов); тогда смещение сдвигается сразу,
+    кнопок не ждал синка и прочих долгих ответов); тогда смещение сдвигается сразу,
     а в списке — ``{"kind": "dispatched"}``. Без него — обработать здесь же, по порядку.
     Смещение сдвигается и для пропущенных сообщений, чтобы чужие не крутились вечно.
     """

@@ -153,20 +153,6 @@ class TelegramConfig:
 
 
 @dataclass
-class MatrixConfig:
-    """Matrix для режима дежурства бота: homeserver, свой mxid и токен (секрет ``matrix.token``).
-
-    Пусто — jwu попробует взять homeserver и токен из конфига matrix-mcp
-    (см. ``matrix.client_from_config``); нет и его — дежурство недоступно.
-    """
-
-    homeserver: str = ""
-    user_id: str = ""
-    token_service: str = "jwu-matrix"
-    token_env: str = "MATRIX_TOKEN"
-
-
-@dataclass
 class StorageConfig:
     db_path: str = ""  # пусто => дефолт data_dir()/state.db; переопределяется env JWU_DB_PATH
 
@@ -179,11 +165,13 @@ class Config:
     github: GitHubConfig = field(default_factory=GitHubConfig)
     jenkins: JenkinsConfig = field(default_factory=JenkinsConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
-    matrix: MatrixConfig = field(default_factory=MatrixConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     # Откуда берутся секреты. По умолчанию — системный keyring (как исторически);
     # для конфига воркспейса подставляется secrets.DbSecrets (см. workspaces.config_for_workspace).
     secrets: "secrets.SecretSource" = field(default_factory=secrets.KeyringSecrets)
+    # Секции аддонов (хук ``config_sections``): {"matrix": {"homeserver": …}} — из config.toml
+    # и настроек воркспейса; ядро их не разбирает, только хранит и сохраняет.
+    addons: dict = field(default_factory=dict)
 
 
 # Слот секрета -> где он лежал в keyring: (service, account). Пара вычисляется из конфига,
@@ -206,8 +194,6 @@ def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
     elif section == "telegram":
         pairs = {"token": (cfg.telegram.token_service, "bot"),
                  "backup_token": (cfg.telegram.token_service, "backup-bot")}
-    elif section == "matrix":
-        pairs = {"token": (cfg.matrix.token_service, cfg.matrix.user_id or "me")}
     else:
         return None
     ref = pairs.get(kind)
@@ -217,13 +203,23 @@ def slot_keyring_ref(cfg: Config, slot: str) -> tuple[str, str] | None:
 def get_slot(cfg: Config, slot: str) -> str | None:
     """Значение секрета по слоту из настроенного источника (env → источник → keyring)."""
     return cfg.secrets.get(
-        slot, env_var=secrets.SLOT_ENV.get(slot), keyring_ref=slot_keyring_ref(cfg, slot)
+        slot, env_var=secrets.slot_env(slot), keyring_ref=slot_keyring_ref(cfg, slot)
     )
 
 
 def set_slot(cfg: Config, slot: str, value: str) -> None:
     """Записать секрет по слоту в настроенный источник."""
     cfg.secrets.set(slot, value, keyring_ref=slot_keyring_ref(cfg, slot))
+
+
+def addon_sections() -> list[str]:
+    """Секции конфига, которые объявили аддоны (хук ``config_sections``)."""
+    from . import addons
+
+    out: list[str] = []
+    for addon in addons.active():
+        out += [str(n) for n in addon.call("config_sections", default=[]) or [] if str(n) not in out]
+    return out
 
 
 class ConfigError(RuntimeError):
@@ -324,10 +320,10 @@ def _apply_raw(cfg: Config, raw: dict) -> Config:
     cfg.telegram.chat_id = str(t.get("chat_id", cfg.telegram.chat_id) or "")
     cfg.telegram.token_env = t.get("token_env", cfg.telegram.token_env)
 
-    m = raw.get("matrix", {}) or {}
-    cfg.matrix.homeserver = str(m.get("homeserver", cfg.matrix.homeserver) or "").rstrip("/")
-    cfg.matrix.user_id = str(m.get("user_id", cfg.matrix.user_id) or "")
-    cfg.matrix.token_env = m.get("token_env", cfg.matrix.token_env)
+    for name in addon_sections():
+        section = raw.get(name)
+        if isinstance(section, dict):
+            cfg.addons[name] = {**cfg.addons.get(name, {}), **{k: str(v) for k, v in section.items()}}
 
     s = raw.get("storage", {}) or {}
     cfg.storage.db_path = s.get("db_path", cfg.storage.db_path)
@@ -357,8 +353,6 @@ ENV_SETTINGS: dict[str, tuple[str, str]] = {
     "JWU_JENKINS_URL": ("jenkins", "base_url"),
     "JWU_JENKINS_USER": ("jenkins", "username"),
     "JWU_TELEGRAM_CHAT": ("telegram", "chat_id"),
-    "JWU_MATRIX_URL": ("matrix", "homeserver"),
-    "JWU_MATRIX_USER": ("matrix", "user_id"),
 }
 
 
@@ -434,7 +428,7 @@ def save_config(cfg: Config, path: Path | None = None) -> Path:
 def _require_slot(cfg: Config, slot: str) -> str:
     val = get_slot(cfg, slot)
     if not val:
-        env_var = secrets.SLOT_ENV.get(slot, "")
+        env_var = secrets.slot_env(slot) or ""
         hint = f" или задай переменную окружения {env_var}" if env_var else ""
         raise ConfigError(
             f"Секрет не найден ({slot}). Запусти `jwu configure`{hint}."
@@ -499,11 +493,6 @@ def telegram_token(cfg: Config) -> str:
 def telegram_backup_token(cfg: Config) -> str:
     """Токен резервного бота: основной не отвечает — шлём через него (пусто — резерва нет)."""
     return get_slot(cfg, "telegram.backup_token") or ""
-
-
-def matrix_token(cfg: Config) -> str:
-    """Токен Matrix для дежурства (пусто — не настроен). Не бросает: дежурство опционально."""
-    return get_slot(cfg, "matrix.token") or ""
 
 
 def jenkins_auth(cfg: Config) -> tuple[str, str] | None:
@@ -581,11 +570,12 @@ def export_bundle(cfg: Config, path: Path) -> int:
         raw["jenkins"] = {"base_url": cfg.jenkins.base_url, "username": cfg.jenkins.username}
     if cfg.telegram.chat_id:
         raw["telegram"] = {"chat_id": cfg.telegram.chat_id}
-    if cfg.matrix.homeserver:
-        raw["matrix"] = {"homeserver": cfg.matrix.homeserver, "user_id": cfg.matrix.user_id}
+    for name, section in cfg.addons.items():
+        if section:
+            raw[name] = dict(section)
 
     sec_list: list[dict] = []
-    for slot in secrets.SECRET_SLOTS:
+    for slot in secrets.all_slots():
         val = get_slot(cfg, slot)
         if val:
             sec_list.append({"slot": slot, "value": val})
@@ -613,7 +603,7 @@ def read_bundle(path: Path) -> tuple[Config, dict[str, str]]:
         raw = tomllib.load(fh)
 
     cfg = _apply_raw(Config(), raw)
-    by_ref = {slot_keyring_ref(cfg, slot): slot for slot in secrets.SECRET_SLOTS}
+    by_ref = {slot_keyring_ref(cfg, slot): slot for slot in secrets.all_slots()}
     values: dict[str, str] = {}
     for entry in raw.get("secrets", []) or []:
         value = entry.get("value")

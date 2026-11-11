@@ -1,6 +1,6 @@
 """Голос пользователя: профиль стиля и корпус его реальных внешних текстов.
 
-Внешние тексты (комменты в PR и Jira, ответы клиенту в Support, тексты задач, 4test,
+Внешние тексты (комменты в PR и Jira, ответы клиенту в Support, тексты задач, тексты для QA,
 коммиты) пишет один агент голоса, а не каждый скилл по-своему. Агент в пакете —
 безличный дефолт (``voice-writer-sample``); персональное живёт только на машине
 пользователя, в каталоге данных jwu по воркспейсу:
@@ -40,8 +40,15 @@ AGENT_SETTING = "voice.agent"
 
 CHANNELS = (
     "pr_comment", "pr_reply", "pr_review_body", "pr_task", "pr_description",
-    "jira_comment", "support_client", "task", "4test", "commit", "message", "matrix",
+    "jira_comment", "support_client", "task", "qa_note", "commit", "message", "chat",
 )
+# Старые имена каналов (профили и корпуса, собранные раньше) → нынешние.
+CHANNEL_ALIASES = {"4test": "qa_note", "matrix": "chat"}
+
+
+def channel_name(channel: str) -> str:
+    return CHANNEL_ALIASES.get(channel, channel)
+
 AUDIENCES = ("colleague", "qa", "analyst", "client")
 
 # Если своих текстов в канале мало, примеры берутся из соседнего по жанру.
@@ -54,11 +61,11 @@ _CHANNEL_FALLBACK = {
     "jira_comment": ("pr_reply", "pr_comment"),
     "support_client": ("jira_comment",),
     "task": ("jira_comment", "pr_description"),
-    "4test": ("jira_comment", "task"),
+    "qa_note": ("jira_comment", "task"),
     "commit": ("pr_description",),
     "message": ("pr_reply", "jira_comment"),
-    # чаты (комнаты, треды, личка): правила — раздел «matrix» анализа корпуса
-    "matrix": ("message", "pr_reply", "jira_comment"),
+    # чаты (комнаты, треды, личка): правила — раздел «chat» анализа корпуса
+    "chat": ("message", "pr_reply", "jira_comment"),
 }
 
 FEEDBACK_HEADER = "## Журнал правок"
@@ -224,7 +231,7 @@ def save_analysis(slug: str, markdown: str, *, channels: Iterable[str]) -> Path:
     body = markdown.strip()
     if not body:
         raise ValueError("Пустой анализ")
-    chans = sorted({c.strip() for c in channels if c and c.strip()})
+    chans = sorted({channel_name(c.strip()) for c in channels if c and c.strip()})
     total = corpus_stats(slug)["total"]
     day = datetime.now(timezone.utc).date().isoformat()
     meta = f"at={day} total={total} channels={','.join(chans)} "
@@ -281,11 +288,12 @@ def _good_length(text: str) -> bool:
 def examples(slug: str, channel: str, *, audience: str | None = None, limit: int = 8) -> list[dict]:
     """Few-shot для агента: сначала сам канал и аудитория, потом соседние каналы; свежее выше."""
     samples = [s for s in load_corpus(slug) if _good_length(s.text)]
+    channel = channel_name(channel)
     order = (channel, *_CHANNEL_FALLBACK.get(channel, ()))
     picked: list[VoiceSample] = []
     seen: set[str] = set()
     for ch in order:
-        pool = [s for s in samples if s.channel == ch and s.id not in seen]
+        pool = [s for s in samples if channel_name(s.channel) == ch and s.id not in seen]
         # нужная аудитория — первой (клиенту и коллеге пишут по-разному), внутри — свежее;
         # сортировка устойчивая, поэтому второй проход сохраняет порядок первого
         pool.sort(key=lambda s: s.created, reverse=True)
@@ -313,6 +321,7 @@ def add_feedback(slug: str, *, channel: str, verdict: str, before: str, after: s
     """
     if verdict not in ("edited", "rejected", "accepted"):
         raise ValueError("verdict: edited | rejected | accepted")
+    channel = channel_name(channel)
     path = ensure_profile(slug)
     text = path.read_text(encoding="utf-8")
     if FEEDBACK_HEADER not in text:

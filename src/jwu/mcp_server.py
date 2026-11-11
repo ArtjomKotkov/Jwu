@@ -508,7 +508,7 @@ async def jwu_voice_profile(workspace: Optional[str] = None) -> dict:
     только если канала нет в анализе или пользователь сказал «не похоже на меня».
 
     Любой внешний текст от имени пользователя (коммент в PR, ответ ревьюверу, коммент в
-    Jira/Support, текст задачи, 4test, коммит) пишет субагент `agent` — вызывающий скилл
+    Jira/Support, текст задачи, инструкция для QA, коммит) пишет субагент `agent` — вызывающий скилл
     передаёт ему факты, а не сочиняет сам. Без сети.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
@@ -546,7 +546,7 @@ async def jwu_voice_examples(channel: str, audience: Optional[str] = None, limit
     """Примеры реальных текстов пользователя для канала — few-shot для агента голоса.
 
     channel — pr_comment | pr_reply | pr_review_body | pr_task | pr_description |
-    jira_comment | support_client | task | 4test | commit | message. audience — colleague |
+    jira_comment | support_client | task | qa_note | commit | message | chat. audience — colleague |
     qa | analyst | client. Если в канале мало текстов, добираются соседние по жанру.
     Без сети; пустой корпус собирает `jwu voice collect` (или jwu_voice_collect).
     """
@@ -2637,8 +2637,8 @@ async def jwu_todo_take(numbers: Optional[list[int]] = None, group: str = "", se
     from .core import todo as todo_mod
     from .core.service import _read_identity
 
-    if group and group not in todo_mod.GROUPS:
-        raise ValueError(f"group: {', '.join(todo_mod.GROUPS)}")
+    if group and group not in todo_mod.groups():
+        raise ValueError(f"group: {', '.join(todo_mod.groups())}")
     store = _store_only(workspace)
     caller = _session_name(store, session)
     session = for_worker.strip() or caller
@@ -2692,57 +2692,6 @@ async def jwu_guide_save(name: str, title: str, text: str, tag: str = "", scope:
         raise ValueError(str(exc)) from exc
     return _stamp(item.brief(), _resolve(workspace))
 
-
-
-@mcp.tool()
-async def jwu_duty_question(summary: str, author: str = "", when: str = "", where: str = "",
-                            event_id: str = "", link: str = "", details: str = "",
-                            workspace: Optional[str] = None) -> dict:
-    """Записать вопрос с дежурства — номер «Д<N>». РАБОТА НЕ ЗАВОДИТСЯ: она появится, только когда
-    вопрос возьмут (jwu_duty_question_take). То же сообщение (event_id) — тот же вопрос, детали
-    обновятся. summary — суть (клиент + симптом); author/when/where — кто, когда, где;
-    details — что спрашивает, что у него есть, что уже ответили, срочность. Наружу ничего не пишет.
-    """
-    from .core import duty
-
-    store = _store_only(workspace)
-    return _stamp(duty.question_add(store, summary=summary, author=author, when=when, where=where,
-                                    event_id=event_id, link=link, details=details), _resolve(workspace))
-
-
-@mcp.tool()
-async def jwu_duty_questions(include_closed: bool = False, workspace: Optional[str] = None) -> dict:
-    """Вопросы дежурства: открытые и взятые (с работой), по просьбе — и закрытые."""
-    from .core import duty
-
-    store = _store_only(workspace)
-    return _stamp({"questions": duty.questions(store, include_closed=include_closed)}, _resolve(workspace))
-
-
-@mcp.tool()
-async def jwu_duty_question_take(question: str, workspace: Optional[str] = None) -> dict:
-    """«Берём Д12» — взять вопрос в работу этой сессией: заводится работа «🛟 Дежурство: …» с
-    источником и деталями; дальше — jwu-continue-job по ней (разбор, ответ голосом, закрытие)."""
-    from .core import duty
-
-    store = _store_only(workspace)
-    try:
-        return _stamp(duty.question_take(store, question, session=_session_name(store)), _resolve(workspace))
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
-
-
-@mcp.tool()
-async def jwu_duty_question_close(question: str, workspace: Optional[str] = None) -> dict:
-    """«Закрой вопрос Д12», «не берём» — закрыть, не заводя работы: ни итога, ни строки в учёте
-    времени. Если вопрос уже взят и над ним работали — закрывай его работу через jwu-close-job."""
-    from .core import duty
-
-    store = _store_only(workspace)
-    try:
-        return _stamp(duty.question_close(store, question), _resolve(workspace))
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
 
 
 @mcp.tool()

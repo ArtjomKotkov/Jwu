@@ -42,13 +42,3 @@ def test_registry_builtin_addon_override_and_unknown(monkeypatch):
         assert chats.factory("nope", cfg)() is None                   # адаптера нет — как «не настроен»
     finally:
         addons._cache = None
-
-
-def test_matrix_adapter_speaks_chat_types():
-    from jwu.core import matrix
-
-    assert matrix.MatrixClient.name == "matrix" and issubclass(matrix.MatrixError, chats.ChatError)
-    msg = matrix.parse_event({"event_id": "$1", "sender": "@a:x", "type": "m.room.message",
-                              "content": {"body": "привет", "m.relates_to": {"rel_type": "m.thread", "event_id": "$r"}}})
-    assert isinstance(msg, chats.ChatMessage) and msg.thread_root == "$r" and msg.is_new
-    assert not matrix.parse_event({"event_id": "$2", "type": "m.reaction", "content": {"body": "x"}}).is_new

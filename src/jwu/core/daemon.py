@@ -52,7 +52,6 @@ MIN_INTERVAL = 60
 # Long polling бота Telegram: запрос getUpdates висит до N секунд и возвращается сразу,
 # как только пришло сообщение. Реакция мгновенная, пустых опросов нет.
 DEFAULT_POLL_INTERVAL = 25
-DUTY_INTERVAL = 25   # секунд между проверками Matrix (дежурство и личное)
 
 
 class DaemonError(RuntimeError):
@@ -632,32 +631,10 @@ def flush_quiet(store: "Store") -> int:
     return sent
 
 
-def poll_duty(store: "Store") -> list[dict]:
-    """Matrix: дежурство и личное по каждому контуру с Telegram → новое в чат."""
-    from . import chats, duty
-
-    handled: list[dict] = []
-    for ws, cfg, sender, _login in _bot_senders(store):
-        try:
-            n = duty.poll(store, chats.factory("matrix", cfg), sender)
-            if n:
-                handled.append({"workspace": ws.slug, "kind": "duty", "count": n})
-        except Exception as exc:  # noqa: BLE001 — Matrix лежит: позиция не сдвинута, повторим
-            log(f"[{ws.slug}] Matrix: проверка не удалась: {exc}")
-        finally:
-            sender.close()
-    return handled
-
-
-TICK_INTERVAL = DUTY_INTERVAL   # шаг общего периодического цикла демона, с
+TICK_INTERVAL = 25   # шаг общего периодического цикла демона, с
 
 
 def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
-    def duty(store):
-        handled = poll_duty(store)
-        if handled:
-            log(f"Matrix: отправлено {sum(h['count'] for h in handled)} сообщений")
-
     def disk(store):
         if disk_alert(store):
             log("предупреждение о месте на диске отправлено")
@@ -672,7 +649,7 @@ def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
         if upd.offer_if_due(store):
             log("в бот отправлено предложение обновиться")
 
-    return [("duty", 0, duty), ("disk", 300, disk),
+    return [("disk", 300, disk),
             ("quiet", 0, quiet), ("grants", 0, resend_grants), ("update", 3600, update)]
 
 
@@ -744,7 +721,7 @@ def run_loop(
                 store.close()
             if n:
                 log(f"стартовое сообщение отправлено в {n} чат(а)")
-        # Три потока: синк (этот), слушатель бота и Matrix. Слушатель только принимает —
+        # Потоки: синк (этот), слушатели ботов и периодические задачи (jwu-ticks). Слушатель только принимает —
         # каждое нажатие и команда исполняются в пуле, так кнопки отвечают сразу, даже когда
         # другая кнопка ждёт сеть, а синк идёт минутами. /sync будит синк через waiter.
         from concurrent.futures import ThreadPoolExecutor

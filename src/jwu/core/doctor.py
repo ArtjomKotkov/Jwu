@@ -139,7 +139,6 @@ def check_config(store: "Store", ws) -> tuple[list[Check], object]:
             out.append(Check("Конфиг GitHub", "ok", f"{cfg.github.owner} · {cfg.github.repos or 'все репозитории'}"))
     else:
         out.append(Check("Конфиг", "ok", "локальный контур — внешних доступов не требуется"))
-    out.append(_matrix_check(cfg))
     out.append(_disk_check(store, ws))
     out += _jobflow_checks(store, ws)
     out += _integration_checks(store, ws)
@@ -228,19 +227,6 @@ def _disk_check(store, ws) -> "Check":
     if report.ok:
         return Check("Место на диске", "ok", report.summary() + where)
     return Check("Место на диске", "fail", report.summary() + where, "jwu disk · jwu job cleanup <id> · docker system prune")
-
-
-def _matrix_check(cfg) -> "Check":
-    """Доступ к Matrix для дежурства в боте: свой конфиг, конфиг matrix-mcp или ничего."""
-    from .matrix import access_from_config
-
-    homeserver, _user, _token, source = access_from_config(cfg)
-    if source == "jwu":
-        return Check("Matrix (дежурство)", "ok", homeserver)
-    if source == "matrix-mcp":
-        return Check("Matrix (дежурство)", "ok", f"{homeserver} · из конфига matrix-mcp")
-    return Check("Matrix (дежурство)", "skip", "не настроен — /duty в боте недоступен",
-                 "jwu configure --non-interactive --matrix-host … --matrix-token …")
 
 
 def check_access(ws, cfg) -> list[Check]:

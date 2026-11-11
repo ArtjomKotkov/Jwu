@@ -52,8 +52,23 @@ my-addon = "my_package.my_addon"
 
 Модуль может определить любые из хуков (все необязательны): `register_cli`, `register_mcp`,
 `skills_dir`, `agents_dir`, `bot_text`, `bot_commands` + `bot_command`, `callback_prefixes` +
-`bot_callback`, `menu_buttons` + `menu_action`, `facades`, `chat_sources`, `daemon_tasks`, `after_hints`, `doctor`.
+`bot_callback`, `menu_buttons` + `menu_action`, `status_lines`, `board_groups`, `config_sections`,
+`secret_slots`, `facades`, `chat_sources`, `daemon_tasks`, `after_hints`, `doctor`.
 Сигнатуры и смысл — в начале `src/jwu/core/addons.py`.
+
+## Настройки и секреты аддона
+
+`config_sections() -> ["имя"]` — секция конфига аддона: значения из `config.toml` (`[имя]`) и
+из настроек воркспейса (`имя.ключ`) приходят в `cfg.addons["имя"]`. `secret_slots() ->
+{"имя.token": "ENV"}` — слот секрета: хранится в секретах воркспейса, читается
+`config.get_slot(cfg, "имя.token")`, переменная окружения перебивает.
+
+## Доска «что делать»
+
+`board_groups()` — свои группы доски; встают первыми. Группа — словарь: `group`, `title`,
+`items(store, workspace_id, login) -> [{key, title, problems, job_id}]`, `take(store, key,
+session) -> job_id` (работа у пункта заводится, только когда его взяли), необязательные
+`columns` и `hide_job(job)` (служебные работы аддона доска не предлагает закрыть).
 
 ## Встроенные аддоны
 
@@ -76,7 +91,7 @@ update Bot API: `send`, `edit`, `delete`, `answer_callback`, `get_updates`, `set
 воркспейса отдаёт источник или `None` (не настроен). Источник реализует `ChatSource` из
 `jwu.core.chats`: кто я, комнаты с именами, «что нового» с позиции (`news(cursor)` — сообщения
 по комнатам, непрочитанное, личные диалоги), одно сообщение по id. Только чтение: писать в чаты
-jwu не умеет. Потребители (дежурство, упоминания) берут источник по имени и не знают, какой
+jwu не умеет. Потребители (слежение за комнатами, упоминания) берут источник по имени и не знают, какой
 это мессенджер. Аддон с тем же именем перекрывает встроенный адаптер.
 
 Опираться можно только на `jwu.addon_api` (store для CLI и MCP, контуры с ботом, отправка с

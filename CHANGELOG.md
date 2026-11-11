@@ -2,6 +2,19 @@
 
 Раньше история версий жила только в релизах GitHub; дальше — и здесь.
 
+## 3.0.0.dev7
+
+- **Дежурство и Matrix ушли из jwu** — теперь это аддоны (приватные): дежурство с вопросами
+  «Д<N>», `/duty`, `/personal`, `/matrix`, `jwu duty …`, `jwu_duty_*`, скилл `jwu-duty` и агент
+  `duty-support-sample`; адаптер Matrix и флаги `jwu configure --matrix-*`. Туда же —
+  скиллы `jwu-4test-message`, `jwu-qa-triage` и агент `qa-triage-sample`. Данные в базе
+  остались — аддон подхватывает их как есть.
+- Для аддонов: группы доски «что делать» (`board_groups`), строки `/status` (`status_lines`),
+  своя секция конфига (`config_sections` → `cfg.addons[…]`) и слоты секретов (`secret_slots`);
+  `/help` бота показывает команды аддонов. Финиш работы предлагает тексты аддонов (подсказки
+  `jwu_addons()`), а не зашитый 4test.
+- Каналы голоса `4test` и `matrix` переименованы в `qa_note` и `chat` (старые имена понимаются).
+
 ## 3.0.0.dev6
 
 - **Telegram — встроенный аддон-фасад** (`jwu.builtin.telegram`). Транспорт (Bot API,

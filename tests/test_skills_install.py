@@ -150,10 +150,6 @@ def test_copyable_texts_in_code_block_and_no_promises():
     root = files("jwu")
     voice = (root / "agents" / "voice-writer-sample.md").read_text(encoding="utf-8")
     assert "```text" in voice and "Никаких обещаний от имени пользователя" in voice
-    duty = (root / "agents" / "duty-support-sample.md").read_text(encoding="utf-8")
-    assert "Предлагаю сделать дежурному:" in duty and "каждый в своём блоке кода" in duty
-    skill = (root / "skills" / "jwu-duty" / "SKILL.md").read_text(encoding="utf-8")
-    assert "Обещания — только по решению дежурного" in skill and 'kind="todo"' in skill
     for d in (root / "skills").iterdir():
         md = d / "SKILL.md"
         text = md.read_text(encoding="utf-8") if md.is_file() else ""

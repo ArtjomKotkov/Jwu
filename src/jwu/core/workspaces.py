@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import secrets as secrets_mod
-from .config import Config, _apply_raw, apply_env_overrides, load_config
+from .config import Config, _apply_raw, addon_sections, apply_env_overrides, load_config
 from .models import WORKSPACE_PROVIDERS, Workspace
 from .store import DEFAULT_WORKSPACE_SLUG as DEFAULT_SLUG, Store
 
@@ -250,8 +250,6 @@ _SETTING_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("jenkins.base_url", "jenkins", "base_url"),
     ("jenkins.username", "jenkins", "username"),
     ("telegram.chat_id", "telegram", "chat_id"),
-    ("matrix.homeserver", "matrix", "homeserver"),
-    ("matrix.user_id", "matrix", "user_id"),
 )
 
 LEGACY_MIGRATED_META = "workspaces.legacy_migrated"
@@ -266,7 +264,7 @@ def _settings_to_raw(settings: dict[str, str]) -> dict:
     for key, value in settings.items():
         parts = key.split(".")
         if len(parts) < 2 or parts[0] not in ("jira", "support", "bitbucket", "github", "jenkins",
-                                              "telegram", "matrix"):
+                                              "telegram", *addon_sections()):
             continue  # служебные ключи воркспейса (features.seq и пр.) — не конфиг
         node = raw
         for part in parts[:-1]:
@@ -314,7 +312,7 @@ def migrate_legacy_config(store: Store, workspace: Workspace | None = None) -> t
     cfg = load_config()  # глобальный config.toml + KeyringSecrets
     save_workspace_config(store, workspace, cfg)
     moved = 0
-    for slot in secrets_mod.SECRET_SLOTS:
+    for slot in secrets_mod.all_slots():
         ref = _keyring_ref(cfg, slot)
         if ref is None:
             continue

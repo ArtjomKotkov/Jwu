@@ -1,6 +1,6 @@
 ---
 name: jwu-task-branches
-description: Use when the duty/support question is whether a fix has reached a given release or client version — «есть ли фикс в версии клиента», «в какие ветки доехала задача», «эта задача в 10.7 есть?», «доехал ли фикс до релиза», «/jwu-task-branches». Ничего не пишет: собирает коммиты и PR из dev-панели задачи и проверяет по локальным клонам репозиториев воркспейса, в какие релизные ветки фикс доехал, а в какие нет.
+description: Use when a support question is whether a fix has reached a given release or client version — «есть ли фикс в версии клиента», «в какие ветки доехала задача», «эта задача в 10.7 есть?», «доехал ли фикс до релиза», «/jwu-task-branches». Ничего не пишет: собирает коммиты и PR из dev-панели задачи и проверяет по локальным клонам репозиториев воркспейса, в какие релизные ветки фикс доехал, а в какие нет.
 ---
 
 # jwu: в какие ветки доехал фикс задачи

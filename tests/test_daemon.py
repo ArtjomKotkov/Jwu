@@ -331,7 +331,6 @@ def test_run_loop_reports_after_bot_sync(tmp_path, monkeypatch):
 
     monkeypatch.setattr(daemon, "run_pass", lambda store, **kw: _stamped(fake_pass(store)))
     monkeypatch.setattr(daemon, "poll_bots", fake_poll)
-    monkeypatch.setattr(daemon, "poll_duty", lambda store: [])
     monkeypatch.setattr(daemon, "report_pass", fake_report)
     try:
         daemon.run_loop(lambda: Store(db), interval=3600, announce=False, poll_interval=1)

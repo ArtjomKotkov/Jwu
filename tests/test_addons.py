@@ -172,3 +172,23 @@ def test_telegram_is_builtin_addon_and_can_be_disabled(eps, monkeypatch):
     addons.set_enabled("telegram", False)
     addons.load(refresh=True)
     assert notify.notifier_from_config(cfg) is None          # фасад выключен — слать некуда
+
+
+def test_addon_config_section_and_secret_slot(eps, tmp_path, monkeypatch):
+    from jwu.core import config, secrets
+    from jwu.core.store import Store
+    from jwu.core.workspaces import config_for_workspace
+
+    eps.append(_EP("chatx", _mod("chatx", config_sections=lambda: ["chatx"],
+                                 secret_slots=lambda: {"chatx.token": "CHATX_TOKEN"})))
+    store = Store(tmp_path / "s.db")
+    ws = store.get_workspace_by_slug("work")
+    store.set_workspace_settings(ws.id, {"chatx.host": "https://chat.x", "chatx.user": "@me"})
+    store.set_workspace_secret(ws.id, "chatx.token", "sekret")
+    cfg = config_for_workspace(store, ws)
+    assert cfg.addons["chatx"] == {"host": "https://chat.x", "user": "@me"}
+    assert config.get_slot(cfg, "chatx.token") == "sekret"
+    assert "chatx.token" in secrets.all_slots() and secrets.slot_env("chatx.token") == "CHATX_TOKEN"
+    monkeypatch.setenv("CHATX_TOKEN", "из-окружения")
+    assert config.get_slot(cfg, "chatx.token") == "из-окружения"
+    store.close()

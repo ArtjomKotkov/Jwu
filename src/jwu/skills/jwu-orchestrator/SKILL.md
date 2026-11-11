@@ -1,6 +1,6 @@
 ---
 name: jwu-orchestrator
-description: Use when the user wants this session to be an ORCHESTRATOR that hands work to separate worker sessions — «будь оркестратором», «/jwu-orchestrator», «возьми PROJ-1 и PROJ-2 воркеру», «почини сборки PR 12, 13, 14 одним воркером», «Д4 воркеру», «2 и 5 с доски воркерам», «поревьюй PR 10725 воркером», «что у воркеров», «передай воркеру …», «останови воркер …». Starts worker sessions (Claude with Remote Control, named after the job) ONLY on the user's command and exactly as many as asked, writes each worker a good brief for its kind of work (task, review, failed build, conflict, QA return, duty question, test cases), records the brief in the job log, tracks worker states in jwu (shown in this session's status line) and relays who is waiting for the user. Never answers for the user and never spawns workers on its own.
+description: Use when the user wants this session to be an ORCHESTRATOR that hands work to separate worker sessions — «будь оркестратором», «/jwu-orchestrator», «возьми PROJ-1 и PROJ-2 воркеру», «почини сборки PR 12, 13, 14 одним воркером», «2 и 5 с доски воркерам», «поревьюй PR 10725 воркером», «что у воркеров», «передай воркеру …», «останови воркер …». Starts worker sessions (Claude with Remote Control, named after the job) ONLY on the user's command and exactly as many as asked, writes each worker a good brief for its kind of work (task, review, failed build, conflict, test cases, addon board items), records the brief in the job log, tracks worker states in jwu (shown in this session's status line) and relays who is waiting for the user. Never answers for the user and never spawns workers on its own.
 ---
 
 # jwu: оркестратор воркеров
@@ -45,7 +45,7 @@ Claude, которые jwu поднимает в фоне с Remote Control по
 | «возьми PROJ-1 и PROJ-2 воркеру» | **один** воркер, задачи по очереди |
 | «PROJ-1 и PROJ-2 — каждую своему», «двум воркерам» | по воркеру на задачу, запуск параллельно |
 | «почини сборки PR 12, 13, 14 одним воркером» | один воркер, три сборки по очереди |
-| «2 и 5 с доски воркеру», «Д4 воркеру» | номера доски **jwu-todo**, Д дежурства — как ключи |
+| «2 и 5 с доски воркеру» | номера доски **jwu-todo** (пункты групп аддонов — их ключами) |
 | «что у воркеров» | таблица (ниже) |
 | «передай <воркеру>: …» | SendMessage воркеру — дословно, как факт от пользователя без «разрешаю» |
 | «останови <воркер>» | раздел «Остановка» |
@@ -56,13 +56,13 @@ Claude, которые jwu поднимает в фоне с Remote Control по
 ## Возьми … воркеру — по шагам
 
 1. **Пункты.** Ключ, номер доски, Д, PR, сборка → пункт: `jwu_todo()` (номера доски), `jwu_task`,
-   `jwu_prs`, вопросы дежурства. Задача уже взята другой сессией или воркером — скажи и не бери.
+   `jwu_prs`, пункты групп аддонов на доске. Задача уже взята другой сессией или воркером — скажи и не бери.
 2. **Вид работы** — по справочнику ниже (из пункта доски он виден: задача, ревью, сборка,
    конфликт, возврат).
 3. **Известное.** `jwu_context(key)` по каждой задаче/PR — решения, грабли, статус, прошлая
    работа, ветки. Работа уже есть — `jwu_job_handoff(id)`: на чём остановились.
 4. **Имя** — по делу, до 40 символов, уникальное среди живых: «PROJ-1 · выгрузка»,
-   «Сборки · PR 12–14», «Ревью · PR 12», «Д4 · выгрузка чатов». Дату запуска спереди
+   «Сборки · PR 12–14», «Ревью · PR 12». Дату запуска спереди
    («29.10 · …») jwu добавит сам — по ней в списке сессий видно сегодняшних.
 5. **Занять.** Пункт доски — `jwu_todo_take(numbers=[…], keys=[…], for_worker="<имя воркера>")`
    (номера — по доске, которую показали тебе; `keys` — ключи этих пунктов с неё): работа заводится
@@ -98,7 +98,7 @@ Claude, которые jwu поднимает в фоне с Remote Control по
 
 | вид | скилл воркера | в задании | ждёт пользователя | готово, когда |
 |---|---|---|---|---|
-| задача | **jwu-start-job** KEY | ключ, суть, известное, уточнения | план; финальное меню (коммит, PR, ревьюверы, 4test, статус) | PR создан, 4test в задаче, работа закрыта |
+| задача | **jwu-start-job** KEY | ключ, суть, известное, уточнения | план; финальное меню (коммит, PR, ревьюверы, статус) | PR создан, работа закрыта |
 | продолжить работу | **jwu-continue-job** #id | номер, на чём остановились, что осталось | как у задачи | как у задачи |
 | ревью чужих PR (любой круг, один или несколько) | **jwu-review-queue** с номерами: `/jwu-review-queue <PR…>` | PR, задача, ревьювер репозитория, круг; на повторном — что было в прошлых кругах (закреплённый статус, сводки `reviews/…/summary.md`) и «новое — только в изменённом» | перед публикацией комментов и статуса по каждому PR | опубликовано с «да» или черновик отдан; работы закрыты, статус-заметка PR обновлена |
 | вся очередь ревью | **jwu-review-queue** без номеров | глубина light/full, что пропускать | на каждом PR перед публикацией | очередь разобрана |
@@ -107,8 +107,6 @@ Claude, которые jwu поднимает в фоне с Remote Control по
 | демо (🎬 с доски) | **jwu-continue-job** / **jwu-start-job** с целью «подготовить демо», как в **jwu-todo** | задача, PR, стенд, что показать | перевод статуса | сценарий показа готов, фича проверена на стенде |
 | конфликт PR | **jwu-continue-job** / **jwu-start-job** с целью «конфликт» | PR, целевая ветка | пуш | PR мержится |
 | замечания ревью к моему PR | **jwu-continue-job** + **jwu-pr-comment** | PR, какие треды | ответы в треды, пуш | внесено, треды отвечены |
-| возврат с тестов | **jwu-qa-triage** | задача, коммент тестировщика | ответ тестировщику и перевод | ответ ушёл, задача переведена |
-| вопрос дежурства | **jwu-duty** «берём Д<N>» | Д, тред, тикет, «сначала перечитай тред» | черновик ответа (постинг запрещён) | черновик у пользователя, вопрос закрыт |
 | тест-кейсы | **jwu-zephyr-testcase** | задача, что сделано | перед созданием кейсов | кейсы созданы |
 | разобраться | **jwu-start-job** «только анализ» | вопрос, где копать | — | вывод в журнале |
 

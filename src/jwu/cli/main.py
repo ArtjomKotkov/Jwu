@@ -79,11 +79,6 @@ guide_app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(guide_app, name="guide")
-duty_app = typer.Typer(
-    help="Matrix в Telegram-боте: дежурство за комнатой и личное (непрочитанное 1:1 и упоминания).",
-    invoke_without_command=True,
-)
-app.add_typer(duty_app, name="duty")
 queue_app = typer.Typer(
     help="Очередь задач сессии: мелкие просьбы из чата встают в конец и выполняются подряд "
          "в основном потоке либо субагентами по свободным слотам.",
@@ -499,12 +494,6 @@ def configure_main(
     telegram_backup_opt: Optional[str] = typer.Option(None, "--telegram-backup-token",
         help="Токен резервного бота: основной не отвечает — уведомления и кнопки идут через него "
              "(тот же chat_id; резервному боту один раз напиши /start). Пусто — убрать резерв."),
-    matrix_host: Optional[str] = typer.Option(None, "--matrix-host",
-        help="Homeserver Matrix для дежурства в боте (пусто — брать из конфига matrix-mcp)."),
-    matrix_user: Optional[str] = typer.Option(None, "--matrix-user",
-        help="Свой mxid в Matrix (@login:server); пусто — узнаем по токену."),
-    matrix_token_opt: Optional[str] = typer.Option(None, "--matrix-token",
-        help="Access-токен Matrix (Element → Настройки → Помощь и о программе)."),
     db_path_opt: Optional[str] = typer.Option(None, "--db-path"),
     force: bool = typer.Option(False, "--force",
         help="Разрешить путь до БД в облачной папке (iCloud/Dropbox) — там токены уедут в облако."),
@@ -667,12 +656,6 @@ def configure_main(
             "bitbucket.token": btok,
             "jenkins.token": ktok,
         }
-
-    # Matrix (дежурство в боте) не спрашиваем в визарде: обычно хватает конфига
-    # matrix-mcp. Флаги — для тех, у кого его нет или нужен другой аккаунт.
-    if matrix_host is not None: cfg.matrix.homeserver = matrix_host.strip().rstrip("/")
-    if matrix_user is not None: cfg.matrix.user_id = matrix_user.strip()
-    if matrix_token_opt is not None: new_secrets["matrix.token"] = matrix_token_opt
 
     # Путь до БД — единственное, что остаётся глобальным: БД надо найти ДО того,
     # как известен воркспейс (в ней же лежат конфиги воркспейсов).
@@ -6504,157 +6487,6 @@ def statusline_preview() -> None:
 
     with _open_store() as store:
         typer.echo(sl.render({"cwd": str(Path.cwd())}, store, with_claude=False), color=True)
-
-
-# --------------------------------------------------------------------------- #
-# duty: дежурство в Telegram-боте — слежение за комнатой Matrix
-# --------------------------------------------------------------------------- #
-
-
-def _duty_client(store: Store):
-    from ..core import chats
-
-    ws = _resolve_workspace(store)
-    cfg = workspaces.config_for_workspace(store, ws)
-    client = chats.factory("matrix", cfg)()
-    if client is None:
-        err.print("[red]Matrix не настроен.[/red] jwu configure --non-interactive "
-                  "--matrix-host … --matrix-token …  (или конфиг matrix-mcp на этой машине)")
-        raise typer.Exit(code=1)
-    return client
-
-
-def _duty_state_dict(state) -> dict:
-    return {"room_id": state.room_id, "room_name": state.room_name, "enabled": state.enabled,
-            "active": state.active, "personal": state.personal, "me": state.me}
-
-
-@duty_app.callback()
-def duty_root(ctx: typer.Context,
-              as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
-    """Состояние (без подкоманды): дежурство за комнатой и личное."""
-    if ctx.invoked_subcommand is not None:
-        return
-    from ..core import duty
-
-    with _store() as store:
-        state = duty.load(store)
-    if as_json:
-        _emit_json(_duty_state_dict(state))
-        return
-    if not state.configured:
-        console.print("[dim]Дежурство: комната не выбрана.[/dim] jwu duty rooms → jwu duty room <номер|название>")
-    else:
-        mark = "[green]включено[/green]" if state.active else "[yellow]выключено[/yellow]"
-        console.print(f"Дежурство: {mark} · комната [bold]{state.title}[/bold]")
-    mark = "[green]включено[/green]" if state.personal else "[yellow]выключено[/yellow]"
-    console.print(f"Личное (1:1 и упоминания): {mark}")
-
-
-@duty_app.command("rooms")
-def duty_rooms(
-    show_all: bool = typer.Option(False, "--all", help="И личные диалоги (комнаты без названия)."),
-    refresh: bool = typer.Option(False, "--refresh", help="Перечитать имена всех комнат, а не только новых."),
-    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
-) -> None:
-    """Комнаты Matrix, где я состою (номер — для `jwu duty room`)."""
-    from ..core import duty
-
-    with _store() as store:
-        with _duty_client(store) as client:
-            rooms = duty.list_rooms(store, client, refresh=refresh)
-    if not show_all:
-        rooms = [r for r in rooms if r.name]
-    if as_json:
-        _emit_json([{"n": i + 1, "id": r.id, "name": r.name} for i, r in enumerate(rooms)])
-        return
-    for i, r in enumerate(rooms, 1):
-        console.print(f"{i:>3}. {r.title}  [dim]{r.id}[/dim]")
-
-
-@duty_app.command("room")
-def duty_room(query: str = typer.Argument(..., help="Номер из `jwu duty rooms`, id или часть названия.")) -> None:
-    """Выбрать комнату дежурства (настройка; включённое дежурство переедет в неё)."""
-    from ..core import duty
-
-    with _store() as store:
-        with _duty_client(store) as client:
-            rooms = duty.list_rooms(store, client)
-            named = [r for r in rooms if r.name]
-            # номер — как в `jwu duty rooms` (без --all); id и название — по всем комнатам
-            room = duty.pick_room(named, query) if query.strip().isdigit() else duty.pick_room(rooms, query)
-            if room is None:
-                err.print(f"[red]Комната не найдена или неоднозначна:[/red] {query}. Список — jwu duty rooms")
-                raise typer.Exit(code=1)
-            state = duty.set_room(store, client, room)
-    console.print(f"Комната дежурства: [bold]{state.title}[/bold]"
-                  + ("" if state.active else " · включить — jwu duty on или /duty в боте"))
-
-
-@duty_app.command("on")
-def duty_on() -> None:
-    """Включить дежурство в выбранной комнате."""
-    from ..core import duty
-
-    with _store() as store:
-        if not duty.load(store).configured:
-            err.print("[red]Комната не выбрана.[/red] jwu duty rooms → jwu duty room <номер|название>")
-            raise typer.Exit(code=1)
-        with _duty_client(store) as client:
-            state = duty.enable(store, client)
-    console.print(f"Дежурство [green]включено[/green]: {state.title}. Сообщения пришлёт демон в Telegram.")
-
-
-@duty_app.command("off")
-def duty_off() -> None:
-    """Выключить дежурство (комната остаётся в настройке)."""
-    from ..core import duty
-
-    with _store() as store:
-        state = duty.disable(store)
-    console.print(f"Дежурство [yellow]выключено[/yellow]{' · ' + state.title if state.configured else ''}.")
-
-
-@duty_app.command("personal")
-def duty_personal(switch: str = typer.Argument(..., help="on | off")) -> None:
-    """Личное: непрочитанное из диалогов 1:1 и упоминания в чатах — независимо от дежурства."""
-    from ..core import duty
-
-    switch = switch.strip().lower()
-    if switch not in ("on", "off"):
-        err.print("[red]Нужно on или off.[/red]")
-        raise typer.Exit(code=1)
-    with _store() as store:
-        if switch == "off":
-            duty.set_personal(store, False)
-            console.print("Личное [yellow]выключено[/yellow].")
-            return
-        with _duty_client(store) as client:
-            duty.set_personal(store, True, client)
-    console.print("Личное [green]включено[/green]: непрочитанное 1:1 и упоминания пришлёт демон в Telegram.")
-
-
-@duty_app.command("check")
-def duty_check(as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
-    """Проверить прямо сейчас и показать новое (позиция сдвигается, в Telegram не шлёт)."""
-    import re as _re
-
-    from ..core import duty
-
-    with _store() as store:
-        if not duty.load(store).watching:
-            err.print("[yellow]Ничего не включено.[/yellow] jwu duty on · jwu duty personal on")
-            raise typer.Exit(code=1)
-        with _duty_client(store) as client:
-            state, items, _ = duty.check(store, client)
-    if as_json:
-        _emit_json([{"who": i.who, "body": i.body, "thread": i.thread, "to_me": i.to_me,
-                     "direct": i.direct, "room": i.room} for i in items])
-        return
-    if not items:
-        console.print("[dim]Нового нет.[/dim]")
-        return
-    console.print(_re.sub(r"<[^>]+>", "", duty.format_items(state, items)), markup=False, highlight=False)
 
 
 # --------------------------------------------------------------------------- #

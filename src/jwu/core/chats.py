@@ -122,10 +122,8 @@ def factories() -> dict[str, Factory]:
 
 
 def _builtin() -> dict[str, Factory]:
-    """Встроенные адаптеры (переезжают в аддоны — тогда их здесь не будет)."""
-    from .matrix import client_from_config
-
-    return {"matrix": client_from_config}
+    """Встроенных адаптеров нет: все мессенджеры — аддоны."""
+    return {}
 
 
 def factory(name: str, cfg: "Config") -> Callable[[], Optional[ChatSource]]:

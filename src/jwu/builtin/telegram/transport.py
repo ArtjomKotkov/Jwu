@@ -127,7 +127,7 @@ class TelegramNotifier:
         ``reply_to`` — ответить на конкретное сообщение (подтверждение заметки, ответ на
         команду), чтобы в чате было видно, к чему это. ``keyboard`` — приложить постоянную
         клавиатуру с командами (к последнему куску). ``markup`` — своя клавиатура (например,
-        inline-кнопки настройки дежурства), тоже к последнему куску; главнее ``keyboard``.
+        inline-кнопки меню), тоже к последнему куску; главнее ``keyboard``.
         """
         ids: list[int] = []
         chunks = split_message(text)
@@ -195,7 +195,7 @@ class TelegramNotifier:
         return resp.json() if resp.content else {}
 
     def edit(self, message_id: int, text: str, *, markup: Optional[dict] = None) -> None:
-        """Заменить текст и кнопки своего сообщения (меню настройки дежурства)."""
+        """Заменить текст и кнопки своего сообщения (меню, склейка уведомлений)."""
         payload: dict = {"chat_id": self.chat_id, "message_id": int(message_id), "text": text,
                          "parse_mode": "HTML", "disable_web_page_preview": True,
                          "reply_markup": markup or {"inline_keyboard": []}}

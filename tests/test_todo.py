@@ -175,25 +175,38 @@ def test_two_prs_for_one_task_are_flagged_and_linked(store):
     assert {(p.repo, p.pr_id) for p in job.prs} == {("r", 1), ("other", 4)}
 
 
-def test_duty_question_no_job_until_taken(store):
-    from jwu.core import duty
+def test_addon_board_group_first_taken_by_addon_and_hides_its_jobs(store, monkeypatch):
+    """Группа доски от аддона: встаёт первой, пункт берёт сам аддон, его работы доска не закрывает."""
+    import types
 
-    q = duty.question_add(store, summary="shop — Too many open files", author="ivan", when="26.10 17:17",
-                          where="корень комнаты", event_id="$e1", details="Спрашивает: …")
-    again = duty.question_add(store, summary="shop — уточнили", event_id="$e1")
-    assert q["id"] == "Д1" and q["created"] and not again["created"] and again["id"] == "Д1"
-    assert store.list_jobs() == []                                   # пока не взяли — работы нет
-    board = todo.build(store, store.workspace_id, "me", session="S1")
-    item = next(i for i in board.items if i.group == "duty")
-    assert item.key == "Д1" and board.items[0].group == "duty" and item.taken is None
-    res = todo.take(store, store.workspace_id, "me", numbers=[item.n], session="S1")
-    job = store.get_job(res["taken"][0]["job_id"])
-    assert job.title.startswith(duty.QUESTION_PREFIX) and len(store.list_jobs()) == 1
-    assert todo.take(store, store.workspace_id, "me", group="duty", session="S2")["taken"] == []
-    # закрыть, не беря: ни работы, ни следа
-    q2 = duty.question_add(store, summary="вопрос попроще", event_id="$e2")
-    duty.question_close(store, q2["id"])
-    assert [x["id"] for x in duty.questions(store)] == ["Д1"] and len(store.list_jobs()) == 1
+    from jwu.core import addons
+
+    made = []
+
+    def take(st, key, session):
+        job = st.create_job("", f"🔸 {key}")
+        made.append((key, session))
+        return job.id
+
+    mod = types.ModuleType("fake")
+    mod.board_groups = lambda: [{"group": "asks", "title": "🔸 Вопросы",
+                                 "items": lambda st, wid, login: [{"key": "В1", "title": "почему падает", "problems": ["ivan"]}],
+                                 "take": take, "hide_job": lambda job: job.title.startswith("🔸")}]
+    monkeypatch.setattr(addons, "_entry_points", lambda: [types.SimpleNamespace(
+        name="fake", dist=types.SimpleNamespace(version="1"), load=lambda: mod)])
+    monkeypatch.setattr(addons, "_cache", None)
+    try:
+        assert todo.groups()[0] == "asks" and todo.group_titles()["asks"] == "🔸 Вопросы"
+        board = todo.build(store, store.workspace_id, "me", session="S1")
+        item = board.items[0]
+        assert (item.group, item.key, item.problems) == ("asks", "В1", ["ivan"])
+        assert "### 🔸 Вопросы · 1" in todo.render_md(board)
+        res = todo.take(store, store.workspace_id, "me", numbers=[item.n], session="S1")
+        assert res["taken"][0]["group"] == "asks" and made == [("В1", "S1")]
+        board = todo.build(store, store.workspace_id, "me", session="S1")
+        assert not any(i.group == "close" for i in board.items)       # служебная работа аддона — не «закрыть»
+    finally:
+        addons._cache = None
 
 
 def test_board_move_reply_close_groups(store):

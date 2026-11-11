@@ -29,9 +29,8 @@ if TYPE_CHECKING:
     from .models import PR, Issue, Job
     from .store import Store
 
-GROUPS = ("duty", "simple", "build", "fixes", "demo", "reply", "move", "todo", "review", "close")
+GROUPS = ("simple", "build", "fixes", "demo", "reply", "move", "todo", "review", "close")
 GROUP_TITLES = {
-    "duty": "🛟 Дежурство",
     "reply": "📣 Ответить",
     "move": "➡️ Двигать дальше",
     "close": "🧹 Закрыть работу",
@@ -42,6 +41,40 @@ GROUP_TITLES = {
     "todo": "📋 Несделанные задачи",
     "review": "👀 Ждут моего ревью",
 }
+ADDON_COLUMNS = ("№", "Пункт", "Откуда", "Взято")
+
+
+def _addon_boards() -> list[dict]:
+    """Группы доски от аддонов (хук ``board_groups``) — встают первыми, перед своими.
+
+    Группа: ``{"group", "title", "items": fn(store, workspace_id, login) -> [{"key", "title",
+    "problems", "job_id"}], "take": fn(store, key, session) -> job_id, "columns"?,
+    "hide_job": fn(job) -> bool?}`` — ``hide_job``: служебные работы аддона, которые доска не
+    предлагает закрыть.
+    """
+    from . import addons
+
+    out: list[dict] = []
+    for addon in addons.active():
+        for g in addon.call("board_groups", default=[]) or []:
+            if isinstance(g, dict) and g.get("group") and g["group"] not in GROUPS:
+                out.append(g)
+    return out
+
+
+def groups() -> tuple[str, ...]:
+    """Все группы доски по порядку: аддонов, потом свои."""
+    return tuple(g["group"] for g in _addon_boards()) + GROUPS
+
+
+def group_titles() -> dict[str, str]:
+    return {**{g["group"]: g.get("title") or g["group"] for g in _addon_boards()}, **GROUP_TITLES}
+
+
+def is_addon_group(group: str) -> bool:
+    return group not in GROUPS
+
+
 TODO_STATUSES_SETTING = "todo.statuses.todo"
 QA_STATUSES_SETTING = "todo.statuses.qa_failed"
 DEMO_STATUSES_SETTING = "todo.statuses.demo"
@@ -303,25 +336,28 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                           pr={"id": pr.id, "project": pr.project, "repo": pr.repository, "title": pr.title},
                           taken=_taken(by_pr.get((pr.project, pr.repository, pr.id)))))
 
-    # Дежурство: вопросы «Д<N>»; работа у вопроса появляется, только когда его взяли
-    from .duty import questions as duty_questions
-
-    for q in duty_questions(store):
-        taken = None
-        if q.get("job_id"):
-            job = store.get_job(int(q["job_id"]))
-            info = _taken(job) if job else None
-            taken = info if info and info["session"] else None
-        source = " · ".join(x for x in (q.get("author", ""), q.get("when", ""), q.get("where", "")) if x)
-        items.append(Item(n=0, group="duty", key=q["id"], title=q["summary"],
-                          problems=[source] if source else [], taken=taken))
+    # Группы аддонов: работа у пункта появляется, только когда его взяли
+    for board in _addon_boards():
+        try:
+            entries = board["items"](store, workspace_id, login) or []
+        except Exception:  # noqa: BLE001 — аддон не должен ронять доску
+            entries = []
+        for e in entries:
+            taken = None
+            if e.get("job_id"):
+                job = store.get_job(int(e["job_id"]))
+                info = _taken(job) if job else None
+                taken = info if info and info["session"] else None
+            items.append(Item(n=0, group=board["group"], key=str(e["key"]), title=str(e.get("title") or ""),
+                              problems=list(e.get("problems") or []), taken=taken))
 
     listed = {i.key for i in items}
     _extra_groups(store, workspace_id, login, items, listed, issues, qa_st)
 
     # Группы — в фиксированном порядке; внутри: свободное выше взятого, в работе выше не начатого,
     # дальше от важного приоритета к неважному.
-    items.sort(key=lambda i: (GROUPS.index(i.group), i.taken is not None,
+    order = groups()
+    items.sort(key=lambda i: (order.index(i.group) if i.group in order else len(order), i.taken is not None,
                               0 if (i.status or "").casefold() in IN_WORK_STATUSES else 1,
                               _prio(i.priority), i.key))
     for n, item in enumerate(items, 1):
@@ -397,7 +433,6 @@ def _finished(issue: "Issue") -> bool:
 def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, listed: set,
                   issues: dict, qa_st: set) -> None:
     """То, что раньше давал дневной анализ: двигать дальше, ответить, закрыть работу."""
-    from .duty import QUESTION_PREFIX
     from .store import is_testing_status
 
     by_key, by_pr = _taken_index(store)
@@ -447,7 +482,7 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
         last = ms[-1]
         text = " ".join((last.text or "").split())
         said = f"{last.author}: {text[:70]}" + (f" (+{len(ms) - 1})" if len(ms) > 1 else "")
-        same = [i for i in items if i.issue_key == task_key and i.group not in ("duty", "close")]
+        same = [i for i in items if i.issue_key == task_key and i.group in GROUPS and i.group != "close"]
         if same:
             # задача уже на доске — коммент к её пункту, а не второй пункт той же задачи
             for item in same:
@@ -460,8 +495,9 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
     # 🧹 работа открыта, а задача закрыта или ушла от меня
     all_prs = {(pr.project, pr.repository, pr.id): pr for pr in store.latest_prs()}
     in_review = {(pr.project, pr.repository, pr.id) for pr in store.latest_prs("review")}
+    hidden = [b["hide_job"] for b in _addon_boards() if callable(b.get("hide_job"))]
     for job in store.list_jobs(status="active"):
-        if job.title.startswith(QUESTION_PREFIX):
+        if any(hide(job) for hide in hidden):
             continue
         review_prs = _review_prs(job, all_prs, login)
         if review_prs:
@@ -723,7 +759,7 @@ def _goal(item: Item) -> str:
     if item.group == "reply":
         return "Ответить на упоминание"
     if item.group == "todo" and item.reply:
-        return "Разбор возврата QA"      # вернули в работу и ждут ответа — jwu-qa-triage
+        return "Разбор возврата QA"      # вернули в работу и ждут ответа
     return "Сделать задачу"
 
 
@@ -772,18 +808,17 @@ def take(store: "Store", workspace_id: int, login: str, *, numbers: Iterable[int
         wanted_keys += [i.key for i in board.items if i.group == group and i.taken is None]
     items = {i.key: i for i in board.items}
     taken: list[dict] = []
-    # Вопросы дежурства берутся отдельно: работа у них заводится только сейчас
-    from .duty import question_take
-
-    for key in [k for k in dict.fromkeys(wanted_keys) if items.get(k) and items[k].group == "duty"]:
+    # Пункты групп аддонов берёт сам аддон: работа у них заводится только сейчас
+    takers = {b["group"]: b["take"] for b in _addon_boards() if callable(b.get("take"))}
+    for key in [k for k in dict.fromkeys(wanted_keys) if items.get(k) and items[k].group in takers]:
         item = items[key]
         if item.taken:
             skipped.append({"key": key, "n": asked_n.get(key, item.n), "reason": f"уже взято сессией «{item.taken['session']}», {item.taken['ago']}"})
             continue
-        q = question_take(store, key, session=session)
-        taken.append({"n": asked_n.get(key, item.n), "key": key, "group": "duty", "job_id": q["job_id"],
+        job_id = takers[item.group](store, key, session)
+        taken.append({"n": asked_n.get(key, item.n), "key": key, "group": item.group, "job_id": job_id,
                       "goal": item.title, "issue_key": "", "pr": None})
-    wanted_keys = [k for k in wanted_keys if not (items.get(k) and items[k].group == "duty")]
+    wanted_keys = [k for k in wanted_keys if not (items.get(k) and items[k].group in takers)]
     conn = store.conn
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -892,7 +927,6 @@ def _prio_cell(item: Item) -> str:
 
 # Колонки по группе: у «несделанных» проблем нет — там важны статус и приоритет.
 _COLUMNS = {
-    "duty":   ("№", "Вопрос", "Откуда", "Взято"),
     "reply":  ("№", "Задача", "Заголовок", "Кто и что", "Взято"),
     "move":   ("№", "PR", "Задача", "Заголовок", "Статус", "Сборка", "Что дальше", "Взято"),
     "close":  ("№", "Работа", "Задача", "Почему"),
@@ -945,7 +979,7 @@ def _row(group: str, i: Item) -> list[str]:
         return [str(i.n), pr_md, key_md, _title(i), _cell(i.status), _cell(build), _cell(nxt), _taken_cell(i)]
     if group == "close":
         return [str(i.n), f"**{i.key}**", key_md, _cell(", ".join(i.problems))]
-    if group == "duty":
+    if is_addon_group(group):
         return [str(i.n), f"**{i.key}** {_cell(i.title, 70)}", _cell(", ".join(i.problems), 50), _taken_cell(i)]
     pr, key = pr_md, key_md
     problems = _cell(", ".join(p for p in i.problems if not p.startswith("автор ")))
@@ -991,12 +1025,14 @@ def render_md(board: Board, *, disk: str = "") -> str:
     lines.append("")
     free = sum(1 for i in board.items if not i.taken)
     lines.append(f"Всего {len(board.items)}, свободно {free}. Взять: «делай 1 и 3» или «бери все конфликты и падения».")
-    for group in GROUPS:
+    titles = group_titles()
+    columns = {b["group"]: tuple(b.get("columns") or ADDON_COLUMNS) for b in _addon_boards()}
+    for group in groups():
         part = [i for i in board.items if i.group == group]
         if not part:
             continue
-        cols = _COLUMNS[group]
-        lines += ["", f"### {GROUP_TITLES[group]} · {len(part)}", "",
+        cols = _COLUMNS.get(group) or columns.get(group, ADDON_COLUMNS)
+        lines += ["", f"### {titles[group]} · {len(part)}", "",
                   "| " + " | ".join(cols) + " |",
                   "|" + "|".join(":-:" if c == "№" else "---" for c in cols) + "|"]
         lines += ["| " + " | ".join(_row(group, i)) + " |" for i in part]
