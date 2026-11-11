@@ -221,27 +221,72 @@ def _cmd_today(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -
     return "\n".join(lines)
 
 
-def _chat_mention_block(m) -> list[str]:
-    """Упоминание из чата: «💬 комната · источник · кто» и цитата; ссылка — на сообщение."""
-    place = html.escape(notify._short(m.where, 60))
-    head = f'💬 <a href="{html.escape(m.url)}">{place}</a>' if m.url else f"💬 {place}"
-    head += f" · {html.escape(m.source)}" + (f" · {html.escape(notify._short(m.author, 60))}" if m.author else "")
-    return [head, f"<i>«{html.escape(notify._short(m.text, 160))}»</i>"] if m.text else [head]
+MENTIONS_SHOWN = 12   # сколько упоминаний показать на экране, остальное — счётчиком
+TRACKER = "tracker"
+
+
+def _mention_groups(items: list) -> dict[str, list]:
+    """Непрочитанные по источнику: сначала задачи и PR, потом чаты по имени источника."""
+    groups: dict[str, list] = {}
+    for m in items:
+        groups.setdefault(m.source if m.from_chat else TRACKER, []).append(m)
+    return dict(sorted(groups.items(), key=lambda kv: (kv[0] != TRACKER, kv[0])))
+
+
+def _source_title(source: str) -> str:
+    return "📋 Задачи и PR" if source == TRACKER else f"💬 {source}"
+
+
+def _mention_lines(m, links: Optional[notify.Links], count: int) -> list[str]:
+    """Одно место: где (ключ задачи или комната со ссылкой), от кого, сколько, последняя цитата."""
+    who = html.escape(notify._short(m.author or "кто-то", 60)) + (f" ({count})" if count > 1 else "")
+    if m.from_chat:
+        place = html.escape(notify._short(m.where, 60))
+        head = (f'<a href="{html.escape(m.url)}">{place}</a> ↗' if m.url else place) + f" · {who}"
+        text = m.text
+    else:
+        head = f"{notify._key_html(m.task_key, links)} · {who}"
+        text = notify.strip_mention_tags(m.text)
+    return [head, f"<i>«{html.escape(notify._short(text, 160))}»</i>"] if text else [head]
+
+
+def mentions_view(store: "Store", links: Optional[notify.Links]) -> tuple[str, dict]:
+    """Экран «📣 Упоминания»: непрочитанные по источникам — где и от кого; кнопки «прочитано»."""
+    items = store.unseen_mentions()
+    if not items:
+        return "📣 Непрочитанных упоминаний нет.", {"inline_keyboard": [BACK_TO_MENU]}
+    lines = [f"📣 <b>Упоминания</b> · {len(items)} непрочитанных"]
+    shown = 0
+    groups = _mention_groups(items)
+    for source, group in groups.items():
+        lines += ["", f"<b>{_source_title(source)}</b> · {len(group)}"]
+        by_place: dict[str, list] = {}
+        for m in group:                     # свежие сверху: первое в месте — последнее сказанное
+            by_place.setdefault(m.task_key, []).append(m)
+        for ms in by_place.values():
+            if shown >= MENTIONS_SHOWN:
+                break
+            lines += _mention_lines(ms[0], links, len(ms))
+            shown += 1
+    if shown < sum(len({m.task_key for m in g}) for g in groups.values()):
+        lines += ["", "… и ещё — полный список: jwu mentions list -u"]
+    lines += ["", "Ключ или ссылка ↗ — где прочитать."]
+    rows = [[_menu_btn("✅ Пометить все прочитанными", "seen")]]
+    if len(groups) > 1:
+        rows.append([_menu_btn(f"✅ {_source_title(s)[2:]}", f"seen:{s}") for s in groups])
+    return "\n".join(lines), {"inline_keyboard": rows + [BACK_TO_MENU]}
+
+
+def mark_seen(store: "Store", source: str = "") -> int:
+    """Пометить прочитанными непрочитанные: все или одного источника. → сколько."""
+    items = [m for m in store.unseen_mentions()
+             if not source or (m.source if m.from_chat else TRACKER) == source]
+    store.mark_mentions_seen([m.id for m in items])
+    return len(items)
 
 
 def _cmd_mentions(store: "Store", links: Optional[notify.Links]) -> str:
-    items = store.unseen_mentions()
-    if not items:
-        return "📣 Непрочитанных упоминаний нет."
-    lines = notify.section(f"📣 НЕПРОЧИТАННЫЕ УПОМИНАНИЯ ({len(items)})", [
-        _chat_mention_block(m) if m.from_chat else
-        notify.item_block(m.task_key, m.author or "кто-то", notify.strip_mention_tags(m.text),
-                          links=links, quote=True, body_limit=160)
-        for m in items[:10]
-    ])
-    if len(items) > 10:
-        lines += ["", f"… и ещё {len(items) - 10}, /seen — пометить все прочитанными"]
-    return "\n".join(lines).lstrip("\n")
+    return mentions_view(store, links)[0]
 
 
 SYNC_REQUEST_META = "daemon:sync_requested"   # {slug: когда попросили /sync} — общий meta БД
@@ -302,7 +347,7 @@ MENU_ROWS = [
     [("🗂 Что делать", "board")],
     [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
     [("📋 Мои задачи", "tasks"), ("🕒 Что сделал сегодня", "today")],
-    [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
+    [("📣 Упоминания", "mentions")],
     [("🔔 Уведомления", "notify")],
 ]
 
@@ -370,6 +415,12 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
 
         text, markup = notifyprefs.home(store)
         return text, {"inline_keyboard": list(markup["inline_keyboard"]) + [BACK_TO_MENU]}
+    if action == "mentions":
+        return mentions_view(store, notify.links_from_config(cfg))
+    if action == "seen" or action.startswith("seen:"):
+        n = mark_seen(store, action.partition(":")[2])
+        text, markup = mentions_view(store, notify.links_from_config(cfg))
+        return (f"✅ Помечено прочитанными: {n}\n\n" if n else "") + text, markup
     if action == "board":
         from . import todo
 
@@ -553,6 +604,9 @@ def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
     addon_cmd = _addon_command(cmd, text, store=store, ws=ws, cfg=cfg) if cmd else None
     if addon_cmd is not None:
         reply, markup = addon_cmd
+        item = {"kind": "command", "text": text, "reply": reply}
+    elif cmd == "/mentions":                 # с кнопками «прочитано», как в меню
+        reply, markup = mentions_view(store, links)
         item = {"kind": "command", "text": text, "reply": reply}
     elif text.startswith("/"):
         reply = handle_command(text, store=store, ws=ws, login=login, links=links, on_sync=on_sync)

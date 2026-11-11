@@ -9,7 +9,7 @@ import respx
 from jwu.builtin.telegram import transport as tg
 from jwu.core import bot, daemon, notify, workspaces
 from jwu.core.config import Config
-from jwu.core.models import Issue, PR, Reviewer
+from jwu.core.models import Issue, Mention, PR, Reviewer
 from jwu.core.store import Store
 
 TG = "https://api.telegram.org"
@@ -239,3 +239,26 @@ def test_backup_menu_marked_and_checks_main(monkeypatch):
     assert bot.check_main_bot(pair.swapped()).startswith("❌") and tg.is_down("tok")
     respx.get(f"{TG}/bottok/getMe").mock(return_value=httpx.Response(200, json={"ok": True, "result": {"username": "main_bot"}}))
     assert "@main_bot отвечает" in bot.check_main_bot(pair.swapped()) and not tg.is_down("tok")
+
+
+def test_mentions_screen_groups_by_source_and_marks_read(tmp_path):
+    """«📣 Упоминания»: задачи и чаты отдельно, где читать; «прочитано» — всё или по источнику."""
+    store, ws, cfg = _env(tmp_path)
+    store.add_mentions([
+        Mention(task_key="AB-1", comment_id="1", author="Иван", text="[~me] глянь", created="2026-09-02T10:00:00+03:00"),
+        Mention(task_key="AB-1", comment_id="2", author="Иван", text="ещё", created="2026-09-01T10:00:00+03:00"),
+        Mention(task_key="!r:x", comment_id="$e", author="Пётр", text="релиз сегодня?", source="chatx",
+                place="Релизы", url="https://chat.x/r/e", created="2026-09-02T11:00:00+03:00"),
+    ])
+    assert ("📣 Упоминания", "mentions") in sum(bot.MENU_ROWS, []) and not any(
+        a == "seen" for row in bot.MENU_ROWS for _, a in row)
+    text, kb = bot.handle_menu("mentions", store=store, ws=ws, cfg=cfg, login="", on_sync=None)
+    assert "3 непрочитанных" in text and "📋 Задачи и PR</b> · 2" in text and "💬 chatx</b> · 1" in text
+    assert "Иван (2)" in text and '<a href="https://chat.x/r/e">Релизы</a> ↗' in text
+    datas = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
+    assert {"menu:seen", "menu:seen:tracker", "menu:seen:chatx", "menu:main"} <= set(datas)
+    text, _ = bot.handle_menu("seen:chatx", store=store, ws=ws, cfg=cfg, login="", on_sync=None)
+    assert "Помечено прочитанными: 1" in text and [m.source for m in store.unseen_mentions()] == ["tracker"] * 2
+    text, kb = bot.handle_menu("seen", store=store, ws=ws, cfg=cfg, login="", on_sync=None)
+    assert "Помечено прочитанными: 2" in text and "Непрочитанных упоминаний нет" in text
+    store.close()
