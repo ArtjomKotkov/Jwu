@@ -52,8 +52,23 @@ my-addon = "my_package.my_addon"
 
 Модуль может определить любые из хуков (все необязательны): `register_cli`, `register_mcp`,
 `skills_dir`, `agents_dir`, `bot_text`, `bot_commands` + `bot_command`, `callback_prefixes` +
-`bot_callback`, `menu_buttons` + `menu_action`, `chat_sources`, `daemon_tasks`, `after_hints`, `doctor`.
+`bot_callback`, `menu_buttons` + `menu_action`, `facades`, `chat_sources`, `daemon_tasks`, `after_hints`, `doctor`.
 Сигнатуры и смысл — в начале `src/jwu/core/addons.py`.
+
+## Встроенные аддоны
+
+Часть jwu подключается тем же механизмом и так же выключается:
+
+- **telegram** — фасад бота: уведомления, меню, команды и кнопки идут в Telegram через него.
+  `jwu addons disable telegram` — jwu перестаёт писать в Telegram и читать его.
+
+## Фасад бота
+
+Куда jwu пишет уведомления и откуда берёт команды — хук `facades() -> {"имя": фабрика(cfg)}`.
+Отправщик говорит HTML-подмножеством Telegram и его inline-клавиатурами, входящие отдаёт в виде
+update Bot API: `send`, `edit`, `delete`, `answer_callback`, `get_updates`, `set_commands`,
+`get_me`, `close`; поля `chat_id`, `token`, `role`, `offset_meta`. Логика бота (что показать,
+команды, меню) — в ядре и от фасада не зависит.
 
 ## Источники чатов
 

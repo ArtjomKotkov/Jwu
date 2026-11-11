@@ -338,18 +338,11 @@ def main_menu(sender=None) -> tuple[str, dict]:
 
 
 def check_main_bot(sender) -> str:
-    """Кнопка резервного бота: отвечает ли основной. Ожил — снимаем отметку «лежит»."""
-    main = getattr(sender, "second", None)
-    if not _is_backup(sender) or main is None:
+    """Кнопка резервного бота: отвечает ли основной (умеет только отправщик с резервом)."""
+    check = getattr(sender, "check_main", None)
+    if not _is_backup(sender) or not callable(check):
         return "Это и есть основной бот — он отвечает."
-    try:
-        me = main.get_me()
-    except notify.NotifyError as exc:
-        notify.mark_down(main.token)
-        return f"❌ Основной бот не отвечает: {html.escape(str(exc))}\nПишу через резервный, проверю ещё раз сам."
-    notify._DOWN.pop(main.token, None)
-    return (f"✅ Основной бот @{html.escape(me.get('username', '?'))} отвечает — "
-            "уведомления снова идут через него. Кнопки и команды — тоже в нём.")
+    return check()
 
 
 BACK_TO_MENU = [_menu_btn("← меню", "main")]
@@ -415,7 +408,7 @@ def handle_duty_command(cmd: str, *, store: "Store", cfg: "Config") -> tuple[str
 
 
 def handle_callback(upd: dict, *, store: "Store", cfg: "Config",
-                    sender: notify.TelegramNotifier, ws: Optional["Workspace"] = None,
+                    sender, ws: Optional["Workspace"] = None,
                     login: str = "", on_sync: Optional[Callable[[], bool]] = None) -> Optional[dict]:
     """Нажатие inline-кнопки из нашего чата → перерисовать меню на месте."""
     cq = upd.get("callback_query") or {}
@@ -538,7 +531,7 @@ def _addon_text(store: "Store", ws: "Workspace", cfg: "Config", text: str) -> Op
     return None
 
 
-def show_menu(store: "Store", sender: notify.TelegramNotifier, *, pressed: Optional[int],
+def show_menu(store: "Store", sender, *, pressed: Optional[int],
               text: str = "") -> dict:
     """Одно меню на чат: старое и нажатие «📋 Меню» удаляются, новое — внизу, без цитаты."""
     for mid in (pressed, store.get_workspace_meta(notify.MENU_META)):
@@ -552,7 +545,7 @@ def show_menu(store: "Store", sender: notify.TelegramNotifier, *, pressed: Optio
 
 
 def handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
-                  sender: notify.TelegramNotifier, login: str = "",
+                  sender, login: str = "",
                   on_sync: Optional[Callable[[], bool]] = None) -> Optional[dict]:
     """Одно входящее: нажатие кнопки, команда или заметка → ответ в чат. None — не наше.
 
@@ -572,7 +565,7 @@ def handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
 
 
 def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
-                   sender: notify.TelegramNotifier, login: str = "",
+                   sender, login: str = "",
                    on_sync: Optional[Callable[[], bool]] = None) -> Optional[dict]:
     if upd.get("callback_query"):
         return handle_callback(upd, store=store, cfg=cfg, sender=sender, ws=ws,
@@ -627,7 +620,7 @@ def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
 
 
 def process_updates(
-    store: "Store", ws: "Workspace", cfg: "Config", sender: notify.TelegramNotifier, *,
+    store: "Store", ws: "Workspace", cfg: "Config", sender, *,
     login: str = "", on_sync: Optional[Callable[[], bool]] = None, long_poll: int = 0,
     dispatch: Optional[Callable[[dict], None]] = None,
 ) -> list[dict]:

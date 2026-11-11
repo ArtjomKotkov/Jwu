@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from jwu.builtin.telegram import transport as tg
 from jwu.core import notify
 from jwu.core.bitbucket import BitbucketClient
 from jwu.core.config import Config
@@ -87,7 +88,7 @@ def test_telegram_notifier_sends_and_reports_errors():
     route = respx.post(f"{TG}/bottok/sendMessage").mock(
         return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
     )
-    sender = notify.TelegramNotifier("tok", "42")
+    sender = tg.TelegramNotifier("tok", "42")
     try:
         assert sender.send("<b>hi</b>") == [7]
         import json as _json
@@ -105,7 +106,7 @@ def test_telegram_notifier_sends_and_reports_errors():
 
 def test_notifier_requires_token_and_chat():
     with pytest.raises(notify.NotifyError):
-        notify.TelegramNotifier("", "1")
+        tg.TelegramNotifier("", "1")
     cfg = Config()
     assert notify.notifier_from_config(cfg) is None          # chat_id пуст
     cfg.telegram.chat_id = "1"
@@ -248,15 +249,15 @@ def test_all_sync_events_have_titles_and_default_set():
 @respx.mock
 def test_backup_bot_takes_over_when_main_is_down(monkeypatch):
     """Основной бот не отвечает — сообщение уходит через резервный; лежащий не ждём заново."""
-    notify._DOWN.clear()
+    tg._DOWN.clear()
     main = respx.post(f"{TG}/botmain/sendMessage").mock(side_effect=httpx.ReadTimeout("timed out"))
     backup = respx.post(f"{TG}/botspare/sendMessage").mock(
         return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 9}}))
-    sender = notify.FallbackNotifier(notify.TelegramNotifier("main", "42"),
-                                     notify.TelegramNotifier("spare", "42", role="backup"))
+    sender = tg.FallbackNotifier(tg.TelegramNotifier("main", "42"),
+                                     tg.TelegramNotifier("spare", "42", role="backup"))
     assert sender.send("привет") == [9] and main.call_count == 1 and backup.call_count == 1
     assert sender.send("ещё") == [9] and main.call_count == 1           # основной помечен лежащим
-    clock = [notify.time.monotonic() + notify.DOWN_FOR + 1]
+    clock = [notify.time.monotonic() + tg.DOWN_FOR + 1]
     monkeypatch.setattr(notify.time, "monotonic", lambda: clock[0])
     main.mock(return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 5}}))
     assert sender.send("ожил") == [5]                                   # через 5 минут — снова основной
@@ -268,7 +269,7 @@ def test_backup_bot_takes_over_when_main_is_down(monkeypatch):
     cb = respx.post(f"{TG}/botspare/answerCallbackQuery").mock(return_value=httpx.Response(200, json={"ok": True}))
     sender.swapped().answer_callback("c1")
     assert cb.call_count == 1 and sender.swapped().offset_meta != sender.offset_meta
-    notify._DOWN.clear()
+    tg._DOWN.clear()
 
 
 def test_notifier_from_config_with_backup(monkeypatch):
@@ -279,9 +280,9 @@ def test_notifier_from_config_with_backup(monkeypatch):
     monkeypatch.setattr(config_mod, "telegram_token", lambda c: "main")
     monkeypatch.setattr(config_mod, "telegram_backup_token", lambda c: "spare")
     sender = notify.notifier_from_config(cfg)
-    assert isinstance(sender, notify.FallbackNotifier) and sender.second.token == "spare"
+    assert isinstance(sender, tg.FallbackNotifier) and sender.second.token == "spare"
     monkeypatch.setattr(config_mod, "telegram_backup_token", lambda c: "")
-    assert isinstance(notify.notifier_from_config(cfg), notify.TelegramNotifier)
+    assert isinstance(notify.notifier_from_config(cfg), tg.TelegramNotifier)
 
 
 def test_split_message_keeps_html_tags_balanced():

@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from jwu.builtin.telegram import transport as tg
 from jwu.core import bot, daemon, notify, workspaces
 from jwu.core.config import Config
 from jwu.core.models import Issue, PR, Reviewer
@@ -52,7 +53,7 @@ def test_process_updates_commands_notes_and_replies(tmp_path):
     ]}))
     sent = respx.post(f"{TG}/bottok/sendMessage").mock(
         return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}}))
-    sender = notify.TelegramNotifier("tok", "42")
+    sender = tg.TelegramNotifier("tok", "42")
     kicks = []
     try:
         handled = bot.process_updates(store, ws, cfg, sender, login="me", on_sync=lambda: kicks.append(1) or True)
@@ -133,7 +134,7 @@ def test_daemon_sync_hook_does_not_touch_telegram():
 @respx.mock
 def test_get_updates_long_poll_passes_timeout():
     route = respx.get(f"{TG}/bottok/getUpdates").mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
-    sender = notify.TelegramNotifier("tok", "42")
+    sender = tg.TelegramNotifier("tok", "42")
     try:
         assert sender.get_updates(5, timeout=25) == []
         params = route.calls.last.request.url.params
@@ -228,13 +229,13 @@ def test_backup_bot_polled_separately_and_replies_itself(tmp_path, monkeypatch):
 @respx.mock
 def test_backup_menu_marked_and_checks_main(monkeypatch):
     """Меню резервного бота помечено «резервный» и умеет проверить основной."""
-    notify._DOWN.clear()
-    pair = notify.FallbackNotifier(notify.TelegramNotifier("tok", "42"),
-                                   notify.TelegramNotifier("spare", "42", role="backup"))
+    tg._DOWN.clear()
+    pair = tg.FallbackNotifier(tg.TelegramNotifier("tok", "42"),
+                                   tg.TelegramNotifier("spare", "42", role="backup"))
     title, kb = bot.main_menu(pair.swapped())
     assert "резервный бот" in title and "menu:checkmain" in str(kb)
     assert "резервный" not in bot.main_menu(pair)[0] and "checkmain" not in str(bot.main_menu(pair)[1])
     respx.get(f"{TG}/bottok/getMe").mock(side_effect=httpx.ReadTimeout("timed out"))
-    assert bot.check_main_bot(pair.swapped()).startswith("❌") and notify.is_down("tok")
+    assert bot.check_main_bot(pair.swapped()).startswith("❌") and tg.is_down("tok")
     respx.get(f"{TG}/bottok/getMe").mock(return_value=httpx.Response(200, json={"ok": True, "result": {"username": "main_bot"}}))
-    assert "@main_bot отвечает" in bot.check_main_bot(pair.swapped()) and not notify.is_down("tok")
+    assert "@main_bot отвечает" in bot.check_main_bot(pair.swapped()) and not tg.is_down("tok")

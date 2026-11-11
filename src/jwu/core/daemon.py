@@ -463,11 +463,10 @@ def _bot_senders(store: "Store"):
 
 def _as_role(sender, role: str):
     """Отправщик, у которого главный — бот этой роли (main | backup); резерва нет — None."""
-    from .notify import FallbackNotifier
-
     if role == "main":
         return sender
-    return sender.swapped() if isinstance(sender, FallbackNotifier) else None
+    swapped = getattr(sender, "swapped", None)     # есть резервный бот — отправщик умеет поменяться
+    return swapped() if callable(swapped) else None
 
 
 def poll_bots(store: "Store", *, on_sync: Callable[[], bool] | None = None,
@@ -512,11 +511,9 @@ BOT_ROLE_KEY = "_jwu_bot"   # в каком боте (main | backup) пришл�
 
 
 def has_backup_bot(store: "Store") -> bool:
-    from .notify import FallbackNotifier
-
     found = False
     for _ws, _cfg, sender, _login in _bot_senders(store):
-        found = found or isinstance(sender, FallbackNotifier)
+        found = found or callable(getattr(sender, "swapped", None))
         sender.close()
     return found
 

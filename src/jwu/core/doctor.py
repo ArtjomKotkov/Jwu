@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from . import daemon, memory, workspaces as ws_mod
-from .config import db_path, telegram_token
+from .config import db_path
 from .maintenance import warn_if_cloud_path
 from .. import __version__
 from ..skills_install import EXPECTED_AGENTS, EXPECTED_SKILLS, default_agents_dest, default_dest
@@ -139,13 +139,6 @@ def check_config(store: "Store", ws) -> tuple[list[Check], object]:
             out.append(Check("Конфиг GitHub", "ok", f"{cfg.github.owner} · {cfg.github.repos or 'все репозитории'}"))
     else:
         out.append(Check("Конфиг", "ok", "локальный контур — внешних доступов не требуется"))
-    if cfg.telegram.chat_id:
-        if has("telegram.token"):
-            out.append(Check("Telegram", "ok", f"чат {cfg.telegram.chat_id}"))
-        else:
-            out.append(Check("Telegram", "warn", "chat_id задан, токена бота нет", "jwu configure --telegram-token … / TELEGRAM_BOT_TOKEN"))
-    else:
-        out.append(Check("Telegram", "skip", "уведомления не настроены", "jwu configure --telegram-chat <id> --telegram-token …"))
     out.append(_matrix_check(cfg))
     out.append(_disk_check(store, ws))
     out += _jobflow_checks(store, ws)
@@ -269,28 +262,6 @@ def check_access(ws, cfg) -> list[Check]:
             else:
                 out.append(Check(f"Доступ {name}", "fail", res.get("error", "?"),
                                  "проверь токен/пароль и сеть (VPN?); 401 — креды, таймаут — сеть"))
-        if cfg.telegram.chat_id and telegram_token(cfg):
-            try:
-                from .notify import TelegramNotifier
-
-                sender = TelegramNotifier(telegram_token(cfg), cfg.telegram.chat_id)
-                try:
-                    me = sender.get_me()
-                finally:
-                    sender.close()
-                out.append(Check("Доступ telegram", "ok", f"бот @{me.get('username', '?')}"))
-            except Exception as exc:  # noqa: BLE001
-                out.append(Check("Доступ telegram", "fail", str(exc), "токен от @BotFather, chat_id — id чата с ботом"))
-            from .config import telegram_backup_token
-
-            if telegram_backup_token(cfg):
-                try:
-                    from .notify import TelegramNotifier
-
-                    me = TelegramNotifier(telegram_backup_token(cfg), cfg.telegram.chat_id, role="backup").get_me()
-                    out.append(Check("Резервный бот telegram", "ok", f"бот @{me.get('username', '?')}"))
-                except Exception as exc:  # noqa: BLE001
-                    out.append(Check("Резервный бот telegram", "fail", str(exc), "jwu configure --telegram-backup-token …"))
     finally:
         svc.close()
     return out

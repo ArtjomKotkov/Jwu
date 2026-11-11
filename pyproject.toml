@@ -1,6 +1,6 @@
 [project]
 name = "jwu"
-version = "3.0.0.dev5"
+version = "3.0.0.dev6"
 description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
 authors = [
     {name = "Artem Kotkov", email = "ArtjomKotkov@users.noreply.github.com"}
@@ -25,6 +25,10 @@ dependencies = [
 jwu = "jwu.cli.main:app"
 jwu-mcp = "jwu.mcp_server:main"
 jwu-git-guard = "jwu.core.gitguard:main"
+
+# Встроенные аддоны — тем же механизмом, что и внешние: их можно выключить (jwu addons disable).
+[project.entry-points."jwu.addons"]
+telegram = "jwu.builtin.telegram"
 
 [tool.poetry]
 packages = [{include = "jwu", from = "src"}]

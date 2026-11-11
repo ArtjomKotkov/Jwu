@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from jwu.builtin.telegram import transport as tgt
 from jwu.core.chats import ChatRoom
 from jwu.core import bot, daemon, duty, matrix, notify, workspaces
 from jwu.core.config import Config
@@ -274,7 +275,7 @@ def test_bot_duty_command_and_button_edit(tmp_path, monkeypatch):
         return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 99}}))
     edited = respx.post(f"{TG}/bottok/editMessageText").mock(return_value=httpx.Response(200, json={"ok": True}))
     answered = respx.post(f"{TG}/bottok/answerCallbackQuery").mock(return_value=httpx.Response(200, json={"ok": True}))
-    sender = notify.TelegramNotifier("tok", "42")
+    sender = tgt.TelegramNotifier("tok", "42")
     try:
         handled = bot.process_updates(store, ws, cfg, sender)
     finally:
@@ -419,11 +420,14 @@ class _Tg:
     def send(self, text, **kw):
         self.next += 1
         self.sent.append(text)
-        notify._remember_last(self.chat_id, self.next)
+        tgt._remember_last(self.chat_id, self.next)
         return [self.next]
 
     def edit(self, mid, text, **kw):
         self.edited.append((mid, text))
+
+    def last_message_id(self):
+        return tgt.last_message_id(self.chat_id)
 
 
 def test_consecutive_notifications_are_appended_to_last_message(tmp_path):
@@ -439,7 +443,7 @@ def test_consecutive_notifications_are_appended_to_last_message(tmp_path):
     assert len(tg.sent) == 1 and [m for m, _ in tg.edited] == [101, 101]
     text = tg.edited[-1][1]
     assert text.count("👤 <b>Наталья</b>") == 2 and "2.png" in text    # тот же тред — без повтора шапки
-    notify._remember_last("42", 555)                                   # в чате было что-то ещё
+    tgt._remember_last("42", 555)                                   # в чате было что-то ещё
     duty._send_or_append(store, state, [a], tg)
     assert len(tg.sent) == 2
     store.close()

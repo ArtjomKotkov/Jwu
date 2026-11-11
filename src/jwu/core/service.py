@@ -675,7 +675,7 @@ class Service:
         return cls(cfg, None, bitbucket, store, jenkins, workspace=workspace)
 
     def close(self) -> None:
-        if isinstance(self._notifier, (notify.TelegramNotifier, notify.FallbackNotifier)):
+        if self._notifier not in (_UNSET, None) and callable(getattr(self._notifier, "close", None)):
             self._notifier.close()
             self._notifier = _UNSET
         clients = [self.tasks_client, self.pr_client, self.support, self.jenkins,

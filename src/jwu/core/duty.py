@@ -636,7 +636,7 @@ def _send_or_append(store: "Store", state: State, items: list[Item], sender) -> 
         age = (now - datetime.fromisoformat(prev.get("ts", ""))).total_seconds() / 60
     except ValueError:
         age = 1e9
-    if prev.get("id") and age <= MERGE_MINUTES and notify.last_message_id(sender.chat_id) == int(prev["id"]):
+    if prev.get("id") and age <= MERGE_MINUTES and getattr(sender, "last_message_id", lambda: 0)() == int(prev["id"]):
         merged = [Item(**d) for d in prev.get("items", [])] + items
         text = format_items(state, merged)
         if len(text) <= MERGE_MAX_CHARS:

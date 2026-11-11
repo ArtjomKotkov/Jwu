@@ -154,3 +154,21 @@ def test_install_puts_addon_agents_next_to_bundled(eps, tmp_path):
     dest = tmp_path / "out"
     res = dict(skills_install.install_agents(dest))
     assert res["chat-helper"] == "добавлен" and (dest / "chat-helper.md").read_text().endswith("тело\n")
+
+
+def test_telegram_is_builtin_addon_and_can_be_disabled(eps, monkeypatch):
+    from jwu.builtin import telegram
+    from jwu.builtin.telegram import transport
+    from jwu.core import notify
+    from jwu.core.config import Config
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    cfg = Config()
+    cfg.telegram.chat_id = "42"
+    eps.append(_EP("telegram", telegram))
+    sender = notify.notifier_from_config(cfg)
+    assert isinstance(sender, transport.TelegramNotifier) and sender.chat_id == "42"
+    sender.close()
+    addons.set_enabled("telegram", False)
+    addons.load(refresh=True)
+    assert notify.notifier_from_config(cfg) is None          # фасад выключен — слать некуда
