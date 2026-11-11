@@ -62,6 +62,12 @@ class TelegramDown(NotifyError):
 
 DOWN_FOR = 300.0                  # бот не ответил — столько секунд сразу идём в резерв
 _DOWN: dict[str, float] = {}      # токен → до какого времени (monotonic) считаем лежащим
+# Сорвавшийся длинный опрос — обычно сетевая заминка, а не лежащий бот: в резерв — только
+# после стольких срывов подряд (отправка, которая не ушла, переключает сразу).
+POLL_FAILS_TO_DOWN = 3
+_POLL_FAILS: dict[str, int] = {}  # токен → срывов опроса подряд
+NOTICE_EVERY = 3600.0             # «пишу через резервный» — не чаще раза в час на бота
+_NOTICED: dict[str, float] = {}
 
 
 def mark_down(token: str) -> None:
@@ -235,8 +241,9 @@ class TelegramNotifier:
 class FallbackNotifier:
     """Основной бот + резервный: основной не ответил — то же сообщение уходит через резервный.
 
-    Лежащий бот (TelegramDown) помечается на ``DOWN_FOR`` секунд: следующие отправки сразу идут
-    в резерв, не ожидая таймаута. Порядок ``first``/``second`` — кто главный для этого отправщика:
+    Лежащий бот (TelegramDown на отправке или ``POLL_FAILS_TO_DOWN`` срывов опроса подряд)
+    помечается на ``DOWN_FOR`` секунд: следующие отправки сразу идут в резерв, не ожидая
+    таймаута; о переходе резервный бот пишет в чат (не чаще ``NOTICE_EVERY``). Порядок ``first``/``second`` — кто главный для этого отправщика:
     ответ на нажатие в резервном боте собирается как ``swapped()`` и уходит через него же.
     """
 
@@ -255,13 +262,30 @@ class FallbackNotifier:
             return [self.second, self.first]
         return [self.first, self.second]
 
+    def _went_down(self, bot: TelegramNotifier, why: str) -> None:
+        """Пометить бот лежащим. Это основной и он только что лёг — сказать в чат через резервный."""
+        was = is_down(bot.token)
+        mark_down(bot.token)
+        if was or bot.role != "main":
+            return
+        now = time.monotonic()
+        if now - _NOTICED.get(bot.token, -NOTICE_EVERY) < NOTICE_EVERY:
+            return
+        _NOTICED[bot.token] = now
+        other = self.second if bot is self.first else self.first
+        try:
+            other.send(f"⚠️ Основной бот не отвечает ({why}) — пока пишу сюда, через резервный. "
+                       "Проверить его — «🩺 Проверить основной бот» в меню.")
+        except NotifyError:
+            pass
+
     def _try(self, method: str, *args, any_error: bool = False, **kwargs):
         last: Optional[Exception] = None
         for bot in self.bots():
             try:
                 return getattr(bot, method)(*args, **kwargs)
             except TelegramDown as exc:
-                mark_down(bot.token)
+                self._went_down(bot, f"сообщение не ушло: {exc}")
                 last = exc
             except NotifyError as exc:
                 if not any_error:
@@ -283,11 +307,17 @@ class FallbackNotifier:
         self.first.answer_callback(callback_id, text)     # нажатие пришло в этот бот — ему и отвечать
 
     def get_updates(self, offset: Optional[int] = None, **kwargs) -> list[dict]:
+        token = self.first.token
         try:
-            return self.first.get_updates(offset, **kwargs)
-        except TelegramDown:
-            mark_down(self.first.token)
+            got = self.first.get_updates(offset, **kwargs)
+        except TelegramDown as exc:
+            _POLL_FAILS[token] = _POLL_FAILS.get(token, 0) + 1
+            if _POLL_FAILS[token] >= POLL_FAILS_TO_DOWN:
+                self._went_down(self.first, f"{_POLL_FAILS[token]} опроса подряд сорвались: {exc}")
+                _POLL_FAILS[token] = 0
             raise
+        _POLL_FAILS.pop(token, None)
+        return got
 
     def set_commands(self) -> bool:
         return all([self.first.set_commands(), self.second.set_commands()])

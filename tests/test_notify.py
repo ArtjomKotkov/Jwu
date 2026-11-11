@@ -254,8 +254,11 @@ def test_backup_bot_takes_over_when_main_is_down(monkeypatch):
         return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 9}}))
     sender = tg.FallbackNotifier(tg.TelegramNotifier("main", "42"),
                                      tg.TelegramNotifier("spare", "42", role="backup"))
-    assert sender.send("привет") == [9] and main.call_count == 1 and backup.call_count == 1
-    assert sender.send("ещё") == [9] and main.call_count == 1           # основной помечен лежащим
+    tg._NOTICED.clear()
+    assert sender.send("привет") == [9] and main.call_count == 1 and backup.call_count == 2
+    notice = json.loads(backup.calls[0].request.content)["text"]          # сначала — почему пишем сюда
+    assert notice.startswith("⚠️ Основной бот не отвечает (сообщение не ушло")
+    assert sender.send("ещё") == [9] and main.call_count == 1 and backup.call_count == 3   # без повтора
     clock = [tg.time.monotonic() + tg.DOWN_FOR + 1]
     monkeypatch.setattr(tg.time, "monotonic", lambda: clock[0])
     main.mock(return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 5}}))
@@ -296,3 +299,30 @@ def test_split_message_keeps_html_tags_balanced():
         notify._open_tags(chunk.replace("\n", " "), stack)
         assert stack == [], chunk
     assert "событие 11.5" in chunks[-1] and all(len(c) <= 400 + 40 for c in chunks)
+
+
+@respx.mock
+def test_poll_timeouts_switch_to_backup_only_after_several_in_a_row():
+    """Сорвавшийся длинный опрос — заминка: в резерв только после POLL_FAILS_TO_DOWN подряд."""
+    tg._DOWN.clear()
+    tg._POLL_FAILS.clear()
+    tg._NOTICED.clear()
+    poll = respx.get(f"{TG}/botmain/getUpdates").mock(side_effect=httpx.ReadTimeout("timed out"))
+    backup = respx.post(f"{TG}/botspare/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 9}}))
+    sender = tg.FallbackNotifier(tg.TelegramNotifier("main", "42"),
+                                 tg.TelegramNotifier("spare", "42", role="backup"))
+    for _ in range(tg.POLL_FAILS_TO_DOWN - 1):
+        with pytest.raises(tg.TelegramDown):
+            sender.get_updates(timeout=25)
+    assert not tg.is_down("main") and backup.call_count == 0
+    poll.mock(return_value=httpx.Response(200, json={"ok": True, "result": []}))
+    assert sender.get_updates() == [] and "main" not in tg._POLL_FAILS     # удачный опрос — счёт заново
+    poll.mock(side_effect=httpx.ReadTimeout("timed out"))
+    for _ in range(tg.POLL_FAILS_TO_DOWN):
+        with pytest.raises(tg.TelegramDown):
+            sender.get_updates(timeout=25)
+    assert tg.is_down("main") and backup.call_count == 1
+    assert "опроса подряд сорвались" in json.loads(backup.calls[0].request.content)["text"]
+    tg._DOWN.clear()
+    tg._POLL_FAILS.clear()
