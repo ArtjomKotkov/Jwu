@@ -153,7 +153,6 @@ def render_board(board, slug: str, links: Optional[notify.Links]) -> str:
             lines.append(f"… и ещё {len(free) - BOARD_TOP}")
     if not board.items:
         lines += ["", "Ничего не горит."]
-    lines += ["", "Раздать по сессиям — /jwu-todo в Claude Code."]
     return "\n".join(lines)
 
 
