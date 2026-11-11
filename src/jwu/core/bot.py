@@ -343,9 +343,8 @@ def handle_command(text: str, *, store: "Store", ws: "Workspace", login: str,
 MENU_PREFIX = "menu:"
 # (подпись, действие) — inline-меню; действие → команда того же имени
 MENU_ROWS = [
-    [("🗂 Что делать", "board")],
     [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
-    [("📋 Мои задачи", "tasks")],
+    [("📋 Мои задачи", "tasks"), ("🗂 Что делать", "board")],
     [("📣 Упоминания", "mentions"), ("🔔 Уведомления", "notify")],
 ]
 
