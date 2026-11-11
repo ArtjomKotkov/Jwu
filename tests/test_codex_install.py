@@ -43,6 +43,10 @@ def test_install_for_codex_cli(tmp_path, monkeypatch):
 
     from jwu.cli import main as cli
 
+    from jwu.core import addons
+
+    monkeypatch.setattr(addons, "_entry_points", lambda: [])   # только своё, без установленных аддонов
+    monkeypatch.setattr(addons, "_cache", None)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setattr(si, "mcp_command", lambda: "/p/jwu-mcp")
     r = CliRunner().invoke(cli.app, ["install", "--for", "codex"])

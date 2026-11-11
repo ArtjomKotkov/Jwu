@@ -58,3 +58,10 @@ def chat_mention(source, room_id: str, room_name: str, message, who: str):
 def add_mentions(store: "Store", mentions: list) -> list:
     """Записать упоминания в общий список jwu (/mentions, дашборд). Повторы пропускаются."""
     return store.add_mentions(mentions)
+
+
+def session_name(store: "Store") -> str:
+    """Имя текущей сессии агента (как его видят доска и строка статуса) — для MCP-инструментов."""
+    from .mcp_server import _session_name
+
+    return _session_name(store)
