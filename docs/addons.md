@@ -52,8 +52,17 @@ my-addon = "my_package.my_addon"
 
 Модуль может определить любые из хуков (все необязательны): `register_cli`, `register_mcp`,
 `skills_dir`, `agents_dir`, `bot_text`, `bot_commands` + `bot_command`, `callback_prefixes` +
-`bot_callback`, `menu_buttons` + `menu_action`, `daemon_tasks`, `after_hints`, `doctor`.
+`bot_callback`, `menu_buttons` + `menu_action`, `chat_sources`, `daemon_tasks`, `after_hints`, `doctor`.
 Сигнатуры и смысл — в начале `src/jwu/core/addons.py`.
+
+## Источники чатов
+
+Адаптер мессенджера — хук `chat_sources() -> {"имя": фабрика(cfg)}`. Фабрика по конфигу
+воркспейса отдаёт источник или `None` (не настроен). Источник реализует `ChatSource` из
+`jwu.core.chats`: кто я, комнаты с именами, «что нового» с позиции (`news(cursor)` — сообщения
+по комнатам, непрочитанное, личные диалоги), одно сообщение по id. Только чтение: писать в чаты
+jwu не умеет. Потребители (дежурство, упоминания) берут источник по имени и не знают, какой
+это мессенджер. Аддон с тем же именем перекрывает встроенный адаптер.
 
 Опираться можно только на `jwu.addon_api` (store для CLI и MCP, контуры с ботом, отправка с
 учётом тихих часов, лог демона). Остальное в `jwu.*` — внутреннее и меняется без предупреждения.

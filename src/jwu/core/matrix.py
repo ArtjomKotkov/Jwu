@@ -1,9 +1,8 @@
-"""Мини-клиент Matrix для режима дежурства бота: только чтение.
+"""Matrix как источник чатов (``chats.ChatSource``): только чтение.
 
-Умеет ровно то, что нужно демону для дежурства: кто я, список комнат с именами,
-инкрементальный ``/sync`` (новые события всех комнат, счётчики непрочитанного, карта
-личных диалогов ``m.direct``) и одно событие по id (для «ответ на моё?»). Писать в Matrix клиент не умеет вовсе — у него нет такого метода, и это
-намеренно: дежурство только читает, отвечает человек.
+Кто я, комнаты с именами, инкрементальный ``/sync`` (новые сообщения всех комнат, счётчики
+непрочитанного, личные диалоги из ``m.direct``) и одно сообщение по id. Писать в Matrix
+клиент не умеет вовсе — у него нет такого метода, и это намеренно: отвечает человек.
 
 Доступ: ``Config.matrix`` (homeserver + секрет ``matrix.token``); если там пусто,
 ``client_from_config`` берёт homeserver и токен из конфига matrix-mcp — он у дежурного
@@ -14,12 +13,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote
 
 import httpx
+
+from .chats import ChatError, ChatMessage, ChatNews, ChatRoom, RoomNews, sort_rooms
 
 if TYPE_CHECKING:
     from .config import Config
@@ -27,38 +27,8 @@ if TYPE_CHECKING:
 API = "/_matrix/client/v3"
 
 
-class MatrixError(RuntimeError):
+class MatrixError(ChatError):
     """Matrix не настроен или не отвечает."""
-
-
-@dataclass
-class Room:
-    id: str
-    name: str
-
-    @property
-    def title(self) -> str:
-        return self.name or self.id
-
-
-@dataclass
-class RoomUpdate:
-    events: list["Event"] = field(default_factory=list)
-    unread: int = 0          # unread_notifications.notification_count — 0, если я уже прочитал
-    limited: bool = False    # событий было больше, чем отдали
-
-
-@dataclass
-class SyncResult:
-    next_batch: str
-    rooms: dict[str, RoomUpdate] = field(default_factory=dict)
-    direct: Optional[dict[str, list[str]]] = None   # m.direct, если пришёл (первый раз или изменился)
-
-    @property
-    def direct_rooms(self) -> Optional[set[str]]:
-        if self.direct is None:
-            return None
-        return {rid for rooms in self.direct.values() for rid in (rooms or [])}
 
 
 ENCRYPTED = "m.room.encrypted"
@@ -77,40 +47,7 @@ def _sync_filter(timeline: int) -> str:
     }, separators=(",", ":"))
 
 
-@dataclass
-class Event:
-    """Событие ленты комнаты в том виде, в каком его смотрит дежурство."""
-
-    id: str
-    sender: str
-    body: str
-    ts: int = 0
-    type: str = "m.room.message"
-    msgtype: str = "m.text"
-    thread_root: str = ""      # id корня треда, если сообщение в треде
-    reply_to: str = ""         # id сообщения, на которое это ответ
-    mentions: list[str] = field(default_factory=list)   # mxid из m.mentions
-    display_name: str = ""     # имя отправителя, если известно
-    replaces: str = ""         # правка: id исправленного сообщения (m.replace)
-
-    @property
-    def encrypted(self) -> bool:
-        """Зашифровано (E2E, обычно личка в Element): текста jwu не видит, только кто и когда."""
-        return self.type == ENCRYPTED
-
-    @property
-    def is_message(self) -> bool:
-        """Новое сообщение. Правка — не новое: об исходном уже сказали, второй раз не шлём."""
-        if self.replaces:
-            return False
-        return self.encrypted or (self.type == "m.room.message" and bool(self.body))
-
-
-def sort_rooms(rooms: list[Room]) -> list[Room]:
-    return sorted(rooms, key=lambda r: (not r.name, r.title.lower()))
-
-
-def parse_event(raw: dict) -> Event:
+def parse_event(raw: dict) -> ChatMessage:
     content = raw.get("content") or {}
     rel = content.get("m.relates_to") or {}
     reply_to = ((rel.get("m.in_reply_to") or {}).get("event_id") or "")
@@ -119,19 +56,24 @@ def parse_event(raw: dict) -> Event:
     body = content.get("body") or ""
     if raw.get("type") == ENCRYPTED:
         body = ENCRYPTED_BODY   # связи (треды, правки) у E2E открыты, текст — нет
+    elif raw.get("type") != "m.room.message":
+        body = ""               # не сообщение — для ленты его нет
     if content.get("msgtype") in ("m.image", "m.file", "m.video", "m.audio") and body:
         body = f"[{content['msgtype'][2:]}] {body}"
-    mentions = list((content.get("m.mentions") or {}).get("user_ids") or [])
-    return Event(
+    return ChatMessage(
         id=raw.get("event_id", ""), sender=raw.get("sender", ""), body=body,
-        ts=int(raw.get("origin_server_ts") or 0), type=raw.get("type", ""),
-        msgtype=content.get("msgtype", ""), thread_root=thread_root, reply_to=reply_to,
-        mentions=mentions, replaces=replaces,
+        ts=int(raw.get("origin_server_ts") or 0), thread_root=thread_root, reply_to=reply_to,
+        mentions=list((content.get("m.mentions") or {}).get("user_ids") or []),
+        sealed=raw.get("type") == ENCRYPTED, edit_of=replaces,
     )
 
 
 class MatrixClient:
-    """HTTP-клиент к одному homeserver. ``client`` подменяется в тестах."""
+    """Адаптер Matrix к ``chats.ChatSource``: HTTP-клиент к одному homeserver.
+    ``client`` подменяется в тестах."""
+
+    name = "matrix"
+    title = "Matrix"
 
     def __init__(self, homeserver: str, token: str, *, client: Optional[httpx.Client] = None,
                  timeout: float = 15.0) -> None:
@@ -167,6 +109,12 @@ class MatrixClient:
     def whoami(self) -> str:
         return str(self._get("/account/whoami").get("user_id") or "")
 
+    def display_name(self, user_id: str) -> str:
+        try:
+            return str(self._get(f"/profile/{quote(user_id)}/displayname").get("displayname") or "")
+        except MatrixError:
+            return ""
+
     def room_name(self, room_id: str) -> str:
         """Имя комнаты; без имени — канонический алиас; без него — пусто (покажем id)."""
         try:
@@ -180,7 +128,7 @@ class MatrixClient:
         except MatrixError:
             return ""
 
-    def joined_room_ids(self) -> list[str]:
+    def room_ids(self) -> list[str]:
         return [str(r) for r in (self._get("/joined_rooms").get("joined_rooms") or [])]
 
     def room_names(self, room_ids: list[str], *, workers: int = 16) -> dict[str, str]:
@@ -192,61 +140,37 @@ class MatrixClient:
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(room_ids)))) as pool:
             return dict(zip(room_ids, pool.map(self.room_name, room_ids)))
 
-    def joined_rooms(self) -> list[Room]:
-        """Комнаты, где я состою, с именами — отсортированы по имени (без имени — в конце)."""
-        names = self.room_names(self.joined_room_ids())
-        return sort_rooms([Room(id=rid, name=name) for rid, name in names.items()])
+    def rooms(self) -> list[ChatRoom]:
+        """Комнаты, где я состою, с именами — по имени (без имени — в конце)."""
+        names = self.room_names(self.room_ids())
+        return sort_rooms([ChatRoom(id=rid, name=name) for rid, name in names.items()])
 
-    def latest_token(self, room_id: str) -> str:
-        """Позиция «сейчас» в ленте комнаты: с неё дальше читаются только новые события."""
-        data = self._get(f"/rooms/{quote(room_id)}/messages", {"dir": "b", "limit": 1})
-        return str(data.get("start") or "")
-
-    def new_events(self, room_id: str, since: str, *, limit: int = 100) -> tuple[list[Event], str]:
-        """События после позиции ``since`` и новая позиция. Пусто — позиция прежняя."""
-        data = self._get(f"/rooms/{quote(room_id)}/messages",
-                         {"dir": "f", "from": since, "limit": limit})
-        events = [parse_event(e) for e in (data.get("chunk") or [])]
-        return events, str(data.get("end") or since)
-
-    def sync(self, since: str = "", *, timeline: int = 30) -> SyncResult:
-        """Без ``since`` — лёгкая точка отсчёта (без ленты) и карта личных; с ним — что нового."""
-        params = {"timeout": 0, "filter": _sync_filter(timeline if since else 0)}
-        if since:
-            params["since"] = since
+    def news(self, cursor: str = "", *, timeline: int = 30) -> ChatNews:
+        """Без ``cursor`` — лёгкая точка отсчёта (без ленты) и личные диалоги; с ним — что
+        нового (один инкрементальный ``/sync`` на все комнаты)."""
+        params = {"timeout": 0, "filter": _sync_filter(timeline if cursor else 0)}
+        if cursor:
+            params["since"] = cursor
         data = self._get("/sync", params)
-        rooms: dict[str, RoomUpdate] = {}
+        rooms: dict[str, RoomNews] = {}
         for rid, room in ((data.get("rooms") or {}).get("join") or {}).items():
             tl = room.get("timeline") or {}
-            rooms[rid] = RoomUpdate(
-                events=[parse_event(e) for e in (tl.get("events") or [])],
+            rooms[rid] = RoomNews(
+                messages=[parse_event(e) for e in (tl.get("events") or [])],
                 unread=int((room.get("unread_notifications") or {}).get("notification_count") or 0),
                 limited=bool(tl.get("limited")),
             )
         direct = None
         for ev in ((data.get("account_data") or {}).get("events") or []):
             if ev.get("type") == "m.direct":
-                direct = {str(k): [str(r) for r in (v or [])] for k, v in (ev.get("content") or {}).items()}
-        return SyncResult(next_batch=str(data.get("next_batch") or since), rooms=rooms, direct=direct)
+                direct = {str(r) for v in (ev.get("content") or {}).values() for r in (v or [])}
+        return ChatNews(cursor=str(data.get("next_batch") or cursor), rooms=rooms, direct_rooms=direct)
 
-    def direct_map(self, user_id: str) -> dict[str, list[str]]:
+    def message(self, room_id: str, message_id: str) -> Optional[ChatMessage]:
         try:
-            content = self._get(f"/user/{quote(user_id)}/account_data/m.direct")
-        except MatrixError:
-            return {}
-        return {str(k): [str(r) for r in (v or [])] for k, v in content.items() if isinstance(v, list)}
-
-    def event(self, room_id: str, event_id: str) -> Optional[Event]:
-        try:
-            return parse_event(self._get(f"/rooms/{quote(room_id)}/event/{quote(event_id)}"))
+            return parse_event(self._get(f"/rooms/{quote(room_id)}/event/{quote(message_id)}"))
         except MatrixError:
             return None
-
-    def display_name(self, user_id: str) -> str:
-        try:
-            return str(self._get(f"/profile/{quote(user_id)}/displayname").get("displayname") or "")
-        except MatrixError:
-            return ""
 
 
 # --------------------------------------------------------------------------- #

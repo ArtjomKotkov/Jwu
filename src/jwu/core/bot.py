@@ -389,10 +389,10 @@ DUTY_COMMANDS = ("/duty", "/personal", "/matrix", "/duty_settings")
 
 
 def _matrix_factory(cfg: "Config"):
-    """Ленивый конструктор клиента Matrix: сеть нужна не каждой кнопке."""
-    from . import matrix
+    """Ленивый конструктор источника чатов дежурства: сеть нужна не каждой кнопке."""
+    from . import chats
 
-    return lambda: matrix.client_from_config(cfg)
+    return chats.factory("matrix", cfg)
 
 
 def handle_duty_command(cmd: str, *, store: "Store", cfg: "Config") -> tuple[str, dict]:

@@ -27,7 +27,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Optional
 
-from .matrix import Event, MatrixClient, MatrixError, Room, SyncResult, sort_rooms
+from .chats import ChatError, ChatMessage, ChatNews, ChatRoom, ChatSource, sort_rooms
 
 if TYPE_CHECKING:
     from .store import Store
@@ -102,26 +102,26 @@ def dm_rooms(store: "Store") -> set[str]:
     return set(_json_meta(store, DM_ROOMS_META, []))
 
 
-def _save_direct(store: "Store", result: SyncResult) -> None:
+def _save_direct(store: "Store", result: ChatNews) -> None:
     rooms = result.direct_rooms
     if rooms is not None:
         store.set_workspace_meta(DM_ROOMS_META, json.dumps(sorted(rooms)))
 
 
-def _remember_me(store: "Store", client: MatrixClient) -> None:
+def _remember_me(store: "Store", client: ChatSource) -> None:
     me = client.whoami()
     store.set_workspace_meta(ME_META, me)
     store.set_workspace_meta(ME_NAME_META, client.display_name(me) if me else "")
 
 
-def _reset_position(store: "Store", client: MatrixClient) -> None:
+def _reset_position(store: "Store", client: ChatSource) -> None:
     """Точка отсчёта «сейчас»: старое не пересказываем. Заодно — карта личных."""
-    result = client.sync()
+    result = client.news()
     _save_direct(store, result)
-    store.set_workspace_meta(SINCE_META, result.next_batch)
+    store.set_workspace_meta(SINCE_META, result.cursor)
 
 
-def set_room(store: "Store", client: MatrixClient, room: Room) -> State:
+def set_room(store: "Store", client: ChatSource, room: ChatRoom) -> State:
     """Настройка: запомнить комнату дежурства и себя."""
     _remember_me(store, client)
     store.set_workspace_meta(ROOM_META, room.id)
@@ -130,7 +130,7 @@ def set_room(store: "Store", client: MatrixClient, room: Room) -> State:
     return load(store)
 
 
-def _switch(store: "Store", key: str, on: bool, client: Optional[MatrixClient]) -> State:
+def _switch(store: "Store", key: str, on: bool, client: Optional[ChatSource]) -> State:
     """Включить/выключить одну из слежек. Позиция /sync общая: при старте с нуля — «сейчас»
     (старое не пересказываем), при выключении последней — сброс. Без клиента позицию
     выставит первая проверка демона."""
@@ -148,7 +148,7 @@ def _switch(store: "Store", key: str, on: bool, client: Optional[MatrixClient]) 
     return load(store)
 
 
-def enable(store: "Store", client: Optional[MatrixClient] = None) -> State:
+def enable(store: "Store", client: Optional[ChatSource] = None) -> State:
     return _switch(store, ENABLED_META, True, client)
 
 
@@ -156,7 +156,7 @@ def disable(store: "Store") -> State:
     return _switch(store, ENABLED_META, False, None)
 
 
-def set_personal(store: "Store", on: bool, client: Optional[MatrixClient] = None) -> State:
+def set_personal(store: "Store", on: bool, client: Optional[ChatSource] = None) -> State:
     return _switch(store, PERSONAL_META, on, client)
 
 
@@ -165,12 +165,12 @@ def set_personal(store: "Store", on: bool, client: Optional[MatrixClient] = None
 # --------------------------------------------------------------------------- #
 
 
-def cached_rooms(store: "Store") -> list[Room]:
+def cached_rooms(store: "Store") -> list[ChatRoom]:
     cache = _json_meta(store, ROOMS_CACHE_META, {})
-    return sort_rooms([Room(id=rid, name=name) for rid, name in cache.items()])
+    return sort_rooms([ChatRoom(id=rid, name=name) for rid, name in cache.items()])
 
 
-def list_rooms(store: "Store", client: Optional[MatrixClient], *, refresh: bool = False) -> list[Room]:
+def list_rooms(store: "Store", client: Optional[ChatSource], *, refresh: bool = False) -> list[ChatRoom]:
     """Мои комнаты с именами. Есть кеш и не просили обновить — сеть не трогаем вовсе.
 
     Обновление спрашивает имена только у новых комнат (вышел из комнаты — забываем).
@@ -178,7 +178,7 @@ def list_rooms(store: "Store", client: Optional[MatrixClient], *, refresh: bool 
     cache: dict[str, str] = _json_meta(store, ROOMS_CACHE_META, {})
     if cache and not refresh or client is None:
         return cached_rooms(store)
-    ids = client.joined_room_ids()
+    ids = client.room_ids()
     missing = [rid for rid in ids if rid not in cache]
     if missing:
         cache.update(client.room_names(missing))
@@ -187,7 +187,7 @@ def list_rooms(store: "Store", client: Optional[MatrixClient], *, refresh: bool 
     return cached_rooms(store)
 
 
-def pick_room(rooms: list[Room], query: str) -> Optional[Room]:
+def pick_room(rooms: list[ChatRoom], query: str) -> Optional[ChatRoom]:
     """Комната по номеру (с 1), id или части названия; неоднозначно — None."""
     q = query.strip()
     if q.isdigit() and 1 <= int(q) <= len(rooms):
@@ -199,9 +199,9 @@ def pick_room(rooms: list[Room], query: str) -> Optional[Room]:
     return hits[0] if len(hits) == 1 else None
 
 
-def _choices(store: "Store") -> list[Room]:
+def _choices(store: "Store") -> list[ChatRoom]:
     raw = _json_meta(store, CHOICES_META, [])
-    return [Room(id=str(r[0]), name=str(r[1])) for r in raw if isinstance(r, list) and len(r) == 2]
+    return [ChatRoom(id=str(r[0]), name=str(r[1])) for r in raw if isinstance(r, list) and len(r) == 2]
 
 
 # --------------------------------------------------------------------------- #
@@ -217,7 +217,7 @@ def _btn(text: str, action: str) -> dict:
     return {"text": text, "callback_data": _cb(action)}
 
 
-def _button_text(room: Room) -> str:
+def _button_text(room: ChatRoom) -> str:
     title = room.title
     return title if len(title) <= BUTTON_MAX else title[:BUTTON_MAX - 1] + "…"
 
@@ -242,7 +242,7 @@ def menu(state: State) -> tuple[str, dict]:
     return text, {"inline_keyboard": rows}
 
 
-def rooms_keyboard(store: "Store", client: Optional[MatrixClient], *, page: int = 0,
+def rooms_keyboard(store: "Store", client: Optional[ChatSource], *, page: int = 0,
                    refresh: bool = False) -> tuple[str, dict]:
     """Комнаты с названием кнопками, по страницам. ``client=None`` — листаем запомненное.
 
@@ -284,14 +284,14 @@ def _with_client(client_factory, fn) -> tuple[str, dict]:
     try:
         with client:
             return fn(client)
-    except MatrixError as exc:
+    except ChatError as exc:
         return f"Matrix не отвечает: {html.escape(str(exc))}", {}
 
 
 def handle_callback(store: "Store", client_factory, data: str) -> tuple[str, dict]:
     """Нажатие кнопки → (текст, клавиатура), которыми заменить сообщение с меню.
 
-    ``client_factory`` — ленивый конструктор MatrixClient: сеть только там, где без неё никак.
+    ``client_factory`` — ленивый конструктор ChatSource: сеть только там, где без неё никак.
     """
     action = data[len(CALLBACK_PREFIX):] if data.startswith(CALLBACK_PREFIX) else data
     if action == CB_MENU:
@@ -322,7 +322,7 @@ def handle_callback(store: "Store", client_factory, data: str) -> tuple[str, dic
         except (ValueError, IndexError):
             return "Список устарел — открой заново.", {"inline_keyboard": [[_btn("🏠 Выбрать комнату", CB_ROOMS)]]}
 
-        def pick(client: MatrixClient) -> tuple[str, dict]:
+        def pick(client: ChatSource) -> tuple[str, dict]:
             first = not load(store).configured
             state = set_room(store, client, room)
             if first:   # первая настройка — сразу и включаем: ради этого её и открыли
@@ -348,7 +348,7 @@ def toggle(store: "Store", client_factory) -> tuple[str, dict]:
         else:
             with client:
                 state = enable(store, client)
-    except MatrixError:
+    except ChatError:
         state = enable(store)   # позицию выставит демон
     return (f"🟢 Дежурство включено: {html.escape(state.title)}. Новые сообщения пришлю сюда. "
             "/duty — выключить, /matrix — настройка."), {}
@@ -365,7 +365,7 @@ def toggle_personal(store: "Store", client_factory) -> tuple[str, dict]:
     try:
         with client:
             set_personal(store, True, client)
-    except MatrixError:
+    except ChatError:
         set_personal(store, True)
     return ("🟢 Личное включено: непрочитанное из диалогов 1:1 и упоминания в чатах пришлю сюда. "
             "/personal — выключить."), {}
@@ -390,7 +390,7 @@ def _localpart(mxid: str) -> str:
 class _Names:
     """Кеш отображаемых имён в meta воркспейса — чтобы не дёргать профиль на каждое сообщение."""
 
-    def __init__(self, store: "Store", client: MatrixClient) -> None:
+    def __init__(self, store: "Store", client: ChatSource) -> None:
         self._store, self._client = store, client
         self._cache: dict[str, str] = _json_meta(store, NAMES_META, {})
         self._dirty = False
@@ -424,7 +424,7 @@ class Item:
         return f"{head}\n   <i>{html.escape(self.body)}</i>"
 
 
-def _mentions_me(ev: Event, state: State) -> bool:
+def _mentions_me(ev: ChatMessage, state: State) -> bool:
     if state.me and state.me in ev.mentions:
         return True
     low = ev.body.lower()
@@ -432,18 +432,18 @@ def _mentions_me(ev: Event, state: State) -> bool:
     return any(n.lower() in low for n in needles)
 
 
-def classify(events: list[Event], state: State, client: MatrixClient, names: _Names) -> list[Item]:
+def classify(events: list[ChatMessage], state: State, client: ChatSource, names: _Names) -> list[Item]:
     """Новые чужие сообщения комнаты дежурства → пункты. События по id тянутся один раз."""
-    seen: dict[str, Optional[Event]] = {}
+    seen: dict[str, Optional[ChatMessage]] = {}
 
-    def fetch(event_id: str) -> Optional[Event]:
+    def fetch(event_id: str) -> Optional[ChatMessage]:
         if event_id not in seen:
-            seen[event_id] = client.event(state.room_id, event_id)
+            seen[event_id] = client.message(state.room_id, event_id)
         return seen[event_id]
 
     items: list[Item] = []
     for ev in events:
-        if not ev.is_message or ev.sender == state.me:
+        if not ev.is_new or ev.sender == state.me:
             continue
         to_me = ""
         thread = ""
@@ -467,7 +467,7 @@ def classify(events: list[Event], state: State, client: MatrixClient, names: _Na
 class _RoomNames:
     """Имя комнаты для упоминания: из кеша списка комнат, нет там — спросить один раз."""
 
-    def __init__(self, store: "Store", client: MatrixClient) -> None:
+    def __init__(self, store: "Store", client: ChatSource) -> None:
         self._store, self._client = store, client
         self._cache: dict[str, str] = _json_meta(store, ROOMS_CACHE_META, {})
         self._dirty = False
@@ -483,7 +483,7 @@ class _RoomNames:
             self._store.set_workspace_meta(ROOMS_CACHE_META, json.dumps(self._cache, ensure_ascii=False))
 
 
-def personal_items(result: SyncResult, state: State, dms: set[str], names: _Names,
+def personal_items(result: ChatNews, state: State, dms: set[str], names: _Names,
                    room_names: "_RoomNames") -> list[Item]:
     """Личное: непрочитанное из 1:1 (по DM_PER_ROOM последних с диалога) и упоминания меня
     в остальных комнатах, пока они не прочитаны. Комната дежурства — не здесь: её и так
@@ -492,9 +492,9 @@ def personal_items(result: SyncResult, state: State, dms: set[str], names: _Name
     for rid, upd in result.rooms.items():
         if rid == state.room_id and state.active or upd.unread <= 0:
             continue
-        theirs = [e for e in upd.events if e.is_message and e.sender != state.me]
+        theirs = [e for e in upd.messages if e.is_new and e.sender != state.me]
         if rid in dms:
-            sealed = [e for e in theirs if e.encrypted]
+            sealed = [e for e in theirs if e.sealed]
             if sealed:   # текста нет — кто и сколько, по человеку
                 by_who: dict[str, int] = {}
                 for e in sealed:
@@ -502,7 +502,7 @@ def personal_items(result: SyncResult, state: State, dms: set[str], names: _Name
                 for who, n in by_who.items():
                     body = "🔒 новое сообщение" if n == 1 else f"🔒 {n} новых сообщения" if n < 5 else f"🔒 {n} новых сообщений"
                     items.append(Item(who=names.get(who), body=f"{body} — открой Element", direct=True))
-            for ev in [e for e in theirs if not e.encrypted][-DM_PER_ROOM:]:
+            for ev in [e for e in theirs if not e.sealed][-DM_PER_ROOM:]:
                 items.append(Item(who=names.get(ev.sender), body=_short(ev.body, BODY_MAX), direct=True))
             continue
         for ev in theirs:
@@ -541,7 +541,7 @@ def format_items(state: State, items: list[Item]) -> str:
     return "\n\n".join("\n".join(b) for b in blocks)
 
 
-def check(store: "Store", client: MatrixClient, *, commit: bool = True) -> tuple[State, list[Item], str]:
+def check(store: "Store", client: ChatSource, *, commit: bool = True) -> tuple[State, list[Item], str]:
     """Новое с прошлой проверки: (состояние, пункты, новая позиция). Ничего не включено — без сети.
 
     ``commit=False`` — позицию не сдвигать (демон сдвинет сам, когда уведомление ушло).
@@ -555,19 +555,19 @@ def check(store: "Store", client: MatrixClient, *, commit: bool = True) -> tuple
     if not state.since:
         _reset_position(store, client)
         return load(store), [], load(store).since
-    result = client.sync(state.since)
+    result = client.news(state.since)
     _save_direct(store, result)
     names = _Names(store, client)
     upd = result.rooms.get(state.room_id) if state.active else None
-    items = classify(upd.events, state, client, names) if upd else []
+    items = classify(upd.messages, state, client, names) if upd else []
     if state.personal:
         rooms = _RoomNames(store, client)
         items += personal_items(result, state, dm_rooms(store), names, rooms)
         rooms.save()
     names.save()
     if commit:
-        advance(store, state, result.next_batch)
-    return state, items, result.next_batch
+        advance(store, state, result.cursor)
+    return state, items, result.cursor
 
 
 def advance(store: "Store", state: State, end: str) -> None:

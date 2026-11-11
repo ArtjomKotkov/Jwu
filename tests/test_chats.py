@@ -1,0 +1,54 @@
+"""Источники чатов: общий вид и реестр адаптеров (встроенные + аддоны)."""
+
+import types
+
+from jwu.core import addons, chats
+from jwu.core.config import Config
+
+
+class _EP:
+    def __init__(self, name, module):
+        self.name, self._module = name, module
+        self.dist = types.SimpleNamespace(version="1")
+
+    def load(self):
+        return self._module
+
+
+def test_message_is_new_unless_edit():
+    assert chats.ChatMessage("$1", "@a", "текст").is_new
+    assert chats.ChatMessage("$2", "@a", "", sealed=True).is_new          # текста нет, но сообщение есть
+    assert not chats.ChatMessage("$3", "@a", "правка", edit_of="$1").is_new
+    assert not chats.ChatMessage("$4", "@a", "").is_new
+
+
+def test_sort_rooms_named_first():
+    rooms = [chats.ChatRoom("!z"), chats.ChatRoom("!b", "бета"), chats.ChatRoom("!a", "Альфа")]
+    assert [r.id for r in chats.sort_rooms(rooms)] == ["!a", "!b", "!z"]
+
+
+def test_registry_builtin_addon_override_and_unknown(monkeypatch):
+    made = []
+    mod = types.ModuleType("fake")
+    mod.chat_sources = lambda: {"fakechat": lambda cfg: made.append(cfg) or "SRC",
+                                "matrix": lambda cfg: "ADDON-MATRIX"}
+    monkeypatch.setattr(addons, "_entry_points", lambda: [_EP("fake", mod)])
+    monkeypatch.setattr(addons, "_cache", None)
+    try:
+        cfg = Config()
+        assert set(chats.factories()) >= {"fakechat", "matrix"}
+        assert chats.factory("fakechat", cfg)() == "SRC" and made == [cfg]
+        assert chats.factory("matrix", cfg)() == "ADDON-MATRIX"       # аддон перекрывает встроенный
+        assert chats.factory("nope", cfg)() is None                   # адаптера нет — как «не настроен»
+    finally:
+        addons._cache = None
+
+
+def test_matrix_adapter_speaks_chat_types():
+    from jwu.core import matrix
+
+    assert matrix.MatrixClient.name == "matrix" and issubclass(matrix.MatrixError, chats.ChatError)
+    msg = matrix.parse_event({"event_id": "$1", "sender": "@a:x", "type": "m.room.message",
+                              "content": {"body": "привет", "m.relates_to": {"rel_type": "m.thread", "event_id": "$r"}}})
+    assert isinstance(msg, chats.ChatMessage) and msg.thread_root == "$r" and msg.is_new
+    assert not matrix.parse_event({"event_id": "$2", "type": "m.reaction", "content": {"body": "x"}}).is_new

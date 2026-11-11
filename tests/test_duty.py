@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from jwu.core.chats import ChatRoom
 from jwu.core import bot, daemon, duty, matrix, notify, workspaces
 from jwu.core.config import Config
 from jwu.core.store import Store
@@ -135,7 +136,7 @@ def test_toggle_command(tmp_path):
     _mock_matrix()
     text, kb = duty.toggle(store, _factory(cfg))          # комнаты нет → выбор комнаты
     assert "За какой комнатой" in text and kb["inline_keyboard"]
-    duty.set_room(store, matrix.client_from_config(cfg), matrix.Room(ROOM_A, "Поддержка продаж"))
+    duty.set_room(store, matrix.client_from_config(cfg), ChatRoom(ROOM_A, "Поддержка продаж"))
     text, kb = duty.toggle(store, _factory(cfg))
     assert text.startswith("🟢 Дежурство включено") and duty.load(store).active and not kb
     text, kb = duty.toggle(store, _factory(cfg))
@@ -198,7 +199,7 @@ def test_check_classifies_thread_reply_mention_and_skips_own(tmp_path):
     _mock_matrix({ROOM_A: (events, 0)})
     _mock_events(extra)
     client = matrix.client_from_config(cfg)
-    duty.set_room(store, client, matrix.Room(ROOM_A, "Поддержка продаж"))
+    duty.set_room(store, client, ChatRoom(ROOM_A, "Поддержка продаж"))
     duty.enable(store, client)
     state, items, end = duty.check(store, client)
     assert end == "s1" and duty.load(store).since == "s1"
@@ -220,7 +221,7 @@ def test_poll_keeps_position_when_telegram_fails(tmp_path):
     store, ws, cfg = _env(tmp_path)
     _mock_matrix({ROOM_A: ([_ev("$1", "@ivan:mx.test", "есть кто?")], 1)})
     client = matrix.client_from_config(cfg)
-    duty.set_room(store, client, matrix.Room(ROOM_A, "Поддержка продаж"))
+    duty.set_room(store, client, ChatRoom(ROOM_A, "Поддержка продаж"))
     duty.enable(store, client)
     client.close()
 
@@ -294,7 +295,7 @@ def test_daemon_poll_bots_sends_duty_news(tmp_path, monkeypatch):
     store.use_workspace(work.id)
     cfg = workspaces.config_for_workspace(store, work)
     client = matrix.client_from_config(cfg)
-    duty.set_room(store, client, matrix.Room(ROOM_A, "Поддержка продаж"))
+    duty.set_room(store, client, ChatRoom(ROOM_A, "Поддержка продаж"))
     duty.enable(store, client)
     client.close()
     sent = respx.post(f"{TG}/bottok/sendMessage").mock(
@@ -347,8 +348,8 @@ def test_room_pages_and_name_cache(tmp_path, monkeypatch):
 
 
 def test_pick_room():
-    rooms = [matrix.Room("!1:x", "Болталка"), matrix.Room("!2:x", "Поддержка продаж"),
-             matrix.Room("!3:x", "Поддержка партнёров")]
+    rooms = [ChatRoom("!1:x", "Болталка"), ChatRoom("!2:x", "Поддержка продаж"),
+             ChatRoom("!3:x", "Поддержка партнёров")]
     assert duty.pick_room(rooms, "2").id == "!2:x"
     assert duty.pick_room(rooms, "продаж").id == "!2:x"
     assert duty.pick_room(rooms, "поддержка") is None          # неоднозначно
@@ -368,8 +369,8 @@ def test_edit_is_not_a_new_message():
                         "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
                         "m.mentions": {"user_ids": [ME]}}}
     ev = matrix.parse_event(edit)
-    assert ev.replaces == "$orig" and not ev.is_message
-    assert matrix.parse_event(_ev("$1", "@olga:mx.test", "текст")).is_message
+    assert ev.edit_of == "$orig" and not ev.is_new
+    assert matrix.parse_event(_ev("$1", "@olga:mx.test", "текст")).is_new
 
 
 def _enc(eid, sender, **rel):
@@ -381,9 +382,9 @@ def _enc(eid, sender, **rel):
 
 def test_encrypted_event_parsed_as_message_without_text():
     ev = matrix.parse_event(_enc("$e", "@olga:mx.test"))
-    assert ev.encrypted and ev.is_message and ev.body == matrix.ENCRYPTED_BODY
+    assert ev.sealed and ev.is_new and ev.body == matrix.ENCRYPTED_BODY
     edit = matrix.parse_event(_enc("$e2", "@olga:mx.test", rel_type="m.replace", event_id="$e"))
-    assert not edit.is_message                                  # правка зашифрованного — не новое
+    assert not edit.is_new                                  # правка зашифрованного — не новое
     assert "m.room.encrypted" in matrix._sync_filter(30)
 
 

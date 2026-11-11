@@ -637,12 +637,12 @@ def flush_quiet(store: "Store") -> int:
 
 def poll_duty(store: "Store") -> list[dict]:
     """Matrix: дежурство и личное по каждому контуру с Telegram → новое в чат."""
-    from . import duty, matrix
+    from . import chats, duty
 
     handled: list[dict] = []
     for ws, cfg, sender, _login in _bot_senders(store):
         try:
-            n = duty.poll(store, lambda cfg=cfg: matrix.client_from_config(cfg), sender)
+            n = duty.poll(store, chats.factory("matrix", cfg), sender)
             if n:
                 handled.append({"workspace": ws.slug, "kind": "duty", "count": n})
         except Exception as exc:  # noqa: BLE001 — Matrix лежит: позиция не сдвинута, повторим

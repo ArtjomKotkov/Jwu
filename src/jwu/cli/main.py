@@ -6511,11 +6511,11 @@ def statusline_preview() -> None:
 
 
 def _duty_client(store: Store):
-    from ..core import matrix
+    from ..core import chats
 
     ws = _resolve_workspace(store)
     cfg = workspaces.config_for_workspace(store, ws)
-    client = matrix.client_from_config(cfg)
+    client = chats.factory("matrix", cfg)()
     if client is None:
         err.print("[red]Matrix не настроен.[/red] jwu configure --non-interactive "
                   "--matrix-host … --matrix-token …  (или конфиг matrix-mcp на этой машине)")
