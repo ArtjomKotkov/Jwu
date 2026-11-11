@@ -347,8 +347,7 @@ MENU_ROWS = [
     [("🗂 Что делать", "board")],
     [("🔄 Синк сейчас", "sync"), ("ℹ️ Статус", "status")],
     [("📋 Мои задачи", "tasks"), ("🕒 Что сделал сегодня", "today")],
-    [("📣 Упоминания", "mentions")],
-    [("🔔 Уведомления", "notify")],
+    [("📣 Упоминания", "mentions"), ("🔔 Уведомления", "notify")],
 ]
 
 
@@ -356,23 +355,39 @@ def _menu_btn(text: str, action: str) -> dict:
     return {"text": text, "callback_data": f"{MENU_PREFIX}{action}"}
 
 
-def _addon_buttons() -> list[tuple[str, str]]:
+CONNECTORS = "connectors"   # подменю «🔌 Коннекторы»: кнопки аддонов-коннекторов (чаты и т.п.)
+
+
+def _addon_buttons(place: str = "") -> list[tuple[str, str]]:
+    """Кнопки аддонов: (подпись, действие[, место]). Место ``connectors`` — в подменю коннекторов."""
     from . import addons
 
     out: list[tuple[str, str]] = []
     for addon in addons.active():
-        for label, action in addon.call("menu_buttons", default=[]) or []:
-            out.append((label, f"addon:{addon.name}:{action}"))
+        for button in addon.call("menu_buttons", default=[]) or []:
+            label, action, where = (tuple(button) + ("",))[:3]
+            if where == place:
+                out.append((label, f"addon:{addon.name}:{action}"))
     return out
+
+
+def connectors_menu() -> tuple[str, dict]:
+    rows = [[_menu_btn(label, action)] for label, action in _addon_buttons(CONNECTORS)]
+    text = "🔌 <b>Коннекторы</b>" + ("" if rows else "\nНет ни одного — их приносят аддоны (jwu addons list).")
+    return text, {"inline_keyboard": rows + [BACK_TO_MENU]}
 
 
 def _is_backup(sender) -> bool:
     return getattr(sender, "role", "main") == "backup"
 
 
-def main_menu(sender=None) -> tuple[str, dict]:
-    rows = [[_menu_btn(label, action) for label, action in row] for row in MENU_ROWS]
+def main_menu(sender=None, store: Optional["Store"] = None) -> tuple[str, dict]:
+    unseen = len(store.unseen_mentions()) if store is not None else 0
+    rows = [[_menu_btn(f"{label} · {unseen}" if action == "mentions" and unseen else label, action)
+             for label, action in row] for row in MENU_ROWS]
     rows += [[_menu_btn(label, action)] for label, action in _addon_buttons()]
+    if _addon_buttons(CONNECTORS):
+        rows.append([_menu_btn("🔌 Коннекторы", CONNECTORS)])
     title = "📋 <b>Меню jwu</b>"
     if _is_backup(sender):
         # меню пришло из резервного бота: видно, что основной сейчас не на связи
@@ -396,7 +411,9 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
                 on_sync: Optional[Callable[[], bool]], sender=None) -> tuple[str, dict]:
     """Кнопка меню → (текст, клавиатура) для того же сообщения. Под ответом — «← меню»."""
     if action == "main":
-        return main_menu(sender)
+        return main_menu(sender, store)
+    if action == CONNECTORS:
+        return connectors_menu()
     if action == "checkmain":
         return check_main_bot(sender), {"inline_keyboard": [BACK_TO_MENU]}
     if action.startswith("addon:"):
@@ -558,7 +575,7 @@ def show_menu(store: "Store", sender, *, pressed: Optional[int],
     for mid in (pressed, store.get_workspace_meta(notify.MENU_META)):
         if mid:
             sender.delete(int(mid))
-    body, markup = main_menu(sender)
+    body, markup = main_menu(sender, store)
     ids = sender.send(body, markup=markup)
     if ids and ids[-1]:
         store.set_workspace_meta(notify.MENU_META, str(ids[-1]))

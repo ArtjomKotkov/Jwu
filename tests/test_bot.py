@@ -262,3 +262,29 @@ def test_mentions_screen_groups_by_source_and_marks_read(tmp_path):
     text, kb = bot.handle_menu("seen", store=store, ws=ws, cfg=cfg, login="", on_sync=None)
     assert "Помечено прочитанными: 2" in text and "Непрочитанных упоминаний нет" in text
     store.close()
+
+
+def test_main_menu_counts_mentions_and_groups_connectors(tmp_path, monkeypatch):
+    import types
+
+    from jwu.core import addons
+
+    store, ws, cfg = _env(tmp_path)
+    mod = types.ModuleType("fake")
+    mod.menu_buttons = lambda: [("💼 Работа", "home"), ("💬 Чат", "chat", "connectors")]
+    monkeypatch.setattr(addons, "_entry_points", lambda: [types.SimpleNamespace(
+        name="fake", dist=types.SimpleNamespace(version="1"), load=lambda: mod)])
+    monkeypatch.setattr(addons, "_cache", None)
+    try:
+        labels = lambda kb: [[b["text"] for b in row] for row in kb["inline_keyboard"]]  # noqa: E731
+        assert ["📣 Упоминания", "🔔 Уведомления"] in labels(bot.main_menu(None, store)[1])
+        store.add_mentions([Mention(task_key="A-1", comment_id="1", author="x", text="[~me]")])
+        rows = labels(bot.main_menu(None, store)[1])
+        assert ["📣 Упоминания · 1", "🔔 Уведомления"] in rows
+        assert ["💼 Работа"] in rows and ["🔌 Коннекторы"] in rows and ["💬 Чат"] not in rows
+        text, kb = bot.handle_menu("connectors", store=store, ws=ws, cfg=cfg, login="", on_sync=None)
+        assert "Коннекторы" in text and labels(kb) == [["💬 Чат"], ["← меню"]]
+        assert kb["inline_keyboard"][0][0]["callback_data"] == "menu:addon:fake:chat"
+    finally:
+        addons._cache = None
+    store.close()
