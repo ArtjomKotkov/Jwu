@@ -44,7 +44,7 @@ def gh_pr_raw(number=7, state="open", merged_at=None, mergeable=True,
     repo = {"name": REPO, "owner": {"login": OWNER}}
     return {
         "number": number,
-        "title": f"Fix save (#42)",
+        "title": "Fix save (#42)",
         "body": "Описание PR",
         "state": state,
         "merged_at": merged_at,

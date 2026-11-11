@@ -1189,10 +1189,6 @@ class WorkspaceRule(BaseModel):
     created_at: str = ""
     updated_at: str = ""
 
-    def index_entry(self) -> dict:
-        """Компактная запись для индекса: что правило есть, без его текста."""
-        return {"id": self.id, "kind": self.kind, "tag": self.tag, "title": self.title}
-
 
 class LocalFeature(BaseModel):
     """Задача локального трекера воркспейса — замена карточки Jira, когда Jira нет.

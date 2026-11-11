@@ -48,10 +48,6 @@ def _anchor_index(lines: list[dict], anchor: dict) -> int:
     return -1
 
 
-def _diff_context(diff: dict, max_lines: int = 24) -> list[str]:
-    return [ln["text"] for ln in _diff_lines(diff, max_lines)]
-
-
 def _flatten_comment(
     c: dict, comments: list[PRComment], *, file: str, line, context, anchor_idx: int, depth: int
 ) -> None:

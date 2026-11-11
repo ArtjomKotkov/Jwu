@@ -111,19 +111,14 @@ Factory = Callable[["Config"], Optional[ChatSource]]
 
 
 def factories() -> dict[str, Factory]:
-    """Адаптеры чатов: встроенные + из аддонов (``chat_sources``)."""
+    """Адаптеры чатов из аддонов (``chat_sources``); встроенных нет — все мессенджеры аддоны."""
     from . import addons
 
-    out: dict[str, Factory] = dict(_builtin())
+    out: dict[str, Factory] = {}
     for addon in addons.active():
         for name, factory in (addon.call("chat_sources", default={}) or {}).items():
-            out[str(name)] = factory       # аддон перекрывает встроенный
+            out[str(name)] = factory       # одноимённый у двух аддонов — побеждает поздний
     return out
-
-
-def _builtin() -> dict[str, Factory]:
-    """Встроенных адаптеров нет: все мессенджеры — аддоны."""
-    return {}
 
 
 def factory(name: str, cfg: "Config") -> Callable[[], Optional[ChatSource]]:

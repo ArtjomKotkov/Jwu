@@ -20,12 +20,9 @@ from __future__ import annotations
 
 import html
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Iterable, Optional
-
-import httpx
 
 from .models import Delta, Issue, Mention, PR
 
@@ -193,18 +190,6 @@ def _key_html(key: str, links: Optional[Links]) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{label}</a>' if url else f"<b>{label}</b>"
 
 
-def _clean_detail(kind: str, detail: str) -> str:
-    """Деталь без повторения того, что уже сказано заголовком группы."""
-    text = " ".join((detail or "").split())
-    if kind == "reviewer_needs_work":
-        text = text.replace(": needs work", "")
-    if kind == "new_conflict" and text.startswith("появился"):
-        text = ""
-    if kind == "build_failed" and text == "сборка упала":
-        text = ""
-    return text
-
-
 # Порядок групп в сообщении: сначала блокеры мержа, потом остальное.
 _GROUP_ORDER = ["new_conflict", "build_failed", "reviewer_needs_work", "new_pr_task",
                 "returned_from_testing", "qa_comment", "new_issue", "new_review_pr",
@@ -213,29 +198,6 @@ _GROUP_ORDER = ["new_conflict", "build_failed", "reviewer_needs_work", "new_pr_t
                 "pr_task_resolved", "gone", "pr_gone"]
 
 
-SECTION_TITLES: dict[str, str] = {
-    "new_conflict": "⚠️ КОНФЛИКТ",
-    "build_failed": "❌ СБОРКА УПАЛА",
-    "reviewer_needs_work": "✍️ NEEDS WORK",
-    "new_pr_task": "☑️ НОВАЯ ЗАДАЧА В PR",
-    "new_pr_comment": "💬 КОММЕНТАРИЙ В PR",
-    "status_change": "🔀 СТАТУС",
-    "returned_from_testing": "↩️ ВЕРНУЛИ С ТЕСТОВ",
-    "qa_comment": "🧪 КОММЕНТАРИЙ QA",
-    "build_fixed": "✅ СБОРКА ПОЗЕЛЕНЕЛА",
-    "pr_all_approved": "👍 СОБРАЛ ВСЕ АПРУВЫ",
-    "pr_ready_to_merge": "🚀 ГОТОВ К МЕРЖУ",
-    "new_issue": "🆕 НОВЫЕ ЗАДАЧИ",
-    "new_comment": "💬 КОММЕНТАРИИ В ЗАДАЧАХ",
-    "resolved": "✔️ РЕШЕНЫ",
-    "new_pr": "🔗 НОВЫЕ PR ПО ЗАДАЧАМ",
-    "new_review_pr": "👀 НОВЫЕ PR НА РЕВЬЮ",
-    "new_pr_commit": "📝 КОММИТЫ В PR",
-    "reviewer_approved": "✅ АПРУВЫ",
-    "pr_task_resolved": "☑️ ЗАДАЧИ В PR ЗАКРЫТЫ",
-    "gone": "📤 УШЛИ ИЗ ВЫБОРКИ",
-    "pr_gone": "📤 PR ПРОПАЛИ (СМЕРЖЕН / ОТКЛОНЁН)",
-}
 MENTION_TAG_RE = re.compile(r"\[~[^\]]+\]\s*[-—:,]?\s*")
 
 
@@ -377,61 +339,8 @@ def resolve_roles(keys: Iterable[str], *, me: Iterable[str], issues: dict[str, I
     return out
 
 
-def _role_line(role: Optional[Role], kind: str) -> str:
-    """Строка роли под ключом: «👁 наблюдаю · исп. Иванов» / «перевёл Петров · на мне»."""
-    if role is None:
-        return ""
-    parts = [role.label]
-    if kind in STATUS_KINDS:
-        if role.actor:
-            parts.append(f"перевёл {role.actor}")
-        parts.append("на мне" if role.assignee_is_me else
-                     f"на {role.assignee}" if role.assignee else "не назначена")
-    elif role.assignee and not role.assignee_is_me:
-        parts.append(f"исп. {role.assignee}")
-    return " · ".join(parts)
-
-
-def _item(key: str, who: str, body: str, role_line: str, *, links: Optional[Links],
-          quote: bool = False, body_limit: int = 110) -> list[str]:
-    block = item_block(key, who, body, links=links, quote=quote, body_limit=body_limit)
-    if role_line:
-        block.insert(1, html.escape(_short(role_line, 90)))
-    return block
-
-
-def _sections(deltas: list[Delta], mentions: list[Mention], roles: dict[str, Role],
-              links: Optional[Links]) -> list[str]:
-    lines: list[str] = []
-    by_kind: dict[str, list[Delta]] = {}
-    for d in deltas:
-        by_kind.setdefault(d.kind, []).append(d)
-    order = [k for k in _GROUP_ORDER if k in by_kind] + [k for k in by_kind if k not in _GROUP_ORDER]
-    for kind in order:
-        title = SECTION_TITLES.get(kind, NOTABLE_KINDS.get(kind, kind).upper())
-        lines += section(title, [
-            _item(d.key, _who(kind, d.detail), d.summary, _role_line(roles.get(d.key), kind), links=links)
-            for d in by_kind[kind]
-        ])
-    if mentions:
-        lines += section("📣 УПОМИНАНИЯ", [
-            _item(m.task_key, m.author or "кто-то", strip_mention_tags(m.text),
-                  _role_line(roles.get(m.task_key), "mention"), links=links, quote=True, body_limit=160)
-            for m in mentions
-        ])
-    return lines
-
-
 def _rank(kind: str) -> int:
     return _GROUP_ORDER.index(kind) if kind in _GROUP_ORDER else len(_GROUP_ORDER)
-
-
-def _role_extra(role: Optional[Role], kinds: set[str]) -> str:
-    """Хвост роли для шапки карточки: на ком задача, кто перевёл статус."""
-    if role is None:
-        return ""
-    line = _role_line(role, next((k for k in kinds if k in STATUS_KINDS), ""))
-    return line[len(role.label):].lstrip(" ·") if line.startswith(role.label) else ""
 
 
 _PRIORITY_ICON = {"blocker": "🔴", "highest": "🔴", "critical": "🔴", "high": "🟠", "major": "🟠",
@@ -603,16 +512,6 @@ def build_notification(workspace: str, deltas: Iterable[Delta], mentions: Iterab
         mentions=list(mentions),
         roles=dict(roles or {}),
     )
-
-
-def send_after_sync(notifier, note: Notification,
-                    *, links: Optional[Links] = None) -> bool:
-    """Отправить, если есть что. True — ушло."""
-    if not note:
-        return False
-    for text in format_messages(note, links=links):
-        notifier.send(text)
-    return True
 
 
 def parse_incoming(update: dict, *, chat_id: str) -> Optional[tuple[str, str]]:

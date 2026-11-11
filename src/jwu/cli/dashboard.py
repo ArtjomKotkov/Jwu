@@ -430,10 +430,6 @@ def _fmt_dur(secs: float) -> str:
     return f"{m}м {s:02d}с" if m else f"{s}с"
 
 
-def _conflict_cell(pr: PR) -> str:
-    return "—" if pr.conflicted is None else ("⚠ да" if pr.conflicted else "нет")
-
-
 # Jira wiki блоки кода: {code:lang}...{code}, {noformat}...{noformat}, а также
 # ```fenced``` (так оформляют код в комментах) — все идут отдельной панелью.
 _JIRA_BLOCK_RE = re.compile(
@@ -2425,17 +2421,6 @@ class JwuDashboard(App):
             self._update_head("#structure-head", self._structure_head_lines())
         except Exception:  # noqa: BLE001 — виджета может не быть в тестовой сборке
             pass
-
-    def _git_cell(self, path: str) -> Text:
-        """Маркер git для папки: «имя/ветка» либо сколько репозиториев внутри."""
-        repos = self._git_index.get(path)
-        if repos is None:
-            return Text("…", style="dim")   # ещё не проиндексировано
-        if not repos:
-            return Text("—", style="dim")
-        if repos[0].root == path:
-            return Text(repos[0].label, style="cyan")
-        return Text(f"{len(repos)} репо", style="dim cyan")
 
     def _fill_workspaces(self, table_id: str, items: list) -> None:
         table = self.query_one(f"#{table_id}", DataTable)

@@ -915,7 +915,6 @@ def test_sync_stores_builds_and_reports_red_build(tmp_path):
 
 def test_http_deadline_caps_total_time(monkeypatch):
     """Общий бюджет: медленный сервер с повторами не вешает операцию дольше бюджета."""
-    import time as _time
 
     from jwu.core import http
 

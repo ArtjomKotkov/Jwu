@@ -1,8 +1,7 @@
-"""Доска /jwu-todo, раздача по сессиям, живые сессии, инструкции, порты, утренняя сводка."""
+"""Доска /jwu-todo, раздача по сессиям, живые сессии, инструкции, порты."""
 
 import json
 import os
-from datetime import datetime
 
 import pytest
 
@@ -133,7 +132,6 @@ def test_board_rendered_for_chat(store):
 def test_silent_sync_defers_notifications_to_next_normal(store):
     from types import SimpleNamespace
 
-    from jwu.core import notify
     from jwu.core.models import Delta
     from jwu.core.service import Service
 

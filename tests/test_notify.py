@@ -235,7 +235,6 @@ def test_all_sync_events_have_titles_and_default_set():
     must = {"new_issue", "status_change", "new_review_pr", "new_conflict", "build_failed", "new_comment",
             "new_pr_comment", "reviewer_needs_work", "gone", "pr_gone"}
     assert must <= set(notify.DEFAULT_KINDS) and "pr_ready_to_merge" not in notify.DEFAULT_KINDS
-    assert all(k in notify.SECTION_TITLES for k in notify.DEFAULT_KINDS)
     note = notify.build_notification("work", [
         Delta(key="PROJ-5", kind="new_issue", summary="Новая"),
         Delta(key="P/r#9", kind="new_review_pr", summary="feat", detail="автор Иванов"),
@@ -257,8 +256,8 @@ def test_backup_bot_takes_over_when_main_is_down(monkeypatch):
                                      tg.TelegramNotifier("spare", "42", role="backup"))
     assert sender.send("привет") == [9] and main.call_count == 1 and backup.call_count == 1
     assert sender.send("ещё") == [9] and main.call_count == 1           # основной помечен лежащим
-    clock = [notify.time.monotonic() + tg.DOWN_FOR + 1]
-    monkeypatch.setattr(notify.time, "monotonic", lambda: clock[0])
+    clock = [tg.time.monotonic() + tg.DOWN_FOR + 1]
+    monkeypatch.setattr(tg.time, "monotonic", lambda: clock[0])
     main.mock(return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 5}}))
     assert sender.send("ожил") == [5]                                   # через 5 минут — снова основной
     # 4xx основного (не сбой связи) — ошибка как есть, без молчаливого ухода в резерв

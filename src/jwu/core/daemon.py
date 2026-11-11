@@ -255,6 +255,7 @@ def run_pass(
 
 
 LAST_PASS_META = "daemon:last_pass"
+LAST_PASS_SUMMARY_META = "daemon:last_summary"
 SILENT_META = "daemon:silent_requested"   # следующий проход — тихий (без уведомлений в Telegram)
 PASSING_META = "daemon:passing"   # когда начался идущий сейчас проход; пусто — синк не идёт
 PASSING_MAX_AGE = 30 * 60         # старше — считаем, что демон упал посреди прохода
@@ -274,7 +275,6 @@ def pass_in_progress(store: "Store") -> str | None:
     except ValueError:
         return None
     return started if age < PASSING_MAX_AGE else None
-LAST_PASS_SUMMARY_META = "daemon:last_summary"
 
 
 class Waiter:

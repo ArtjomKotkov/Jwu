@@ -585,18 +585,6 @@ def _m013_git_policy(conn: sqlite3.Connection) -> None:
     ensure_schema(conn)
 
 
-def _m015_mention_sources(conn: sqlite3.Connection) -> None:
-    """v14 → v15: упоминания не только из трекера, но и из чатов.
-
-    ``source`` — откуда (``tracker`` — задачи Jira/GitHub, иначе имя источника чатов),
-    ``place`` — где для человека (комната), ``url`` — ссылка на само сообщение. У чатов
-    ``task_key`` — id комнаты, ``comment_id`` — id сообщения.
-    """
-    _add_column(conn, "mentions", "source", "TEXT NOT NULL DEFAULT 'tracker'")
-    _add_column(conn, "mentions", "url", "TEXT NOT NULL DEFAULT ''")
-    _add_column(conn, "mentions", "place", "TEXT NOT NULL DEFAULT ''")
-
-
 def _m014_job_numbers(conn: sqlite3.Connection) -> None:
     """v13 → v14: номер работы внутри воркспейса (``jobs.num``) вместо сквозного id.
 
@@ -637,6 +625,18 @@ def _m014_job_numbers(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value = ? WHERE key = ?", (json.dumps(data, ensure_ascii=False), key))
     # показанные доски держат «#id» пунктов закрытия — пусть доску покажут заново
     conn.execute("DELETE FROM meta WHERE key LIKE 'w%:todo:board:%'")
+
+
+def _m015_mention_sources(conn: sqlite3.Connection) -> None:
+    """v14 → v15: упоминания не только из трекера, но и из чатов.
+
+    ``source`` — откуда (``tracker`` — задачи Jira/GitHub, иначе имя источника чатов),
+    ``place`` — где для человека (комната), ``url`` — ссылка на само сообщение. У чатов
+    ``task_key`` — id комнаты, ``comment_id`` — id сообщения.
+    """
+    _add_column(conn, "mentions", "source", "TEXT NOT NULL DEFAULT 'tracker'")
+    _add_column(conn, "mentions", "url", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "mentions", "place", "TEXT NOT NULL DEFAULT ''")
 
 
 _MIGRATIONS: list[tuple[int, object]] = [

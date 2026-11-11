@@ -248,7 +248,6 @@ def test_read_bundle_missing_file_raises(tmp_path):
 
 def test_db_secrets_prefer_env_then_db_then_keyring(tmp_path, monkeypatch):
     """Порядок источников: переменная окружения → БД воркспейса → keyring (фолбэк)."""
-    from jwu.core import secrets as secmod
     from jwu.core.store import Store
     from jwu.core.workspaces import config_for_workspace
 

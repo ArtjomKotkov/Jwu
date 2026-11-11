@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import re
-import shutil
 import sqlite3
 from datetime import date
 from pathlib import Path

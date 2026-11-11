@@ -33,7 +33,6 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from .. import __version__
 from ..skills_install import EXPECTED_AGENTS, EXPECTED_SKILLS, default_agents_dest, default_dest

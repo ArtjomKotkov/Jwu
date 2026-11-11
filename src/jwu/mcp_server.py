@@ -52,7 +52,7 @@ from .core import workspaces as ws_mod
 from .core.config import db_path
 from .core.maintenance import ensure_db_available
 from .core.models import (
-    JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, QUEUE_MODES, QUEUE_STATUSES, WORKSPACE_RULE_KINDS,
+    JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, QUEUE_MODES, WORKSPACE_RULE_KINDS,
     Workspace,
 )
 from .core.service import Service
@@ -1194,7 +1194,7 @@ async def jwu_git_policy(path: str = "", workspace: Optional[str] = None) -> dic
     операции (allow | ask | grant | deny) и каким правилом решено, плюс ожидающие допуски.
     Только чтение: менять политику и выдавать допуски агент НЕ может (это делает пользователь
     сам: jwu git policy edit / jwu git grant)."""
-    from .core import gitops, gitpolicy
+    from .core import gitpolicy
 
     def run(c):
         table = {op: gitpolicy.decide(c.policy, op, remote=c.remote, branch=c.branch, where=c.where).to_dict()

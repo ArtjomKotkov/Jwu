@@ -340,7 +340,6 @@ class GitHubClient:
                     continue
                 if "pull_request" not in src:
                     continue
-                pr_repo = (src.get("repository") or {}).get("name", "") or repo
                 issue.pull_requests.append(DevPullRequest(
                     id=str(src.get("number", "")),
                     name=src.get("title", "") or "",
@@ -903,14 +902,3 @@ class GitHubClient:
     def issue_key(self, repo: str, number: int, *, owner: str = "") -> str:
         """Ключ задачи в формате jwu: ``repo#42`` (или ``owner/repo#42`` для чужого owner'а)."""
         return github_key(repo, number, owner=owner, default_owner=self.owner)
-
-    def issue_url(self, key: str) -> str:
-        """Ссылка на задачу в вебе (в API-ответах она есть, но ключ приходит и «сухим»)."""
-        ref = parse_github_key(
-            key, default_owner=self.owner,
-            default_repo=self.repos[0] if len(self.repos) == 1 else "",
-        )
-        if ref is None:
-            return ""
-        owner, repo, number = ref
-        return f"{self.web_url}/{owner}/{repo}/issues/{number}"

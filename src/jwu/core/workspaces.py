@@ -261,10 +261,10 @@ def _settings_to_raw(settings: dict[str, str]) -> dict:
     Так переиспользуется весь разбор из config._apply_raw: дефолты, rstrip('/'), merge views.
     """
     raw: dict = {}
+    sections = ("jira", "support", "bitbucket", "github", "jenkins", "telegram", *addon_sections())
     for key, value in settings.items():
         parts = key.split(".")
-        if len(parts) < 2 or parts[0] not in ("jira", "support", "bitbucket", "github", "jenkins",
-                                              "telegram", *addon_sections()):
+        if len(parts) < 2 or parts[0] not in sections:
             continue  # служебные ключи воркспейса (features.seq и пр.) — не конфиг
         node = raw
         for part in parts[:-1]:

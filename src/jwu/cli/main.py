@@ -21,7 +21,7 @@ from ..core.github import GitHubError
 from ..core import secrets
 from ..core.config import ConfigError, db_path, load_config, save_config, telegram_token
 from ..core import notify
-from ..core.dates import fmt_ago, fmt_dt
+from ..core.dates import fmt_dt
 from ..core import daemon, gitinfo, handoff, memory
 from ..core.maintenance import (
     AUTO_PRUNE_DAYS, ensure_db_available, run_daily_maintenance, run_daily_prune,
@@ -41,7 +41,7 @@ from ..core.models import (
     WORKSPACE_RULE_BADGES, WORKSPACE_RULE_KINDS,
     Delta, Issue, Job, LocalFeature, PR, QueueItem, Workspace,
 )
-from ..core.service import DashboardData, DayContext, Service, dashboard_from_memory
+from ..core.service import DashboardData, Service, dashboard_from_memory
 from .dashboard import render_jira_text
 from ..core.store import QueueBusy, Store
 from ..core import workspaces
@@ -2241,7 +2241,7 @@ def pr_task_add(
              else f"свой inline-коммент {path}:{line}" if path
              else "свой общий коммент")
     if not yes:
-        console.print(f"[yellow]Превью[/yellow] (ничего не создано, добавь --yes):")
+        console.print("[yellow]Превью[/yellow] (ничего не создано, добавь --yes):")
         console.print(f"  PR #{pr_id} · {where} · задача: «{text}»")
         raise typer.Exit(code=1)
     with _service_with_prs() as svc:
@@ -3132,7 +3132,7 @@ def _workspace_tags() -> list[str]:
 # --------------------------------------------------------------------------- #
 
 from ..core.daycontext import (  # noqa: E402 — рендер дневного контекста живёт в core
-    _BUILD_RU, _DAY_PROMPT, _day_context_json, _pr_line, _pr_state, _render_day_context_md,
+    _DAY_PROMPT, _day_context_json, _pr_line, _pr_state, _render_day_context_md,
 )
 
 
@@ -6646,8 +6646,6 @@ def guide_rm(name: str = typer.Argument(..., help="Имя инструкции."
 
 
 def _zephyr(svc, project: Optional[str] = None, *, require: bool = True):
-    from ..core import zephyr as z
-
     try:
         client = svc.zephyr(require_project=require and not project)
     except ValueError as exc:
@@ -6806,8 +6804,9 @@ def zephyr_folder_create(path: str = typer.Argument(..., help="Путь папк
 
 
 # --------------------------------------------------------------------------- #
-# Аддоны: подмешиваемые команды из установленных рядом пакетов (core/addons.py)
+# update: проверить релиз и обновить jwu вместе с аддонами (core/update.py)
 # --------------------------------------------------------------------------- #
+
 
 @app.command("update")
 def update_cmd(
@@ -6871,10 +6870,13 @@ def update_cmd(
         upd.announce(store, f"✅ {html.escape(done)}. В сессиях агента переподключи jwu (/mcp).")
 
 
+# --------------------------------------------------------------------------- #
+# Аддоны: вкл/выкл и подмешиваемые команды из установленных рядом пакетов (core/addons.py)
+# --------------------------------------------------------------------------- #
+
 addons_app = typer.Typer(help="Аддоны: какие установлены, включить / выключить.")
 app.add_typer(addons_app, name="addons")
 
-_ADDON_STATE_RU = {"active": "включён", "disabled": "выключен", "broken": "сломан", "blocked": "не подключён"}
 _ADDON_RESTART = "Чтобы применилось: перезапусти демон (jwu daemon install) и переподключи jwu в сессиях (/mcp)."
 
 
@@ -6894,7 +6896,7 @@ def addons_list(as_json: bool = typer.Option(False, "--json", help="Вывест
     for col in ("Аддон", "Версия", "Состояние", "Требует", "Причина"):
         table.add_column(col)
     for r in rows:
-        table.add_row(r["name"], r["version"], _ADDON_STATE_RU.get(r["state"], r["state"]),
+        table.add_row(r["name"], r["version"], addons.STATE_RU.get(r["state"], r["state"]),
                       ", ".join(r["requires"]) or "—", r["error"] or "")
     console.print(table)
 

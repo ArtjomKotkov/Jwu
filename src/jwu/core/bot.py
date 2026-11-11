@@ -44,9 +44,8 @@ HELP = (
 
 
 def _cmd_status(store: "Store", ws: "Workspace") -> str:
-    from .daemon import LAST_PASS_META, LAST_PASS_SUMMARY_META, SingleInstance
-
-    from .daemon import pass_in_progress
+    from . import addons
+    from .daemon import LAST_PASS_META, LAST_PASS_SUMMARY_META, SingleInstance, pass_in_progress
 
     pid = SingleInstance().holder_pid()
     running = pass_in_progress(store)
@@ -60,8 +59,6 @@ def _cmd_status(store: "Store", ws: "Workspace") -> str:
         f"🔄 синк: {fmt_ago(last, fallback='ещё не было') if last else 'ещё не было'}"
         + (f" · {html.escape(summary)}" if summary else ""),
     ]
-    from . import addons
-
     for addon in addons.active():
         lines += [str(x) for x in addon.call("status_lines", {"store": store, "workspace": ws}, default=[]) or []]
     return "\n".join(lines)

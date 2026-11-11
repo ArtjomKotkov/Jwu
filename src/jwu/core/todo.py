@@ -62,13 +62,15 @@ def _addon_boards() -> list[dict]:
     return out
 
 
-def groups() -> tuple[str, ...]:
+def groups(boards: Optional[list[dict]] = None) -> tuple[str, ...]:
     """Все группы доски по порядку: аддонов, потом свои."""
-    return tuple(g["group"] for g in _addon_boards()) + GROUPS
+    boards = _addon_boards() if boards is None else boards
+    return tuple(g["group"] for g in boards) + GROUPS
 
 
-def group_titles() -> dict[str, str]:
-    return {**{g["group"]: g.get("title") or g["group"] for g in _addon_boards()}, **GROUP_TITLES}
+def group_titles(boards: Optional[list[dict]] = None) -> dict[str, str]:
+    boards = _addon_boards() if boards is None else boards
+    return {**{g["group"]: g.get("title") or g["group"] for g in boards}, **GROUP_TITLES}
 
 
 def is_addon_group(group: str) -> bool:
@@ -337,7 +339,8 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                           taken=_taken(by_pr.get((pr.project, pr.repository, pr.id)))))
 
     # Группы аддонов: работа у пункта появляется, только когда его взяли
-    for board in _addon_boards():
+    boards = _addon_boards()
+    for board in boards:
         try:
             entries = board["items"](store, workspace_id, login) or []
         except Exception:  # noqa: BLE001 — аддон не должен ронять доску
@@ -352,11 +355,11 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
                               problems=list(e.get("problems") or []), taken=taken))
 
     listed = {i.key for i in items}
-    _extra_groups(store, workspace_id, login, items, listed, issues, qa_st)
+    _extra_groups(store, workspace_id, login, items, listed, issues, qa_st, boards)
 
     # Группы — в фиксированном порядке; внутри: свободное выше взятого, в работе выше не начатого,
     # дальше от важного приоритета к неважному.
-    order = groups()
+    order = groups(boards)
     items.sort(key=lambda i: (order.index(i.group) if i.group in order else len(order), i.taken is not None,
                               0 if (i.status or "").casefold() in IN_WORK_STATUSES else 1,
                               _prio(i.priority), i.key))
@@ -431,7 +434,7 @@ def _finished(issue: "Issue") -> bool:
 
 
 def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, listed: set,
-                  issues: dict, qa_st: set) -> None:
+                  issues: dict, qa_st: set, boards: list[dict]) -> None:
     """То, что раньше давал дневной анализ: двигать дальше, ответить, закрыть работу."""
     from .store import is_testing_status
 
@@ -495,7 +498,7 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
     # 🧹 работа открыта, а задача закрыта или ушла от меня
     all_prs = {(pr.project, pr.repository, pr.id): pr for pr in store.latest_prs()}
     in_review = {(pr.project, pr.repository, pr.id) for pr in store.latest_prs("review")}
-    hidden = [b["hide_job"] for b in _addon_boards() if callable(b.get("hide_job"))]
+    hidden = [b["hide_job"] for b in boards if callable(b.get("hide_job"))]
     for job in store.list_jobs(status="active"):
         if any(hide(job) for hide in hidden):
             continue
@@ -1025,9 +1028,10 @@ def render_md(board: Board, *, disk: str = "") -> str:
     lines.append("")
     free = sum(1 for i in board.items if not i.taken)
     lines.append(f"Всего {len(board.items)}, свободно {free}. Взять: «делай 1 и 3» или «бери все конфликты и падения».")
-    titles = group_titles()
-    columns = {b["group"]: tuple(b.get("columns") or ADDON_COLUMNS) for b in _addon_boards()}
-    for group in groups():
+    boards = _addon_boards()
+    titles = group_titles(boards)
+    columns = {b["group"]: tuple(b.get("columns") or ADDON_COLUMNS) for b in boards}
+    for group in groups(boards):
         part = [i for i in board.items if i.group == group]
         if not part:
             continue

@@ -67,6 +67,7 @@ def test_render_workspace_job_queue_daemon(store, tmp_path, monkeypatch):
     store.queue_add("обновить доку", mode="parallel")
     store.queue_take(mode="parallel", worker="agent")
     monkeypatch.setattr(sl.SingleInstance, "holder_pid", lambda self: 4242)
+    monkeypatch.setattr(sl, "_disk_part", lambda store, wid: "")   # место на диске машины — не предмет теста
 
     lines = _strip(sl.render({"cwd": str(folder), "model": {"display_name": "M"}}, store, with_claude=True)).splitlines()
     assert lines[0] == "M"

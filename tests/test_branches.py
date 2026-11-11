@@ -77,7 +77,7 @@ def test_worktree_detected(tmp_path):
 
 
 def test_cli_and_mcp_branches(tmp_path, monkeypatch):
-    root = _repo(tmp_path)
+    _repo(tmp_path)
     db = tmp_path / "state.db"
     store = Store(db)
     ws = store.get_workspace_by_slug("work")

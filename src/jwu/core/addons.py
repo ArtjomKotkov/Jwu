@@ -51,6 +51,7 @@ from typing import Any, Optional
 GROUP = "jwu.addons"
 
 ACTIVE, DISABLED, BROKEN, BLOCKED = "active", "disabled", "broken", "blocked"
+STATE_RU = {ACTIVE: "включён", DISABLED: "выключен", BROKEN: "сломан", BLOCKED: "не подключён"}
 
 
 @dataclass
@@ -132,8 +133,7 @@ def _resolve(found: list[Addon]) -> None:
             for req in addon.requires:
                 dep = by_name.get(req)
                 if dep is None or dep.state != ACTIVE:
-                    why = "не установлен" if dep is None else {DISABLED: "выключен", BROKEN: "сломан",
-                                                               BLOCKED: "не подключён"}[dep.state]
+                    why = "не установлен" if dep is None else STATE_RU[dep.state]
                     addon.state, addon.error = BLOCKED, f"нужен аддон {req} — он {why}"
                     changed = True
                     break

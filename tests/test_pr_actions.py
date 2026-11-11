@@ -73,7 +73,7 @@ def test_github_diff_comment_and_review():
     gh = GitHubClient(GH, "tok")
     diff_route = respx.get(f"{GH}/repos/o/r/pulls/7").mock(return_value=httpx.Response(200, text=_GH_DIFF))
     reply = respx.post(f"{GH}/repos/o/r/pulls/7/comments/99/replies").mock(return_value=httpx.Response(201, json={"id": 100}))
-    general = respx.post(f"{GH}/repos/o/r/issues/7/comments").mock(return_value=httpx.Response(201, json={"id": 101}))
+    respx.post(f"{GH}/repos/o/r/issues/7/comments").mock(return_value=httpx.Response(201, json={"id": 101}))
     reviews = respx.post(f"{GH}/repos/o/r/pulls/7/reviews").mock(return_value=httpx.Response(200, json={"id": 5, "state": "APPROVED"}))
     try:
         assert gh.pr_diff("o", "r", 7) == _GH_DIFF

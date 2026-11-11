@@ -5,7 +5,7 @@ import pytest
 import respx
 
 from jwu.core import http as jhttp
-from jwu.core.bitbucket import BitbucketClient, BitbucketError
+from jwu.core.bitbucket import BitbucketClient
 from jwu.core.models import Comment, Delta, Issue, Mention, PR, Reviewer
 from jwu.core.service import DashboardData, _brief_dashboard
 from jwu.core.store import Store, is_testing_status

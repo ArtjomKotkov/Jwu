@@ -47,7 +47,7 @@ from . import diffmap, notify
 from . import thresholds as thresholds_mod
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
-    PR_TASK_STATES, PRAttachment, PRTask, check_task_text, job_description_text, pr_note_key,
+    PR_TASK_STATES, PRAttachment, PRTask, check_task_text, pr_note_key,
     Attachment,
     DOWNLOADABLE_ATTACH_KINDS,
     GITHUB_SHORT_REF_RE,
@@ -551,34 +551,6 @@ class Service:
     def github(self) -> GitHubClient | None:
         """Клиент GitHub — или None, если контур не на GitHub."""
         return self.pr_client if isinstance(self.pr_client, GitHubClient) else None
-
-    @classmethod
-    def from_config(cls, cfg: Config | None = None, *, db_path: str | None = None,
-                    workspace_id: int | None = None) -> "Service":
-        from .config import db_path as default_db_path
-
-        cfg = cfg or load_config()
-        login = jira_login(cfg)
-        if login is not None:
-            # за Jira стоит nginx Basic-гейт + сессионная авторизация
-            jira = _jira_like_client(
-                cfg.jira.base_url, login=login, proxy_basic=jira_proxy_basic(cfg)
-            )
-            if not cfg.jira.username:
-                cfg.jira.username = login[0]
-        else:
-            # гейта нет — обычный PAT через Bearer
-            jira = _jira_like_client(cfg.jira.base_url, token=jira_token(cfg))
-        # Support — второй Jira-инстанс (если подключён): строится ЛЕНИВО, чтобы его
-        # логин (сессия за гейтом либо PAT) не выполнялся, пока не понадобится задача
-        # с его префиксом ключа. Иначе недоступный Support ронял бы все команды.
-        support_factory = (lambda: _build_support_client(cfg)) if support_enabled(cfg) else None
-        bitbucket = BitbucketClient(cfg.bitbucket.base_url, bitbucket_token(cfg))
-        # Jenkins опционален: клиент создаётся всегда (для парсинга/единообразия),
-        # но без токена — без auth, и глубокие вызовы вернут 401/403, что мы ловим.
-        jenkins = JenkinsClient(cfg.jenkins.base_url, jenkins_auth(cfg))
-        store = Store(db_path or str(default_db_path()), workspace_id)
-        return cls(cfg, jira, bitbucket, store, jenkins, support_factory=support_factory)
 
     @classmethod
     def for_builds(cls, cfg: Config | None = None, *, db_path: str | None = None,
