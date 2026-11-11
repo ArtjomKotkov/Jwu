@@ -6976,6 +6976,77 @@ def zephyr_folder_create(path: str = typer.Argument(..., help="Путь папк
 # Аддоны: подмешиваемые команды из установленных рядом пакетов (core/addons.py)
 # --------------------------------------------------------------------------- #
 
+addons_app = typer.Typer(help="Аддоны: какие установлены, включить / выключить.")
+app.add_typer(addons_app, name="addons")
+
+_ADDON_STATE_RU = {"active": "включён", "disabled": "выключен", "broken": "сломан", "blocked": "не подключён"}
+_ADDON_RESTART = "Чтобы применилось: перезапусти демон (jwu daemon install) и переподключи jwu в сессиях (/mcp)."
+
+
+@addons_app.command("list")
+def addons_list(as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Установленные аддоны: версия, состояние, от каких зависят, что не так."""
+    from ..core import addons
+
+    rows = addons.describe()
+    if as_json:
+        _emit_json([{k: v for k, v in r.items() if k != "after"} for r in rows])
+        return
+    if not rows:
+        typer.echo("Аддонов не установлено.")
+        return
+    table = Table(show_lines=False)
+    for col in ("Аддон", "Версия", "Состояние", "Требует", "Причина"):
+        table.add_column(col)
+    for r in rows:
+        table.add_row(r["name"], r["version"], _ADDON_STATE_RU.get(r["state"], r["state"]),
+                      ", ".join(r["requires"]) or "—", r["error"] or "")
+    console.print(table)
+
+
+def _known_addon(name: str):
+    from ..core import addons
+
+    addon = addons.get(name)
+    if addon is None:
+        known = ", ".join(a.name for a in addons.load()) or "нет"
+        typer.echo(f"Аддон «{name}» не установлен. Установлены: {known}", err=True)
+        raise typer.Exit(code=1)
+    return addon
+
+
+@addons_app.command("enable")
+def addons_enable(name: str = typer.Argument(..., help="Имя аддона (jwu addons list).")) -> None:
+    """Включить аддон (и проверить, что есть всё, что он требует)."""
+    from ..core import addons
+
+    _known_addon(name)
+    addons.set_enabled(name, True)
+    addon = next(a for a in addons.load(refresh=True) if a.name == name)
+    if addon.active:
+        typer.echo(f"Аддон {name} включён. {_ADDON_RESTART}")
+    else:
+        typer.echo(f"Аддон {name} включён, но не подключится: {addon.error}")
+
+
+@addons_app.command("disable")
+def addons_disable(name: str = typer.Argument(..., help="Имя аддона (jwu addons list)."),
+                   force: bool = typer.Option(False, "--force", help="Выключить, даже если от него зависят другие.")) -> None:
+    """Выключить аддон, не удаляя: jwu перестанет его загружать."""
+    from ..core import addons
+
+    _known_addon(name)
+    deps = addons.dependents(name)
+    if deps and not force:
+        typer.echo(f"От {name} зависят: {', '.join(deps)} — они тоже отключатся. "
+                   f"Если так и надо — повтори с --force.", err=True)
+        raise typer.Exit(code=1)
+    addons.set_enabled(name, False)
+    addons.load(refresh=True)
+    typer.echo(f"Аддон {name} выключен{' (вместе с ним не подключатся: ' + ', '.join(deps) + ')' if deps else ''}. "
+               f"{_ADDON_RESTART}")
+
+
 def _load_addon_cli() -> None:
     """Команды аддонов. Аддон, чьи команды typer не может собрать, отключается целиком —
     сломанный аддон не должен ронять весь jwu (ошибка видна в `jwu doctor`)."""
@@ -6983,7 +7054,7 @@ def _load_addon_cli() -> None:
 
     from ..core import addons
 
-    for addon in addons.load():
+    for addon in addons.active():
         if not addon.has("register_cli"):
             continue
         probe = typer.Typer()

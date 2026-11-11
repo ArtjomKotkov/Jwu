@@ -52,6 +52,18 @@ BOT_COMMANDS = [
     {"command": "matrix", "description": "Matrix: настройка кнопками"},
     {"command": "help", "description": "Как пользоваться"},
 ]
+
+
+def all_commands() -> list[dict]:
+    """Свои команды + команды аддонов (перед /help), без повторов."""
+    from .bot import addon_commands
+
+    have = {c["command"] for c in BOT_COMMANDS}
+    extra = [{"command": c.lstrip("/"), "description": d[:256]} for c, d in addon_commands()
+             if c.lstrip("/") not in have]
+    return BOT_COMMANDS[:-1] + extra + BOT_COMMANDS[-1:]
+
+
 MENU_BUTTON = "📋 Меню"
 MENU_META = "telegram:menu_id"   # id последнего сообщения с меню (meta воркспейса)
 # Постоянная клавиатура — одна кнопка: она шлёт в чат «📋 Меню», бот отвечает сообщением
@@ -697,7 +709,7 @@ class TelegramNotifier:
         """Меню команд бота (подсказки на «/»). Ошибка не критична."""
         try:
             resp = self._client.post(f"{self._api}/bot{self.token}/setMyCommands",
-                                     json={"commands": BOT_COMMANDS})
+                                     json={"commands": all_commands()})
         except httpx.HTTPError:
             return False
         return resp.status_code < 400

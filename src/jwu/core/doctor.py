@@ -178,10 +178,16 @@ def _addon_checks(store, ws) -> list["Check"]:
 
     out: list[Check] = []
     for addon in addons.load():
-        if addon.error:
+        if addon.state == addons.DISABLED:
+            out.append(Check(f"Аддон {addon.name}", "ok", "выключен (jwu addons enable — включить)"))
+            continue
+        if not addon.active:
             out.append(Check(f"Аддон {addon.name}", "fail", addon.error))
             continue
-        out.append(Check(f"Аддон {addon.name}", "ok", addon.version or "загружен"))
+        if addon.error:
+            out.append(Check(f"Аддон {addon.name}", "warn", addon.error))
+        else:
+            out.append(Check(f"Аддон {addon.name}", "ok", addon.version or "загружен"))
         for name, status, detail in addon.call("doctor", store, ws, default=[]) or []:
             out.append(Check(name, status, detail))
     return out

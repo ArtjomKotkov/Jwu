@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from .config import data_dir
 
@@ -668,6 +668,65 @@ def poll_duty(store: "Store") -> list[dict]:
     return handled
 
 
+TICK_INTERVAL = DUTY_INTERVAL   # шаг общего периодического цикла демона, с
+
+
+def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
+    def duty(store):
+        handled = poll_duty(store)
+        if handled:
+            log(f"Matrix: отправлено {sum(h['count'] for h in handled)} сообщений")
+
+    def disk(store):
+        if disk_alert(store):
+            log("предупреждение о месте на диске отправлено")
+
+    def briefs(store):
+        if send_briefs(store):
+            log("утренняя сводка отправлена")
+
+    def quiet(store):
+        if flush_quiet(store):
+            log("отложенное за тихие часы отправлено")
+
+    return [("duty", 0, duty), ("disk", 300, disk), ("brief", 0, briefs),
+            ("quiet", 0, quiet), ("grants", 0, resend_grants)]
+
+
+def periodic_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
+    """Что демон делает между синками: встроенное + ``daemon_tasks()`` аддонов.
+
+    (имя, раз в сколько секунд — 0: каждый шаг цикла, функция от общего store).
+    """
+    from . import addons
+
+    tasks = list(_builtin_tasks())
+    for addon in addons.active():
+        for item in addon.call("daemon_tasks", default=[]) or []:
+            try:
+                name, every, fn = item
+                tasks.append((f"{addon.name}:{name}", float(every or 0), fn))
+            except (TypeError, ValueError):
+                log(f"аддон {addon.name}: задача демона в неверном виде — {item!r}")
+    return tasks
+
+
+def run_due_tasks(store: "Store", tasks, last: dict[str, float], *, now: Optional[float] = None) -> list[str]:
+    """Запустить задачи, чей срок подошёл. Падение одной не мешает остальным. → имена запущенных."""
+    now = time.monotonic() if now is None else now
+    ran: list[str] = []
+    for name, every, fn in tasks:
+        if every and name in last and now - last[name] < every:
+            continue
+        last[name] = now
+        try:
+            fn(store)
+            ran.append(name)
+        except Exception as exc:  # noqa: BLE001
+            log(f"задача «{name}» упала: {type(exc).__name__}: {exc}")
+    return ran
+
+
 def run_loop(
     open_store: Callable[[], "Store"],
     *,
@@ -761,28 +820,18 @@ def run_loop(
                     log(f"бот: опрос не удался: {exc}")
                     stop.wait(5)
 
-        def duty_loop() -> None:
-            ticks = 0
-            while not stop.wait(DUTY_INTERVAL):
+        def ticks_loop() -> None:
+            tasks = periodic_tasks()
+            last: dict[str, float] = {}
+            while not stop.wait(TICK_INTERVAL):
                 try:
                     store = open_store()
                     try:
-                        handled = poll_duty(store)
-                        ticks += 1
-                        if ticks % 12 == 1:   # место — раз в ~5 минут
-                            if disk_alert(store):
-                                log("предупреждение о месте на диске отправлено")
-                        if send_briefs(store):
-                            log("утренняя сводка отправлена")
-                        if flush_quiet(store):
-                            log("отложенное за тихие часы отправлено")
-                        resend_grants(store)
+                        run_due_tasks(store, tasks, last)
                     finally:
                         store.close()
-                    if handled:
-                        log(f"Matrix: отправлено {sum(h['count'] for h in handled)} сообщений")
-                except Exception as exc:  # noqa: BLE001
-                    log(f"Matrix: проверка не удалась: {exc}")
+                except Exception as exc:  # noqa: BLE001 — цикл не должен умирать
+                    log(f"периодические задачи: {exc}")
 
         if sleep is None and not once:
             # Telegram читает поток бота; хук синка его не трогает: второй getUpdates даёт 409
@@ -791,7 +840,7 @@ def run_loop(
                 after_sync = no_telegram_after_sync
             threading.Thread(target=bot_loop, name="jwu-bot", daemon=True).start()
             threading.Thread(target=bot_loop, args=("backup",), name="jwu-bot-backup", daemon=True).start()
-            threading.Thread(target=duty_loop, name="jwu-matrix", daemon=True).start()
+            threading.Thread(target=ticks_loop, name="jwu-ticks", daemon=True).start()
             # Без синка на старте: продолжаем расписание от прошлого прохода (kick и /sync будят раньше).
             store = open_store()
             try:

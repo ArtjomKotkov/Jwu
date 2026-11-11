@@ -3295,7 +3295,8 @@ async def jwu_queue_slots(
 
 @mcp.tool()
 async def jwu_addons() -> dict:
-    """Установленные аддоны jwu и что они предлагают после шагов jwu (after: {скилл: подсказка}).
+    """Установленные аддоны jwu: состояние (active | disabled | broken | blocked — нет нужного
+    аддона из requires), и что они предлагают после шагов jwu (after: {скилл: подсказка}).
 
     После jwu-track-time и других шагов загляни сюда: если у аддона есть продолжение для
     этого шага — предложи его пользователю одной строкой (сам не запускай).
@@ -3308,7 +3309,7 @@ async def jwu_addons() -> dict:
 def _load_addon_mcp() -> None:
     from .core import addons
 
-    for addon in addons.load():
+    for addon in addons.active():
         addon.call("register_mcp", mcp)
 
 

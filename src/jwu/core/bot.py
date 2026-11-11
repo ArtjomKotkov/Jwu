@@ -273,7 +273,7 @@ def _addon_buttons() -> list[tuple[str, str]]:
     from . import addons
 
     out: list[tuple[str, str]] = []
-    for addon in addons.load():
+    for addon in addons.active():
         for label, action in addon.call("menu_buttons", default=[]) or []:
             out.append((label, f"addon:{addon.name}:{action}"))
     return out
@@ -323,7 +323,7 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
         from . import addons
 
         _, name, sub = action.split(":", 2)
-        for addon in addons.load():
+        for addon in addons.active():
             if addon.name == name:
                 res = addon.call("menu_action", {"store": store, "workspace": ws, "cfg": cfg}, sub)
                 if res:
@@ -442,7 +442,11 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
                 or data.startswith(duty.CALLBACK_PREFIX + duty.CB_ROOM):
             markup = {"inline_keyboard": list((markup or {}).get("inline_keyboard") or []) + [BACK_TO_MENU]}
     else:
-        text, markup = "Эта кнопка устарела — открой меню заново.", {"inline_keyboard": [BACK_TO_MENU]}
+        res = _addon_callback(data, store=store, ws=ws, cfg=cfg)
+        if res is not None:
+            text, markup = res
+        else:
+            text, markup = "Эта кнопка устарела — открой меню заново.", {"inline_keyboard": [BACK_TO_MENU]}
     if mid:
         sender.edit(int(mid), text, markup=markup)
     else:
@@ -450,11 +454,48 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
     return {"kind": "button", "text": data, "reply": text}
 
 
+def _addon_callback(data: str, *, store, ws, cfg) -> Optional[tuple[str, dict]]:
+    """Кнопка с префиксом аддона (``callback_prefixes``) → его ``bot_callback``."""
+    from . import addons
+
+    for addon in addons.active():
+        if any(data.startswith(p) for p in addon.call("callback_prefixes", default=[]) or []):
+            res = addon.call("bot_callback", {"store": store, "workspace": ws, "cfg": cfg}, data)
+            if res:
+                return res[0], res[1] or {}
+            return "Аддон не ответил.", {"inline_keyboard": [BACK_TO_MENU]}
+    return None
+
+
+def addon_commands() -> list[tuple[str, str]]:
+    """Команды бота от аддонов: (``/команда``, описание)."""
+    from . import addons
+
+    out: list[tuple[str, str]] = []
+    for addon in addons.active():
+        for cmd, descr in addon.call("bot_commands", default=[]) or []:
+            out.append(("/" + str(cmd).lstrip("/").lower(), str(descr)))
+    return out
+
+
+def _addon_command(cmd: str, text: str, *, store, ws, cfg) -> Optional[tuple[str, dict]]:
+    from . import addons
+
+    for addon in addons.active():
+        mine = {"/" + str(c).lstrip("/").lower() for c, _ in addon.call("bot_commands", default=[]) or []}
+        if cmd in mine:
+            res = addon.call("bot_command", {"store": store, "workspace": ws, "cfg": cfg}, cmd, text)
+            if isinstance(res, tuple):
+                return res[0], res[1] or {}
+            return (res or "Аддон не ответил."), {}
+    return None
+
+
 def _addon_text(store: "Store", ws: "Workspace", cfg: "Config", text: str) -> Optional[str]:
     """Присланный боту текст — сначала аддонам (например, ссылка, которую аддон умеет запомнить)."""
     from . import addons
 
-    for addon in addons.load():
+    for addon in addons.active():
         reply = addon.call("bot_text", {"store": store, "workspace": ws, "cfg": cfg}, text)
         if reply:
             return reply
@@ -510,7 +551,11 @@ def _handle_update(upd: dict, *, store: "Store", ws: "Workspace", cfg: "Config",
     cmd = text.split()[0].lower().split("@")[0] if text.startswith("/") else ""
     if text == notify.MENU_BUTTON or cmd in ("/menu", "/start"):
         return show_menu(store, sender, pressed=reply_to, text=text)
-    if cmd in DUTY_COMMANDS:
+    addon_cmd = _addon_command(cmd, text, store=store, ws=ws, cfg=cfg) if cmd else None
+    if addon_cmd is not None:
+        reply, markup = addon_cmd
+        item = {"kind": "command", "text": text, "reply": reply}
+    elif cmd in DUTY_COMMANDS:
         reply, markup = handle_duty_command(cmd, store=store, cfg=cfg)
         item = {"kind": "command", "text": text, "reply": reply}
     elif text.startswith("/"):

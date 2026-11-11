@@ -125,7 +125,7 @@ def _install_addon_skills(dest: Path) -> list[tuple[str, str]]:
     from .core import addons
 
     out: list[tuple[str, str]] = []
-    for addon in addons.load():
+    for addon in addons.active():
         folder = addon.call("skills_dir")
         if not folder:
             continue
@@ -365,4 +365,29 @@ def install_agents(dest: Path, *, cursor: bool = False, codex: bool = False) -> 
         action = "обновлён" if target.exists() else "добавлен"
         target.write_text(content, encoding="utf-8")
         results.append((name, action))
+    results.extend(_install_addon_agents(dest, cursor=cursor, codex=codex))
     return sorted(results)
+
+
+def _install_addon_agents(dest: Path, *, cursor: bool, codex: bool) -> list[tuple[str, str]]:
+    """Субагенты аддонов (``agents_dir()`` модуля аддона) — рядом со своими, в том же виде."""
+    from .core import addons
+
+    out: list[tuple[str, str]] = []
+    for addon in addons.active():
+        folder = addon.call("agents_dir")
+        if not folder:
+            continue
+        for entry in sorted(Path(folder).glob("*.md")):
+            name, content = entry.stem, entry.read_text(encoding="utf-8")
+            if cursor:
+                content = _for_cursor(content)
+            target_name = entry.name
+            if codex:
+                content, target_name = _for_codex(content), f"{name}.toml"
+            dest.mkdir(parents=True, exist_ok=True)
+            target = dest / target_name
+            action = "обновлён" if target.exists() else "добавлен"
+            target.write_text(content, encoding="utf-8")
+            out.append((name, action))
+    return out

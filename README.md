@@ -76,4 +76,5 @@ jwu init ~/code/my-project --provider jira    # подключить проек�
 - [Скиллы, субагенты и MCP](docs/agents.md) — в том числе агент голоса
 - [Политика git](docs/git.md) — что агенту можно делать с git, допуски, хук, уборка копий
 - [Confluence, Zephyr, пуш работы, SSH-стенды](docs/integrations.md)
+- [Аддоны](docs/addons.md) — свои команды, инструменты, кнопки бота; вкл/выкл, зависимости
 - [Дашборд](docs/dashboard.md) · [Все команды](docs/commands.md)
