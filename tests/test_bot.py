@@ -164,13 +164,13 @@ def test_today_shows_only_latest_summary_of_a_job(tmp_path):
     store, ws, cfg = _env(tmp_path)
     job = store.create_job("PROJ-1", "задача")
     store.add_job_record(job.id, "убрал поле: бэкенд и PR", kind="summary")
-    store.add_job_record(job.id, "убрал поле: бэкенд, PR и 4test", kind="summary")
+    store.add_job_record(job.id, "убрал поле: бэкенд, PR и текст для QA", kind="summary")
     other = store.create_job("PROJ-1", "возврат")
     store.add_job_record(other.id, "починил возврат с тестов", kind="summary")
     text = bot._cmd_today(store, ws, None)
     assert "бэкенд и PR" not in text
     assert text.count("✍️") == 2
-    assert "PR и 4test" in text and "починил возврат" in text
+    assert "PR и текст для QA" in text and "починил возврат" in text
 
 
 def test_today_uses_local_day_not_worklog_tz(tmp_path):

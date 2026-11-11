@@ -995,7 +995,7 @@ class Mention(BaseModel):
     summary: str = ""    # заголовок задачи на момент упоминания
     seen: bool = False   # прочитано ли (снимается при заходе внутрь)
     added_at: str = ""
-    source: str = "tracker"   # tracker — задачи; иначе имя источника чатов (matrix…)
+    source: str = "tracker"   # tracker — задачи; иначе имя источника чатов
     url: str = ""             # ссылка на сообщение (у чатов)
     place: str = ""           # где — для человека (имя комнаты чата)
 

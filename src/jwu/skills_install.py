@@ -63,8 +63,6 @@ RETIRED_SKILLS = {
     "jwu-wrap-up",       # → jwu-close-job (итог, уборка) / jwu-continue-job (пауза)
     # 2.2.0: у всех скиллов jwu — префикс jwu-
     "build-failure",     # → jwu-build-failure
-    "duty-support",      # → jwu-duty
-    "jwu-duty-support",  # → jwu-duty (короче и по делу)
     "jwu-analyze-day",       # → доска /jwu-todo (двигать дальше, буксует, ответить, закрыть работу)
     "jwu-post-analyze-day",  # → jwu-track-time (план без записи — «покажи, что затрекал бы»)
 }

@@ -979,7 +979,7 @@ def test_issue_create_with_yes_creates_and_returns_key(monkeypatch, tmp_path):
     body = tmp_path / "task.md"
     body.write_text("Шаги:\n# открыть\n# нажать", encoding="utf-8")
     res = runner.invoke(cli.app, ["issue", "create", "-p", "PROJ", "-s", "Падает экспорт",
-                                  "-F", str(body), "--type", "Bug", "--label", "duty",
+                                  "-F", str(body), "--type", "Bug", "--label", "urgent",
                                   "--yes", "--json"])
     assert res.exit_code == 0
     payload = json.loads(res.stdout)
@@ -987,7 +987,7 @@ def test_issue_create_with_yes_creates_and_returns_key(monkeypatch, tmp_path):
                        "url": "https://jira.test/browse/PROJ-777",
                        "fields": payload["fields"]}
     assert svc.created[0]["description"].startswith("Шаги:")   # описание взято из файла
-    assert svc.created[0]["labels"] == ["duty"]
+    assert svc.created[0]["labels"] == ["urgent"]
 
 
 def test_issue_create_reads_description_from_stdin(monkeypatch):

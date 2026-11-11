@@ -32,8 +32,8 @@ def _env(monkeypatch, tmp_path):
     (agents / "reviewer-myproj.md").write_text("Ревьювер, используется скиллом /jwu-job-review")
     (agents / "unrelated.md").write_text("Про кошек")
     (agents / "reviewer-jwu-sample.md").write_text("из поставки jwu")
-    (skills / "myproj-duty").mkdir()
-    (skills / "myproj-duty" / "SKILL.md").write_text("---\nname: myproj-duty\n---\nзовёт jwu_task")
+    (skills / "myproj-helper").mkdir()
+    (skills / "myproj-helper" / "SKILL.md").write_text("---\nname: myproj-helper\n---\nзовёт jwu_task")
     (skills / "jwu-start-job").mkdir()
     (skills / "jwu-start-job" / "SKILL.md").write_text("из поставки jwu")
     monkeypatch.setattr(bk, "default_agents_dest", lambda: agents)
@@ -50,7 +50,7 @@ def _env(monkeypatch, tmp_path):
 def test_collect_extras_picks_only_project_files_about_jwu(monkeypatch, tmp_path):
     _, _, agents, skills = _env(monkeypatch, tmp_path)
     names = sorted(arc for _, arc in bk.collect_extras(agents, skills))
-    assert names == ["claude-extras/agents/reviewer-myproj.md", "claude-extras/skills/myproj-duty/SKILL.md"]
+    assert names == ["claude-extras/agents/reviewer-myproj.md", "claude-extras/skills/myproj-helper/SKILL.md"]
 
 
 def test_backup_archive_contents_and_no_secrets(monkeypatch, tmp_path):
@@ -60,7 +60,7 @@ def test_backup_archive_contents_and_no_secrets(monkeypatch, tmp_path):
         names = sorted(m.name for m in tar.getmembers() if m.isfile())
     assert names == sorted([
         "b/state.db", "b/config.toml", "b/claude-extras/agents/reviewer-myproj.md",
-        "b/claude-extras/skills/myproj-duty/SKILL.md", "b/manifest.json", "b/RESTORE.md", "b/SHA256SUMS",
+        "b/claude-extras/skills/myproj-helper/SKILL.md", "b/manifest.json", "b/RESTORE.md", "b/SHA256SUMS",
     ])
     with tarfile.open(report.archive) as tar:
         manifest = json.loads(tar.extractfile("b/manifest.json").read())
@@ -85,12 +85,12 @@ def test_restore_into_fresh_home_rewrites_db_path_and_extras(monkeypatch, tmp_pa
     skills = tmp_path / "new" / "skills"
     dry = bk.restore_backup(archive, dry_run=True, target_db=new_db, target_config=new_cfg,
                             agents_dir=agents, skills_dir=skills)
-    assert dry.dry_run and not new_db.exists() and dry.extras == ["agents/reviewer-myproj.md", "skills/myproj-duty"]
+    assert dry.dry_run and not new_db.exists() and dry.extras == ["agents/reviewer-myproj.md", "skills/myproj-helper"]
 
     rep = bk.restore_backup(archive, target_db=new_db, target_config=new_cfg, agents_dir=agents, skills_dir=skills)
     assert new_db.exists() and (new_db.stat().st_mode & 0o777) == 0o600
     assert f'db_path = "{new_db}"' in new_cfg.read_text()          # путь переписан под эту машину
-    assert (agents / "reviewer-myproj.md").exists() and (skills / "myproj-duty" / "SKILL.md").exists()
+    assert (agents / "reviewer-myproj.md").exists() and (skills / "myproj-helper" / "SKILL.md").exists()
     restored = Store(new_db)
     try:
         ws = restored.get_workspace_by_slug("work")

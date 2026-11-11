@@ -42,12 +42,6 @@ CHANNELS = (
     "pr_comment", "pr_reply", "pr_review_body", "pr_task", "pr_description",
     "jira_comment", "support_client", "task", "qa_note", "commit", "message", "chat",
 )
-# Старые имена каналов (профили и корпуса, собранные раньше) → нынешние.
-CHANNEL_ALIASES = {"4test": "qa_note", "matrix": "chat"}
-
-
-def channel_name(channel: str) -> str:
-    return CHANNEL_ALIASES.get(channel, channel)
 
 AUDIENCES = ("colleague", "qa", "analyst", "client")
 
@@ -231,7 +225,7 @@ def save_analysis(slug: str, markdown: str, *, channels: Iterable[str]) -> Path:
     body = markdown.strip()
     if not body:
         raise ValueError("Пустой анализ")
-    chans = sorted({channel_name(c.strip()) for c in channels if c and c.strip()})
+    chans = sorted({c.strip() for c in channels if c and c.strip()})
     total = corpus_stats(slug)["total"]
     day = datetime.now(timezone.utc).date().isoformat()
     meta = f"at={day} total={total} channels={','.join(chans)} "
@@ -288,12 +282,11 @@ def _good_length(text: str) -> bool:
 def examples(slug: str, channel: str, *, audience: str | None = None, limit: int = 8) -> list[dict]:
     """Few-shot для агента: сначала сам канал и аудитория, потом соседние каналы; свежее выше."""
     samples = [s for s in load_corpus(slug) if _good_length(s.text)]
-    channel = channel_name(channel)
     order = (channel, *_CHANNEL_FALLBACK.get(channel, ()))
     picked: list[VoiceSample] = []
     seen: set[str] = set()
     for ch in order:
-        pool = [s for s in samples if channel_name(s.channel) == ch and s.id not in seen]
+        pool = [s for s in samples if s.channel == ch and s.id not in seen]
         # нужная аудитория — первой (клиенту и коллеге пишут по-разному), внутри — свежее;
         # сортировка устойчивая, поэтому второй проход сохраняет порядок первого
         pool.sort(key=lambda s: s.created, reverse=True)
@@ -321,7 +314,6 @@ def add_feedback(slug: str, *, channel: str, verdict: str, before: str, after: s
     """
     if verdict not in ("edited", "rejected", "accepted"):
         raise ValueError("verdict: edited | rejected | accepted")
-    channel = channel_name(channel)
     path = ensure_profile(slug)
     text = path.read_text(encoding="utf-8")
     if FEEDBACK_HEADER not in text:

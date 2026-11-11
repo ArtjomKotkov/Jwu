@@ -683,7 +683,7 @@ def test_mention_sources_migration_and_roundtrip(tmp_path):
     assert s.get_meta("schema_version") == str(SCHEMA_VERSION)
     [old] = s.list_mentions()
     assert old.source == "tracker" and not old.from_chat and old.where == "AB-1"
-    s.add_mentions([Mention(task_key="!room:x", comment_id="$e", author="b", text="эй", source="matrix",
+    s.add_mentions([Mention(task_key="!room:x", comment_id="$e", author="b", text="эй", source="chatx",
                             place="Релизы", url="https://matrix.to/#/!room:x/$e")])
     chat = next(m for m in s.list_mentions() if m.from_chat)
     assert chat.where == "Релизы" and chat.url.endswith("$e")

@@ -27,18 +27,18 @@ def test_sort_rooms_named_first():
     assert [r.id for r in chats.sort_rooms(rooms)] == ["!a", "!b", "!z"]
 
 
-def test_registry_builtin_addon_override_and_unknown(monkeypatch):
+def test_registry_from_addons_and_unknown(monkeypatch):
     made = []
     mod = types.ModuleType("fake")
     mod.chat_sources = lambda: {"fakechat": lambda cfg: made.append(cfg) or "SRC",
-                                "matrix": lambda cfg: "ADDON-MATRIX"}
+                                "otherchat": lambda cfg: "OTHER"}
     monkeypatch.setattr(addons, "_entry_points", lambda: [_EP("fake", mod)])
     monkeypatch.setattr(addons, "_cache", None)
     try:
         cfg = Config()
-        assert set(chats.factories()) >= {"fakechat", "matrix"}
+        assert set(chats.factories()) == {"fakechat", "otherchat"}         # встроенных нет
         assert chats.factory("fakechat", cfg)() == "SRC" and made == [cfg]
-        assert chats.factory("matrix", cfg)() == "ADDON-MATRIX"       # аддон перекрывает встроенный
+        assert chats.factory("otherchat", cfg)() == "OTHER"
         assert chats.factory("nope", cfg)() is None                   # адаптера нет — как «не настроен»
     finally:
         addons._cache = None

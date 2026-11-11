@@ -169,7 +169,7 @@ class Config:
     # Откуда берутся секреты. По умолчанию — системный keyring (как исторически);
     # для конфига воркспейса подставляется secrets.DbSecrets (см. workspaces.config_for_workspace).
     secrets: "secrets.SecretSource" = field(default_factory=secrets.KeyringSecrets)
-    # Секции аддонов (хук ``config_sections``): {"matrix": {"homeserver": …}} — из config.toml
+    # Секции аддонов (хук ``config_sections``): {"chat": {"host": …}} — из config.toml
     # и настроек воркспейса; ядро их не разбирает, только хранит и сохраняет.
     addons: dict = field(default_factory=dict)
 

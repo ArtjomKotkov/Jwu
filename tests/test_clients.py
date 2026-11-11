@@ -241,7 +241,7 @@ def test_jira_create_issue_posts_fields_and_returns_link():
     fields = build_create_fields(
         "PROJ", "Падает экспорт", description="Шаги:\n# открыть\n# нажать",
         issuetype="Bug", priority="Major", assignee="bob",
-        labels=["duty"], components=["core"], fix_versions=["12.5"], parent="PROJ-1",
+        labels=["urgent"], components=["core"], fix_versions=["12.5"], parent="PROJ-1",
     )
     with JiraClient(JIRA, "tok") as jira:
         res = jira.create_issue(fields)
@@ -426,14 +426,14 @@ def test_check_create_fields_resolves_names_to_ids():
     meta = jira_createmeta_raw()["projects"][0]
     check = check_create_fields(meta, build_create_fields(
         "PROJ", "тема", issuetype="bug", priority="Major", components=["core"],
-        labels=["duty"], assignee="bob"))
+        labels=["urgent"], assignee="bob"))
     assert check["ok"] is True
     sent = check["fields"]
     assert sent["issuetype"] == {"id": "10001"}          # Bug — второй тип в фикстуре
     assert sent["priority"] == {"id": "3"}
     assert sent["components"] == [{"id": "55"}]
     # поля без allowedValues трогать нечем — уходят как были
-    assert sent["labels"] == ["duty"]
+    assert sent["labels"] == ["urgent"]
     assert sent["assignee"] == {"name": "bob"}
     assert check["issuetype"] == "Bug"                   # человекочитаемое имя для показа
 
