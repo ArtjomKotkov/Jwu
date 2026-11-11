@@ -405,8 +405,9 @@ async def jwu_day_context(brief: bool = True, as_json: bool = False,
 
 @mcp.tool()
 async def jwu_mentions(unseen: bool = False, limit: int = 50, workspace: Optional[str] = None) -> list[dict]:
-    """Упоминания меня в комментариях (из памяти последнего синка, без сети): задача,
-    автор, текст, дата, seen. unseen=True — только непрочитанные.
+    """Упоминания меня (из памяти, без сети): автор, текст, дата, seen. source=tracker — в
+    комментарии задачи (task_key — задача); иначе — в чате (source — его имя, place — комната,
+    url — ссылка на сообщение). unseen=True — только непрочитанные.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
     можно узнать через jwu_workspace_current).

@@ -441,7 +441,8 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
     # 📣 непрочитанные упоминания — от меня чего-то ждут
     seen_keys: dict[str, list] = {}
     for m in store.unseen_mentions():
-        seen_keys.setdefault(m.task_key, []).append(m)
+        if not m.from_chat:          # из чатов — не задача: их показывает /mentions, не доска
+            seen_keys.setdefault(m.task_key, []).append(m)
     for task_key, ms in seen_keys.items():
         last = ms[-1]
         text = " ".join((last.text or "").split())

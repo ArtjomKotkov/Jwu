@@ -2052,7 +2052,7 @@ class JwuDashboard(App):
         groups: dict[str, tuple[str, list]] = {}
         fresh = [m for m in self.data.mentions if not m.seen]
         for m in fresh:
-            summary, items = groups.setdefault(m.task_key, (m.summary, []))
+            summary, items = groups.setdefault(m.where, (m.summary, []))
             author = f"{m.author}: " if m.author else ""
             items.append(("💬", f"{author}{self._mention_text(m)[:80]}"))
         return [(key, summary, items) for key, (summary, items) in groups.items()], len(fresh)
@@ -2183,7 +2183,7 @@ class JwuDashboard(App):
             cell.truncate(80, overflow="ellipsis")
             table.add_row(
                 Text(_fmt_dt(m.created), style="dim"),
-                self._key_cell(m.task_key, fresh),
+                self._key_cell(m.where, fresh),
                 Text(m.author or "—", style=author_color(m.author)),
                 cell,
             )
@@ -2604,7 +2604,10 @@ class JwuDashboard(App):
         elif isinstance(obj, Mention):
             # карточку задачи грузим только здесь: за самим упоминанием мы не следим
             self._mark_mentions_seen([obj.id])
-            if obj.task_key and self._issue_get_fn is not None:
+            if obj.from_chat:
+                if obj.url:
+                    webbrowser.open(obj.url)
+            elif obj.task_key and self._issue_get_fn is not None:
                 self._open_issue_loading(obj.task_key)
         elif isinstance(obj, PR):
             self.push_screen(PRDetailScreen(
@@ -2832,6 +2835,8 @@ class JwuDashboard(App):
         obj = self._selected_obj()
         if isinstance(obj, Issue) and self._task_url(obj.key):
             webbrowser.open(self._task_url(obj.key))
+        elif isinstance(obj, Mention) and obj.from_chat and obj.url:
+            webbrowser.open(obj.url)
         elif isinstance(obj, Mention) and obj.task_key and self._task_url(obj.task_key):
             webbrowser.open(self._task_url(obj.task_key))
         elif isinstance(obj, PR) and obj.url:

@@ -46,3 +46,15 @@ def log(message: str) -> None:
     from .core.daemon import log as _log
 
     _log(message)
+
+
+def chat_mention(source, room_id: str, room_name: str, message, who: str):
+    """Упоминание из чата (``jwu.core.chats.ChatMessage``) в общем виде — для ``add_mentions``."""
+    from .core.chats import mention
+
+    return mention(source, room_id, room_name, message, who)
+
+
+def add_mentions(store: "Store", mentions: list) -> list:
+    """Записать упоминания в общий список jwu (/mentions, дашборд). Повторы пропускаются."""
+    return store.add_mentions(mentions)

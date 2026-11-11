@@ -166,6 +166,9 @@ class MatrixClient:
                 direct = {str(r) for v in (ev.get("content") or {}).values() for r in (v or [])}
         return ChatNews(cursor=str(data.get("next_batch") or cursor), rooms=rooms, direct_rooms=direct)
 
+    def link(self, room_id: str, message_id: str) -> str:
+        return f"https://matrix.to/#/{quote(room_id, safe='!:')}/{quote(message_id, safe='$')}"
+
     def message(self, room_id: str, message_id: str) -> Optional[ChatMessage]:
         try:
             return parse_event(self._get(f"/rooms/{quote(room_id)}/event/{quote(message_id)}"))

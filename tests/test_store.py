@@ -651,3 +651,40 @@ def test_settle_releases_stuck_transaction(tmp_path):
     assert other.execute("SELECT value FROM meta WHERE key='z'").fetchone() == ("3",)
     other.close()
     stuck.close()
+
+
+def test_mention_sources_migration_and_roundtrip(tmp_path):
+    """v15: у старых упоминаний источник — трекер; чатовые хранят комнату, место и ссылку."""
+    import sqlite3
+
+    from jwu.core.models import Mention
+    from jwu.core.store import SCHEMA_VERSION, Store
+
+    path = tmp_path / "old.db"
+    s = Store(path)
+    s.use_workspace(s.get_workspace_by_slug("work").id)
+    s.add_mentions([Mention(task_key="AB-1", comment_id="c1", author="a", text="t")])
+    s.close()
+    con = sqlite3.connect(path)                     # «старая» база: без новых колонок
+    con.execute("CREATE TABLE m2 (id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id INTEGER NOT NULL,"
+                " task_key TEXT NOT NULL, comment_id TEXT NOT NULL, author TEXT NOT NULL DEFAULT '',"
+                " text TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '',"
+                " summary TEXT NOT NULL DEFAULT '', seen INTEGER NOT NULL DEFAULT 0, added_at TEXT NOT NULL,"
+                " archived INTEGER NOT NULL DEFAULT 0)")
+    con.execute("INSERT INTO m2 SELECT id, workspace_id, task_key, comment_id, author, text, created,"
+                " summary, seen, added_at, archived FROM mentions")
+    con.execute("DROP TABLE mentions")
+    con.execute("ALTER TABLE m2 RENAME TO mentions")
+    con.execute("UPDATE meta SET value = '14' WHERE key = 'schema_version'")
+    con.commit()
+    con.close()
+    s = Store(path)
+    s.use_workspace(s.get_workspace_by_slug("work").id)
+    assert s.get_meta("schema_version") == str(SCHEMA_VERSION)
+    [old] = s.list_mentions()
+    assert old.source == "tracker" and not old.from_chat and old.where == "AB-1"
+    s.add_mentions([Mention(task_key="!room:x", comment_id="$e", author="b", text="эй", source="matrix",
+                            place="Релизы", url="https://matrix.to/#/!room:x/$e")])
+    chat = next(m for m in s.list_mentions() if m.from_chat)
+    assert chat.where == "Релизы" and chat.url.endswith("$e")
+    s.close()

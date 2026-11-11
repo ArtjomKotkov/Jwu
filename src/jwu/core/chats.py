@@ -74,9 +74,32 @@ class ChatSource(Protocol):
     def news(self, cursor: str = "") -> ChatNews:
         """Без ``cursor`` — точка отсчёта «сейчас» (без сообщений); с ним — что нового."""
     def message(self, room_id: str, message_id: str) -> Optional[ChatMessage]: ...
+    def link(self, room_id: str, message_id: str) -> str:
+        """Ссылка на сообщение для человека (пусто — источник не умеет)."""
     def close(self) -> None: ...
     def __enter__(self) -> "ChatSource": ...
     def __exit__(self, *exc: object) -> None: ...
+
+
+def link(source, room_id: str, message_id: str) -> str:
+    """Ссылка на сообщение, если адаптер её умеет."""
+    fn = getattr(source, "link", None)
+    try:
+        return str(fn(room_id, message_id) or "") if callable(fn) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def mention(source, room_id: str, room_name: str, msg: ChatMessage, who: str):
+    """Упоминание из чата в общем виде ``Mention`` (его хранит и показывает ядро)."""
+    from datetime import datetime, timezone
+
+    from .models import Mention
+
+    created = datetime.fromtimestamp(msg.ts / 1000, tz=timezone.utc).isoformat() if msg.ts else ""
+    return Mention(task_key=room_id, comment_id=msg.id, author=who, text=msg.body, created=created,
+                   source=getattr(source, "name", "chat"), place=room_name or room_id,
+                   url=link(source, room_id, msg.id))
 
 
 def sort_rooms(rooms: list[ChatRoom]) -> list[ChatRoom]:

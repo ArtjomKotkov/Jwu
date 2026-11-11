@@ -153,7 +153,10 @@ CREATE TABLE IF NOT EXISTS mentions (
     summary      TEXT NOT NULL DEFAULT '',
     seen         INTEGER NOT NULL DEFAULT 0,
     added_at     TEXT NOT NULL,
-    archived     INTEGER NOT NULL DEFAULT 0
+    archived     INTEGER NOT NULL DEFAULT 0,
+    source       TEXT NOT NULL DEFAULT 'tracker',
+    url          TEXT NOT NULL DEFAULT '',
+    place        TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mentions_comment
     ON mentions(workspace_id, task_key, comment_id);
@@ -393,7 +396,7 @@ def _readiness_detail(sig: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 # Версия схемы, до которой доводится любая открываемая БД. Хранится в meta['schema_version'].
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -582,6 +585,18 @@ def _m013_git_policy(conn: sqlite3.Connection) -> None:
     ensure_schema(conn)
 
 
+def _m015_mention_sources(conn: sqlite3.Connection) -> None:
+    """v14 → v15: упоминания не только из трекера, но и из чатов.
+
+    ``source`` — откуда (``tracker`` — задачи Jira/GitHub, иначе имя источника чатов),
+    ``place`` — где для человека (комната), ``url`` — ссылка на само сообщение. У чатов
+    ``task_key`` — id комнаты, ``comment_id`` — id сообщения.
+    """
+    _add_column(conn, "mentions", "source", "TEXT NOT NULL DEFAULT 'tracker'")
+    _add_column(conn, "mentions", "url", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "mentions", "place", "TEXT NOT NULL DEFAULT ''")
+
+
 def _m014_job_numbers(conn: sqlite3.Connection) -> None:
     """v13 → v14: номер работы внутри воркспейса (``jobs.num``) вместо сквозного id.
 
@@ -638,6 +653,7 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (12, _m012_job_resources),
     (13, _m013_git_policy),
     (14, _m014_job_numbers),
+    (15, _m015_mention_sources),
 ]
 
 
@@ -1939,6 +1955,7 @@ class Store:
             id=row["id"], task_key=row["task_key"], comment_id=row["comment_id"],
             author=row["author"], text=row["text"], created=row["created"],
             summary=row["summary"], seen=bool(row["seen"]), added_at=row["added_at"],
+            source=row["source"], url=row["url"], place=row["place"],
         )
 
     def add_mentions(self, mentions: list[Mention], *, archived: bool = False) -> list[Mention]:
@@ -1955,9 +1972,10 @@ class Store:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO mentions"
                 " (workspace_id, task_key, comment_id, author, text, created, summary,"
-                "  seen, added_at, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  seen, added_at, archived, source, url, place)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (self.workspace_id, m.task_key, m.comment_id, m.author, m.text,
-                 m.created, m.summary, flag, ts, flag),
+                 m.created, m.summary, flag, ts, flag, m.source or "tracker", m.url, m.place),
             )
             if cur.rowcount:
                 added.append(m.model_copy(update={"id": int(cur.lastrowid), "added_at": ts}))

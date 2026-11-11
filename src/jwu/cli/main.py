@@ -2516,7 +2516,8 @@ def _render_mentions(items: list) -> None:
         return
     for m in items:
         mark = "[yellow]●[/yellow]" if not m.seen else "[dim]○[/dim]"
-        console.print(f"{mark} [dim]#{m.id}[/dim] [cyan]{m.task_key}[/cyan] [dim]{fmt_dt(m.created)} · {m.author}[/dim] — {m.summary}")
+        what = m.summary or (m.source if m.from_chat else "")
+        console.print(f"{mark} [dim]#{m.id}[/dim] [cyan]{escape(m.where)}[/cyan] [dim]{fmt_dt(m.created)} · {m.author}[/dim] — {escape(what)}")
         console.print(f"    {' '.join((m.text or '').split())[:240]}")
 
 

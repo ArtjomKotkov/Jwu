@@ -221,11 +221,20 @@ def _cmd_today(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -
     return "\n".join(lines)
 
 
+def _chat_mention_block(m) -> list[str]:
+    """Упоминание из чата: «💬 комната · источник · кто» и цитата; ссылка — на сообщение."""
+    place = html.escape(notify._short(m.where, 60))
+    head = f'💬 <a href="{html.escape(m.url)}">{place}</a>' if m.url else f"💬 {place}"
+    head += f" · {html.escape(m.source)}" + (f" · {html.escape(notify._short(m.author, 60))}" if m.author else "")
+    return [head, f"<i>«{html.escape(notify._short(m.text, 160))}»</i>"] if m.text else [head]
+
+
 def _cmd_mentions(store: "Store", links: Optional[notify.Links]) -> str:
     items = store.unseen_mentions()
     if not items:
         return "📣 Непрочитанных упоминаний нет."
     lines = notify.section(f"📣 НЕПРОЧИТАННЫЕ УПОМИНАНИЯ ({len(items)})", [
+        _chat_mention_block(m) if m.from_chat else
         notify.item_block(m.task_key, m.author or "кто-то", notify.strip_mention_tags(m.text),
                           links=links, quote=True, body_limit=160)
         for m in items[:10]

@@ -106,7 +106,8 @@ def _render_day_context_md(ctx: DayContext) -> str:
     for m in ctx.mentions:
         mark = " · новое" if not m.seen else ""
         when = fmt_dt(m.created) if m.created else "—"
-        L.append(f"- {m.task_key} [{when}] от {m.author or '—'}{mark} — {m.summary}")
+        where = f"{m.where} ({m.source})" if m.from_chat else m.task_key
+        L.append(f"- {where} [{when}] от {m.author or '—'}{mark} — {m.summary or m.url}")
         L.append(f"  > {' '.join((m.text or '').split())[:300]}")
     return "\n".join(L)
 

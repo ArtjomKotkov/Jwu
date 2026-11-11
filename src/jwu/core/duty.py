@@ -483,6 +483,21 @@ class _RoomNames:
             self._store.set_workspace_meta(ROOMS_CACHE_META, json.dumps(self._cache, ensure_ascii=False))
 
 
+def chat_mentions(source: ChatSource, result: ChatNews, state: State, dms: set[str], names: _Names,
+                  room_names: "_RoomNames") -> list:
+    """Упоминания меня в комнатах (кроме личных диалогов) — в общий список упоминаний jwu."""
+    from .chats import mention
+
+    out = []
+    for rid, upd in result.rooms.items():
+        if rid in dms or upd.unread <= 0:      # прочитал в клиенте — уже не новость
+            continue
+        for ev in upd.messages:
+            if ev.is_new and ev.sender != state.me and not ev.sealed and _mentions_me(ev, state):
+                out.append(mention(source, rid, room_names.get(rid), ev, names.get(ev.sender)))
+    return out
+
+
 def personal_items(result: ChatNews, state: State, dms: set[str], names: _Names,
                    room_names: "_RoomNames") -> list[Item]:
     """Личное: непрочитанное из 1:1 (по DM_PER_ROOM последних с диалога) и упоминания меня
@@ -562,7 +577,10 @@ def check(store: "Store", client: ChatSource, *, commit: bool = True) -> tuple[S
     items = classify(upd.messages, state, client, names) if upd else []
     if state.personal:
         rooms = _RoomNames(store, client)
-        items += personal_items(result, state, dm_rooms(store), names, rooms)
+        dms = dm_rooms(store)
+        items += personal_items(result, state, dms, names, rooms)
+        # сразу, даже без сдвига позиции: повторное чтение тех же сообщений дублей не даст
+        store.add_mentions(chat_mentions(client, result, state, dms, names, rooms))
         rooms.save()
     names.save()
     if commit:

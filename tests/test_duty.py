@@ -168,6 +168,16 @@ def test_personal_is_independent_of_duty(tmp_path):
         ("olga", True, ""), ("Иван Петров", False, "Релизы")]       # прочитанное, своё и дежурство — мимо
     text = duty.format_items(state, items)
     assert "💬 <b>личные</b>" in text and "📣 <b>упоминание · Релизы</b>" in text and "дежурство ·" not in text
+    [m] = store.unseen_mentions()                       # упоминание — и в общий список jwu
+    assert (m.source, m.place, m.task_key, m.comment_id, m.author) == ("matrix", "Релизы", OTHER, "$o1", "Иван Петров")
+    assert m.url.startswith("https://matrix.to/#/") and m.from_chat and m.where == "Релизы"
+    from jwu.core import bot
+    reply = bot._cmd_mentions(store, None)
+    assert "💬 <a href=" in reply and "Релизы" in reply and "matrix" in reply
+    client = matrix.client_from_config(cfg)
+    duty.check(store, client)                           # перечитали — дубля нет
+    client.close()
+    assert len(store.unseen_mentions()) == 1
     text, _ = duty.handle_callback(store, lambda: None, "duty:personal")
     assert "🔕 выключено" in text and not duty.load(store).watching and duty.load(store).since == ""
     store.close()
