@@ -689,8 +689,14 @@ def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
         if flush_quiet(store):
             log("отложенное за тихие часы отправлено")
 
+    def update(store):
+        from . import update as upd
+
+        if upd.offer_if_due(store):
+            log("в бот отправлено предложение обновиться")
+
     return [("duty", 0, duty), ("disk", 300, disk), ("brief", 0, briefs),
-            ("quiet", 0, quiet), ("grants", 0, resend_grants)]
+            ("quiet", 0, quiet), ("grants", 0, resend_grants), ("update", 3600, update)]
 
 
 def periodic_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:

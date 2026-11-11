@@ -5,7 +5,7 @@
 
 | Группа | Команды |
 |---|---|
-| установка | `install [--for claude\|cursor\|both]`, `install-claude-skills`, `doctor`, `addons list\|enable\|disable` ([addons.md](addons.md)), `configure [export\|import]`, `auth check`, `statusline [install\|uninstall\|preview]`, `duty [rooms\|room\|on\|off\|personal\|check]` |
+| установка | `install [--for claude\|cursor\|both]`, `install-claude-skills`, `doctor`, `addons list\|enable\|disable` ([addons.md](addons.md)), `update [--check]`, `configure [export\|import]`, `auth check`, `statusline [install\|uninstall\|preview]`, `duty [rooms\|room\|on\|off\|personal\|check]` |
 | проект | `init`, `workspace jobs-dir`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `guide [show\|add\|rm]` |
 | чтение | `todo [номера] [-g simple\|fixes\|todo\|review] [-s сессия]`, `tasks`, `task`, `attachments`, `prs`, `pr [--diff [--numbered]\|--download]`, `video-frames`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze`, `review queue\|agents` |
 | память | `job start\|add\|link\|status\|done [--summary] [--cleanup]\|reopen\|cancel\|delete\|show\|handoff\|worktree\|push\|ports\|resource\|resources\|cleanup`, `disk`, `sweep [--only] [--force]`, `jobs`, `note`, `notes`, `feature …`, `features`, `queue add\|list\|show\|take\|done\|fail\|cancel\|release\|edit\|move\|clear\|slots`, `mentions read\|archive`, `memory export\|import\|sync` |

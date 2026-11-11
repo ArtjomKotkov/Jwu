@@ -6976,6 +6976,68 @@ def zephyr_folder_create(path: str = typer.Argument(..., help="Путь папк
 # Аддоны: подмешиваемые команды из установленных рядом пакетов (core/addons.py)
 # --------------------------------------------------------------------------- #
 
+@app.command("update")
+def update_cmd(
+    check_only: bool = typer.Option(False, "--check", help="Только проверить, есть ли новая версия."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение."),
+    force: bool = typer.Option(False, "--force", help="Переставить, даже если новее нет."),
+    notify_bot: bool = typer.Option(False, "--notify", help="Итог — в чаты ботов (так зовёт кнопка в боте)."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON (с --check)."),
+) -> None:
+    """Проверить обновление jwu и обновиться: копия БД → pipx → аддоны → jwu install → демон."""
+    import html
+
+    from ..core import update as upd
+
+    try:
+        info = upd.check()
+    except upd.UpdateError as exc:
+        info = None
+        if check_only:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        err.print(f"[yellow]{exc}[/yellow] — проверить релиз не вышло")
+    if check_only:
+        if as_json:
+            _emit_json(info)
+            return
+        if info["newer"]:
+            console.print(f"Есть новая версия: [bold]{info['latest']}[/bold] (у тебя {info['current']}). "
+                          f"Обновиться: jwu update")
+            if info["notes"]:
+                console.print(escape(upd._notes_short(info["notes"])))
+        else:
+            console.print(f"У тебя последняя версия: {info['current']} (релиз — {info['latest'] or 'нет'}).")
+        return
+    try:
+        inst = upd.current_install()
+    except upd.UpdateError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    target = upd.Release(info["latest"], info["tag"], info["url"], info["notes"]) if info else None
+    if inst.from_folder:
+        console.print(f"jwu стоит из папки {inst.source} — переставлю из неё (релизы GitHub не трогаю).")
+    elif not (info and info["newer"]) and not force:
+        console.print(f"У тебя последняя версия: {info['current'] if info else '?'}. Переставить всё равно — --force.")
+        return
+    steps = upd.plan(target, inst)
+    console.print("Шаги:\n" + "\n".join("  " + " ".join(c) for c in steps))
+    if not yes and not typer.confirm("Обновляем?", default=True):
+        raise typer.Exit(code=1)
+    store = _open_store() if notify_bot else None
+    try:
+        res = upd.run(target, inst=inst, log=lambda m: console.print(escape(m)))
+    except upd.UpdateError as exc:
+        err.print(f"[red]Обновление не удалось:[/red] {escape(str(exc))}")
+        if store is not None:
+            upd.announce(store, f"⚠️ Обновление jwu не удалось: {html.escape(str(exc))[:800]}")
+        raise typer.Exit(code=1)
+    done = f"jwu обновлён ({res['from']} → {target.version if target and not inst.from_folder else 'из папки'})"
+    console.print(f"[green]{done}.[/green] В сессиях агента переподключи jwu: /mcp")
+    if store is not None:
+        upd.announce(store, f"✅ {html.escape(done)}. В сессиях агента переподключи jwu (/mcp).")
+
+
 addons_app = typer.Typer(help="Аддоны: какие установлены, включить / выключить.")
 app.add_typer(addons_app, name="addons")
 

@@ -435,6 +435,10 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
         from . import gitgrant
 
         text, markup = gitgrant.handle_callback(store, data)
+    elif data.startswith("upd:"):
+        from . import update
+
+        text, markup = update.handle_callback(store, data)
     elif data.startswith(duty.CALLBACK_PREFIX):
         text, markup = duty.handle_callback(store, _matrix_factory(cfg), data)
         if data in (duty.CALLBACK_PREFIX + duty.CB_MENU, duty.CALLBACK_PREFIX + duty.CB_ON,
