@@ -123,6 +123,40 @@ def _cmd_tasks(store: "Store", ws: "Workspace", links: Optional[notify.Links]) -
     return "\n".join(lines)
 
 
+BOARD_TOP = 5   # сколько свободных пунктов группы показать в «🗂 Что делать»
+
+
+def render_board(board, slug: str, links: Optional[notify.Links]) -> str:
+    """Доска «что делать» для чата: группы, сколько свободно, верхние пункты."""
+    from datetime import datetime
+
+    from . import todo
+
+    lines = [f"🗂 <b>Что делать · {html.escape(slug)}</b> · {datetime.now().strftime('%d.%m')}"]
+    for group in todo.GROUPS:
+        part = [i for i in board.items if i.group == group]
+        if not part:
+            continue
+        free = [i for i in part if not i.taken]
+        lines += ["", f"<b>{todo.GROUP_TITLES[group]}</b> — {len(part)}, свободно {len(free)}"]
+        for i in free[:BOARD_TOP]:
+            prio = todo.PRIORITY_ICON.get(todo._prio(i.priority), "") if i.priority else ""
+            key = i.issue_key or i.key
+            if group == "duty":
+                lines.append(f"🛟 {html.escape(key)} — {html.escape(notify._short(i.title, 70))}")
+                continue
+            what = ", ".join(p for p in i.problems if not p.startswith("автор ")) or i.status
+            title = i.title[len(i.issue_key):].lstrip(" :—-") if i.issue_key and i.title.startswith(i.issue_key) else i.title
+            lines.append(f"{prio} {notify._key_html(key, links)} — {html.escape(notify._short(title, 60))}"
+                         + (f" · <i>{html.escape(what)}</i>" if what else ""))
+        if len(free) > BOARD_TOP:
+            lines.append(f"… и ещё {len(free) - BOARD_TOP}")
+    if not board.items:
+        lines += ["", "Ничего не горит."]
+    lines += ["", "Раздать по сессиям — /jwu-todo в Claude Code."]
+    return "\n".join(lines)
+
+
 TODAY_TASKS = 20
 SUMMARY_MAX = 160
 
@@ -261,7 +295,7 @@ MENU_ROWS = [
     [("📋 Мои задачи", "tasks"), ("🕒 Что сделал сегодня", "today")],
     [("📣 Упоминания", "mentions"), ("✅ Прочитал все", "seen")],
     [("📡 Matrix: дежурство и личное", "matrix")],
-    [("⏰ Утренняя сводка", "brief"), ("🔔 Уведомления", "notify")],
+    [("🔔 Уведомления", "notify")],
 ]
 
 
@@ -336,17 +370,11 @@ def handle_menu(action: str, *, store: "Store", ws: "Workspace", cfg: "Config", 
         text, markup = notifyprefs.home(store)
         return text, {"inline_keyboard": list(markup["inline_keyboard"]) + [BACK_TO_MENU]}
     if action == "board":
-        from . import brief, todo
+        from . import todo
 
-        text = brief.render(todo.build(store, ws.id, login, session="telegram"), ws.slug,
+        text = render_board(todo.build(store, ws.id, login, session="telegram"), ws.slug,
                             notify.links_from_config(cfg))
-        text = text.replace("☀️", "🗂", 1)
         return text, {"inline_keyboard": [BACK_TO_MENU]}
-    if action == "brief":
-        from . import brief
-
-        text, markup = brief.menu(store, ws.id)
-        return text, {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
     if action == "matrix":
         text, markup = duty.menu(duty.load(store))
         return text, {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
@@ -421,11 +449,6 @@ def _handle_callback_action(data: str, mid, *, store, cfg, sender, ws, login, on
     if data.startswith(MENU_PREFIX) and ws is not None:
         text, markup = handle_menu(data[len(MENU_PREFIX):], store=store, ws=ws, cfg=cfg,
                                    login=login, on_sync=on_sync, sender=sender)
-    elif data.startswith("brief:") and ws is not None:
-        from . import brief
-
-        text, markup = brief.handle_callback(store, ws.id, data)
-        markup = {"inline_keyboard": list(markup.get("inline_keyboard") or []) + [BACK_TO_MENU]}
     elif data.startswith("np:"):
         from . import notifyprefs
 

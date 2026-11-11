@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from jwu.core import brief, guides, jobspace, todo
+from jwu.core import guides, jobspace, todo
 from jwu.core.models import PR, BuildStatus, Issue, Reviewer
 from jwu.core.store import Store
 
@@ -122,19 +122,12 @@ def test_ports_unique_and_idempotent(store):
     assert jobspace.allocate_ports(store, j1.id, ["db"]) == {"db": p1["db"]}
 
 
-def test_brief_due_once_a_day(store):
-    ws = store.workspace_id
-    assert not brief.due(store, ws)
-    brief.set_time(store, ws, "09:00")
-    tz = brief._tz(store, ws)
-    assert not brief.due(store, ws, now=datetime(2026, 10, 27, 8, 59, tzinfo=tz))
-    assert brief.due(store, ws, now=datetime(2026, 10, 27, 9, 1, tzinfo=tz))
-    store.set_workspace_meta(brief.LAST_META, "2026-10-27")
-    assert not brief.due(store, ws, now=datetime(2026, 10, 27, 12, 0, tzinfo=tz))
-    assert brief.set_time(store, ws, "25:00") == ""          # только из списка
+def test_board_rendered_for_chat(store):
+    from jwu.core import bot
+
     _seed(store)
-    text = brief.render(todo.build(store, ws, "me", session="brief"), "work", None)
-    assert "Что делать · work" in text and "AB-6" in text
+    text = bot.render_board(todo.build(store, store.workspace_id, "me", session="telegram"), "work", None)
+    assert "🗂 <b>Что делать · work</b>" in text and "AB-6" in text
 
 
 def test_silent_sync_defers_notifications_to_next_normal(store):

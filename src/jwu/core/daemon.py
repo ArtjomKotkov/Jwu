@@ -606,22 +606,6 @@ def report_bot_failure(open_store: Callable[[], "Store"], workspace_id: int, exc
         pass
 
 
-def send_briefs(store: "Store") -> int:
-    """Утренняя сводка «что делать» по контурам, где наступило выбранное время."""
-    from . import brief
-
-    sent = 0
-    for ws, cfg, sender, login in _bot_senders(store):
-        try:
-            if brief.send_if_due(store, ws, cfg, sender, login):
-                sent += 1
-        except Exception as exc:  # noqa: BLE001
-            log(f"[{ws.slug}] утренняя сводка не ушла: {exc}")
-        finally:
-            sender.close()
-    return sent
-
-
 def resend_grants(store: "Store") -> int:
     """Запросы допуска git, не дошедшие до бота из сессии, — дослать."""
     from . import gitgrant
@@ -681,10 +665,6 @@ def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
         if disk_alert(store):
             log("предупреждение о месте на диске отправлено")
 
-    def briefs(store):
-        if send_briefs(store):
-            log("утренняя сводка отправлена")
-
     def quiet(store):
         if flush_quiet(store):
             log("отложенное за тихие часы отправлено")
@@ -695,7 +675,7 @@ def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
         if upd.offer_if_due(store):
             log("в бот отправлено предложение обновиться")
 
-    return [("duty", 0, duty), ("disk", 300, disk), ("brief", 0, briefs),
+    return [("duty", 0, duty), ("disk", 300, disk),
             ("quiet", 0, quiet), ("grants", 0, resend_grants), ("update", 3600, update)]
 
 
