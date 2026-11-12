@@ -28,6 +28,9 @@ _DAY_PROMPT = """## Что нужно сделать
 Пиши сжато, маркерами, без воды; группируй по действиям."""
 
 
+MAX_DELTAS = 150   # в кратком контексте больше не читают — остальное в `jwu changes`
+
+
 def _pr_state(pr: PR) -> str:
     """Короткая готовность PR для эвристик: что мешает мержу прямо сейчас."""
     if pr.conflicted:
@@ -74,9 +77,13 @@ def _render_day_context_md(ctx: DayContext) -> str:
         "",
         _DAY_PROMPT,
         "",
-        f"## Изменения с прошлого синка ({len(ctx.deltas)})",
+        (f"## Изменения с прошлого анализа ({len(ctx.deltas)}, с {ctx.deltas_since[:16].replace('T', ' ')} UTC)"
+         if ctx.brief and ctx.deltas_since else f"## Изменения с прошлого синка ({len(ctx.deltas)})"),
     ]
-    L += [f"- [{d.kind}] {d.key} {d.detail} — {d.summary}" for d in ctx.deltas] or ["- нет"]
+    shown = ctx.deltas[:MAX_DELTAS] if ctx.brief else ctx.deltas
+    L += [f"- [{d.kind}] {d.key} {d.detail} — {d.summary}" for d in shown] or ["- нет"]
+    if len(shown) < len(ctx.deltas):
+        L.append(f"- … ещё {len(ctx.deltas) - len(shown)} — полный список: `jwu changes`")
 
     if ctx.stuck:
         th = ctx.thresholds

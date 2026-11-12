@@ -576,7 +576,7 @@ def test_job_number_is_per_workspace_in_tools(fresh_server):
     assert work["docker"] != home["docker"]                              # имена стенда не путаются
     assert work["docker"]["compose_project"].startswith("jwu-job")
     _run(srv.jwu_job_add(job_id=1, text="дома", workspace="home"))
-    texts = lambda ws: [r["text"] for j in _run(srv.jwu_jobs(workspace=ws)) for r in j["records"]]  # noqa: E731
+    texts = lambda ws: [r["text"] for j in _run(srv.jwu_jobs(workspace=ws, full=True)) for r in j["records"]]  # noqa: E731
     assert "дома" in texts("home") and "дома" not in texts("work")
     res = _run(srv.jwu_job_resources(job_id=1, workspace="home"))
     assert res["label"] == "jwu.job=" + home["docker"]["label"].split("=", 1)[1]

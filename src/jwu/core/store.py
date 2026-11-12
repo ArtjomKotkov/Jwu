@@ -1815,11 +1815,12 @@ class Store:
         )
         self.conn.commit()
 
-    def pending_changes(self) -> list[Delta]:
+    def pending_changes(self, since: str | None = None) -> list[Delta]:
+        """Накопленные дельты; ``since`` (ISO) — только записанные после этого момента."""
         rows = self.conn.execute(
             "SELECT key, kind, summary, detail, section FROM pending_changes"
-            " WHERE workspace_id = ? ORDER BY id",
-            (self.workspace_id,),
+            " WHERE workspace_id = ? AND (? IS NULL OR ts > ?) ORDER BY id",
+            (self.workspace_id, since, since),
         ).fetchall()
         return [
             Delta(key=r["key"], kind=r["kind"], summary=r["summary"], detail=r["detail"],

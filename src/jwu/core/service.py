@@ -287,6 +287,8 @@ class DayContext:
     stuck: list[dict] = field(default_factory=list)
     # Закреплённые status-заметки по ключам задач и PR («почему висит»).
     status_notes: dict[str, str] = field(default_factory=dict)
+    # brief: дельты показаны начиная с этого момента (прошлый анализ; первый — сутки назад)
+    deltas_since: str = ""
 
 
 @dataclass
@@ -2480,8 +2482,16 @@ class Service:
             pr_note_key(p.project, p.repository, p.id) for p in d.prs_mine + d.prs_review
         ]
         status_notes = {k: v for k, v in self.store.status_notes(note_keys).items() if v}
+        deltas_since = ""
         if brief:
+            # дельты копятся, пока их не очистят, а демон синкает весь день: в кратком
+            # контексте — только новое с прошлого анализа (первый раз — за сутки)
+            meta_key = f"day:analyzed_at:{self.store.workspace_id}"
+            deltas_since = self.store.get_meta(meta_key) or (
+                datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+            d = dataclasses.replace(d, deltas=self.store.pending_changes(since=deltas_since))
             d = _brief_dashboard(d, user, mention_days=th.mention_days or mention_days)
+            self.store.set_meta(meta_key, datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
         # подтянуть комменты только для проблемных PR (конфликт / есть NEEDS_WORK)
         pr_comments: dict[int, list[PRComment]] = {}
@@ -2515,6 +2525,7 @@ class Service:
             thresholds=th.as_dict(),
             stuck=stuck,
             status_notes=status_notes,
+            deltas_since=deltas_since,
         )
 
     def changes(self) -> list[Delta]:

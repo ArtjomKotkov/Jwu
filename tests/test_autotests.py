@@ -95,3 +95,23 @@ def test_board_waits_for_queued_tests_and_flags_failed(store):
     assert by_id[2].group == "build" and "тесты не запускали" in by_id[2].problems
     assert todo.TESTS_RED in by_id[3].problems
     assert "тесты в очереди" in todo.build_cell(queued, True)
+
+
+def test_job_brief_drops_journal_keeps_last_and_summary():
+    from jwu.core.models import Job, JobRecord, job_brief
+
+    job = Job(id=7, task_key="AB-1", records=[JobRecord(kind="summary", text="итог"), JobRecord(kind="note", text="x" * 500)])
+    b = job_brief(job)
+    assert "records" not in b and b["records_count"] == 2
+    assert b["last"]["kind"] == "note" and len(b["last"]["text"]) == 300 and b["summary"] == "итог"
+
+
+def test_pending_changes_since(store):
+    from jwu.core.models import Delta
+
+    run = store.start_sync_run(["mine"])
+    store.add_pending_changes(run, [Delta(key="A-1", kind="new_issue")])
+    store.conn.execute("UPDATE pending_changes SET ts = '2020-01-01T00:00:00+00:00'")
+    store.add_pending_changes(run, [Delta(key="A-2", kind="new_issue")])
+    assert [d.key for d in store.pending_changes()] == ["A-1", "A-2"]
+    assert [d.key for d in store.pending_changes(since="2021-01-01T00:00:00+00:00")] == ["A-2"]

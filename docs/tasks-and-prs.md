@@ -11,7 +11,7 @@ jwu builds 1204 · jwu build 1204            # CI PR (сборки, очеред
 jwu pr-autotests-run 1204 [-o maxfail=10]   # запустить автотесты PR (если источник умеет) — после «да»
 jwu branches [ACME-1]                       # локальные ветки по задаче во всех репозиториях
 jwu mentions list --unseen · jwu mentions read --all · jwu mentions archive --older-than 30
-jwu action day-analyze --brief              # контекст + промпт для дневной сводки
+jwu action day-analyze --brief              # контекст + промпт для дневной сводки (изменения — с прошлого анализа)
 ```
 
 **Сборки и автотесты.** `jwu builds` показывает сборки на последнем коммите PR, стоит ли сборка

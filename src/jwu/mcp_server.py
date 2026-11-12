@@ -53,7 +53,7 @@ from .core.config import db_path
 from .core.maintenance import ensure_db_available
 from .core.models import (
     JOB_RECORD_KINDS, LOCAL_FEATURE_STATUSES, QUEUE_MODES, WORKSPACE_RULE_KINDS,
-    Workspace,
+    Workspace, job_brief,
 )
 from .core.service import Service
 from .core.store import QueueBusy, Store
@@ -634,7 +634,7 @@ async def jwu_task(key: str, workspace: Optional[str] = None) -> dict:
             pr_builds[pr.id] = []
     payload = issue.model_dump()
     payload["notes"] = [n.model_dump() for n in notes]
-    payload["jobs"] = [j.model_dump() for j in jobs]
+    payload["jobs"] = [job_brief(j) for j in jobs]     # журнал целиком — jwu_job_handoff(id)
     payload["pr_builds"] = {pid: [b.model_dump() for b in bs] for pid, bs in pr_builds.items()}
     return payload
 
@@ -1744,9 +1744,14 @@ async def jwu_jobs(
     feature: Optional[str] = None,
     on: Optional[str] = None,
     tz: Optional[str] = None,
+    full: bool = False,
     workspace: Optional[str] = None,
 ) -> list[dict]:
     """Список работ (jobs) воркспейса — по задаче / PR / статусу / локальной фиче. Без сети.
+
+    По умолчанию кратко: без журнала, с числом записей (records_count), последней записью
+    (last) и итогом (summary). Журнал одной работы — jwu_job_handoff(id); full=True — журналы
+    всех найденных (дорого: на работу бывает по 5–10 тыс. символов).
 
     feature — id или ключ локальной фичи (HOMEJWU-1); нужен там, где Jira не подключена.
     on — YYYY-MM-DD («today» — сегодня): работы с записями за этот день по МЕСТНОМУ времени
@@ -1763,8 +1768,8 @@ async def jwu_jobs(
         if row is None:
             raise ValueError(f"Фича {feature!r} не найдена в этом воркспейсе")
         feature_id = row.id
-    return [j.model_dump() for j in store.list_jobs(
-        task_key=task, pr_id=pr, status=status, feature_id=feature_id)]
+    jobs = store.list_jobs(task_key=task, pr_id=pr, status=status, feature_id=feature_id)
+    return [j.model_dump() if full else job_brief(j) for j in jobs]
 
 
 # --------------------------------------------------------------------------- #

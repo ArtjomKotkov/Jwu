@@ -1147,6 +1147,19 @@ class Job(BaseModel):
         return self.task_key or self.feature_key or f"#{self.id}"
 
 
+def job_brief(job: "Job") -> dict:
+    """Работа без журнала: кто, что, когда и последняя запись — для списков. Журнал целиком —
+    ``jwu_job_handoff`` (или ``jwu_jobs(full=True)``)."""
+    last = job.records[-1] if job.records else None
+    summary = next((r for r in reversed(job.records) if r.kind == "summary"), None)
+    data = job.model_dump(exclude={"records"})
+    data["records_count"] = len(job.records)
+    data["last"] = ({"kind": last.kind, "ts": last.ts, "text": last.text[:300]} if last else None)
+    if summary is not None and summary is not last:
+        data["summary"] = summary.text[:300]
+    return data
+
+
 # Как записи работы раскладываются по разделам описания задачи. Порядок разделов —
 # порядок этого списка: сначала что сделано, потом чем это грозит, потом детали.
 _JOB_TEXT_SECTIONS: list[tuple[str, tuple[str, ...]]] = [
