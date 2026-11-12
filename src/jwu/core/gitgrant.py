@@ -68,7 +68,8 @@ def notify(store: "Store", req: dict) -> bool:
         return False
     ws = store.get_workspace(store.workspace_id)
     head = f"<i>воркспейс {html.escape(ws.slug)}</i>\n" if ws else ""
-    sender.send(head + _text(req), markup=markup(req, policy.grant_ttl))
+    wait = f"\n<i>ждёт ответа {max(1, policy.request_ttl // 60)} мин, потом истечёт</i>"
+    sender.send(head + _text(req) + wait, markup=markup(req, policy.grant_ttl))
     return True
 
 

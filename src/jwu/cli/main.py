@@ -4556,7 +4556,7 @@ def git_policy_show(as_toml: bool = typer.Option(False, "--toml", help="В ви�
         return
     console.print(f"[b]Политика git[/b]{'' if known else ' [dim](встроенная — ещё не записана)[/dim]'}: "
                   f"guard={'вкл' if pol.guard else 'выкл'}, sync={pol.sync}, допуск {pol.grant_ttl // 60} мин через "
-                  f"{', '.join(pol.grant_via)}", highlight=False)
+                  f"{', '.join(pol.grant_via)}, запрос ждёт ответа {pol.request_ttl // 60} мин", highlight=False)
     console.print("Операции: " + ", ".join(f"{op} {_level(lv)}" for op, lv in pol.ops.items()))
 
     def rules(title: str, items) -> None:

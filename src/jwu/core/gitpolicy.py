@@ -56,7 +56,8 @@ DEFAULT_OPS = {
     "delete_branch": "ask", "tag": "grant", "worktree": "ask",
 }
 DEFAULT_SETTINGS = {"guard": True, "sync": "merge", "backup_days": 14,
-                    "grant_ttl": 600, "grant_via": ["telegram", "cli"], "grant_bind": "head"}
+                    "grant_ttl": 600, "grant_via": ["telegram", "cli"], "grant_bind": "head",
+                    "request_ttl": 900}
 PROD_BRANCHES = ["master", "main"]
 SHARED_BRANCHES = ["develop", "release*", "stable*"]
 DEFAULT_RULES = [
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS git_policy (
     grant_ttl    INTEGER NOT NULL DEFAULT 600,
     grant_via    TEXT NOT NULL DEFAULT 'telegram,cli',
     grant_bind   TEXT NOT NULL DEFAULT 'head',
+    request_ttl  INTEGER NOT NULL DEFAULT 900,
     ops          TEXT NOT NULL DEFAULT '{}',
     updated_at   TEXT NOT NULL DEFAULT ''
 );
@@ -291,6 +293,7 @@ class Policy:
     grant_ttl: int = 600
     grant_via: list[str] = field(default_factory=lambda: list(GRANT_VIA))
     grant_bind: str = "head"
+    request_ttl: int = 900          # сколько ждёт ответа запрос допуска; дальше — expired
     ops: dict = field(default_factory=lambda: dict(DEFAULT_OPS))
     rules: list[Rule] = field(default_factory=list)
     repos: list[Repo] = field(default_factory=list)
@@ -300,6 +303,8 @@ class Policy:
             raise PolicyError(f"sync = «{self.sync}»: бывает {', '.join(SYNC_MODES)}")
         if self.grant_ttl < 30 or self.grant_ttl > 24 * 3600:
             raise PolicyError("grant_ttl — от 30 секунд до суток")
+        if self.request_ttl < 60 or self.request_ttl > 7 * 24 * 3600:
+            raise PolicyError("request_ttl — от минуты до недели")
         bad = [v for v in self.grant_via if v not in GRANT_VIA]
         if bad or not self.grant_via:
             raise PolicyError(f"grant_via: {', '.join(GRANT_VIA)} (хотя бы одно)")
@@ -341,6 +346,10 @@ class Decision:
 
 def ensure_schema(conn) -> None:
     conn.executescript(GIT_SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(git_policy)")}
+    if "request_ttl" not in cols:
+        conn.execute("ALTER TABLE git_policy ADD COLUMN request_ttl INTEGER NOT NULL DEFAULT 900")
+        conn.commit()
 
 
 def _legacy_shared(store: "Store", workspace_id: int) -> list[str]:
@@ -400,6 +409,7 @@ def load(store: "Store", workspace_id: Optional[int] = None) -> Policy:
                           rules=[_rule_from_row(x) for x in rules if x["repo_id"] == r["id"]]))
     return Policy(guard=bool(row["guard"]), sync=row["sync"], backup_days=row["backup_days"],
                   grant_ttl=row["grant_ttl"], grant_via=_list(row["grant_via"]), grant_bind=row["grant_bind"],
+                  request_ttl=row["request_ttl"],
                   ops={**DEFAULT_OPS, **json.loads(row["ops"] or "{}")},
                   rules=[_rule_from_row(x) for x in rules if x["repo_id"] is None], repos=repos)
 
@@ -415,9 +425,9 @@ def save(store: "Store", policy: Policy, workspace_id: Optional[int] = None) -> 
         conn.execute("DELETE FROM git_repos WHERE workspace_id = ?", (ws,))
         conn.execute(
             "INSERT OR REPLACE INTO git_policy (workspace_id, guard, sync, backup_days, grant_ttl, grant_via,"
-            " grant_bind, ops, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " grant_bind, request_ttl, ops, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ws, int(policy.guard), policy.sync, policy.backup_days, policy.grant_ttl, _csv(policy.grant_via),
-             policy.grant_bind, json.dumps({k: v for k, v in policy.ops.items() if DEFAULT_OPS.get(k) != v}),
+             policy.grant_bind, policy.request_ttl, json.dumps({k: v for k, v in policy.ops.items() if DEFAULT_OPS.get(k) != v}),
              _iso()))
 
         def put_rules(rules: list[Rule], repo_id: Optional[int]) -> None:
@@ -562,10 +572,28 @@ def target_branch(policy: Policy, remote: str = "", fallback: str = "") -> str:
 # --------------------------------------------------------------------------- #
 
 
+def expire_requests(store: "Store", policy: Optional[Policy] = None) -> int:
+    """Запросы без ответа дольше ``request_ttl`` → ``expired``: кнопка и ``jwu git grant`` по ним
+    уже не сработают, агент спросит заново. Сколько истекло."""
+    policy = policy or load(store)
+    ensure_schema(store.conn)
+    cutoff = _iso(_now() - timedelta(seconds=policy.request_ttl))
+    rows = store.conn.execute(
+        "SELECT * FROM git_grants WHERE workspace_id = ? AND status = 'requested' AND created_at < ?",
+        (store.workspace_id, cutoff)).fetchall()
+    for row in rows:
+        store.conn.execute("UPDATE git_grants SET status = 'expired' WHERE id = ? AND status = 'requested'",
+                           (row["id"],))
+        audit(store, op=row["op"], decision="grant:expired", remote=row["remote"], branch=row["branch"],
+              detail=f"запрос #{row['id']}: без ответа дольше {policy.request_ttl // 60} мин", job_id=row["job_id"])
+    store.conn.commit()
+    return len(rows)
+
+
 def request_grant(store: "Store", *, remote: str, branch: str, op: str, head: str = "",
                   detail: str = "", job_id: Optional[int] = None) -> dict:
     """Запрос допуска (агент упёрся в ``grant``). Тот же открытый запрос не плодится."""
-    ensure_schema(store.conn)
+    expire_requests(store)
     row = store.conn.execute(
         "SELECT * FROM git_grants WHERE workspace_id = ? AND remote = ? AND branch = ? AND op = ?"
         " AND head_sha = ? AND status = 'requested' ORDER BY id DESC LIMIT 1",
@@ -611,7 +639,7 @@ def notify_failed(store: "Store", req: dict, exc: Exception) -> bool:
 
 
 def pending_grants(store: "Store") -> list[dict]:
-    ensure_schema(store.conn)
+    expire_requests(store)
     return [dict(r) for r in store.conn.execute(
         "SELECT * FROM git_grants WHERE workspace_id = ? AND status = 'requested' ORDER BY id",
         (store.workspace_id,))]
@@ -625,11 +653,14 @@ def answer_grant(store: "Store", grant_id: int, *, allow: bool, via: str,
     policy = policy or load(store)
     if via not in policy.grant_via:
         raise PolicyError(f"Допуск через {via} выключен политикой (grant_via: {', '.join(policy.grant_via)})")
-    ensure_schema(store.conn)
+    expire_requests(store, policy)
     row = store.conn.execute("SELECT * FROM git_grants WHERE id = ? AND workspace_id = ?",
                              (grant_id, store.workspace_id)).fetchone()
     if row is None:
         raise PolicyError(f"Запроса допуска #{grant_id} нет")
+    if row["status"] == "expired":
+        raise PolicyError(f"Запрос #{grant_id} истёк — без ответа дольше {policy.request_ttl // 60} мин. "
+                          "Агент спросит заново, когда повторит операцию.")
     if row["status"] != "requested":
         raise PolicyError(f"Запрос #{grant_id} уже {row['status']}")
     status = "granted" if allow else "denied"
@@ -701,7 +732,8 @@ def to_toml(policy: Policy) -> str:
     import tomli_w
 
     git: dict = {"guard": policy.guard, "sync": policy.sync, "backup_days": policy.backup_days,
-                 "grant": {"ttl": policy.grant_ttl, "via": list(policy.grant_via), "bind": policy.grant_bind},
+                 "grant": {"ttl": policy.grant_ttl, "via": list(policy.grant_via), "bind": policy.grant_bind,
+                           "request_ttl": policy.request_ttl},
                  "ops": dict(policy.ops)}
     if policy.rules:
         git["rule"] = [r.to_toml() for r in policy.rules]
@@ -756,6 +788,7 @@ def from_toml(text: str) -> Policy:
     return Policy(guard=bool(git.get("guard", True)), sync=str(git.get("sync", "merge")),
                   backup_days=int(git.get("backup_days", 14)), grant_ttl=int(grant.get("ttl", 600)),
                   grant_via=list(grant.get("via", list(GRANT_VIA))), grant_bind=str(grant.get("bind", "head")),
+                  request_ttl=int(grant.get("request_ttl", 900)),
                   ops=dict(git.get("ops") or {}), rules=[Rule.from_toml(r) for r in git.get("rule") or []],
                   repos=repos).validate()
 

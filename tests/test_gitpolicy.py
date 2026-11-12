@@ -120,6 +120,44 @@ def test_grant_expires_and_via_restricted(store):
         gp.answer_grant(store, req["id"], allow=True, via="cli", policy=pol)
 
 
+def _age(store, grant_id, minutes):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    store.conn.execute("UPDATE git_grants SET created_at = ? WHERE id = ?", (old, grant_id))
+    store.conn.commit()
+
+
+def test_request_expires_without_answer(store):
+    from jwu.core import gitgrant
+
+    pol = gp.ensure(store)
+    assert pol.request_ttl == 900
+    req = gp.request_grant(store, remote="proj/app", branch="develop", op="push", head="h")
+    _age(store, req["id"], 10)
+    assert [r["id"] for r in gp.pending_grants(store)] == [req["id"]]     # ещё живой
+    _age(store, req["id"], 16)
+    assert gp.pending_grants(store) == []
+    with pytest.raises(gp.PolicyError, match="истёк"):
+        gp.answer_grant(store, req["id"], allow=True, via="cli", policy=pol)
+    assert "истёк" in gitgrant.handle_callback(store, f"git:ok:{store.workspace_id}:{req['id']}")[0]
+    again = gp.request_grant(store, remote="proj/app", branch="develop", op="push", head="h")
+    assert again["new"] and again["id"] != req["id"]                      # агент спросит заново
+    assert "grant:expired" in [a["decision"] for a in gp.audit_log(store)]
+
+
+def test_request_ttl_setting_and_old_schema(store):
+    pol = gp.ensure(store)
+    pol.request_ttl = 3600
+    gp.save(store, pol)
+    assert gp.load(store).request_ttl == 3600
+    assert gp.from_toml(gp.to_toml(gp.load(store))).request_ttl == 3600
+    with pytest.raises(gp.PolicyError, match="request_ttl"):
+        gp.Policy(request_ttl=5).validate()
+    # база до 3.0.2 — без колонки: добавляется сама, политика читается
+    store.conn.execute("ALTER TABLE git_policy DROP COLUMN request_ttl")
+    gp.ensure_schema(store.conn)
+    assert gp.load(store).request_ttl == 900
+
+
 @pytest.mark.parametrize("url, slug", [
     ("ssh://git@git.example:7999/proj/app.git", "proj/app"),
     ("https://git.example/scm/PROJ/app.git", "proj/app"),
