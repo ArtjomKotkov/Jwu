@@ -3204,6 +3204,35 @@ def _size_human(n: int) -> str:
     return f"{n} Б"
 
 
+stats_app = typer.Typer(help="Метрики: как агент пользуется инструментами jwu.", no_args_is_help=True)
+app.add_typer(stats_app, name="stats")
+
+
+@stats_app.command("tools")
+def stats_tools(
+    days: int = typer.Option(7, "--days", "-d", help="За сколько дней."),
+    workspace: str = typer.Option("", "--workspace", "-w", help="Только этот воркспейс (slug)."),
+    limit: int = typer.Option(15, "--limit", "-n", help="Сколько инструментов в топе."),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
+    reset: bool = typer.Option(False, "--reset", help="Удалить накопленное и начать замер с нуля."),
+) -> None:
+    """MCP-инструменты за N дней: вызовы, вес ответов, jwu_query и его экономия, упущенные цепочки."""
+    from rich.markdown import Markdown
+
+    from ..core import toolstats
+
+    _prepare_db()
+    with Store(str(db_path())) as store:
+        if reset:
+            console.print(f"Удалено записей: {toolstats.clear(store)}. Замер начат заново.")
+            return
+        rep = toolstats.report(store, days=days, workspace=workspace)
+    if as_json:
+        _emit_json(rep)
+        return
+    console.print(Markdown(toolstats.render(rep, limit=limit)))
+
+
 @db_app.command("stats")
 def db_stats(json_out: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
     """Сколько занимает БД и из чего она состоит (по воркспейсам)."""

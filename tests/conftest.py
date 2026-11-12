@@ -8,7 +8,13 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Метрики инструментов (core.toolstats) в тестах выключены на весь процесс: буфер сбрасывается
+# в БД по таймеру и при выходе — уже без подмены JWU_DB_PATH, то есть в настоящую БД.
+os.environ["JWU_TOOLSTATS"] = "0"
 
 
 @pytest.fixture(autouse=True)
@@ -23,5 +29,5 @@ def isolate_jwu_env(tmp_path, monkeypatch):
                 "SUPPORT_GATE_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
     for var in list(__import__("os").environ):
-        if var.startswith("JWU_") and var not in ("JWU_DB_PATH",):
+        if var.startswith("JWU_") and var not in ("JWU_DB_PATH", "JWU_TOOLSTATS"):
             monkeypatch.delenv(var, raising=False)

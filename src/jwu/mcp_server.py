@@ -38,7 +38,9 @@ from __future__ import annotations
 import asyncio
 import atexit
 import functools
+import json
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -88,16 +90,35 @@ def _settled_tool(*args, **kwargs):
         @functools.wraps(fn)
         async def tool(*a, **kw):
             ok = False
+            started = time.monotonic()
+            result = None
             try:
                 result = await fn(*a, **kw)
                 ok = True
                 return result
             finally:
                 Store.settle_all(ok)
+                _measure(fn.__name__, kw, result, ok, started)
 
         return register(tool)
 
     return wrap
+
+
+def _measure(name: str, kwargs: dict, result, ok: bool, started: float) -> None:
+    """Метрика вызова (core.toolstats): без аргументов и содержимого — имя, размер, время."""
+    try:
+        from .core import toolstats
+
+        chars = len(json.dumps(result, ensure_ascii=False, default=str)) if result is not None else 0
+        ws = (result.get("workspace") if isinstance(result, dict) else "") or kwargs.get("workspace") or ""
+        inner = result.get("calls") if name == "jwu_query" and isinstance(result, dict) else None
+        toolstats.record(name, session=_SESSION_NAME or f"pid:{os.getpid()}", workspace=str(ws),
+                         ms=int((time.monotonic() - started) * 1000), chars=chars, ok=ok,
+                         inner_calls=len(inner or []), raw_chars=sum(c.get("chars", 0) for c in inner or []))
+        toolstats.start_flusher(lambda: Store(str(db_path())))
+    except Exception:  # noqa: BLE001 — метрика не должна мешать инструменту
+        pass
 
 
 mcp.tool = _settled_tool
@@ -243,6 +264,9 @@ def _require_jira(svc: Service) -> Service:
 
 @atexit.register
 def _cleanup() -> None:
+    from .core import toolstats
+
+    toolstats.flush_now(lambda: Store(str(db_path())))   # метрики последней минуты
     for svc in list(_full.values()) + list(_builds.values()):
         try:
             svc.close()

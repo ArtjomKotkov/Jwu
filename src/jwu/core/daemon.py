@@ -649,8 +649,14 @@ def _builtin_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
         if upd.offer_if_due(store):
             log("в бот отправлено предложение обновиться")
 
+    def toolstats_prune(store):
+        from . import toolstats
+
+        toolstats.prune(store)
+
     return [("disk", 300, disk),
-            ("quiet", 0, quiet), ("grants", 0, resend_grants), ("update", 3600, update)]
+            ("quiet", 0, quiet), ("grants", 0, resend_grants), ("update", 3600, update),
+            ("toolstats", 86400, toolstats_prune)]
 
 
 def periodic_tasks() -> list[tuple[str, float, Callable[["Store"], object]]]:
