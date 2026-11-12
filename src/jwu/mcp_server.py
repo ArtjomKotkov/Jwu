@@ -68,7 +68,9 @@ mcp = FastMCP("jwu", instructions=(
     "делаем по плану, от какой базы, или иначе?». Варианты — 2–4 конкретных действия, рекомендуемый "
     "первым; так же — «закрыть работу?». Нет такого инструмента (Cursor, Codex) — обычным текстом. "
     "Пуш — только jwu_git_push (ветка работы — jwu_git_push(job_id=…)), не git push. Тесты, сборки и прочие долгие прогоны — "
-    "в фоне с таймаутом и под наблюдением: 5 минут без нового вывода — зависание, останови и разбери."))
+    "в фоне с таймаутом и под наблюдением: 5 минут без нового вывода — зависание, останови и разбери. "
+    "Несколько чтений подряд или выжимка из большого ответа — одним скриптом jwu_query (методы — "
+    "jwu_query_help): в контекст придёт только итог."))
 
 _mcp_tool = mcp.tool
 
@@ -1770,6 +1772,37 @@ async def jwu_jobs(
         feature_id = row.id
     jobs = store.list_jobs(task_key=task, pr_id=pr, status=status, feature_id=feature_id)
     return [j.model_dump() if full else job_brief(j) for j in jobs]
+
+
+def _tool(name: str):
+    """MCP-инструмент по имени — для Code Mode (core.codemode зовёт те же функции)."""
+    return globals()[name]
+
+
+@mcp.tool()
+async def jwu_query(code: str, workspace: Optional[str] = None) -> dict:
+    """Code Mode: Python-скрипт против API jwu (ТОЛЬКО ЧТЕНИЕ) — вместо цепочки вызовов.
+
+    Когда нужно несколько чтений подряд или из большого ответа нужна выжимка («по каждому
+    моему PR — сборки и автотесты», «номера активных работ по фиче», «задача + PR + сборки
+    одним итогом») — напиши скрипт: `jwu.<метод>(...)` зовёт те же функции, что инструменты
+    jwu_*, а в ответ приходит только итог (переменная `result` или последнее выражение) и
+    print. Методы и сигнатуры — jwu_query_help(). Скрипт в песочнице: без файлов, сети,
+    импорта и записи; запись — отдельными инструментами после «да». В ответе — calls: какие
+    вызовы сделаны и сколько весили.
+    """
+    from .core import codemode
+
+    _resolve(workspace)
+    return _stamp(await codemode.run(code, _tool, workspace), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_query_help() -> dict:
+    """Шпаргалка Code Mode: методы jwu.* для jwu_query, сигнатуры, лимиты и пример."""
+    from .core import codemode
+
+    return {"markdown": codemode.help_md(_tool)}
 
 
 # --------------------------------------------------------------------------- #

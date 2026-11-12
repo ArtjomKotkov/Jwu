@@ -74,6 +74,7 @@ jwu init ~/code/my-project --provider jira    # подключить проек�
 - [Синк, демон и Telegram](docs/notifications.md)
 - [Задачи, PR и память](docs/tasks-and-prs.md) — запись наружу, трекинг времени
 - [Скиллы, субагенты и MCP](docs/agents.md) — в том числе агент голоса
+- [Code Mode](docs/codemode.md) — цепочка чтений одним скриптом `jwu_query`, в контекст — только итог
 - [Политика git](docs/git.md) — что агенту можно делать с git, допуски, хук, уборка копий
 - [Confluence, Zephyr, пуш работы, SSH-стенды](docs/integrations.md)
 - [Аддоны](docs/addons.md) — свои команды, инструменты, кнопки бота; вкл/выкл, зависимости

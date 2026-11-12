@@ -66,7 +66,8 @@ description: Use when the user wants to see what needs doing and hand work out t
    **jwu-close-job**, следующий пункт очереди.
    - `simple`: фаза 1 — влить целевую ветку и/или разобрать сборку (**jwu-build-failure**), ревью,
      коммит и пуш с «да».
-   - `build`: запустить сборку PR в CI. Сначала `jwu_builds(pr)`: `autotests` в queued/running —
+   - `build`: запустить сборку PR в CI. Сначала `jwu_builds(pr)` (несколько PR — одним
+     `jwu_query`: цикл по номерам, вернуть `(id, build_state, autotests.summary)`): `autotests` в queued/running —
      уже ждут или идут, запускать не надо; есть источник автотестов (аддон) — меню «запустить
      автотесты PR #…?» и после «да» `jwu_pr_autotests_run(pr, user_approved=True)`. Иначе — так,
      как принято в воркспейсе (правило или гайд — `jwu_rules`, `jwu guide`). Способ требует действия наружу
