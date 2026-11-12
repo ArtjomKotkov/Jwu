@@ -11,7 +11,9 @@
 кеш и копии. Копию с незакоммиченным или незапушенным — не трогает без ``force``.
 
 Место на диске проверяется перед созданием копии и подъёмом стенда (``check_space``):
-docker и агент виснут на полном диске. Порог — настройка ``disk.min_free_gb`` (20 ГБ).
+docker и агент виснут на полном диске. Два порога: мягкий ``disk.min_free_gb`` (20 ГБ) —
+ниже него копия создаётся только с разрешения пользователя (``low_disk_ok``), и жёсткий
+``disk.hard_min_free_gb`` (14 ГБ) — ниже него отказ всегда.
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
 JOBS_DIR_SETTING = "jobs.dir"
 DISK_MIN_SETTING = "disk.min_free_gb"
 DEFAULT_MIN_FREE_GB = 20.0
+DISK_HARD_SETTING = "disk.hard_min_free_gb"
+DEFAULT_HARD_MIN_FREE_GB = 14.0
 LABEL = "jwu.job"
 RESOURCE_KINDS = ("worktree", "container", "volume", "network", "image", "compose", "path", "port")
 PORTS_BASE_SETTING = "ports.base"
@@ -88,17 +92,33 @@ def set_jobs_dir(store: "Store", workspace_id: int, path: str) -> Path:
     return target
 
 
-def min_free_gb(store: "Store", workspace_id: int) -> float:
-    raw = (store.workspace_settings(workspace_id).get(DISK_MIN_SETTING) or "").strip()
+def _gb_setting(store: "Store", workspace_id: int, key: str, default: float) -> float:
+    raw = (store.workspace_settings(workspace_id).get(key) or "").strip()
     try:
-        return max(0.0, float(raw.replace(",", "."))) if raw else DEFAULT_MIN_FREE_GB
+        return max(0.0, float(raw.replace(",", "."))) if raw else default
     except ValueError:
-        return DEFAULT_MIN_FREE_GB
+        return default
+
+
+def min_free_gb(store: "Store", workspace_id: int) -> float:
+    """Мягкий порог: ниже — копия только с разрешения пользователя."""
+    return _gb_setting(store, workspace_id, DISK_MIN_SETTING, DEFAULT_MIN_FREE_GB)
+
+
+def hard_min_free_gb(store: "Store", workspace_id: int) -> float:
+    """Жёсткий порог: ниже — отказ всегда. Не выше мягкого."""
+    return min(_gb_setting(store, workspace_id, DISK_HARD_SETTING, DEFAULT_HARD_MIN_FREE_GB),
+               min_free_gb(store, workspace_id))
 
 
 def set_min_free_gb(store: "Store", workspace_id: int, value: float) -> float:
     store.set_workspace_settings(workspace_id, {DISK_MIN_SETTING: str(max(0.0, float(value)))})
     return min_free_gb(store, workspace_id)
+
+
+def set_hard_min_free_gb(store: "Store", workspace_id: int, value: float) -> float:
+    store.set_workspace_settings(workspace_id, {DISK_HARD_SETTING: str(max(0.0, float(value)))})
+    return hard_min_free_gb(store, workspace_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -112,6 +132,7 @@ class DiskReport:
     free_gb: float
     total_gb: float
     min_free_gb: float
+    hard_min_free_gb: float = 0.0
     docker: dict = field(default_factory=dict)    # {"images": "12GB (5GB reclaimable)", …}
     leftovers: list[dict] = field(default_factory=list)   # неубранное у закрытых работ
 
@@ -119,12 +140,19 @@ class DiskReport:
     def ok(self) -> bool:
         return self.free_gb >= self.min_free_gb
 
+    @property
+    def hard_ok(self) -> bool:
+        """Выше жёсткого порога: ниже мягкого копию можно создать с разрешения."""
+        return self.free_gb >= self.hard_min_free_gb
+
     def to_dict(self) -> dict:
-        return {**asdict(self), "ok": self.ok}
+        return {**asdict(self), "ok": self.ok, "hard_ok": self.hard_ok}
 
     def summary(self) -> str:
-        mark = "ок" if self.ok else "МАЛО"
-        return f"свободно {self.free_gb:.1f} из {self.total_gb:.0f} ГБ (порог {self.min_free_gb:.0f}) — {mark}"
+        mark = "ок" if self.ok else ("МАЛО" if self.hard_ok else "КРИТИЧНО МАЛО")
+        hard = f", жёсткий {self.hard_min_free_gb:.0f}" if self.hard_min_free_gb else ""
+        return (f"свободно {self.free_gb:.1f} из {self.total_gb:.0f} ГБ "
+                f"(порог {self.min_free_gb:.0f}{hard}) — {mark}")
 
 
 def _existing(path: Path) -> Path:
@@ -156,19 +184,27 @@ def check_space(store: "Store", workspace_id: int, path: Optional[str] = None, *
     leftovers = [r for r in store.all_open_job_resources() if r["job_status"] in ("done", "cancelled")]
     return DiskReport(path=str(target), free_gb=usage.free / 1024 ** 3, total_gb=usage.total / 1024 ** 3,
                       min_free_gb=min_free_gb(store, workspace_id),
+                      hard_min_free_gb=hard_min_free_gb(store, workspace_id),
                       docker=docker_usage(runner) if with_docker else {}, leftovers=leftovers)
 
 
 def require_space(store: "Store", workspace_id: int, path: Optional[str] = None, *,
-                  runner: Runner = _run) -> DiskReport:
+                  low_disk_ok: bool = False, runner: Runner = _run) -> DiskReport:
+    """Хватает ли места. Ниже мягкого порога — только с ``low_disk_ok`` (разрешение
+    пользователя), ниже жёсткого — отказ всегда."""
     report = check_space(store, workspace_id, path, runner=runner)
-    if not report.ok:
-        hint = ""
-        if report.leftovers:
-            jobs = sorted({r["job_id"] for r in report.leftovers})
-            hint = f" Не убрано у закрытых работ: {', '.join(f'#{j}' for j in jobs)} — jwu job cleanup <id>."
-        raise JobSpaceError(f"Мало места: {report.summary()}.{hint} Освободи место, потом продолжай.")
-    return report
+    if report.ok or (low_disk_ok and report.hard_ok):
+        return report
+    hint = ""
+    if report.leftovers:
+        jobs = sorted({r["job_id"] for r in report.leftovers})
+        hint = f" Не убрано у закрытых работ: {', '.join(f'#{j}' for j in jobs)} — jwu job cleanup <id>."
+    if not report.hard_ok:
+        raise JobSpaceError(f"Мало места: {report.summary()} — ниже жёсткого порога, обойти нельзя.{hint} "
+                            "Освободи место, потом продолжай.")
+    raise JobSpaceError(f"Мало места: {report.summary()}.{hint} Освободи место — или обойди порог с "
+                        "разрешения пользователя: спроси его и после «да» повтори с low_disk_ok=True "
+                        "(в CLI --low-disk-ok).")
 
 
 # --------------------------------------------------------------------------- #
@@ -193,11 +229,13 @@ def _repo_root(path: str, runner: Runner) -> Path:
 
 
 def add_worktree(store: "Store", job: "Job", repo: str, *, branch: str = "", base: str = "",
-                 runner: Runner = _run) -> dict:
+                 low_disk_ok: bool = False, runner: Runner = _run) -> dict:
     """Рабочая копия репозитория для работы. Уже есть — вернуть её.
 
     ``branch`` — ветка копии: есть — берётся она, нет — создаётся от ``base``
     (по умолчанию HEAD основного репозитория). Пусто — ``job<id>-<якорь>``.
+    ``low_disk_ok`` — пользователь разрешил создать копию ниже мягкого порога места;
+    тогда в ответе ``low_disk`` — сколько было свободно.
     """
     root_dir = jobs_dir(store, store.workspace_id)
     if root_dir is None:
@@ -206,7 +244,7 @@ def add_worktree(store: "Store", job: "Job", repo: str, *, branch: str = "", bas
     for res in store.job_resources(job.id):
         if res["kind"] == "worktree" and res["meta"].get("repo") == str(repo_root) and Path(res["ref"]).exists():
             return {**res, "created": False}
-    require_space(store, store.workspace_id, str(root_dir), runner=runner)
+    space = require_space(store, store.workspace_id, str(root_dir), low_disk_ok=low_disk_ok, runner=runner)
     path = root_dir / worktree_name(repo_root, job)
     branch = branch or _slug(f"job{job.id}" + (f"-{job.task_key or job.feature_key}" if (job.task_key or job.feature_key) else ""))
     exists = runner(["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])[0] == 0
@@ -223,8 +261,19 @@ def add_worktree(store: "Store", job: "Job", repo: str, *, branch: str = "", bas
     if code != 0:
         raise JobSpaceError(f"git worktree add не вышел: {out[-400:]}")
     rid = store.add_job_resource(job.id, "worktree", str(path), {"repo": str(repo_root), "branch": branch})
-    return {"id": rid, "kind": "worktree", "ref": str(path),
-            "meta": {"repo": str(repo_root), "branch": branch}, "created": True}
+    res = {"id": rid, "kind": "worktree", "ref": str(path),
+           "meta": {"repo": str(repo_root), "branch": branch}, "created": True}
+    if space is not None and not space.ok:
+        res["low_disk"] = space.summary()
+    return res
+
+
+def worktree_note(res: dict) -> str:
+    """Запись в журнал работы о новой копии; при малом месте — с отметкой о разрешении."""
+    text = f"Рабочая копия: {res['ref']} (ветка {res['meta']['branch']})"
+    if res.get("low_disk"):
+        text += f" — при малом месте, с разрешения пользователя: {res['low_disk']}"
+    return text
 
 
 def worktree_state(path: str, runner: Runner = _run) -> dict:

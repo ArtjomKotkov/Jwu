@@ -119,7 +119,7 @@ jwu rules --tag backend
 
 ```bash
 jwu workspace jobs-dir ~/jwu-jobs/work       # где лежат рабочие копии работ
-jwu disk [--min 20]                          # свободно, docker, неубранное у закрытых работ
+jwu disk [--min 20] [--hard 14]              # свободно, docker, неубранное; пороги: мягкий (обход с «да») и жёсткий
 jwu job worktree <id> <репозиторий>          # копия для работы (обычно делает скилл)
 jwu job ports <id> db redis web             # свободные порты стенду работы (не пересекутся)
 jwu job cleanup <id> [--dry-run] [--force]   # убрать стенд, docker, кеш, порты и копии

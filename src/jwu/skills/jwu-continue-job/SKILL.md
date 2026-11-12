@@ -79,7 +79,8 @@ description: Use when continuing an existing jwu «работа (job)» — an o
 3. **Рабочее место.** `jwu_job_resources(job_id)`:
    - копии (`worktree`) на месте — работай в них, не в основной папке;
    - копий нет (работу закрывали — уборка их сняла), а будут правки кода — `jwu_disk()`
-     (мало места → стоп и вопрос), потом `jwu_job_worktree(job_id, repo, branch="<ветка
+     (мало места → стоп и вопрос; при `hard_ok=True` в меню есть «создать при малом
+     месте» → `low_disk_ok=True`), потом `jwu_job_worktree(job_id, repo, branch="<ветка
      работы из журнала>")` на каждый нужный репозиторий: ветка запушена, копия соберётся из неё;
    - стенд нужен и не поднят — как в **jwu-start-job**, раздел «Стенд работы»: по правилу
      `testenv`, всё с меткой и compose-проектом из `jwu_job_resources(job_id)` (`label`,

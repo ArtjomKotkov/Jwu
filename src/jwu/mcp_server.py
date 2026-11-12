@@ -2395,13 +2395,17 @@ async def jwu_job_reopen(job_id: int, workspace: Optional[str] = None) -> dict:
 
 @mcp.tool()
 async def jwu_job_worktree(job_id: int, repo: str, branch: str = "", base: str = "",
-                           workspace: Optional[str] = None) -> dict:
+                           low_disk_ok: bool = False, workspace: Optional[str] = None) -> dict:
     """Рабочая копия (git worktree) репозитория для работы — ТОЛЬКО когда будут правки кода.
 
     Копия ложится в общую папку воркспейса (jobs.dir) с номером работы в имени
     (<repo>-job<id>-<ключ>). Уже есть — вернёт её (created=False). Перед созданием
     проверяется свободное место; мало — ошибка с подсказкой, что убрать. branch — ветка
     копии: есть — берётся, нет — создаётся от base (по умолчанию HEAD репозитория).
+    Места меньше мягкого порога (disk.min_free_gb), но больше жёсткого
+    (disk.hard_min_free_gb) — копию можно создать с разрешения: спроси пользователя меню
+    («создать при малом месте» / «сначала убрать» / «подождать»), после «да» повтори с
+    low_disk_ok=True. Ниже жёсткого порога — отказ всегда, обхода нет.
     Дальше ВСЯ работа с кодом — в возвращённом пути ref, не в основной папке.
     """
     from .core import jobspace
@@ -2411,11 +2415,11 @@ async def jwu_job_worktree(job_id: int, repo: str, branch: str = "", base: str =
     if job is None:
         raise ValueError(f"Работа #{job_id} не найдена")
     try:
-        res = jobspace.add_worktree(store, job, repo, branch=branch, base=base)
+        res = jobspace.add_worktree(store, job, repo, branch=branch, base=base, low_disk_ok=low_disk_ok)
     except jobspace.JobSpaceError as exc:
         raise ValueError(str(exc)) from exc
     if res.get("created"):
-        store.add_job_record(job_id, f"Рабочая копия: {res['ref']} (ветка {res['meta']['branch']})", kind="note")
+        store.add_job_record(job_id, jobspace.worktree_note(res), kind="note")
     return _stamp({**res, "docker": jobspace.docker_names(job)}, _resolve(workspace))
 
 
@@ -2698,9 +2702,12 @@ async def jwu_guide_save(name: str, title: str, text: str, tag: str = "", scope:
 async def jwu_disk(path: Optional[str] = None, workspace: Optional[str] = None) -> dict:
     """Свободное место (папка рабочих копий или path), docker и неубранное у закрытых работ.
 
-    ok=False — места меньше порога (disk.min_free_gb, 20 ГБ): НЕ создавай копий, не поднимай
-    стенд и не собирай образы — сначала скажи пользователю и предложи убрать (leftovers,
-    docker «можно освободить»). Docker и агент виснут на полном диске.
+    ok=False — места меньше мягкого порога (disk.min_free_gb, 20 ГБ): НЕ создавай копий, не
+    поднимай стенд и не собирай образы — сначала скажи пользователю и предложи убрать
+    (leftovers, docker «можно освободить»). hard_ok=True — копию можно создать и так, если
+    пользователь разрешит (jwu_job_worktree(low_disk_ok=True) после «да»); hard_ok=False —
+    ниже жёсткого порога (disk.hard_min_free_gb, 14 ГБ), обхода нет. Docker и агент виснут
+    на полном диске.
     """
     from .core import jobspace
 

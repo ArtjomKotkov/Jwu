@@ -4156,6 +4156,8 @@ def job_worktree(
     repo: str = typer.Argument(".", help="Основной репозиторий (папка воркспейса)."),
     branch: str = typer.Option("", "--branch", "-b", help="Ветка копии: есть — берётся, нет — создаётся."),
     base: str = typer.Option("", "--base", help="От чего создавать новую ветку (по умолчанию HEAD репозитория)."),
+    low_disk_ok: bool = typer.Option(False, "--low-disk-ok",
+                                     help="Создать, даже если места меньше мягкого порога (но больше жёсткого)."),
     as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Рабочая копия репозитория для работы (git worktree в папке jobs.dir). Есть — вернёт её."""
@@ -4167,12 +4169,12 @@ def job_worktree(
             err.print(f"[red]Работа #{job_id} не найдена.[/red]")
             raise typer.Exit(code=1)
         try:
-            res = jobspace.add_worktree(store, job, repo, branch=branch, base=base)
+            res = jobspace.add_worktree(store, job, repo, branch=branch, base=base, low_disk_ok=low_disk_ok)
         except jobspace.JobSpaceError as exc:
             err.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1)
         if res.get("created"):
-            store.add_job_record(job_id, f"Рабочая копия: {res['ref']} (ветка {res['meta']['branch']})", kind="note")
+            store.add_job_record(job_id, jobspace.worktree_note(res), kind="note")
     if as_json:
         _emit_json(res)
         return
@@ -4316,7 +4318,9 @@ def job_cleanup(
 @app.command("disk")
 def disk_cmd(
     path: Optional[str] = typer.Argument(None, help="Где проверять (по умолчанию — папка рабочих копий)."),
-    min_gb: Optional[float] = typer.Option(None, "--min", help="Задать порог свободного места, ГБ (настройка воркспейса)."),
+    min_gb: Optional[float] = typer.Option(None, "--min", help="Задать мягкий порог свободного места, ГБ: ниже — "
+                                           "копия только с разрешения (настройка воркспейса)."),
+    hard_gb: Optional[float] = typer.Option(None, "--hard", help="Задать жёсткий порог, ГБ: ниже — отказ всегда."),
     as_json: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Свободное место: диск, docker и неубранное у закрытых работ. Код 3 — места мало."""
@@ -4326,6 +4330,8 @@ def disk_cmd(
         ws_id = store.workspace_id
         if min_gb is not None:
             jobspace.set_min_free_gb(store, ws_id, min_gb)
+        if hard_gb is not None:
+            jobspace.set_hard_min_free_gb(store, ws_id, hard_gb)
         report = jobspace.check_space(store, ws_id, path)
     if as_json:
         _emit_json(report.to_dict())
