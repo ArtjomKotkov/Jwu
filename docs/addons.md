@@ -53,7 +53,8 @@ my-addon = "my_package.my_addon"
 Модуль может определить любые из хуков (все необязательны): `register_cli`, `register_mcp`,
 `skills_dir`, `agents_dir`, `bot_text`, `bot_commands` + `bot_command`, `callback_prefixes` +
 `bot_callback`, `menu_buttons` + `menu_action`, `status_lines`, `board_groups`, `config_sections`,
-`secret_slots`, `facades`, `chat_sources`, `daemon_tasks`, `after_hints`, `doctor`.
+`secret_slots`, `facades`, `chat_sources`, `daemon_tasks`, `pr_autotests` + `pr_autotests_run`,
+`after_hints`, `doctor`.
 Сигнатуры и смысл — в начале `src/jwu/core/addons.py`.
 
 ## Настройки и секреты аддона
@@ -69,6 +70,19 @@ my-addon = "my_package.my_addon"
 `items(store, workspace_id, login) -> [{key, title, problems, job_id}]`, `take(store, key,
 session) -> job_id` (работа у пункта заводится, только когда его взяли), необязательные
 `columns` и `hide_job(job)` (служебные работы аддона доска не предлагает закрыть).
+
+## Автотесты PR
+
+Откуда брать состояние автотестов PR (плагин хостинга, свой CI) — хук `pr_autotests(cfg, pr)
+-> dict | None`: `state` (`not_started | queued | running | passed | failed | aborted | unknown`),
+по желанию `queued_since`, `typical_ms`, `remaining_ms`, `build_number`, `url`, `reason`,
+`finished_at`, `server_time` (ms). `None` — у этого PR источника нет. Ядро кладёт ответ в
+`pr.autotests` при синке и показывает в `jwu pr`, `jwu builds`, на доске «что делать» и в
+дневном анализе: в очереди или идут — «подождать», не запускали — «запустить».
+
+`pr_autotests_run(cfg, pr, options) -> dict` — запуск (кнопка «Run autotests» и т.п.); его
+вызывает `jwu_pr_autotests_run` только после «да» пользователя. Запросы к REST Bitbucket
+контура — `addon_api.bitbucket_request(cfg, method, path)`, токен аддону не виден.
 
 ## Встроенные аддоны
 
@@ -95,6 +109,6 @@ jwu не умеет. Потребители (слежение за комнат�
 это мессенджер. Аддон с тем же именем перекрывает встроенный адаптер.
 
 Опираться можно только на `jwu.addon_api` (store для CLI и MCP, контуры с ботом, отправка с
-учётом тихих часов, лог демона). Остальное в `jwu.*` — внутреннее и меняется без предупреждения.
+учётом тихих часов, лог демона, запросы к Bitbucket контура). Остальное в `jwu.*` — внутреннее и меняется без предупреждения.
 
 Ошибка в аддоне не роняет jwu: сломавшийся хук помечается, причина видна в `jwu doctor`.

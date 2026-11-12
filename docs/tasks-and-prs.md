@@ -7,11 +7,18 @@ jwu tasks --view mine|mentions · jwu task ACME-1 · jwu attachments ACME-1 --do
 jwu prs --view mine|review · jwu pr 1204 --project ACME --repo shop-api [--diff [--numbered]] [--download]
 jwu attachments ACME-1 --download -k video  # видео — только явно, оно тяжёлое
 jwu video-frames <видео> --every 3 [--from 0:30 --to 1:10]   # кадры + контактный лист 4×4
-jwu builds 1204 · jwu build 1204            # статусы CI и разбор падения из Jenkins/Actions
+jwu builds 1204 · jwu build 1204            # CI PR (сборки, очередь, автотесты) и разбор падения
+jwu pr-autotests-run 1204 [-o maxfail=10]   # запустить автотесты PR (если источник умеет) — после «да»
 jwu branches [ACME-1]                       # локальные ветки по задаче во всех репозиториях
 jwu mentions list --unseen · jwu mentions read --all · jwu mentions archive --older-than 30
 jwu action day-analyze --brief              # контекст + промпт для дневной сводки
 ```
+
+**Сборки и автотесты.** `jwu builds` показывает сборки на последнем коммите PR, стоит ли сборка
+ветки в очереди Jenkins и автотесты PR, если их состояние сообщает аддон: «в очереди 10 ч ·
+обычно ~2 ч 52 мин», «идут», «не запускали», «упали». Сборки, которые не тесты (ИИ-ревью,
+боты), задаются маской — `jwu workspace setting builds.not_tests "*ai-review*"`: они видны, но не
+красят PR. Очередь Jenkins без прав у токена — предупреждение в `jwu builds` и `jwu doctor`.
 
 **Запись экрана в задаче.** Агент видео не смотрит, а кадры — да: `jwu video-frames` режет
 видео на кадры через заданный шаг на нужном отрезке и собирает **контактный лист** — сетку

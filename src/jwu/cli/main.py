@@ -304,14 +304,18 @@ def _build_icon(state: str) -> str:
     return _BUILD_ICON.get(state, "[dim]•[/dim]")
 
 
-def _render_builds(builds: list) -> None:
-    """Секция «Сборки» в выводе jwu pr (статусы CI по head-коммиту)."""
+def _render_builds(builds: list, autotests=None) -> None:
+    """Секция «Сборки» в выводе jwu pr / jwu builds: статусы CI по head-коммиту и автотесты."""
+    if autotests is not None and autotests.state != "unknown":
+        link = f"  [dim]{autotests.url}[/dim]" if autotests.url else ""
+        console.print(f"\n[bold]Автотесты:[/bold] {autotests.summary()}{link}", highlight=False)
     if not builds:
         return
     console.print(f"\n[bold]Сборки ({len(builds)})[/bold]")
     for b in builds:
         desc = f" [dim]{b.description}[/dim]" if b.description else ""
-        console.print(f"  {_build_icon(b.state)} {b.name or b.key}{desc}")
+        other = " [dim](не тесты)[/dim]" if b.kind == "other" else ""
+        console.print(f"  {_build_icon(b.state)} {b.name or b.key}{other}{desc}")
         if b.url:
             console.print(f"      [dim]{b.url}[/dim]")
 
@@ -1731,7 +1735,7 @@ def pr(
     console.print(f"{pull.source_branch} → {pull.target_branch}  [dim]{pull.project}/{pull.repository}[/dim]")
     if pull.conflicted is not None:
         console.print(f"конфликт: {'[red]да[/red]' if pull.conflicted else 'нет'}  can_merge: {pull.can_merge}")
-    _render_builds(pull.builds)
+    _render_builds(pull.builds, pull.autotests)
     if pull.reviewers:
         console.print("[bold]Ревьюеры[/bold]")
         for r in pull.reviewers:
@@ -1779,18 +1783,51 @@ def builds(
     repo: Optional[str] = typer.Option(None, "--repo", help="Slug репозитория."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
-    """Статусы CI-сборок по head-коммиту PR (быстро, из build-status API Bitbucket)."""
+    """CI PR: сборки по head-коммиту, очередь CI и автотесты (если их сообщает аддон)."""
+    from ..core.models import Autotests, BuildStatus
+
     with _builds_service() as svc:
-        proj = project or svc.cfg.bitbucket.project
-        rp = repo or svc.cfg.bitbucket.repo
-        statuses = svc.build_statuses_for_pr(proj, rp, pr_id)
+        default_project, default_repo = svc.default_pr_ref()
+        ci = svc.pr_ci(project or default_project, repo or default_repo, pr_id)
     if json_out:
-        _emit_json([b.model_dump() for b in statuses])
+        _emit_json(ci)
         return
-    if not statuses:
+    tests = Autotests.model_validate(ci["autotests"]) if ci["autotests"] else None
+    statuses = [BuildStatus.model_validate(b) for b in ci["builds"]]
+    if not statuses and not tests:
         console.print("[dim]Сборок по head-коммиту PR нет.[/dim]")
-        return
-    _render_builds(statuses)
+    if ci["build_queued"]:
+        console.print("⏳ сборка ветки в очереди Jenkins")
+    _render_builds(statuses, tests)
+    if ci["queue_error"]:
+        err.print(f"[yellow]{ci['queue_error']}[/yellow]")
+
+
+@app.command("pr-autotests-run")
+def pr_autotests_run(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    project: Optional[str] = typer.Option(None, "--project", help="Проект (по умолчанию из конфига)."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Репозиторий (по умолчанию из конфига)."),
+    option: list[str] = typer.Option([], "--option", "-o", help="Параметр источника key=value (напр. maxfail=10)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Без подтверждения."),
+) -> None:
+    """Запустить автотесты PR через аддон (кнопка «Run autotests» и т.п.)."""
+    opts: dict = {}
+    for item in option:
+        key, _, value = item.partition("=")
+        if not key or not _:
+            err.print(f"[red]--option ждёт key=value: {item}[/red]")
+            raise typer.Exit(code=2)
+        opts[key.strip()] = int(value) if value.strip().lstrip("-").isdigit() else value.strip()
+    if not yes and not typer.confirm(f"Запустить автотесты PR #{pr_id}?"):
+        raise typer.Exit(code=1)
+    with _builds_service() as svc:
+        try:
+            result = svc.run_autotests(project, repo, pr_id, opts)
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    console.print(f"🧪 {result.get('message') or 'Автотесты запущены'} [dim]({result['source']})[/dim]", highlight=False)
 
 
 @app.command()
@@ -4350,6 +4387,8 @@ def disk_cmd(
 # Настройки потока работы, которые задаются руками (остальные — своими командами).
 EDITABLE_SETTINGS = {
     "job.review.max_iterations": "сколько кругов ревью подряд до вопроса пользователю (по умолчанию 3)",
+    "builds.not_tests": "какие сборки не тесты (ИИ-ревью, боты): маски ключа или имени через запятую — "
+                        "видны, но не красят PR и не считаются сборкой (по умолчанию — все тесты)",
     "todo.build.required": "где без зелёной сборки на последнем коммите PR не двигать: репозитории "
                            "через запятую, * — все, - — нигде (по умолчанию — где CI присылает сборки)",
 }

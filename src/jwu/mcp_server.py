@@ -1631,10 +1631,15 @@ async def jwu_builds(
     project: Optional[str] = None,
     repo: Optional[str] = None,
     workspace: Optional[str] = None,
-) -> list[dict]:
-    """Статусы CI-сборок по head-коммиту PR (быстро: build-status Bitbucket либо
-    check-runs GitHub).
+) -> dict:
+    """CI PR: сборки по head-коммиту (build-status Bitbucket либо check-runs GitHub),
+    очередь CI и автотесты PR.
 
+    Ответ: builds (у каждой kind: tests | other — «other» не сборка тестов, напр. ИИ-ревью,
+    настройка builds.not_tests), build_state — сводно по сборкам тестов, build_queued — сборка
+    ветки стоит в очереди Jenkins, autotests — состояние автотестов PR от аддона (state:
+    not_started | queued | running | passed | failed | aborted | unknown, summary — по-русски;
+    null — источника нет), queue_error — очередь Jenkins не читается (нет прав у токена).
     Не зависит от трекера задач. project/repo — по умолчанию из конфига воркспейса.
 
     workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
@@ -1642,9 +1647,29 @@ async def jwu_builds(
     """
     svc = _builds_svc(workspace)
     default_project, default_repo = svc.default_pr_ref()
-    proj = project or default_project
-    rp = repo or default_repo
-    return [b.model_dump() for b in svc.build_statuses_for_pr(proj, rp, pr_id)]
+    return _stamp(svc.pr_ci(project or default_project, repo or default_repo, pr_id), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_pr_autotests_run(
+    pr_id: int,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    options: Optional[dict] = None,
+    user_approved: bool = False,
+    workspace: Optional[str] = None,
+) -> dict:
+    """ВНЕШНЯЯ ЗАПИСЬ: запустить автотесты PR (кнопка «Run autotests» и т.п.) через аддон.
+
+    Только после «да» пользователя: user_approved=True. Сначала посмотри jwu_builds —
+    autotests в queued/running значит, что уже ждут или идут, второй запуск не нужен.
+    options — параметры источника (что принимает аддон, напр. {"maxfail": 10}); без них —
+    как по умолчанию у кнопки. Аддона, умеющего запуск, нет — ошибка.
+    """
+    if not user_approved:
+        raise ValueError("Запуск автотестов — внешнее действие: спроси пользователя и повтори с user_approved=True")
+    svc = _builds_svc(workspace)
+    return _stamp(svc.run_autotests(project, repo, pr_id, options), _resolve(workspace))
 
 
 @mcp.tool()

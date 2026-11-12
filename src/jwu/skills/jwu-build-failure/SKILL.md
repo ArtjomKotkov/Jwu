@@ -76,7 +76,10 @@ description: Use when the user wants to understand why a CI build failed for a P
 
 2. **Быстрая проверка статуса** (можно прямо здесь, до субагента):
    `jwu builds <PR> [--project P --repo R] --json`
-   - всё `SUCCESSFUL` → билд зелёный, сообщи и закончи;
+   - всё `SUCCESSFUL` → билд зелёный, сообщи и закончи (сборки `kind: other` — не тесты,
+     например ИИ-ревью: их падение не «упали тесты»);
+   - `autotests.state`: `queued` / `running` — тесты ждут или идут (`autotests.summary`), разбирать
+     нечего; `failed` — разбирай прогон по `autotests.url`;
    - `INPROGRESS` → сборка ещё идёт (тесты в CI бывают длинными) — предложи вернуться позже
      или разобрать предыдущую упавшую по `--url`.
 

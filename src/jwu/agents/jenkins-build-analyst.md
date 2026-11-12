@@ -38,7 +38,11 @@ JSON без парсинга stdout): `jwu_builds(pr_id, project, repo)` вме�
 
 1. Список статусов сборок по head-коммиту PR (быстро, из Bitbucket):
    `jwu builds <PR> [--project P --repo R] --json`
-   Поля: state (SUCCESSFUL|FAILED|INPROGRESS), name, url, description.
+   Ответ: `builds` (state SUCCESSFUL|FAILED|INPROGRESS, name, url, description, kind — `other`
+   значит не сборка тестов, напр. ИИ-ревью: её падение не разбирай как тесты), `build_state` —
+   сводно по сборкам тестов, `autotests` — автотесты PR от аддона (`state`, `summary`, `url`).
+   - `autotests.state` = failed, а сборок тестов на коммите нет — разбирай прогон по `autotests.url`
+     (`--url`).
    - Если все SUCCESSFUL — сборка зелёная, разбирать нечего (сообщи и закончи).
    - Если INPROGRESS — сборка ещё идёт (тесты в CI бывают длинными); скажи об этом и предложи
      вернуться позже, либо разбери предыдущую упавшую по `--url`.

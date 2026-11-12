@@ -60,6 +60,30 @@ def add_mentions(store: "Store", mentions: list) -> list:
     return store.add_mentions(mentions)
 
 
+def bitbucket_request(cfg: "Config", method: str, path: str, *, json: Optional[dict] = None,
+                      timeout: float = 20.0) -> tuple[int, object]:
+    """Запрос к REST Bitbucket контура с токеном jwu (токен аддону не виден).
+
+    ``path`` — от корня хоста (``/rest/<плагин>/…``). → (HTTP-код, JSON или текст ответа).
+    Нет Bitbucket в конфиге — ``ValueError``.
+    """
+    import httpx
+
+    from .core.config import bitbucket_token
+
+    base = (cfg.bitbucket.base_url or "").rstrip("/")
+    if not base:
+        raise ValueError("в контуре нет Bitbucket")
+    headers = {"Authorization": f"Bearer {bitbucket_token(cfg)}", "Accept": "application/json"}
+    with httpx.Client(timeout=timeout, headers=headers) as client:
+        resp = client.request(method.upper(), base + "/" + path.lstrip("/"), json=json)
+    try:
+        body: object = resp.json()
+    except ValueError:
+        body = resp.text[:500]
+    return resp.status_code, body
+
+
 def session_name(store: "Store") -> str:
     """Имя текущей сессии агента (как его видят доска и строка статуса) — для MCP-инструментов."""
     from .mcp_server import _session_name

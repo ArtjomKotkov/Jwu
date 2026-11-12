@@ -401,6 +401,9 @@ class BuildStatus(BaseModel):
     url: str = ""
     description: str = ""
     date_added: int = 0  # epoch ms
+    # "other" — не сборка тестов (ИИ-ревью, линтеры-боты…): видна, но в build_state не идёт.
+    # Какие сборки такие — настройка воркспейса builds.not_tests (маски ключа/имени).
+    kind: str = ""
 
     @classmethod
     def from_bitbucket(cls, raw: dict) -> "BuildStatus":
@@ -592,6 +595,64 @@ class PRComment(BaseModel):
     attachments: list[PRAttachment] = Field(default_factory=list)
 
 
+AUTOTEST_STATES = ("not_started", "queued", "running", "passed", "failed", "aborted", "unknown")
+
+
+def _span(ms: Optional[int]) -> str:
+    """Длительность по-русски коротко: «45 с», «12 мин», «10 ч 18 мин»."""
+    sec = max(0, int((ms or 0) / 1000))
+    if sec < 60:
+        return f"{sec} с"
+    mins = sec // 60
+    if mins < 60:
+        return f"{mins} мин"
+    hours, mins = divmod(mins, 60)
+    return f"{hours} ч {mins} мин" if mins else f"{hours} ч"
+
+
+class Autotests(BaseModel):
+    """Автотесты PR — отдельно от build-status коммита.
+
+    Источник — аддон (хук ``pr_autotests``): плагин хостинга, CI и т.п. Ядро знает только
+    состояния: not_started (никто не запускал) | queued | running | passed | failed |
+    aborted | unknown (у репозитория автотесты не настроены или источник не ответил).
+    Времена — epoch ms по часам источника (``server_time``), длительности — ms.
+    """
+
+    state: str = "unknown"
+    queued_since: int = 0
+    typical_ms: int = 0
+    remaining_ms: Optional[int] = None
+    build_number: Optional[int] = None
+    url: str = ""
+    reason: str = ""
+    finished_at: int = 0
+    server_time: int = 0
+    source: str = ""
+
+    @property
+    def pending(self) -> bool:
+        """Тесты ждут или идут — «подождать», а не «запустить»."""
+        return self.state in ("queued", "running")
+
+    def summary(self) -> str:
+        """Одной строкой для доски, бота и вывода: «в очереди 10 ч 18 мин · обычно ~2 ч 52 мин»."""
+        typical = f" · обычно ~{_span(self.typical_ms)}" if self.typical_ms else ""
+        now = self.server_time or 0
+        if self.state == "queued":
+            waited = f" {_span(now - self.queued_since)}" if self.queued_since and now else ""
+            return f"тесты в очереди{waited}{typical}"
+        if self.state == "running":
+            left = f", осталось ~{_span(self.remaining_ms)}" if self.remaining_ms else ""
+            num = f" #{self.build_number}" if self.build_number else ""
+            return f"тесты идут{num}{left}"
+        ago = f" {_span(now - self.finished_at)} назад" if self.finished_at and now else ""
+        return {"not_started": "тесты не запускали",
+                "passed": f"тесты прошли{ago}",
+                "failed": f"тесты упали{ago}",
+                "aborted": f"тесты прерваны{ago}"}.get(self.state, "состояние тестов неизвестно")
+
+
 class PR(BaseModel):
     id: int
     title: str = ""
@@ -620,6 +681,8 @@ class PR(BaseModel):
     # Сборок на head-коммите нет, но в очереди CI (Jenkins) стоит сборка этой ветки/PR —
     # «подождать», а не «запустить». Ставится при синке; без CI-доступа — False.
     build_queued: bool = False
+    # Автотесты PR, если их состояние сообщает аддон (хук pr_autotests); None — источника нет.
+    autotests: Optional[Autotests] = None
     # Задачи на комментах PR (Bitbucket tasks): сколько открыто и сколько закрыто.
     # Открытые — это и есть «что ещё надо поправить» по этому PR.
     tasks_open: int = 0
@@ -636,9 +699,9 @@ class PR(BaseModel):
         PR и блокирует мерж. Поэтому сводим список статусов в одно слово, которым
         оперируют состояние PR, сигнатура снапшота (дельты) и дневной анализ.
         Приоритет: хоть одна упавшая → FAILED; иначе хоть одна идущая → INPROGRESS;
-        иначе все зелёные → SUCCESSFUL.
+        иначе все зелёные → SUCCESSFUL. Сборки kind="other" (не тесты) не учитываются.
         """
-        states = {b.state for b in self.builds}
+        states = {b.state for b in self.builds if b.kind != "other"}
         if "FAILED" in states:
             return "FAILED"
         if "INPROGRESS" in states:
@@ -646,6 +709,11 @@ class PR(BaseModel):
         if states and states <= {"SUCCESSFUL"}:
             return "SUCCESSFUL"
         return ""
+
+    @property
+    def tests_pending(self) -> bool:
+        """Тесты в очереди CI или идут (по очереди Jenkins либо по автотестам аддона)."""
+        return self.build_queued or bool(self.autotests and self.autotests.pending)
 
     @classmethod
     def from_bitbucket(cls, raw: dict) -> "PR":

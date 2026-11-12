@@ -34,6 +34,8 @@ def _pr_state(pr: PR) -> str:
         return "конфликт"
     if pr.build_state == "FAILED":
         return "красный билд"
+    if pr.autotests and pr.autotests.state == "failed":
+        return "тесты упали"
     if pr.tasks_open:
         return f"открытые задачи: {pr.tasks_open}"
     if any((r.status or "") == "NEEDS_WORK" for r in pr.reviewers):
@@ -52,8 +54,9 @@ def _pr_line(pr: PR, status_note: str = "") -> str:
         for r in pr.reviewers
     ) or "—"
     conflict = "КОНФЛИКТ" if pr.conflicted else ("ok" if pr.conflicted is False else "?")
+    tests = f"{pr.autotests.summary()}; " if pr.autotests and pr.autotests.state != "unknown" else ""
     return (f'- {pr.project}/{pr.repository}#{pr.id} "{pr.title}" — {conflict}; '
-            f"состояние: {_pr_state(pr)}; сборка: {_BUILD_RU.get(pr.build_state, 'нет')}; "
+            f"состояние: {_pr_state(pr)}; сборка: {_BUILD_RU.get(pr.build_state, 'нет')}; {tests}"
             f"задач: {pr.tasks_open} открытых / {pr.tasks_resolved} закрытых; "
             f"ревью: {revs}; комментов: {pr.comment_count}; "
             f"обновлён: {fmt_ago(pr.updated)}{note}")

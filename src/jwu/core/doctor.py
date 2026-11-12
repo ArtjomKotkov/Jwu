@@ -129,6 +129,10 @@ def check_config(store: "Store", ws) -> tuple[list[Check], object]:
         if cfg.jenkins.username and not has("jenkins.token"):
             out.append(Check("Конфиг Jenkins", "warn", "логин есть, токена нет — разбор сборок недоступен",
                              "jwu configure --jenkins-token … / JENKINS_TOKEN"))
+        queue_error = store.get_meta(f"ci:queue_error:{ws.id}")
+        if queue_error:
+            out.append(Check("Очередь Jenkins", "warn", queue_error,
+                             "дай токену право Read на папки задач в Jenkins — иначе «в очереди» не видно"))
     elif ws.provider == "github":
         if not has("github.token"):
             out.append(Check("Конфиг GitHub", "fail", "нет токена", "GITHUB_TOKEN или jwu configure --github-token …"))

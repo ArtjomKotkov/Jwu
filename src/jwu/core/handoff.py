@@ -173,6 +173,8 @@ def _pr_block(state: PRState) -> list[str]:
         blockers.append("конфликт")
     if pr.build_state == "FAILED":
         blockers.append("красный билд")
+    if pr.autotests and pr.autotests.state == "failed":
+        blockers.append("тесты упали")
     if pr.tasks_open:
         blockers.append(f"открытых задач {pr.tasks_open}")
     if any((r.status or "") == "NEEDS_WORK" for r in pr.reviewers):
@@ -182,6 +184,8 @@ def _pr_block(state: PRState) -> list[str]:
     L.append(f"- блокеры: {', '.join(blockers) if blockers else 'нет'}; ревью: {reviewers or '—'}")
     if pr.build_state:
         L.append(f"- сборка: {pr.build_state}")
+    if pr.autotests and pr.autotests.state != "unknown":
+        L.append(f"- {pr.autotests.summary()}")
     if state.open_tasks:
         L.append("- открытые задачи на комментах (чек-лист правок):")
         L += [f"  - [ ] #{t.id} {t.text}" for t in state.open_tasks]

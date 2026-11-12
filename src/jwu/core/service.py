@@ -48,7 +48,9 @@ from . import thresholds as thresholds_mod
 from .jira import JiraClient, build_create_fields, check_create_fields
 from .models import (
     PR_TASK_STATES, PRAttachment, PRTask, check_task_text, pr_note_key,
+    AUTOTEST_STATES,
     Attachment,
+    Autotests,
     DOWNLOADABLE_ATTACH_KINDS,
     GITHUB_SHORT_REF_RE,
     BuildReport,
@@ -1495,7 +1497,7 @@ class Service:
             pass
 
     def _fill_builds(self, pr: PR) -> None:
-        """Догрузить head-коммит и статусы CI-сборок PR (два запроса; ошибки — не критичны)."""
+        """Догрузить head-коммит, статусы CI-сборок, очередь CI и автотесты PR (ошибки не критичны)."""
         client = self.pr_client
         if client is None or not (pr.project and pr.repository):
             return
@@ -1508,15 +1510,73 @@ class Service:
                 )
         except Exception:  # noqa: BLE001 — без сборок PR всё равно полезен
             pr.builds = []
-        if not pr.builds:
-            refs = self._jenkins_queue()
-            pr.build_queued = bool(refs) and (bool(pr.source_branch and pr.source_branch in refs)
-                                              or f"PR-{pr.id}" in refs)
+        self._mark_build_kinds(pr)
+        # очередь — независимо от статусов на коммите: там бывают и сборки «не тесты»
+        refs = self._jenkins_queue()
+        pr.build_queued = bool(refs) and (bool(pr.source_branch and pr.source_branch in refs)
+                                          or f"PR-{pr.id}" in refs)
+        pr.autotests = self._autotests(pr)
+
+    NOT_TESTS_SETTING = "builds.not_tests"
+
+    def _mark_build_kinds(self, pr: PR) -> None:
+        """Сборки «не тесты» (маски ключа или имени из builds.not_tests) → kind="other"."""
+        if self.store is None or not pr.builds:
+            return
+        import fnmatch
+
+        raw = self.store.workspace_settings(self.store.workspace_id).get(self.NOT_TESTS_SETTING) or ""
+        masks = [m.strip().casefold() for m in raw.split(",") if m.strip()]
+        for b in pr.builds:
+            names = {(b.key or "").casefold(), (b.name or "").casefold()} - {""}
+            b.kind = "other" if any(fnmatch.fnmatch(n, m) for n in names for m in masks) else "tests"
+
+    def _autotests(self, pr: PR) -> "Autotests | None":
+        """Автотесты PR от аддонов (хук ``pr_autotests(cfg, pr)`` → dict или None); первый ответ."""
+        from . import addons
+
+        for addon in addons.active():
+            raw = addon.call("pr_autotests", self.cfg, pr)
+            if not raw:
+                continue
+            try:
+                found = Autotests.model_validate({**raw, "source": raw.get("source") or addon.name})
+            except Exception:  # noqa: BLE001 — кривой ответ аддона не роняет синк
+                continue
+            if found.state not in AUTOTEST_STATES:
+                found.state = "unknown"
+            return found
+        return None
+
+    def run_autotests(self, project: str | None, repo: str | None, pr_id: int, options: dict | None = None) -> dict:
+        """Запустить автотесты PR через аддон (хук ``pr_autotests_run(cfg, pr, options)``) — ВНЕШНЯЯ запись."""
+        from . import addons
+
+        default_project, default_repo = self.default_pr_ref()
+        pr = self._require_prs().pr(project or default_project, repo or default_repo, pr_id)
+        for addon in addons.active():
+            if not addon.has("pr_autotests_run"):
+                continue
+            addon.error = ""
+            result = addon.call("pr_autotests_run", self.cfg, pr, dict(options or {}))
+            if result is None:
+                if addon.error:
+                    raise ValueError(f"Аддон {addon.name} не запустил тесты: {addon.error}")
+                continue
+            return {"ok": True, "source": addon.name, **(result if isinstance(result, dict) else {"message": str(result)})}
+        raise ValueError("Запускать автотесты этого PR некому: ни один аддон не умеет (хук pr_autotests_run)")
 
     _QUEUE_TTL = 60.0
 
+    def queue_error_key(self) -> str:
+        return f"ci:queue_error:{self.store.workspace_id}" if self.store is not None else ""
+
     def _jenkins_queue(self) -> set[str]:
-        """Очередь Jenkins — один запрос на проход синка (кеш на минуту); нет доступа — пусто."""
+        """Очередь Jenkins — один запрос на проход синка (кеш на минуту); нет доступа — пусто.
+
+        Нет прав (401/403/404) — не молча: текст ошибки ложится в meta ``ci:queue_error:<ws>``
+        (его показывают doctor и ``jwu builds``), снимается, когда очередь снова читается.
+        """
         import time as _time
 
         if self.jenkins is None or getattr(self.jenkins, "auth", None) is None:
@@ -1524,11 +1584,28 @@ class Service:
         cached = getattr(self, "_queue_cache", None)
         if cached and _time.monotonic() - cached[0] < self._QUEUE_TTL:
             return cached[1]
+        error, ok = "", False
         try:
             refs = self.jenkins.queued_refs()
-        except Exception:  # noqa: BLE001 — без очереди доска просто скажет «запустить»
+            ok = True
+        except JenkinsError as exc:
+            refs = set()
+            if exc.status_code in (401, 403, 404):
+                error = f"очередь Jenkins недоступна: нет прав у токена (HTTP {exc.status_code})"
+        except Exception:  # noqa: BLE001 — сеть: без очереди доска просто скажет «запустить»
             refs = set()
         self._queue_cache = (_time.monotonic(), refs)
+        key = self.queue_error_key()
+        if key:
+            try:
+                if error:
+                    if self.store.get_meta(key) != error:
+                        self.store.set_meta(key, error)
+                        logging.getLogger(__name__).warning(error)
+                elif ok and self.store.get_meta(key):
+                    self.store.delete_meta(key)
+            except Exception:  # noqa: BLE001
+                pass
         return refs
 
     def _fill_tasks(self, pr: PR) -> None:
@@ -2287,6 +2364,22 @@ class Service:
         # GitHub ищет сборки только внутри репозитория, Bitbucket — по всему инстансу;
         # project/repo передаём всегда, лишними они не будут.
         return client.build_statuses(sha, project=project, repo=repo)
+
+    def pr_ci(self, project: str, repo: str, pr_id: int) -> dict:
+        """CI PR целиком: сборки по head-коммиту (kind: tests | other), сводный статус сборок
+        тестов, очередь CI и автотесты от аддона — то, что отдают ``jwu builds`` / ``jwu_builds``."""
+        pr = self._require_prs().pr(project, repo, pr_id)
+        self._fill_builds(pr)
+        tests = pr.autotests
+        key = self.queue_error_key()
+        return {
+            "pr": pr.id, "project": pr.project, "repo": pr.repository, "commit": pr.latest_commit,
+            "builds": [b.model_dump() for b in pr.builds],
+            "build_state": pr.build_state,
+            "build_queued": pr.build_queued,
+            "autotests": {**tests.model_dump(), "summary": tests.summary()} if tests else None,
+            "queue_error": (self.store.get_meta(key) or "") if key else "",
+        }
 
     def build_statuses_for_pr_url(self, url: str) -> list[BuildStatus]:
         """Статусы сборок по URL PR из карточки задачи (парсит project/repo/id из URL)."""

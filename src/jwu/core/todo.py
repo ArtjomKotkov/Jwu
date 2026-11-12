@@ -188,6 +188,12 @@ BUILD_REQUIRED_SETTING = "todo.build.required"
 NO_BUILD = "нет сборки на последнем коммите"
 BUILD_RUNNING = "сборка идёт"
 BUILD_RED = "сборка красная"
+TESTS_RED = "тесты упали"
+
+
+def tests_red(pr: "PR") -> bool:
+    """Автотесты PR (от аддона) упали, а сборка на коммите об этом не говорит."""
+    return bool(pr.autotests and pr.autotests.state == "failed") and pr.build_state != "FAILED"
 
 
 def build_expected(store: "Store", workspace_id: int) -> Callable[["PR"], bool]:
@@ -218,17 +224,21 @@ def approvals_cell(pr: "PR") -> str:
 
 
 def build_cell(pr: "PR", expected: bool) -> str:
-    """Сборка на head-коммите одним словом — для доски."""
+    """Сборка на head-коммите одним словом — для доски; автотесты от аддона — через «·»."""
     state = pr.build_state
     if state == "SUCCESSFUL":
-        return "✓ зелёная"
-    if state == "FAILED":
-        return "✗ красная"
-    if state == "INPROGRESS":
-        return "⏳ идёт"
-    if pr.build_queued:
-        return "⏳ в очереди"
-    return "— нет на последнем коммите" if expected else "— CI не сообщает"
+        cell = "✓ зелёная"
+    elif state == "FAILED":
+        cell = "✗ красная"
+    elif state == "INPROGRESS":
+        cell = "⏳ идёт"
+    elif pr.build_queued:
+        cell = "⏳ в очереди"
+    else:
+        cell = "— нет на последнем коммите" if expected else "— CI не сообщает"
+    if pr.autotests and pr.autotests.state != "unknown":
+        cell += " · " + pr.autotests.summary()
+    return cell
 
 
 def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
@@ -269,7 +279,9 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
             tech.append("конфликт")
         if pr.build_state == "FAILED":
             tech.append(BUILD_RED)
-        elif (not pr.build_state and not pr.build_queued and expects_build(pr)
+        elif tests_red(pr):
+            tech.append(TESTS_RED)
+        elif (not pr.build_state and not pr.tests_pending and expects_build(pr)
               and not (issue and (issue.status or "").casefold() in demo_st)):
             # сродни конфликту: без сборки на последнем коммите PR дальше не двигают; в очереди
             # CI — ждём («➡️ Двигать дальше» скажет «дождаться»), не в очереди — запустить
@@ -278,6 +290,8 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
             continue
         group = "fixes" if review else ("build" if tech == [NO_BUILD] else "simple")
         problems = review + tech
+        if pr.autotests and pr.autotests.state not in ("unknown", "failed"):
+            problems.append(pr.autotests.summary())     # «тесты не запускали», «в очереди 10 ч» …
         job = by_pr.get((pr.project, pr.repository, pr.id)) or (by_key.get(key) if key else None)
         items.append(Item(n=0, group=group, key=_pr_ref(pr), title=pr.title, status=issue.status if issue else "",
                           priority=issue.priority if issue else "",
@@ -448,17 +462,19 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
         ref = _pr_ref(pr)
         if ref in listed or not pr.reviewers or not all(r.approved for r in pr.reviewers):
             continue
-        if pr.conflicted or pr.build_state == "FAILED" or pr.tasks_open:
+        if pr.conflicted or pr.build_state == "FAILED" or tests_red(pr) or pr.tasks_open:
             continue
         expected = expects_build(pr)
-        if expected and not pr.build_state and not pr.build_queued:
+        if expected and not pr.build_state and not pr.tests_pending:
             continue   # нет сборки на последнем коммите и не в очереди — «🧪 Запустить сборку»
         key = _issue_key(pr)
         issue = issues.get(key)
         status = issue.status if issue else ""
         if status.casefold() in demo_st:
             continue   # задача на стенде/демо — её ведёт «🎬 Демо и подготовка», не «двигать»
-        if pr.build_state == "INPROGRESS":
+        if pr.autotests and pr.autotests.pending:
+            nxt = f"апрувы собраны, {pr.autotests.summary()} — дождаться"
+        elif pr.build_state == "INPROGRESS":
             nxt = "апрувы собраны, сборка идёт — дождаться зелёной"
         elif expected and not pr.build_state:
             nxt = "апрувы собраны, сборка в очереди — дождаться зелёной"
@@ -745,11 +761,12 @@ def refresh(store: "Store", *, timeout: float = REFRESH_TIMEOUT, sleep=None) -> 
 def _goal(item: Item) -> str:
     pr = f" PR #{item.pr['id']}" if item.pr else ""
     if item.group == "simple":
-        what = " и ".join(p for p in item.problems if p in ("конфликт", BUILD_RED, NO_BUILD))
+        what = " и ".join(p for p in item.problems if p in ("конфликт", BUILD_RED, TESTS_RED, NO_BUILD))
         return (f"{what.capitalize()}{pr}".replace("Сборка красная", "Красная сборка").replace("сборка красная", "красная сборка")
                 .replace("Нет сборки на последнем коммите", "Нет сборки").replace("нет сборки на последнем коммите", "нет сборки"))
     if item.group == "fixes":
-        return f"Правки по ревью{pr}" if any(not p.startswith("QA:") for p in item.problems if p not in ("конфликт", BUILD_RED, NO_BUILD)) \
+        return f"Правки по ревью{pr}" if any(not p.startswith(("QA:", "тесты ")) for p in item.problems
+                                             if p not in ("конфликт", BUILD_RED, TESTS_RED, NO_BUILD)) \
             else f"Правки по возврату QA{pr}"
     if item.group == "build":
         return f"Запустить сборку{pr}"
