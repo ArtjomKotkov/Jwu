@@ -99,6 +99,10 @@ def start_flusher(open_store) -> None:
 
 
 def flush_now(open_store) -> None:
+    """Сбросить буфер своим соединением. Пустой буфер — БД не открывается вовсе (иначе выход
+    любого процесса, хоть тестового, открывал бы БД по пути из окружения на тот момент)."""
+    if not _buffer:
+        return
     try:
         own = open_store()
         try:

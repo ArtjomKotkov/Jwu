@@ -54,7 +54,7 @@ def test_render_unbound_folder(store, tmp_path):
     assert line == "jwu      папка не привязана"
 
 
-def test_render_workspace_job_queue_daemon(store, tmp_path, monkeypatch):
+def test_render_workspace_job_plan_daemon(store, tmp_path, monkeypatch):
     folder = tmp_path / "pet"
     folder.mkdir()
     ws = workspaces.create(store, "pet", name="Питомец")
@@ -63,9 +63,12 @@ def test_render_workspace_job_queue_daemon(store, tmp_path, monkeypatch):
     feature = store.create_feature("Тёмная тема")
     job = store.create_job("", "тема", feature_id=feature.id)
     store.add_job_record(job.id, "Ф1: правка core/statusline.py", kind="phase", status="done")
-    store.queue_add("поправить импорт")
-    store.queue_add("обновить доку", mode="parallel")
-    store.queue_take(mode="parallel", worker="agent")
+    from jwu.core import plans
+
+    plan = plans.create_plan(store, "Тема", focus=True)
+    plans.add_step(store, plan.key, "палитра")
+    plans.add_step(store, plan.key, "переключатель", waits=[{"kind": "owner", "text": "выбрать цвета"}])
+    plans.update_step(store, f"{plan.key}/1", status="doing")
     monkeypatch.setattr(sl.SingleInstance, "holder_pid", lambda self: 4242)
     monkeypatch.setattr(sl, "_disk_part", lambda store, wid: "")   # место на диске машины — не предмет теста
 
@@ -74,11 +77,11 @@ def test_render_workspace_job_queue_daemon(store, tmp_path, monkeypatch):
     assert lines[1] == "jwu      Питомец (local)   ·   демон ✓"
     assert lines[2] == f"работа   #{job.id} {feature.key} ✓  Тёмная тема"
     assert "statusline.py" not in lines[2]  # текст фазы в строку не попадает
-    assert lines[3] == "очередь  ждёт 1  ·  идёт 1  ·  слоты 1/3"
+    assert lines[3] == "план     PLAN-1 · 0/2  ·  идёт: палитра  ·  ждёт тебя: 1"
 
-    store.queue_take(mode="main")
+    plans.create_plan(store, "Второй")
     lines = _strip(sl.render({"cwd": str(folder)}, store, with_claude=False)).splitlines()
-    assert lines[2] == "очередь  ждёт 0  ·  идёт 2  ·  слоты 1/3   ▶ поправить импорт"
+    assert lines[2].endswith("(+1 план.)")
     monkeypatch.setattr(sl.SingleInstance, "holder_pid", lambda self: None)
     assert _strip(sl.render({"cwd": str(folder)}, store, with_claude=False)).splitlines()[0].endswith("демон ✗")
 
@@ -96,14 +99,14 @@ def test_render_truncates_long_title_and_marks_pending_phase(store, tmp_path, mo
     assert line == f"работа   #{job.id} #{job.id} …  Очень длинное название работы, которое…"
 
 
-def test_render_without_job_or_queue(store, tmp_path, monkeypatch):
+def test_render_without_job_or_plan(store, tmp_path, monkeypatch):
     folder = tmp_path / "pet"
     folder.mkdir()
     ws = workspaces.create(store, "pet")
     workspaces.add_path(store, ws, folder)
     monkeypatch.setattr(sl.SingleInstance, "holder_pid", lambda self: None)
     lines = _strip(sl.render({"cwd": str(folder)}, store, with_claude=False)).splitlines()
-    assert lines[1] == "работа   нет активной" and lines[2] == "очередь  пусто"
+    assert lines[1] == "работа   нет активной" and lines[2] == "план     нет"
 
 
 def test_run_previous_passes_stdin_and_survives_failures():

@@ -134,22 +134,29 @@ def _job_line(store: "Store") -> str:
     return label + body
 
 
-def _queue_line(store: "Store") -> str:
-    """Очередь: счётчики и текст пункта, который сейчас в основном потоке."""
-    label = _dim("очередь  ")
-    summary = store.queue_counts()
-    c = summary["counts"]
-    if not c["queued"] and not c["running"]:
-        return label + _dim("пусто")
-    bits = [f"ждёт {c['queued']}", f"идёт {c['running']}"]
-    if summary["slots_busy"]:
-        bits.append(f"слоты {summary['slots_busy']}/{summary['slots']}")
-    line = label + _c("35", "  ·  ".join(bits))
-    current = summary.get("main_running")
-    if current:
-        item = store.queue_get(current)
-        if item is not None:
-            line += _dim("   ▶ ") + _shorten(item.text, TITLE_MAX)
+def _plan_line(store: "Store") -> str:
+    """План: тот, что в фокусе (иначе первый активный) — x/y, что идёт и что ждёт тебя; про
+    остальные активные — их число."""
+    from . import plans
+
+    label = _dim("план     ")
+    try:
+        active = plans.list_plans(store, "active")
+    except Exception:  # noqa: BLE001 — строка статуса не падает
+        return label + _dim("—")
+    if not active:
+        return label + _dim("нет")
+    row = plans.now(store, active[0].key)["plans"][0]
+    bits = [f"{row['plan']} · {row['done']}/{row['total']}"]
+    if row["doing"]:
+        bits.append("идёт: " + _shorten(row["doing"][0]["title"], 40)
+                    + (f" +{len(row['doing']) - 1}" if len(row["doing"]) > 1 else ""))
+    waiting = sum(len(plans.now(store, p.key)["plans"][0]["owner"]) for p in active)
+    line = label + _c("36", "  ·  ".join(bits))
+    if waiting:
+        line += "  ·  " + _c("33", f"ждёт тебя: {waiting}")
+    if len(active) > 1:
+        line += _dim(f"   (+{len(active) - 1} план.)")
     return line
 
 
@@ -192,7 +199,7 @@ def jwu_lines(store: "Store", cwd: str) -> list[str]:
     store.use_workspace(ws.id)
     head = (_dim("jwu      ") + _c("1;34", ws.name or ws.slug) + _dim(f" ({ws.provider})")
             + _dim("   ·   ") + _daemon_part(store) + _disk_part(store, ws.id))
-    return [head, _job_line(store), _queue_line(store)]
+    return [head, _job_line(store), _plan_line(store)]
 
 
 WORKERS_SHOWN = 5

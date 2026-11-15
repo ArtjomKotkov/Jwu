@@ -19,7 +19,6 @@ from pathlib import Path
 # Ожидаемые скиллы (для проверок/тестов; фактически ставится всё, что лежит в пакете).
 EXPECTED_SKILLS = {
     "jwu-start-job",
-    "jwu-queue",
     "jwu-continue-job",
     "jwu-close-job",
     "jwu-todo",
@@ -65,6 +64,7 @@ RETIRED_SKILLS = {
     "build-failure",     # → jwu-build-failure
     "jwu-analyze-day",       # → доска /jwu-todo (двигать дальше, буксует, ответить, закрыть работу)
     "jwu-post-analyze-day",  # → jwu-track-time (план без записи — «покажи, что затрекал бы»)
+    "jwu-queue",         # 3.3.0: очередь убрана — её заменили планы (jwu_plan*)
 }
 
 # Ожидаемые субагенты — дефолтные ревьюеры/исполнители jwu.

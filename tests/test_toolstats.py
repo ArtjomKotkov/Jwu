@@ -96,3 +96,10 @@ def test_clear(store):
     _rec("jwu_task")
     toolstats.flush(store)
     assert toolstats.clear(store) == 1 and toolstats.report(store)["calls"] == 0
+
+
+def test_flush_now_does_not_open_db_when_empty():
+    opened = []
+    toolstats._buffer.clear()
+    toolstats.flush_now(lambda: opened.append(1))
+    assert opened == []

@@ -599,6 +599,7 @@ def test_migration_numbers_existing_jobs_and_references(tmp_path):
                        " VALUES ('', ?, 'active', 'x', 'x', ?)", (f"w{ws}", ws))
     s.conn.execute("UPDATE jobs SET num = NULL")
     uid3 = s.conn.execute("SELECT MAX(id) FROM jobs").fetchone()[0]
+    s.conn.executescript(store_mod.QUEUE_SCHEMA)          # в базе v13 очередь ещё была
     s.conn.execute("INSERT INTO queue_items (workspace_id, text, mode, status, position, job_id, created_at)"
                    " VALUES (?, 't', 'main', 'pending', 1, ?, 'x')", (work, uid3))
     import json as _json
@@ -612,7 +613,7 @@ def test_migration_numbers_existing_jobs_and_references(tmp_path):
     s = Store(db)
     rows = s.conn.execute("SELECT workspace_id, num FROM jobs ORDER BY id").fetchall()
     assert [tuple(r) for r in rows] == [(work, 1), (home, 1), (work, 2)]
-    assert s.conn.execute("SELECT job_id FROM queue_items").fetchone()[0] == 2
+    assert not s.conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'queue_items'").fetchone()  # v16: убрана
     assert _json.loads(s.get_meta(f"w{work}:duty:questions_v2"))["items"][0]["job_id"] == 2
     assert _json.loads(s.get_meta("worker:A"))["jobs"] == [2]
     assert s.get_meta(f"w{work}:todo:board:sess") is None

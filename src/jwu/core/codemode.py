@@ -62,7 +62,6 @@ API: list[Method] = [
     Method("plans", "jwu_plan"),
     Method("plan_now", "jwu_plan_now"),
     Method("plan_next", "jwu_plan_next"),
-    Method("queue", "jwu_queue"),
     Method("workers", "jwu_worker_list"),
     Method("worklogs", "jwu_worklogs"),
     Method("confluence_search", "jwu_confluence_search"),
