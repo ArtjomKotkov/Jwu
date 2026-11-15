@@ -1798,6 +1798,158 @@ async def jwu_jobs(
     return [j.model_dump() if full else job_brief(j) for j in jobs]
 
 
+# --------------------------------------------------------------------------- #
+# Планы (core.plans): дерево шагов с зависимостями, ожиданиями и доказательствами
+# --------------------------------------------------------------------------- #
+
+
+def _plans():
+    from .core import plans
+
+    return plans
+
+
+def _plan_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except _plans().PlanError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+@mcp.tool()
+async def jwu_plan(key: Optional[str] = None, workspace: Optional[str] = None) -> dict:
+    """План целиком (key = PLAN-3): дерево шагов с состояниями, кто делает, где лежит, чем
+    проверено, чего ждёт; правила плана и последние события. Поле markdown — готовая сводка,
+    выводи её как есть. Без key — список планов воркспейса (ключ, заголовок, статус, x/y)."""
+    plans = _plans()
+    store = _store_only(workspace)
+    if key:
+        return _stamp(_plan_call(plans.view, store, key), _resolve(workspace))
+    rows = []
+    for p in plans.list_plans(store):
+        done, total = plans._counts(store, p, plans.steps(store, p))
+        rows.append({**p.to_dict(), "done": done, "total": total})
+    return _stamp({"plans": rows}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_plan_now(key: Optional[str] = None, workspace: Optional[str] = None) -> dict:
+    """Ответ на «чо там / что по плану / что дальше»: по каждому активному плану (или по key) —
+    что идёт, что ждёт владельца, что стоит и почему, что можно брать. markdown — как есть."""
+    store = _store_only(workspace)
+    return _stamp(_plan_call(_plans().now, store, key), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_plan_next(plan: Optional[str] = None, slots: int = 3, workspace: Optional[str] = None) -> dict:
+    """Какие шаги можно брать прямо сейчас: открыты, ничего не ждут (зависимости сделаны,
+    ожидания сняты), не владельцу, без открытых подшагов, файлы не пересекаются с идущими.
+    Есть план в фокусе — без plan только из него. slots — сколько вернуть."""
+    store = _store_only(workspace)
+    return _stamp({"next": _plan_call(_plans().next_steps, store, plan, slots)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_plan_create(title: str, goal: str = "", rules: Optional[list[str]] = None,
+                          needs: Optional[list[str]] = None, priority: int = 0, focus: bool = False,
+                          workspace: Optional[str] = None) -> dict:
+    """Новый план воркспейса (локальная запись). goal — цель одной фразой; rules — правила
+    владельца для всех шагов («агенты на opus»); needs — какие доказательства нужны для
+    «готово» любого шага (tests, build, stand, browser, screenshot, review, owner; code =
+    tests|build, ui = browser|screenshot); focus — план в фокусе, остальные ждут."""
+    store = _store_only(workspace)
+    plan = _plan_call(_plans().create_plan, store, title, goal, rules=rules, needs=needs, priority=priority,
+                      focus=focus, by=_SESSION_NAME)
+    return _stamp(plan.to_dict(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_plan_edit(plan: str, title: Optional[str] = None, goal: Optional[str] = None,
+                        status: Optional[str] = None, priority: Optional[int] = None,
+                        focus: Optional[bool] = None, rules: Optional[list[str]] = None,
+                        needs: Optional[list[str]] = None, workspace: Optional[str] = None) -> dict:
+    """Изменить план: заголовок, цель, статус (active | paused | done | dropped), приоритет,
+    фокус, правила, needs. Переданное заменяет прежнее целиком."""
+    store = _store_only(workspace)
+    p = _plan_call(_plans().edit_plan, store, plan, title=title, goal=goal, status=status, priority=priority,
+                   focus=focus, rules=rules, needs=needs, by=_SESSION_NAME)
+    return _stamp(p.to_dict(), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_plan_step_add(plan: str, title: str, detail: str = "", key: str = "", parent: str = "",
+                            after: Optional[list[str]] = None, waits: Optional[list[dict]] = None,
+                            together_with: Optional[list[str]] = None, executor: str = "main",
+                            model: str = "", est: str = "", needs: Optional[list[str]] = None,
+                            workspace: Optional[str] = None) -> dict:
+    """Шаг плана. detail — что сделать, самодостаточно для агента. key — свой ключ («4а»;
+    пусто — следующий номер). parent — подшаг чего. after — шаги, которые должны быть
+    сделаны раньше («4б» или «PLAN-2/5» из другого плана; круг — отказ). waits — чего ещё
+    ждёт: [{kind: question|owner|external|resource, text}]. together_with — вливать вместе.
+    executor — main | owner | agent:<имя>. needs — доказательства для «готово» этого шага."""
+    plans = _plans()
+    store = _store_only(workspace)
+    st = _plan_call(plans.add_step, store, plan, title, detail=detail, key=key, parent=parent, after=after,
+                    waits=waits, together_with=together_with, executor=executor, model=model, est=est,
+                    needs=needs, by=_SESSION_NAME)
+    p = plans.get_plan(store, plan)
+    return _stamp(plans.step_dict(store, p, st), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_plan_step(
+    step: str,
+    status: Optional[str] = None,
+    evidence: Optional[list[dict]] = None,
+    links: Optional[dict] = None,
+    leftovers: Optional[list[str]] = None,
+    where: Optional[str] = None,
+    add_after: Optional[list[str]] = None,
+    remove_after: Optional[list[str]] = None,
+    add_waits: Optional[list[dict]] = None,
+    resolve_waits: Optional[list[int]] = None,
+    executor: Optional[str] = None,
+    title: Optional[str] = None,
+    detail: Optional[str] = None,
+    est: Optional[str] = None,
+    spent: Optional[str] = None,
+    force: bool = False,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Шаг плана: прочитать (только step) или изменить — с проверкой правил jwu.
+
+    step — «PLAN-3/4а». status: todo | doing | review | done | dropped (blocked и
+    waiting_owner jwu вычисляет сам). Правила: в doing — когда всё из after сделано и
+    ожидания сняты; в done — только с доказательством (evidence: [{kind, text, ref}], kind —
+    tests | build | stand | browser | screenshot | review | owner; ref — абсолютный путь к
+    файлу, коммит, job:<id> с записью test-pass или http-ссылка; проверяется) и с пустым
+    leftovers (остаток — сначала новыми шагами). links — {jobs: [id], commits, files, issue,
+    worktree, migrations}: работы шага, файлы (по ним jwu_plan_next разводит параллельные
+    шаги). where — none | branch | main | stand | prod. Откат сделанного шага, на котором
+    уже строят, — только force=True. В ответе freed — шаги, которые освободились."""
+    plans = _plans()
+    store = _store_only(workspace)
+    changing = any(v is not None for v in (status, evidence, links, leftovers, where, add_after, remove_after,
+                                           add_waits, resolve_waits, executor, title, detail, est, spent))
+    if not changing:
+        p, st = _plan_call(plans.get_step, store, step)
+        data = plans.step_dict(store, p, st)
+        data["rules"] = p.rules
+        data["events"] = plans.events(store, p, step=st, limit=10)
+        return _stamp(data, _resolve(workspace))
+    res = _plan_call(plans.update_step, store, step, status=status, evidence=evidence, links=links,
+                     leftovers=leftovers, where=where, add_after=add_after, remove_after=remove_after,
+                     add_waits=add_waits, resolve_waits=resolve_waits, executor=executor, title=title,
+                     detail=detail, est=est, spent=spent, force=force, by=_SESSION_NAME)
+    data = plans.step_dict(store, res.plan, res.step)
+    data["freed"] = res.freed
+    if res.hanging:
+        data["hanging"] = res.hanging
+        data["note"] = ("на отменённом шаге держатся " + ", ".join(res.hanging)
+                        + " — спроси владельца: снять зависимость (remove_after) или отменить и их")
+    return _stamp(data, _resolve(workspace))
+
+
 def _tool(name: str):
     """MCP-инструмент по имени — для Code Mode (core.codemode зовёт те же функции)."""
     return globals()[name]
@@ -2298,14 +2450,23 @@ async def jwu_job_start(
     task_key: str = "",
     title: str = "",
     feature: Optional[str] = None,
+    step: str = "",
     workspace: Optional[str] = None,
 ) -> dict:
     """Начать НОВУЮ работу (job). Возвращает созданную работу + список уже существующих
     работ по тому же якорю (их не продолжаем — всегда новый цикл = новая работа).
 
     Якорь: ключ задачи Jira (task_key) ЛИБО локальная фича (feature — id или ключ).
-    Без обоих работа заводится без якоря — тогда обязателен title."""
+    Без обоих работа заводится без якоря — тогда обязателен title. step — шаг плана
+    («PLAN-3/4а»), который делает эта работа: работа привяжется к нему (plan_step в ответе)."""
     store = _store_only(workspace)
+    if step:
+        from .core import plans as plans_mod
+
+        try:
+            plans_mod.get_step(store, step)
+        except plans_mod.PlanError as exc:
+            raise ValueError(str(exc)) from exc
     if task_key and feature:
         raise ValueError("Нужно что-то одно: task_key ИЛИ feature")
     feature_row = None
@@ -2328,6 +2489,9 @@ async def jwu_job_start(
     ]
     # Контекст проекта приезжает ровно в момент старта работы: даже если скилл пропустил
     # шаг с jwu_workspace_current, папки с тегами и правила окажутся в контексте ДО правок.
+    if step:
+        plans_mod.link_job(store, step, job.id, by=_SESSION_NAME)
+        payload["plan_step"] = step
     payload.update(store.workspace_context())
     return _with_version(_stamp(payload, _resolve(workspace)))
 

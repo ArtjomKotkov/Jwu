@@ -52,6 +52,8 @@ class Handoff:
     workspace: str = ""
     # мои открытые PR по той же задаче, о которых работа не знает (правки в двух ветках)
     unlinked_prs: list[str] = field(default_factory=list)
+    # шаги планов, которые делает эта работа (core.plans): [{step, title, status, plan, detail, rules}]
+    plan_steps: list[dict] = field(default_factory=list)
 
 
 def _last_git_state(records: list[JobRecord]) -> tuple[str, str]:
@@ -154,6 +156,16 @@ def collect(store: "Store", job: Job, *, svc: "Optional[Service]" = None,
             if job.task_key in (pr.title or "") or job.task_key in (pr.source_branch or ""):
                 if (pr.project, pr.repository, pr.id) not in linked:
                     out.unlinked_prs.append(f"{pr.project}/{pr.repository}#{pr.id} ({pr.source_branch})")
+    try:
+        from . import plans
+
+        for item in plans.steps_for_job(store, job.id):
+            plan, step = plans.get_step(store, item["step"])
+            out.plan_steps.append({**item, "detail": step.detail, "rules": plan.rules,
+                                   "waiting_for": plans.blockers(store, step, plan),
+                                   "needs": list(dict.fromkeys(plan.needs + step.needs))})
+    except Exception:  # noqa: BLE001 — без планов передача всё равно полезна
+        pass
     return out
 
 
@@ -261,6 +273,20 @@ def render(h: Handoff) -> str:
         L.append("Правки по задаче лежат в нескольких ветках. Уточни у пользователя, какие из них "
                  "часть этой работы, и привяжи их (`jwu_job_link`), иначе изменения в одной ветке "
                  "потеряются для другой.")
+
+    for ps in h.plan_steps:
+        L.append("")
+        L.append(f"## Шаг плана {ps['step']} — {ps['title']} ({ps['status']})")
+        L.append(f"План: {ps['plan']}")
+        if ps.get("detail"):
+            L.append(ps["detail"])
+        if ps.get("rules"):
+            L.append("Правила плана: " + "; ".join(ps["rules"]))
+        if ps.get("waiting_for"):
+            L.append("Ждёт: " + "; ".join(ps["waiting_for"]))
+        L.append("«Готово» — `jwu_plan_step(step, status=\"done\", evidence=[…])`"
+                 + (f", нужны доказательства: {', '.join(ps['needs'])}" if ps.get("needs") else "")
+                 + "; невыполненное — в leftovers, не молча.")
 
     # задача
     L.append("")

@@ -3204,6 +3204,173 @@ def _size_human(n: int) -> str:
     return f"{n} Б"
 
 
+plan_app = typer.Typer(help="Планы: шаги с зависимостями, доказательствами и ожиданиями.", no_args_is_help=True)
+app.add_typer(plan_app, name="plan")
+
+
+def _plan_run(fn, *args, **kwargs):
+    from ..core import plans
+
+    try:
+        return fn(*args, **kwargs)
+    except plans.PlanError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
+@plan_app.command("list")
+def plan_list(as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Планы воркспейса."""
+    from ..core import plans
+
+    with _store() as store:
+        rows = []
+        for p in plans.list_plans(store):
+            done, total = plans._counts(store, p, plans.steps(store, p))
+            rows.append({**p.to_dict(), "done": done, "total": total})
+    if as_json:
+        _emit_json(rows)
+        return
+    if not rows:
+        console.print("[dim]Планов нет: jwu plan create «заголовок».[/dim]")
+    for r in rows:
+        star = " ⭐" if r["focus"] else ""
+        console.print(f"{r['key']} [{r['status']}] {r['title']} — {r['done']}/{r['total']}{star}", highlight=False)
+
+
+@plan_app.command("show")
+def plan_show(key: str = typer.Argument(..., help="PLAN-3."),
+              as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """План целиком: дерево шагов, правила, последние события."""
+    from rich.markdown import Markdown
+
+    from ..core import plans
+
+    with _store() as store:
+        data = _plan_run(plans.view, store, key)
+    if as_json:
+        _emit_json(data)
+    else:
+        console.print(Markdown(data["markdown"]))
+
+
+@plan_app.command("now")
+def plan_now(key: Optional[str] = typer.Argument(None, help="PLAN-3; без него — все активные."),
+             as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Что идёт, что ждёт тебя, что стоит и почему, что можно брать."""
+    from rich.markdown import Markdown
+
+    from ..core import plans
+
+    with _store() as store:
+        data = _plan_run(plans.now, store, key)
+    if as_json:
+        _emit_json(data)
+    else:
+        console.print(Markdown(data["markdown"]))
+
+
+@plan_app.command("next")
+def plan_next(key: Optional[str] = typer.Argument(None, help="PLAN-3."),
+              slots: int = typer.Option(3, "--slots", "-n", help="Сколько шагов."),
+              as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Какие шаги можно брать прямо сейчас."""
+    from ..core import plans
+
+    with _store() as store:
+        rows = _plan_run(plans.next_steps, store, key, slots)
+    if as_json:
+        _emit_json(rows)
+        return
+    for r in rows:
+        console.print(f"{r['step']} {r['title']} [dim]({r['executor']})[/dim]", highlight=False)
+    if not rows:
+        console.print("[dim]Брать нечего: всё идёт, ждёт или сделано.[/dim]")
+
+
+@plan_app.command("create")
+def plan_create(title: str = typer.Argument(..., help="Заголовок."),
+                goal: str = typer.Option("", "--goal", "-g", help="Цель одной фразой."),
+                rule: list[str] = typer.Option([], "--rule", "-r", help="Правило для всех шагов."),
+                need: list[str] = typer.Option([], "--need", help="Доказательство для «готово»: tests, code, ui …"),
+                focus: bool = typer.Option(False, "--focus", help="План в фокусе.")) -> None:
+    """Новый план."""
+    from ..core import plans
+
+    with _store() as store:
+        p = _plan_run(plans.create_plan, store, title, goal, rules=rule, needs=need, focus=focus, by="cli")
+    console.print(f"Создан {p.key}: {p.title}")
+
+
+@plan_app.command("edit")
+def plan_edit(key: str = typer.Argument(..., help="PLAN-3."),
+              status: Optional[str] = typer.Option(None, "--status", help="active | paused | done | dropped."),
+              focus: Optional[bool] = typer.Option(None, "--focus/--no-focus", help="В фокусе."),
+              priority: Optional[int] = typer.Option(None, "--priority", help="Приоритет."),
+              title: Optional[str] = typer.Option(None, "--title"), goal: Optional[str] = typer.Option(None, "--goal")) -> None:
+    """Изменить план."""
+    from ..core import plans
+
+    with _store() as store:
+        p = _plan_run(plans.edit_plan, store, key, status=status, focus=focus, priority=priority, title=title,
+                      goal=goal, by="cli")
+    console.print(f"{p.key}: {p.status}{' ⭐' if p.focus else ''} — {p.title}")
+
+
+@plan_app.command("add")
+def plan_add(plan: str = typer.Argument(..., help="PLAN-3."), title: str = typer.Argument(..., help="Шаг."),
+             detail: str = typer.Option("", "--detail", "-d", help="Что сделать."),
+             key: str = typer.Option("", "--key", "-k", help="Свой ключ шага (4а)."),
+             parent: str = typer.Option("", "--parent", help="Подшаг чего."),
+             after: list[str] = typer.Option([], "--after", "-a", help="После какого шага (4б, PLAN-2/5)."),
+             executor: str = typer.Option("main", "--executor", "-e", help="main | owner | agent:<имя>."),
+             need: list[str] = typer.Option([], "--need", help="Доказательство для «готово».")) -> None:
+    """Добавить шаг."""
+    from ..core import plans
+
+    with _store() as store:
+        st = _plan_run(plans.add_step, store, plan, title, detail=detail, key=key, parent=parent, after=after,
+                       executor=executor, needs=need, by="cli")
+    console.print(f"Шаг {plan.upper()}/{st.key}: {st.title}")
+
+
+@plan_app.command("step")
+def plan_step(step: str = typer.Argument(..., help="PLAN-3/4а."),
+              status: Optional[str] = typer.Option(None, "--status", "-s", help="todo | doing | review | done | dropped."),
+              evidence: list[str] = typer.Option([], "--evidence", help="вид:текст[@ссылка], напр. tests:pytest ok@job:61"),
+              job: list[int] = typer.Option([], "--job", "-j", help="Привязать работу."),
+              where: Optional[str] = typer.Option(None, "--where", help="none | branch | main | stand | prod."),
+              force: bool = typer.Option(False, "--force", help="Откат сделанного, на котором строят."),
+              as_json: bool = typer.Option(False, "--json", help="Вывести JSON.")) -> None:
+    """Показать или изменить шаг (с проверкой правил плана)."""
+    from ..core import plans
+
+    evs = []
+    for item in evidence:
+        kind, _, rest = item.partition(":")
+        text, _, ref = rest.partition("@")
+        evs.append({"kind": kind.strip(), "text": text.strip(), "ref": ref.strip()})
+    with _store() as store:
+        if status is None and not evs and not job and where is None:
+            p, st = _plan_run(plans.get_step, store, step)
+        else:
+            res = _plan_run(plans.update_step, store, step, status=status, evidence=evs or None,
+                            links={"jobs": job} if job else None, where=where, force=force, by="cli")
+            p, st = res.plan, res.step
+            if res.freed:
+                console.print("Освободилось: " + ", ".join(res.freed))
+            if res.hanging:
+                console.print("[yellow]На отменённом шаге держатся: " + ", ".join(res.hanging) + "[/yellow]")
+        data = plans.step_dict(store, p, st)
+    if as_json:
+        _emit_json(data)
+        return
+    console.print(f"{data['step']} [{data['state']}] {data['title']}", highlight=False)
+    for k in ("detail", "waiting_for", "after", "evidence", "links", "where", "leftovers"):
+        if data.get(k) and data[k] != "none":
+            console.print(f"  {k}: {data[k]}", highlight=False)
+
+
 stats_app = typer.Typer(help="Метрики: как агент пользуется инструментами jwu.", no_args_is_help=True)
 app.add_typer(stats_app, name="stats")
 
