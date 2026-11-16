@@ -6055,6 +6055,7 @@ def review_history(
 @review_app.command("misses")
 def review_misses(
     days: int = typer.Option(30, "--days", help="За сколько дней."),
+    examples: int = typer.Option(3, "--examples", help="Примеров на категорию."),
     json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
 ) -> None:
     """Пропуски нашего ревью: что нашло внешнее ревью, а наше на том же коде — нет, по категориям."""
@@ -6064,7 +6065,7 @@ def review_misses(
 
     store, _ws = _store_and_ws()
     with store:
-        rep = reviewhist.misses(store, days)
+        rep = reviewhist.misses(store, days, examples=examples)
     if json_out:
         _emit_json(rep)
         return

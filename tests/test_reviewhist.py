@@ -235,3 +235,19 @@ def test_manual_link_survives_relink(store):
     rh.link(store, b, a)
     rh.add_round(store, PR, side="local", label="a", ts="2026-01-03T10:00:00+00:00", findings=[{"text": "x y z"}])
     assert store.conn.execute("SELECT same_as FROM review_findings WHERE id = ?", (b,)).fetchone()["same_as"] == a
+
+
+@pytest.mark.parametrize("text, file, expected", [
+    ("Названия quick reply обрезаются до 20 символов без проверки уникальности", "gate/api.py", "логика и баги"),
+    ("Стандартный postback без `postback.mid` показывается как неподдерживаемое", "gate/hook.py", "логика и баги"),
+    ("Две добавленные строки превышают установленную ширину 160 символов.", "README.md", "длина строк и форматирование"),
+    ("В новом тесте используется запрещённый реальный домен `example.org`", "app/tests/test_x.py", "правила проекта"),
+    ("Чтение внутренних логов открыто без авторизации.", "nginx/conf.d/main.conf", "безопасность"),
+    ("docstring обещает устойчивость, а типы не проверяются", "app/serializers.py", "документация"),
+    ("ассерт проверяет не то", "app/tests/test_views.py", "тесты"),
+    ("Лишний запрос посетителя на каждый вебхук.", "gate/hook.py", "производительность"),
+    ("имя `stored` ничего не говорит о содержимом", "gate/hook.py", "нейминг"),
+    ("гонка при записи счётчика", "", "конкурентность"),
+])
+def test_category(text, file, expected):
+    assert rh.category(text, file) == expected
