@@ -1543,6 +1543,11 @@ async def jwu_pr_create(
         description = description or job_body
     pull = svc.pr_create(project, repo, source=branch, target=target, title=title,
                          description=description, reviewers=list(reviewers or []))
+    if from_job is not None:   # PR из работы — сразу к ней: её круги ревью попадут в историю PR
+        try:
+            svc.store.link_job_pr(from_job, pull.id, pull.project, pull.repository)
+        except Exception:  # noqa: BLE001
+            pass
     return _stamp(pull.model_dump(), _resolve(workspace))
 
 

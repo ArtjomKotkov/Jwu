@@ -38,6 +38,7 @@ FATE_RU = {"fixed": "исправлено", "rejected": "отклонено", "o
            "fabricated": "не подтвердилось по коду", "duplicate": "дубль"}
 MAX_CHARS = 5000
 MATCH_MIN = 0.4
+MATCH_SAME_SOURCE = 0.35     # тот же ревьюер в другом круге — повтор той же темы сводится охотнее
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS review_rounds (
@@ -152,10 +153,11 @@ def _tokens(text: str, file: str = "") -> tuple:
     return words(text), identifiers(text), PurePosixPath(file).name if file else ""
 
 
-def _sim(a: tuple, b: tuple) -> float:
+def _sim(a: tuple, b: tuple, same_source: bool = False) -> float:
+    """Похожесть по токенам. Разные файлы — не запрет (ревьюер в другом круге часто называет
+    соседний файл той же цепочки), но нужно сильное совпадение слов: у того же ревьюера — от
+    половины, у разных — почти всё."""
     (wa, ia, fa), (wb, ib, fb) = a, b
-    if fa and fb and fa != fb:
-        return 0.0
     if ia and ib and not ia & ib:
         return 0.0
     common = len(wa & wb)
@@ -164,16 +166,18 @@ def _sim(a: tuple, b: tuple) -> float:
     score = common / min(len(wa), len(wb))
     if common == 2 and score < 0.6:
         return 0.0
+    if fa and fb and fa != fb:
+        return score if score >= (0.5 if same_source else 0.75) else 0.0
     return score + (0.1 if fa and fb else 0.0)
 
 
-def similarity(text_a: str, text_b: str, file_a: str = "", file_b: str = "") -> float:
+def similarity(text_a: str, text_b: str, file_a: str = "", file_b: str = "", same_source: bool = False) -> float:
     """Похожесть двух находок, 0…1+: доля общих слов от меньшего набора.
 
     Разные файлы — не одна находка; есть имена из кода в обоих текстах, но ни одного общего —
     тоже. Меньше двух общих слов — не одна; ровно два — только если это почти все слова короткой.
     """
-    return _sim(_tokens(text_a, file_a), _tokens(text_b, file_b))
+    return _sim(_tokens(text_a, file_a), _tokens(text_b, file_b), same_source)
 
 
 # --------------------------------------------------------------------------- #
@@ -246,10 +250,41 @@ def _findings(store: "Store", pr: PRRef) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _insert_round(store: "Store", pr: PRRef, side: str, label: str, full_pass: bool, commit: str, ts: str,
+                  verdict: str, ref: str, source_key: str) -> int:
+    cur = store.conn.execute(
+        "INSERT INTO review_rounds (workspace_id, project, repo, pr_id, side, label, full_pass, commit_sha, ts,"
+        " verdict, ref, source_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store.workspace_id, pr.project or "", pr.repo or "", pr.pr_id, side, label.strip(), int(full_pass),
+         commit or "", ts, verdict or "", ref or "", source_key or "", _now()))
+    return cur.lastrowid
+
+
+def _retext(store: "Store", rows: list[dict], fresh: list[dict]) -> list[dict]:
+    """Источник переформулировал находку того же уровня в том же месте (файл и строка) — обновить
+    её текст, а не завести вторую; судьба остаётся. → находки, которых в круге действительно нет."""
+    rest = []
+    for item in fresh:
+        text = " ".join(str(item.get("text") or "").split())
+        file, line = item.get("file") or "", item.get("line")
+        if not file:
+            file, line = find_file(text)
+        same = [r for r in rows if file and r["file"] == file and r["line"] == (int(line) if line else None)
+                and r["level"] == level_of(item.get("level") or "minor")]
+        if text and len(same) == 1:
+            store.conn.execute("UPDATE review_findings SET text = ?, words = ? WHERE id = ?",
+                               (text, " ".join(sorted(words(text, file))), same[0]["id"]))
+            rows.remove(same[0])
+        else:
+            rest.append(item)
+    return rest
+
+
 def add_round(store: "Store", pr: PRRef, *, side: str, label: str = "", findings: Iterable[dict] = (),
               commit: str = "", ts: str = "", verdict: str = "", ref: str = "", source_key: str = "",
               full_pass: bool = True, by: str = "") -> dict:
-    """Добавить круг ревью с находками. Повторный ``source_key`` — ничего не делает (импорт идемпотентен).
+    """Добавить круг ревью с находками. Повторный ``source_key`` — дописать в тот же круг только новые
+    находки (импорт идемпотентен; источник мог дописать круг на месте).
 
     findings — [{level, text, file?, line?, anchor?, fate?, reason?, fate_ref?, fate_commit?}];
     file:line без поля берётся из текста. Каждая находка сопоставляется с прошлыми кругами
@@ -259,18 +294,32 @@ def add_round(store: "Store", pr: PRRef, *, side: str, label: str = "", findings
     ensure_schema(store.conn)
     if side not in SIDES:
         raise ReviewError(f"side: {' | '.join(SIDES)}")
+    ts = _ts(ts)
+    existing: set[str] = set()
+    round_id = None
     if source_key:
         row = store.conn.execute("SELECT id FROM review_rounds WHERE workspace_id = ? AND source_key = ?",
                                  (store.workspace_id, source_key)).fetchone()
         if row:
-            return {"round_id": row["id"], "added": 0, "matched": [], "skipped": True}
-    ts = _ts(ts)
-    cur = store.conn.execute(
-        "INSERT INTO review_rounds (workspace_id, project, repo, pr_id, side, label, full_pass, commit_sha, ts,"
-        " verdict, ref, source_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (store.workspace_id, pr.project or "", pr.repo or "", pr.pr_id, side, label.strip(), int(full_pass),
-         commit or "", ts, verdict or "", ref or "", source_key or "", _now()))
-    round_id = cur.lastrowid
+            # Источник дописал круг на месте (бот сначала публикует заготовку, потом правит её):
+            # недостающие находки — в тот же круг; записанные и их судьбы не трогаются.
+            round_id = row["id"]
+            rows = [dict(r) for r in store.conn.execute(
+                "SELECT id, text, level, file, line FROM review_findings WHERE round_id = ?", (round_id,))]
+            existing = {r["text"] for r in rows}
+            fresh = [f for f in findings if " ".join(str(f.get("text") or "").split()) not in existing]
+            fresh = _retext(store, rows, fresh)
+            if not fresh:
+                if store.conn.in_transaction:
+                    store.conn.commit()
+                    relink(store, pr)
+                return {"round_id": round_id, "added": 0, "matched": [], "skipped": True}
+            findings = fresh
+            store.conn.execute("UPDATE review_rounds SET verdict = COALESCE(NULLIF(?, ''), verdict),"
+                               " commit_sha = COALESCE(NULLIF(?, ''), commit_sha) WHERE id = ?",
+                               (verdict or "", commit or "", round_id))
+    if round_id is None:
+        round_id = _insert_round(store, pr, side, label, full_pass, commit, ts, verdict, ref, source_key)
     added, new_ids = 0, []
     for item in findings:
         text = " ".join(str(item.get("text") or "").split())
@@ -313,12 +362,13 @@ def relink(store: "Store", pr: PRRef) -> dict[int, Optional[int]]:
         if row["link_manual"]:
             out[row["id"]] = row["same_as"]
             continue
-        best, best_score = None, MATCH_MIN
+        best, best_score = None, 0.0
         for j in range(i):
             if rows[j]["rid"] == row["rid"]:
                 continue
-            score = _sim(toks[i], toks[j])
-            if score >= best_score:
+            same = (rows[j]["side"], rows[j]["label"]) == (row["side"], row["label"])
+            score = _sim(toks[i], toks[j], same)
+            if score >= (MATCH_SAME_SOURCE if same else MATCH_MIN) and score >= best_score:
                 best, best_score = rows[j]["id"], score
         out[row["id"]] = best
         if best != row["same_as"]:
@@ -389,10 +439,12 @@ def _fid(raw) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def import_job_reviews(store: "Store", pr: PRRef) -> int:
+def import_job_reviews(store: "Store", pr: PRRef, source_branch: str = "") -> int:
     """Записи ``kind=review`` работ, привязанных к PR, → круги ``local`` (по одному на запись).
 
     Берутся только записи с шапкой скилла jwu-job-review («Ревьюер: …»); свободный текст пропускается.
+    Коммит записи берётся, только если её ветка — ветка PR (``source_branch``): запись, сделанная
+    из другой папки, несёт чужой HEAD, и сверка «на том же коде» по нему соврала бы.
     """
     ensure_schema(store.conn)
     added = 0
@@ -406,11 +458,16 @@ def import_job_reviews(store: "Store", pr: PRRef) -> int:
             if parsed["pr"] is not None and parsed["pr"] != pr.pr_id:
                 continue
             iteration = f" · итерация {parsed['iteration']}" if parsed["iteration"] else ""
+            commit = rec.commit if (not source_branch or rec.branch == source_branch) else ""
+            key = f"job_record:{rec.id}"
+            store.conn.execute("UPDATE review_rounds SET commit_sha = ? WHERE workspace_id = ? AND source_key = ?"
+                               " AND commit_sha != ?", (commit, store.workspace_id, key, commit))
             res = add_round(store, pr, side="local", label=parsed["reviewer"],
-                            findings=parsed["findings"], commit=rec.commit, ts=rec.ts,
+                            findings=parsed["findings"], commit=commit, ts=rec.ts,
                             verdict=parsed["verdict"], ref=f"работа #{job.id}{iteration}",
-                            source_key=f"job_record:{rec.id}")
+                            source_key=key)
             added += 0 if res["skipped"] else 1
+    store.conn.commit()
     return added
 
 
@@ -502,7 +559,8 @@ def issues(store: "Store", pr: PRRef) -> tuple[list[Issue], list[dict]]:
         issue = Issue(members=members)
         fated = [m for m in members if m["fate"]]
         if fated:
-            issue.fate_row = max(fated, key=lambda m: m["fate_at"])
+            # действует судьба на звене из самого позднего круга (при равенстве — поставленная позже)
+            issue.fate_row = max(fated, key=lambda m: (m["ts"], m["rid"], m["fate_at"]))
             fate = issue.fate_row["fate"]
             issue.repeats_after = [m for m in members if m["ts"] > issue.fate_row["ts"]
                                    and m["rid"] != issue.fate_row["rid"]]
@@ -654,8 +712,14 @@ def history(store: "Store", pr: PRRef, max_chars: int = MAX_CHARS) -> dict:
     findings = [{"id": i.last["id"], "state": i.state, "level": i.level, "text": i.last["text"],
                  "file": i.last["file"], "line": i.last["line"], "side": i.last["side"],
                  "label": i.last["label"], "times": len(i.members)} for i in found]
+    per_round: dict[int, int] = {}
+    for i in found:
+        for m in i.members:
+            per_round[m["rid"]] = per_round.get(m["rid"], 0) + 1
+    round_rows = [{"id": r["id"], "side": r["side"], "label": r["label"], "ts": r["ts"], "commit": r["commit_sha"],
+                   "verdict": r["verdict"], "ref": r["ref"], "findings": per_round.get(r["id"], 0)} for r in rounds]
     return {"markdown": md, "rounds": len(rounds), "counts": counts, "rejected_repeats": rejected_repeats,
-            "last_external": diff, "compare": cmp, "findings": findings}
+            "last_external": diff, "compare": cmp, "findings": findings, "round_list": round_rows}
 
 
 # --------------------------------------------------------------------------- #
@@ -711,26 +775,28 @@ def round_diff(store: "Store", pr: PRRef, round_id: Optional[int] = None,
 
 
 def compare(store: "Store", pr: PRRef, external_round_id: Optional[int] = None,
-            _cache: Optional[tuple] = None) -> Optional[dict]:
+            _cache: Optional[tuple] = None, local_label: str = "") -> Optional[dict]:
     """Наше ревью против внешнего на том же коде: совпало · только local · только external.
 
-    Внешний круг — последний полный (или указанный); локальные — все полные круги до него на
-    том же коммите, а если коммиты не записаны или не совпали — последний круг каждого нашего
-    ревьюера до него. Только external делится на «по делу» и отклонённое (вне PR, не
-    подтвердилось, отклонено). None — сравнивать не с чем.
+    Внешний круг — последний полный (или указанный); локальные — все наши полные круги на том
+    же коммите (в любое время: код тот же), а если коммиты не записаны или не совпали —
+    последний круг каждого нашего ревьюера до него. Только external делится на «по делу» и отклонённое (вне PR, не
+    подтвердилось, отклонено). local_label — только этот наш ревьюер. None — сравнивать не с чем.
     """
     found, rounds = _cache or issues(store, pr)
     ext = _rounds_of(rounds, "external")
+    mine = [r for r in _rounds_of(rounds, "local") if not local_label or r["label"] == local_label]
     if external_round_id is not None:
         ext = [r for r in ext if r["id"] == external_round_id]
     if not ext:
         return None
     rd = ext[-1]
-    before = [r for r in _rounds_of(rounds, "local") if (r["ts"], r["id"]) <= (rd["ts"], rd["id"])]
-    if not before:
-        return None
+    before = [r for r in mine if (r["ts"], r["id"]) <= (rd["ts"], rd["id"])]
     commit = (rd["commit_sha"] or "")[:10]
-    same_commit = [r for r in before if commit and (r["commit_sha"] or "")[:10] == commit]
+    # тот же код — тот же коммит, когда бы наш круг ни прошёл (deep часто запускают после внешнего)
+    same_commit = [r for r in mine if commit and (r["commit_sha"] or "")[:10] == commit]
+    if not before and not same_commit:
+        return None
     if same_commit:
         local = same_commit
     else:
@@ -744,7 +810,8 @@ def compare(store: "Store", pr: PRRef, external_round_id: Optional[int] = None,
         in_ext = [m for m in issue.members if m["rid"] == rd["id"]]
         # «видел ли наш ревьюер»: звено цепочки в выбранных локальных кругах или раньше них
         in_local = [m for m in issue.members if m["rid"] in local_ids or
-                    (m["side"] == "local" and (m["ts"], m["rid"]) <= (rd["ts"], rd["id"]))]
+                    (m["side"] == "local" and (not local_label or m["label"] == local_label)
+                     and (m["ts"], m["rid"]) <= (rd["ts"], rd["id"]))]
         if in_ext and in_local:
             both.append(in_ext[0]["id"])
         elif in_ext:
@@ -759,6 +826,19 @@ def compare(store: "Store", pr: PRRef, external_round_id: Optional[int] = None,
                       + ("" if same_commit else " (коммиты не сверены — по последним кругам)")
                       + f": совпало {len(both)}, только local {len(only_local)}, только external "
                         f"{len(only_ext)}" + (f" (+{len(ext_rejected)} отклонённых)" if ext_rejected else ""))
+    return out
+
+
+def compare_all(store: "Store", pr: PRRef, local_label: str = "") -> list[dict]:
+    """compare по каждому полному внешнему кругу PR (по порядку) — замена ручных сверок «наше vs внешнее»."""
+    cache = issues(store, pr)
+    out = []
+    for rd in _rounds_of(cache[1], "external"):
+        cmp = compare(store, pr, rd["id"], _cache=cache, local_label=local_label)
+        if cmp:
+            cmp["commit"] = rd["commit_sha"][:10]
+            cmp["ref"] = rd["ref"]
+            out.append(cmp)
     return out
 
 

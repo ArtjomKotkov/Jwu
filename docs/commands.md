@@ -7,7 +7,7 @@
 |---|---|
 | установка | `install [--for claude\|cursor\|both]`, `install-claude-skills`, `doctor`, `addons list\|enable\|disable` ([addons.md](addons.md)), `update [--check]`, `configure [export\|import]`, `auth check`, `statusline [install\|uninstall\|preview]` |
 | проект | `init`, `workspace jobs-dir`, `workspace list\|create\|use\|current\|show\|provider\|add-path\|remove-path\|tag\|paths\|rename\|delete\|migrate\|thresholds`, `rule add\|list\|show\|edit\|rm`, `guide [show\|add\|rm]` |
-| чтение | `todo [номера] [-g simple\|fixes\|todo\|review] [-s сессия]`, `tasks`, `task`, `attachments`, `prs`, `pr [--diff [--numbered]\|--download]`, `video-frames`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze`, `review queue\|agents\|history\|misses` |
+| чтение | `todo [номера] [-g simple\|fixes\|todo\|review] [-s сессия]`, `tasks`, `task`, `attachments`, `prs`, `pr [--diff [--numbered]\|--download]`, `video-frames`, `builds`, `build`, `branches`, `mentions list`, `changes`, `sync`, `action day-analyze`, `review queue\|agents\|history\|compare\|misses` |
 | память | `job start\|add\|link\|status\|done [--summary] [--cleanup]\|reopen\|cancel\|delete\|show\|handoff\|worktree\|push\|ports\|resource\|resources\|cleanup`, `disk`, `sweep [--only] [--force]`, `jobs`, `note`, `notes`, `feature …`, `features`, `plan list\|show\|now\|next\|create\|edit\|add\|step`, `stats tools`, `mentions read\|archive`, `memory export\|import\|sync` |
 | задачи Jira | `issue create\|edit\|link\|transition\|transitions\|attach\|similar\|link-types`, `comment`, `comment-edit`, `comment-delete` |
 | время | `worklog`, `worklog-chain`, `worklog-tz`, `worklog-edit`, `worklog-delete`, `worklogs` |

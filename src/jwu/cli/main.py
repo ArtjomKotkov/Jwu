@@ -6052,6 +6052,30 @@ def review_history(
         err.print(f"[yellow]{out['warning']}[/yellow]")
 
 
+@review_app.command("compare")
+def review_compare(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    project: Optional[str] = typer.Option(None, "--project", help="Проект (по умолчанию из конфига)."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Репозиторий (по умолчанию из конфига)."),
+    local_label: str = typer.Option("", "--local", help="Только этот наш ревьюер (подпись круга)."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Наше ревью против внешнего по каждому внешнему кругу PR: совпало, только наше, только внешнее."""
+    from ..core import reviewhist
+
+    with _service_with_prs() as svc:
+        default_project, default_repo = svc.default_pr_ref()
+        ref = reviewhist.PRRef(pr_id, project or default_project, repo or default_repo)
+        rows = reviewhist.compare_all(svc.store, ref, local_label)
+    if json_out:
+        _emit_json(rows)
+        return
+    if not rows:
+        console.print("[dim]Сравнивать не с чем: нужен внешний полный круг и наш круг до него.[/dim]")
+    for row in rows:
+        console.print(f"• {row['ref'] or row['external']} ({row['commit'] or 'коммит ?'}): {row['summary']}", highlight=False)
+
+
 @review_app.command("misses")
 def review_misses(
     days: int = typer.Option(30, "--days", help="За сколько дней."),

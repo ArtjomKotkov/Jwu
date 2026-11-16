@@ -1587,7 +1587,10 @@ class Service:
 
         default_project, default_repo = self.default_pr_ref()
         ref = reviewhist.PRRef(pr_id, project or default_project, repo or default_repo)
-        reviewhist.import_job_reviews(self.store, ref)
+        source = self._pr_source_branch(ref, online=fetch_comments)
+        if source:
+            self._link_jobs_by_branch([(ref, source)])
+        reviewhist.import_job_reviews(self.store, ref, source)
         warning = ""
         if fetch_comments and self.pr_client is not None:
             try:
@@ -1600,6 +1603,45 @@ class Service:
         if warning:
             out["warning"] = warning
         return out
+
+    def _pr_source_branch(self, ref, *, online: bool) -> str:
+        """Ветка-источник PR: из снапшота синка, иначе (online) — у хостинга."""
+        for pr in self.store.latest_prs():
+            if (pr.id, pr.project, pr.repository) == (ref.pr_id, ref.project, ref.repo) and pr.source_branch:
+                return pr.source_branch
+        if online and self.pr_client is not None:
+            try:
+                return self.pr_client.pr(ref.project, ref.repo, ref.pr_id).source_branch or ""
+            except Exception:  # noqa: BLE001
+                return ""
+        return ""
+
+    def _link_jobs_by_branch(self, prs: list) -> int:
+        """Привязать к PR активные (и отложенные) работы, чья ветка в журнале — ветка PR.
+
+        prs — [(PRRef | PR, source_branch)]. Без привязки работа теряет свои круги ревью в истории PR."""
+        by_branch: dict[str, list] = {}
+        for status in ("active", "paused"):
+            for job in self.store.list_jobs(status=status):
+                branch = next((r.branch for r in reversed(job.records) if r.branch), "")
+                if branch:
+                    by_branch.setdefault(branch, []).append(job)
+        linked = 0
+        for ref, source in prs:
+            if not source or source in ("main", "master", "develop", "dev") or source.startswith("release"):
+                continue   # общие ветки: по ним работы не узнать
+            pr_id = getattr(ref, "pr_id", None) or ref.id
+            project = getattr(ref, "project", "")
+            repo = getattr(ref, "repo", None) or getattr(ref, "repository", "")
+            for job in by_branch.get(source, []):
+                if any((p.pr_id, p.project, p.repo) == (pr_id, project, repo) for p in job.prs):
+                    continue
+                try:
+                    self.store.link_job_pr(job.id, pr_id, project, repo)
+                    linked += 1
+                except Exception:  # noqa: BLE001 — чужая/закрытая работа — мимо
+                    continue
+        return linked
 
     def review_brief(self, project: str, repo: str, pr_id: int) -> "dict | None":
         """История ревью PR коротко (без сети): открыто, повтор отклонённого в последнем внешнем круге."""
@@ -2077,6 +2119,12 @@ class Service:
                 # Счётчики задач на комментах — для состояния «открытые задачи» и дельт.
                 self._fill_tasks(pr)
             self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(ref, [])))
+        # Работы, чья ветка — ветка моего PR, привязать к нему (иначе их круги ревью теряются)
+        try:
+            self._link_jobs_by_branch([(pr, pr.source_branch) for ref, pr in pr_seen.items()
+                                       if "mine" in pr_views.get(ref, set()) and pr.source_branch])
+        except Exception:  # noqa: BLE001
+            pass
         # Новый круг ИИ-ревью и т.п. — в историю ревью PR (только мои PR, только при смене head/статуса)
         self._sync_review_rounds([pr for ref, pr in pr_seen.items() if "mine" in pr_views.get(ref, set())])
         # Подтянуть статус/assignee задач, на которые ссылаются PR — нужно для

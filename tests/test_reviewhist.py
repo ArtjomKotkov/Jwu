@@ -138,7 +138,9 @@ def test_empty_history(store):
 def test_similarity_rules():
     assert rh.similarity("send_contact_message дублирует базовый метод", "_find_quoted дублирует базовый метод") == 0
     assert rh.similarity("get_rate дублирует is_enabled", "`api/x.py:3`: `get_rate` дублирует is_enabled целиком") > 0.4
-    assert rh.similarity("кеш утекает", "кеш утекает", "a/x.py", "b/y.py") == 0          # разные файлы
+    assert rh.similarity("кеш утекает между клиентами сервиса", "кеш пустой после рестарта сервиса",
+                         "a/x.py", "b/y.py") == 0                                     # разные файлы, половина слов
+    assert rh.similarity("кеш утекает между клиентами", "кеш утекает между клиентами", "a/x.py", "b/y.py") > 0.7
     assert rh.similarity("одно слово кеш", "совсем другое про кеш") == 0                    # одно общее слово
 
 
@@ -251,3 +253,70 @@ def test_manual_link_survives_relink(store):
 ])
 def test_category(text, file, expected):
     assert rh.category(text, file) == expected
+
+
+def test_same_source_matches_across_files(store):
+    rh.add_round(store, PR, side="external", label="bot", ts="2026-01-01T10:00:00+00:00", findings=[
+        {"text": "Выключенный отдел остаётся выбранным в селекторах настроек", "file": "app/general.component.ts"}])
+    r = rh.add_round(store, PR, side="external", label="bot", ts="2026-01-02T10:00:00+00:00", findings=[
+        {"text": "Выключенный отдел по-прежнему остаётся выбранным", "file": "app/departments.service.ts"}])
+    assert len(r["matched"]) == 1                       # тот же ревьюер, соседний файл — та же проблема
+    other = rh.add_round(store, PR, side="local", label="deep", ts="2026-01-03T10:00:00+00:00", findings=[
+        {"text": "Выключенный отдел виден в отчёте статистики за месяц", "file": "app/other.ts"}])
+    assert other["matched"] == []                       # другой ревьюер и другой файл — нужно почти всё
+
+
+def test_job_review_commit_only_from_pr_branch(store):
+    job = store.create_job("X-1")
+    store.link_job_pr(job.id, 42, "PROJ", "app")
+    store.add_job_record(job.id, REVIEW_1, kind="review", branch="", commit="mainhead1")
+    store.add_job_record(job.id, REVIEW_2, kind="review", branch="feature/X-1-cache", commit="featcommit")
+    rh.import_job_reviews(store, PR, "feature/X-1-cache")
+    commits = [r["commit_sha"] for r in store.conn.execute("SELECT commit_sha FROM review_rounds ORDER BY ts, id")]
+    assert commits == ["", "featcommit"]
+
+
+def test_rewritten_comment_adds_findings_to_same_round(store):
+    first = rh.add_round(store, PR, side="external", label="bot", source_key="c:1:944", findings=[])
+    again = rh.add_round(store, PR, side="external", label="bot", source_key="c:1:944", verdict="FAILED 0/1/0",
+                         findings=[{"level": "major", "text": "находка после правки коммента"}])
+    assert again["round_id"] == first["round_id"] and again["added"] == 1
+    assert rh.add_round(store, PR, side="external", label="bot", source_key="c:1:944",
+                        findings=[{"text": "находка после правки коммента"}])["skipped"]
+
+
+def test_link_jobs_by_branch(store):
+    from jwu.core.service import Service
+
+    job = store.create_job("X-1")
+    store.add_job_record(job.id, "начал", branch="feature/X-1-cache")
+    dev = store.create_job("X-2")
+    store.add_job_record(dev.id, "в develop", branch="develop")
+    svc = Service.__new__(Service)
+    svc.store = store
+    assert svc._link_jobs_by_branch([(PR, "feature/X-1-cache"), (rh.PRRef(43, "PROJ", "app"), "develop")]) == 1
+    assert svc._link_jobs_by_branch([(PR, "feature/X-1-cache")]) == 0
+    assert [j.id for j in store.jobs_for_pr(42, "PROJ", "app")] == [job.id]
+
+
+def test_reworded_finding_updates_text_keeps_fate(store):
+    r = rh.add_round(store, PR, side="external", label="bot", source_key="c:2:10",
+                     findings=[{"level": "minor", "text": "`app/x.py:5`", "file": "app/x.py", "line": 5}])
+    [fid] = _ids(store, r["round_id"])
+    rh.set_fate(store, [fid], "fixed", commit="abc")
+    again = rh.add_round(store, PR, side="external", label="bot", source_key="c:2:10", findings=[
+        {"level": "minor", "text": "хост вне списка разрешённых — `app/x.py:5`", "file": "app/x.py", "line": 5}])
+    assert again["skipped"] and _ids(store, r["round_id"]) == [fid]
+    row = store.conn.execute("SELECT text, fate FROM review_findings WHERE id = ?", (fid,)).fetchone()
+    assert row["text"].startswith("хост вне списка") and row["fate"] == "fixed"
+
+
+def test_fate_on_latest_round_wins(store):
+    a = rh.add_round(store, PR, side="external", label="bot", ts="2026-01-01T10:00:00+00:00",
+                     findings=[{"text": "недостаточный контраст текста в светлой теме"}])
+    b = rh.add_round(store, PR, side="external", label="bot", ts="2026-01-02T10:00:00+00:00",
+                     findings=[{"text": "контраст текста в светлой теме недостаточный"}])
+    rh.set_fate(store, _ids(store, b["round_id"]), "fixed", commit="c2")
+    rh.set_fate(store, _ids(store, a["round_id"]), "fixed", commit="c1")    # позже по времени, но на раннем круге
+    found, _ = rh.issues(store, PR)
+    assert len(found) == 1 and found[0].state == "fixed"
