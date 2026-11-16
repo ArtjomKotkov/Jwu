@@ -191,6 +191,17 @@ BUILD_RED = "сборка красная"
 TESTS_RED = "тесты упали"
 
 
+def _rejected_repeats(store: "Store", pr: "PR") -> int:
+    """Сколько отклонённого снова подняло последнее внешнее ревью PR (история ревью, без сети)."""
+    from . import reviewhist
+
+    try:
+        info = reviewhist.brief(store, reviewhist.PRRef(pr.id, pr.project, pr.repository))
+    except Exception:  # noqa: BLE001
+        return 0
+    return info["repeat_rejected"] if info else 0
+
+
 def tests_red(pr: "PR") -> bool:
     """Автотесты PR (от аддона) упали, а сборка на коммите об этом не говорит."""
     return bool(pr.autotests and pr.autotests.state == "failed") and pr.build_state != "FAILED"
@@ -292,6 +303,9 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
         problems = review + tech
         if pr.autotests and pr.autotests.state not in ("unknown", "failed"):
             problems.append(pr.autotests.summary())     # «тесты не запускали», «в очереди 10 ч» …
+        repeats = _rejected_repeats(store, pr)
+        if repeats:
+            problems.append(f"повтор отклонённого: {repeats}")   # внешнее ревью снова подняло отклонённое
         job = by_pr.get((pr.project, pr.repository, pr.id)) or (by_key.get(key) if key else None)
         items.append(Item(n=0, group=group, key=_pr_ref(pr), title=pr.title, status=issue.status if issue else "",
                           priority=issue.priority if issue else "",

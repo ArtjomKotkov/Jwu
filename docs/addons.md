@@ -84,6 +84,17 @@ session) -> job_id` (работа у пункта заводится, тольк
 вызывает `jwu_pr_autotests_run` только после «да» пользователя. Запросы к REST Bitbucket
 контура — `addon_api.bitbucket_request(cfg, method, path)`, токен аддону не виден.
 
+## История ревью: внешние ревьюеры
+
+Ревью, которое приходит комментом в PR (бот ревью в CI и т.п.), аддон раскладывает на находки —
+хук `pr_review_rounds(cfg, pr, comments) -> list[dict]`. `pr` — `{project, repo, pr_id}`,
+`comments` — комменты PR (`PRComment`). Круг — `{findings: [{level, text, file?, line?}], label?,
+side? (external), commit?, ts?, verdict?, ref?, source_key, full_pass?, comment_ids}`;
+`source_key` — уникален для прогона (повтор не записывается дважды), `comment_ids` — какие
+комменты круг забрал (ядро не примет их за треды людей). Ядро зовёт хук, когда открывают историю
+ревью или `jwu pr`, и в синке — у моих PR, когда сменились head или статус «не тестовой» сборки
+(`builds.not_tests`). Подробнее — [review-history.md](review-history.md).
+
 ## Встроенные аддоны
 
 Часть jwu подключается тем же механизмом и так же выключается:

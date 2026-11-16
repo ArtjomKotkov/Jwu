@@ -718,6 +718,8 @@ async def jwu_pr(
     payload["attachments"] = [a.model_dump() for a in detail.pr.attachments] + [
         a.model_dump() for c in detail.comments for a in c.attachments
     ]
+    # история ревью коротко: открыто, повтор отклонённого в последнем внешнем круге (полная — jwu_pr_review_history)
+    payload["review_history"] = svc.review_brief(detail.pr.project, detail.pr.repository, detail.pr.id)
     return payload
 
 
@@ -1661,6 +1663,9 @@ async def jwu_builds(
     """CI PR: сборки по head-коммиту (build-status Bitbucket либо check-runs GitHub),
     очередь CI и автотесты PR.
 
+    review — история ревью PR коротко (без сети; null — кругов нет): open — открытых проблем,
+    repeat_rejected — сколько отклонённого снова подняло последнее внешнее ревью, last_external —
+    его разбор (новое / повтор / повтор отклонённого / исчезло). Полная — jwu_pr_review_history.
     Ответ: builds (у каждой kind: tests | other — «other» не сборка тестов, напр. ИИ-ревью,
     настройка builds.not_tests), build_state — сводно по сборкам тестов, build_queued — сборка
     ветки стоит в очереди Jenkins, autotests — состояние автотестов PR от аддона (state:
@@ -1696,6 +1701,105 @@ async def jwu_pr_autotests_run(
         raise ValueError("Запуск автотестов — внешнее действие: спроси пользователя и повтори с user_approved=True")
     svc = _builds_svc(workspace)
     return _stamp(svc.run_autotests(project, repo, pr_id, options), _resolve(workspace))
+
+
+def _review_call(fn, *args, **kwargs):
+    from .core.reviewhist import ReviewError
+
+    try:
+        return fn(*args, **kwargs)
+    except ReviewError as exc:
+        raise ValueError(str(exc)) from None
+
+
+@mcp.tool()
+async def jwu_pr_review_history(
+    pr_id: int,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    max_chars: int = 5000,
+    fetch_comments: bool = True,
+    workspace: Optional[str] = None,
+) -> dict:
+    """История ревью PR для нового круга: отклонено и почему · было исправлено, но подняли снова ·
+    открыто · исправлено (проверить регрессию от фикса) · снято без отметки. markdown — как есть.
+
+    Источники: local — наше ревью (записи kind=review в работах по PR), external — внешнее
+    (треды PR на строку кода или с задачами; круги, добавленные jwu_review_add). Одна проблема
+    в разных кругах сведена в одну (F<id> — номер для jwu_review_fate). Звать ПОСЛЕ своего
+    независимого прохода, а не до: иначе ревьюер заякорится на старом. fetch_comments=False —
+    без сети, только локальная история. counts — проблемы по состояниям, rejected_repeats —
+    сколько раз отклонённое поднимали снова.
+    """
+    svc = _full_svc(workspace)
+    return _stamp(_review_call(svc.pr_review_history, project, repo, pr_id, fetch_comments=fetch_comments,
+                               max_chars=max_chars), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_review_add(
+    pr_id: int,
+    findings: list[dict],
+    side: str = "local",
+    label: str = "",
+    commit: str = "",
+    verdict: str = "",
+    ref: str = "",
+    full_pass: bool = True,
+    project: Optional[str] = None,
+    repo: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Записать круг ревью PR в историю (локально, наружу ничего): находки одного прохода одного
+    ревьюера. side — local (наше ревью) | external (всё внешнее); label — подпись как угодно
+    (имя агента, логин, «ревью в CI #898»). findings — [{level: blocker|critical|major|important|
+    minor|info, text: суть одной строкой, file?, line?, anchor? («I1»), fate?, reason?, fate_commit?}].
+    full_pass — ревьюер каждый круг смотрит весь PR (тогда непрозвучавшее в его следующем круге —
+    снято). Записи kind=review в работах по PR попадают в историю сами — их сюда не дублируй.
+    → round_id, added, matched (какие находки сведены с прошлыми кругами: id → same_as)."""
+    from .core import reviewhist
+
+    svc = _full_svc(workspace)
+    default_project, default_repo = svc.default_pr_ref()
+    ref_pr = reviewhist.PRRef(pr_id, project or default_project, repo or default_repo)
+    return _review_call(reviewhist.add_round, svc.store, ref_pr, side=side, label=label, findings=findings,
+                        commit=commit, verdict=verdict, ref=ref, full_pass=full_pass)
+
+
+@mcp.tool()
+async def jwu_review_misses(days: int = 30, workspace: Optional[str] = None) -> dict:
+    """Пропуски нашего ревью за days дней по всем PR воркспейса (без сети): что нашёл внешний
+    ревьюер (люди, ревью в CI), а наш на том же коде — нет, по категориям (документация, нейминг,
+    права и окружение, конкурентность …) с примерами. Отклонённое, «вне PR», «не подтвердилось»
+    не считаются. Для предложения правок в описание агента-ревьюера — только предложение,
+    правит пользователь. markdown — как есть."""
+    from .core import reviewhist
+
+    return _stamp(reviewhist.misses(_store_only(workspace), days), _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_review_fate(
+    finding_ids: list[str],
+    fate: str,
+    reason: str = "",
+    ref: str = "",
+    commit: str = "",
+    same_as: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> dict:
+    """Судьба находок ревью (F<id> из jwu_pr_review_history), локально: fixed (commit — коммит
+    фикса) | rejected | out_of_pr | fabricated (по коду не подтверждается) | duplicate (с same_as)
+    | "" — снять. rejected/out_of_pr/fabricated — только с reason (довод): по нему следующий круг
+    не поднимет это снова. ref — ссылка на ответ в треде или запись журнала. same_as без fate
+    нельзя; чтобы только связать две находки — fate=duplicate.
+    """
+    from .core import reviewhist
+
+    store = _store_only(workspace)
+    ids = _review_call(reviewhist.set_fate, store, finding_ids, fate, reason=reason, ref=ref, commit=commit,
+                       by=_session_name(store), same_as=same_as)
+    return {"updated": [f"F{i}" for i in ids], "fate": fate}
 
 
 @mcp.tool()

@@ -6024,6 +6024,76 @@ def review_agents(
         console.print(f"  {name}: [cyan]{agent}[/cyan]")
 
 
+@review_app.command("history")
+def review_history(
+    pr_id: int = typer.Argument(..., help="Числовой id PR."),
+    project: Optional[str] = typer.Option(None, "--project", help="Проект (по умолчанию из конфига)."),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Репозиторий (по умолчанию из конфига)."),
+    max_chars: int = typer.Option(5000, "--max-chars", help="Предел выжимки, символов."),
+    offline: bool = typer.Option(False, "--offline", help="Без сети: не читать треды PR."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """История ревью PR: отклонено и почему, исправлено (проверить регрессию), открыто."""
+    from rich.markdown import Markdown
+
+    from ..core.reviewhist import ReviewError
+
+    with _service_with_prs() as svc:
+        try:
+            out = svc.pr_review_history(project, repo, pr_id, fetch_comments=not offline, max_chars=max_chars)
+        except ReviewError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    if json_out:
+        _emit_json(out)
+        return
+    console.print(Markdown(out["markdown"]))
+    if out.get("warning"):
+        err.print(f"[yellow]{out['warning']}[/yellow]")
+
+
+@review_app.command("misses")
+def review_misses(
+    days: int = typer.Option(30, "--days", help="За сколько дней."),
+    json_out: bool = typer.Option(False, "--json", help="Вывести JSON."),
+) -> None:
+    """Пропуски нашего ревью: что нашло внешнее ревью, а наше на том же коде — нет, по категориям."""
+    from rich.markdown import Markdown
+
+    from ..core import reviewhist
+
+    store, _ws = _store_and_ws()
+    with store:
+        rep = reviewhist.misses(store, days)
+    if json_out:
+        _emit_json(rep)
+        return
+    console.print(Markdown(rep["markdown"]))
+
+
+@review_app.command("fate")
+def review_fate(
+    ids: list[str] = typer.Argument(..., help="Находки: F12 F13 …"),
+    fate: str = typer.Option(..., "--fate", help="fixed | rejected | out_of_pr | fabricated | duplicate | '' — снять."),
+    reason: str = typer.Option("", "--reason", help="Довод (обязателен для rejected / out_of_pr / fabricated)."),
+    commit: str = typer.Option("", "--commit", help="Коммит фикса."),
+    ref: str = typer.Option("", "--ref", help="Ссылка: ответ в треде, запись журнала."),
+    same_as: Optional[str] = typer.Option(None, "--same-as", help="Для duplicate: находка-оригинал."),
+) -> None:
+    """Судьба находок ревью (локально): исправлено, отклонено, вне PR, не подтвердилось, дубль."""
+    from ..core import reviewhist
+
+    store, _ws = _store_and_ws()
+    with store:
+        try:
+            done = reviewhist.set_fate(store, ids, fate, reason=reason, ref=ref, commit=commit, by="cli",
+                                       same_as=same_as)
+        except reviewhist.ReviewError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+    console.print(f"[green]{', '.join(f'F{i}' for i in done)}[/green] → {fate or 'без судьбы'}")
+
+
 # --------------------------------------------------------------------------- #
 # правка и удаление (JWU-53): только своё, ВНЕШНЯЯ запись — после подтверждения
 # --------------------------------------------------------------------------- #

@@ -49,6 +49,8 @@ API: list[Method] = [
     Method("pr_tasks", "jwu_pr_tasks"),
     Method("pr_people", "jwu_pr_people"),
     Method("review_queue", "jwu_review_queue"),
+    Method("pr_review_history", "jwu_pr_review_history"),
+    Method("review_misses", "jwu_review_misses"),
     Method("builds", "jwu_builds"),
     Method("build", "jwu_build"),
     Method("jobs", "jwu_jobs"),

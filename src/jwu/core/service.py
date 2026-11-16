@@ -1550,6 +1550,92 @@ class Service:
             return found
         return None
 
+    _REVIEW_ROUND_KEYS = ("side", "label", "findings", "commit", "ts", "verdict", "ref", "source_key", "full_pass")
+
+    def _import_review_sources(self, ref, comments: list) -> int:
+        """Комменты PR → круги истории ревью: сначала аддоны (хук ``pr_review_rounds(cfg, pr, comments)``
+        → [круг]; поле ``comment_ids`` — какие комменты круг забрал себе), остальное — треды людей."""
+        from . import addons, reviewhist
+
+        consumed: set[str] = set()
+        added = 0
+        pr = {"project": ref.project, "repo": ref.repo, "pr_id": ref.pr_id}
+        for addon in addons.active():
+            for raw in addon.call("pr_review_rounds", self.cfg, pr, comments) or []:
+                if not isinstance(raw, dict):
+                    continue
+                consumed.update(str(x) for x in raw.get("comment_ids") or [])
+                kwargs = {k: raw[k] for k in self._REVIEW_ROUND_KEYS if k in raw}
+                kwargs.setdefault("side", "external")
+                kwargs.setdefault("label", addon.name)
+                try:
+                    res = reviewhist.add_round(self.store, ref, **kwargs)
+                except (reviewhist.ReviewError, TypeError, ValueError):   # кривой круг аддона — мимо
+                    continue
+                added += 0 if res["skipped"] else 1
+        try:
+            me = self._resolve_username()
+        except Exception:  # noqa: BLE001 — без логина свои треды тоже попадут, это не страшно
+            me = ""
+        rest = [c for c in comments if str(c.id) not in consumed]
+        return added + reviewhist.import_pr_comments(self.store, ref, rest, me)
+
+    def pr_review_history(self, project: str | None, repo: str | None, pr_id: int, *,
+                          fetch_comments: bool = True, max_chars: int = 5000) -> dict:
+        """История ревью PR: дотянуть круги из журналов работ и комментов PR, отдать выжимку."""
+        from . import reviewhist
+
+        default_project, default_repo = self.default_pr_ref()
+        ref = reviewhist.PRRef(pr_id, project or default_project, repo or default_repo)
+        reviewhist.import_job_reviews(self.store, ref)
+        warning = ""
+        if fetch_comments and self.pr_client is not None:
+            try:
+                self._import_review_sources(ref, self.pr_client.pr_comments(ref.project, ref.repo, pr_id))
+            except Exception as exc:  # noqa: BLE001 — треды не достали, история из журналов всё равно есть
+                warning = f"комменты PR не прочитаны: {exc}"
+        out = reviewhist.history(self.store, ref, max_chars=max_chars)
+        out.update(pr_id=pr_id, project=ref.project, repo=ref.repo)
+        if warning:
+            out["warning"] = warning
+        return out
+
+    def review_brief(self, project: str, repo: str, pr_id: int) -> "dict | None":
+        """История ревью PR коротко (без сети): открыто, повтор отклонённого в последнем внешнем круге."""
+        from . import reviewhist
+
+        try:
+            return reviewhist.brief(self.store, reviewhist.PRRef(pr_id, project, repo))
+        except Exception:  # noqa: BLE001 — подсказка, не повод ронять сборки/доску
+            return None
+
+    def _sync_review_rounds(self, prs: list, limit: int = 10) -> None:
+        """В синке: у PR новый head или сменился статус «не тестовой» сборки (ИИ-ревью и т.п.) —
+        дочитать комменты и разложить новые круги ревью. Только если есть аддон с хуком
+        ``pr_review_rounds``: иначе разбирать нечего. Не больше ``limit`` PR за проход."""
+        from . import addons, reviewhist
+
+        if self.pr_client is None or not any(a.has("pr_review_rounds") for a in addons.active()):
+            return
+        done = 0
+        for pr in prs:
+            if done >= limit:
+                break
+            others = [b for b in pr.builds if b.kind == "other" and b.state in ("SUCCESSFUL", "FAILED")]
+            if not (pr.project and pr.repository and pr.latest_commit and others):
+                continue
+            mark = pr.latest_commit + "|" + ",".join(sorted(f"{b.key}:{b.state}:{b.date_added}" for b in others))
+            key = f"review:seen:{pr.project}/{pr.repository}#{pr.id}"
+            if self.store.get_workspace_meta(key) == mark:
+                continue
+            try:
+                ref = reviewhist.PRRef(pr.id, pr.project, pr.repository)
+                self._import_review_sources(ref, self.pr_client.pr_comments(pr.project, pr.repository, pr.id))
+            except Exception:  # noqa: BLE001 — не прочитали сейчас, прочитаем в следующий синк
+                continue
+            self.store.set_workspace_meta(key, mark)
+            done += 1
+
     def run_autotests(self, project: str | None, repo: str | None, pr_id: int, options: dict | None = None) -> dict:
         """Запустить автотесты PR через аддон (хук ``pr_autotests_run(cfg, pr, options)``) — ВНЕШНЯЯ запись."""
         from . import addons
@@ -1990,6 +2076,8 @@ class Service:
                 # Счётчики задач на комментах — для состояния «открытые задачи» и дельт.
                 self._fill_tasks(pr)
             self.store.save_pr_snapshot(run_id, pr, sorted(pr_views.get(ref, [])))
+        # Новый круг ИИ-ревью и т.п. — в историю ревью PR (только мои PR, только при смене head/статуса)
+        self._sync_review_rounds([pr for ref, pr in pr_seen.items() if "mine" in pr_views.get(ref, set())])
         # Подтянуть статус/assignee задач, на которые ссылаются PR — нужно для
         # колонок «Назначен»/«Статус» в дашборде. PR на чужой релизной задаче
         # никогда не попадёт в mine/mentions, но ключ в branch/title есть.
@@ -2317,6 +2405,13 @@ class Service:
         pr.tasks_open = sum(1 for t in tasks if not t.resolved)
         pr.tasks_resolved = sum(1 for t in tasks if t.resolved)
         task_key = self._task_key_from_pr(pr)
+        if comments:   # комменты уже на руках — разложить новые круги ревью в историю PR
+            from .reviewhist import PRRef
+
+            try:
+                self._import_review_sources(PRRef(pr_id, project, repo), comments)
+            except Exception:  # noqa: BLE001 — история — побочный продукт, PR показываем всё равно
+                pass
         notes = self.store.get_notes(pr_note_key(project, repo, pr_id))
         if task_key:
             notes += self.store.get_notes(task_key)
@@ -2381,6 +2476,7 @@ class Service:
             "build_queued": pr.build_queued,
             "autotests": {**tests.model_dump(), "summary": tests.summary()} if tests else None,
             "queue_error": (self.store.get_meta(key) or "") if key else "",
+            "review": self.review_brief(pr.project, pr.repository, pr.id),
         }
 
     def build_statuses_for_pr_url(self, url: str) -> list[BuildStatus]:
