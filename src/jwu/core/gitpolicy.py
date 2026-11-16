@@ -673,6 +673,45 @@ def answer_grant(store: "Store", grant_id: int, *, allow: bool, via: str,
     return dict(store.conn.execute("SELECT * FROM git_grants WHERE id = ?", (grant_id,)).fetchone())
 
 
+GRANT_WAIT_MAX = 240     # с — одним вызовом ждать не дольше (вызов инструмента не должен упереться в таймаут)
+GRANT_WAIT_STEP = 3      # с — как часто смотреть
+
+
+def grant_status(store: "Store", grant_id: int) -> dict:
+    """Что с запросом допуска: pending | granted | denied | expired | dropped (+ сколько ещё ждёт)."""
+    policy = load(store)
+    expire_requests(store, policy)
+    row = store.conn.execute("SELECT * FROM git_grants WHERE id = ? AND workspace_id = ?",
+                             (grant_id, store.workspace_id)).fetchone()
+    if row is None:
+        raise PolicyError(f"Запроса допуска #{grant_id} нет")
+    status = {"requested": "pending", "used": "granted"}.get(row["status"], row["status"])
+    out = {"grant_id": grant_id, "status": status, "op": row["op"], "branch": row["branch"]}
+    if status == "pending":
+        created = datetime.fromisoformat(row["created_at"])
+        out["expires_in"] = max(0, int(policy.request_ttl - (_now() - created).total_seconds()))
+    return out
+
+
+async def wait_grant(store: "Store", grant_id: int, timeout: int = GRANT_WAIT_MAX, *,
+                     step: float = GRANT_WAIT_STEP, sleep=None) -> dict:
+    """Ждать ответа пользователя на запрос допуска до ``timeout`` с (не больше GRANT_WAIT_MAX).
+
+    Возвращается сразу, как только ответ есть; ``pending`` — время вышло, а запрос ещё жив."""
+    import asyncio
+
+    sleep = sleep or asyncio.sleep
+    timeout = max(0, min(int(timeout), GRANT_WAIT_MAX))
+    waited = 0.0
+    while True:
+        state = grant_status(store, grant_id)
+        if state["status"] != "pending" or waited >= timeout:
+            state["waited"] = int(waited)
+            return state
+        await sleep(step)
+        waited += step
+
+
 def grant_direct(store: "Store", *, remote: str, branch: str, op: str, head: str = "", via: str = "cli",
                  policy: Optional[Policy] = None) -> dict:
     """Допуск без запроса агента — пользователь выдал заранее (``jwu git grant``)."""

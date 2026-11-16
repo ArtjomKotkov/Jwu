@@ -1217,6 +1217,24 @@ async def jwu_git_undo(path: str = "", ref: str = "", user_approved: bool = Fals
 
 
 @mcp.tool()
+async def jwu_git_grant_wait(grant_id: int, timeout: int = 240, workspace: Optional[str] = None) -> dict:
+    """Git: ждать ответа пользователя на запрос допуска (grant_id из отказа «нужен допуск»).
+
+    Смотрит раз в несколько секунд и возвращается сразу, как только пользователь ответил кнопкой
+    в боте или `jwu git grant` — до timeout секунд (не больше 240). status: granted — повтори
+    заблокированный вызов; denied — отказал; expired — запрос истёк; dropped — бот не ответил;
+    pending — время вызова вышло, запрос жив (expires_in — сколько ещё), вызови снова. Сам
+    допуск не выдаёт — только ждёт."""
+    from .core import gitpolicy
+
+    store = _store_only(workspace)
+    try:
+        return _stamp(await gitpolicy.wait_grant(store, grant_id, timeout), _resolve(workspace))
+    except gitpolicy.PolicyError as exc:
+        raise ValueError(str(exc)) from None
+
+
+@mcp.tool()
 async def jwu_git_policy(path: str = "", workspace: Optional[str] = None) -> dict:
     """Git: политика для репозитория в path и его текущей ветки — какой уровень у каждой
     операции (allow | ask | grant | deny) и каким правилом решено, плюс ожидающие допуски.

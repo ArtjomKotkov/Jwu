@@ -196,8 +196,11 @@ def gate(ctx: Ctx, op: str, *, branch: str = "", user_approved: bool = False, de
         if "cli" in ctx.policy.grant_via:
             via.append(f"в своём терминале: `! jwu git grant {req['id']}`")
         raise block(f"{what} — нужен допуск пользователя, «да» в чате не хватает ({d.rule})",
-                    "Нужен допуск: " + " или ".join(via) + ". Сам выдать допуск ты не можешь и не пытайся.",
-                    "после допуска повтори тот же вызов", grant_id=int(req["id"]))
+                    "Нужен допуск: " + " или ".join(via) + ". Сам выдать допуск ты не можешь и не пытайся. "
+                    f"Скажи это пользователю одной строкой и сразу жди ответа: jwu_git_grant_wait({req['id']}) — "
+                    "вернётся, как только он ответит (pending — время вызова вышло, вызови ещё раз).",
+                    "granted — повтори тот же вызов; denied, expired, dropped — скажи пользователю и не повторяй",
+                    grant_id=int(req["id"]))
     gp.audit(ctx.store, op=op, decision="allow" if d.level == "allow" else "allow:approved", remote=ctx.remote,
              branch=branch, rule=d.rule, detail=detail, job_id=ctx.job_id)
     return d

@@ -166,7 +166,7 @@ description: Use when the user wants to START a new jwu «работа (job)» �
 2. пуш — **только** `jwu_git_push(job_id=…, user_approved=True)`, не `git push`:
    он пушит лишь ветку копии этой работы, без force, под политикой git. Ответ `blocked` —
    как в **jwu-session-init** («Git — только через jwu»): `grant` — передай пользователю
-   `ask_user` и жди допуска, `deny` — стоп. Ошибка git — стоп, покажи причину (разошлась
+   `ask_user` и жди допуска через `jwu_git_grant_wait(grant_id)`, `deny` — стоп. Ошибка git — стоп, покажи причину (разошлась
    ветка — `jwu_git_sync`, незакоммиченное);
 3. PR — `jwu_pr_create(target, title, description, source=<ветка из ответа пуша>,
    reviewers=[логины], from_job=job_id)` с показанными заголовком и описанием; `jwu_job_link`;

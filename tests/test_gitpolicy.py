@@ -257,3 +257,38 @@ def test_bot_start_message_lists_local_contours(store):
     lab = store.create_workspace("lab", name="Лаборатория")
     text = daemon.start_message(store, [work], 900, [lab])
     assert "Слежу за контурами:" in text and "Лаборатория</b> — локальный" in text
+
+
+def test_wait_grant_returns_when_answered(tmp_path):
+    import asyncio
+
+    from jwu.core import gitpolicy as gp
+    from jwu.core.store import Store
+
+    st = Store(tmp_path / "s.db")
+    st.use_workspace(st.get_workspace_by_slug("work").id)
+    gp.ensure_schema(st.conn)
+    req = gp.request_grant(st, remote="proj/app", branch="main", op="tag")
+    gid = int(req["id"])
+    assert gp.grant_status(st, gid)["status"] == "pending"
+    assert gp.grant_status(st, gid)["expires_in"] > 0
+
+    calls = []
+
+    async def fake_sleep(_):
+        calls.append(1)
+        if len(calls) == 2:
+            gp.answer_grant(st, gid, allow=True, via="cli")
+
+    out = asyncio.run(gp.wait_grant(st, gid, 60, step=1, sleep=fake_sleep))
+    assert out["status"] == "granted" and len(calls) == 2
+
+    req2 = gp.request_grant(st, remote="proj/app", branch="main", op="push")
+    out = asyncio.run(gp.wait_grant(st, int(req2["id"]), 3, step=1, sleep=lambda _: asyncio.sleep(0)))
+    assert out["status"] == "pending" and out["waited"] == 3
+
+    async def deny(_):
+        gp.answer_grant(st, int(req2["id"]), allow=False, via="cli")
+
+    assert asyncio.run(gp.wait_grant(st, int(req2["id"]), 60, step=1, sleep=deny))["status"] == "denied"
+    st.close()
