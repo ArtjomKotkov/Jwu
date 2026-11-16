@@ -1594,6 +1594,7 @@ class Service:
                 self._import_review_sources(ref, self.pr_client.pr_comments(ref.project, ref.repo, pr_id))
             except Exception as exc:  # noqa: BLE001 — треды не достали, история из журналов всё равно есть
                 warning = f"комменты PR не прочитаны: {exc}"
+        reviewhist.relink(self.store, ref)    # дёшево; чинит связи, записанные до 3.4.1 не по порядку
         out = reviewhist.history(self.store, ref, max_chars=max_chars)
         out.update(pr_id=pr_id, project=ref.project, repo=ref.repo)
         if warning:

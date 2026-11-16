@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS review_findings (
     line         INTEGER,
     words        TEXT NOT NULL DEFAULT '',
     same_as      INTEGER,
+    link_manual  INTEGER NOT NULL DEFAULT 0,
     fate         TEXT NOT NULL DEFAULT '',
     fate_reason  TEXT NOT NULL DEFAULT '',
     fate_ref     TEXT NOT NULL DEFAULT '',
@@ -86,6 +87,10 @@ class ReviewError(ValueError):
 
 def ensure_schema(conn) -> None:
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(review_findings)")}
+    if "link_manual" not in cols:      # 3.4.0 → 3.4.1: ручные связи не пересчитываются
+        conn.execute("ALTER TABLE review_findings ADD COLUMN link_manual INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 def _now() -> str:
@@ -143,27 +148,32 @@ def identifiers(text: str) -> set[str]:
     return {m.lower().strip("_") for m in _IDENT_RE.findall(_FILE_RE.sub(" ", text or ""))}
 
 
+def _tokens(text: str, file: str = "") -> tuple:
+    return words(text), identifiers(text), PurePosixPath(file).name if file else ""
+
+
+def _sim(a: tuple, b: tuple) -> float:
+    (wa, ia, fa), (wb, ib, fb) = a, b
+    if fa and fb and fa != fb:
+        return 0.0
+    if ia and ib and not ia & ib:
+        return 0.0
+    common = len(wa & wb)
+    if common < 2 or not wa or not wb:
+        return 0.0
+    score = common / min(len(wa), len(wb))
+    if common == 2 and score < 0.6:
+        return 0.0
+    return score + (0.1 if fa and fb else 0.0)
+
+
 def similarity(text_a: str, text_b: str, file_a: str = "", file_b: str = "") -> float:
     """Похожесть двух находок, 0…1+: доля общих слов от меньшего набора.
 
     Разные файлы — не одна находка; есть имена из кода в обоих текстах, но ни одного общего —
     тоже. Меньше двух общих слов — не одна; ровно два — только если это почти все слова короткой.
     """
-    if file_a and file_b and PurePosixPath(file_a).name != PurePosixPath(file_b).name:
-        return 0.0
-    ia, ib = identifiers(text_a), identifiers(text_b)
-    if ia and ib and not ia & ib:
-        return 0.0
-    a, b = words(text_a), words(text_b)
-    common = len(a & b)
-    if common < 2 or not a or not b:
-        return 0.0
-    score = common / min(len(a), len(b))
-    if common == 2 and score < 0.6:
-        return 0.0
-    if file_a and file_b:
-        score += 0.1
-    return score
+    return _sim(_tokens(text_a, file_a), _tokens(text_b, file_b))
 
 
 # --------------------------------------------------------------------------- #
@@ -255,14 +265,13 @@ def add_round(store: "Store", pr: PRRef, *, side: str, label: str = "", findings
         if row:
             return {"round_id": row["id"], "added": 0, "matched": [], "skipped": True}
     ts = _ts(ts)
-    earlier = [f for f in _findings(store, pr) if f["ts"] <= ts]
     cur = store.conn.execute(
         "INSERT INTO review_rounds (workspace_id, project, repo, pr_id, side, label, full_pass, commit_sha, ts,"
         " verdict, ref, source_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (store.workspace_id, pr.project or "", pr.repo or "", pr.pr_id, side, label.strip(), int(full_pass),
          commit or "", ts, verdict or "", ref or "", source_key or "", _now()))
     round_id = cur.lastrowid
-    added, matched = 0, []
+    added, new_ids = 0, []
     for item in findings:
         text = " ".join(str(item.get("text") or "").split())
         if not text:
@@ -271,11 +280,6 @@ def add_round(store: "Store", pr: PRRef, *, side: str, label: str = "", findings
         if not file:
             file, line = find_file(text)
         ws = words(text, file)
-        best, best_score = None, MATCH_MIN
-        for prev in earlier:
-            score = similarity(text, prev["text"], file, prev["file"])
-            if score >= best_score:
-                best, best_score = prev, score
         fate = item.get("fate") or ""
         if fate and fate not in FATES:
             raise ReviewError(f"fate: {' | '.join(FATES)}")
@@ -283,14 +287,44 @@ def add_round(store: "Store", pr: PRRef, *, side: str, label: str = "", findings
             "INSERT INTO review_findings (round_id, anchor, level, text, file, line, words, same_as, fate,"
             " fate_reason, fate_ref, fate_commit, fate_by, fate_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (round_id, item.get("anchor") or "", level_of(item.get("level") or "minor"), text, file,
-             int(line) if line else None, " ".join(sorted(ws)), best["id"] if best else None, fate,
+             int(line) if line else None, " ".join(sorted(ws)), None, fate,
              item.get("reason") or "", item.get("fate_ref") or "", item.get("fate_commit") or "",
              (by or label) if fate else "", ts if fate else ""))
         added += 1
-        if best:
-            matched.append({"id": fcur.lastrowid, "same_as": best["id"]})
+        new_ids.append(fcur.lastrowid)
     store.conn.commit()
+    links = relink(store, pr)
+    matched = [{"id": fid, "same_as": links[fid]} for fid in new_ids if links.get(fid)]
     return {"round_id": round_id, "added": added, "matched": matched, "skipped": False}
+
+
+def relink(store: "Store", pr: PRRef) -> dict[int, Optional[int]]:
+    """Пересчитать автоматические связи находок PR в порядке времени кругов.
+
+    Каждая находка связывается с самой похожей из более ранних кругов (при равенстве — с
+    поздней): так круг, импортированный задним числом, встаёт в цепочку на своё место.
+    Ручные связи (``link``, duplicate) не трогаются. → {id: same_as}
+    """
+    rows = _findings(store, pr)
+    rows.sort(key=lambda r: (r["ts"], r["rid"], r["id"]))
+    toks = [_tokens(r["text"], r["file"]) for r in rows]
+    out: dict[int, Optional[int]] = {}
+    for i, row in enumerate(rows):
+        if row["link_manual"]:
+            out[row["id"]] = row["same_as"]
+            continue
+        best, best_score = None, MATCH_MIN
+        for j in range(i):
+            if rows[j]["rid"] == row["rid"]:
+                continue
+            score = _sim(toks[i], toks[j])
+            if score >= best_score:
+                best, best_score = rows[j]["id"], score
+        out[row["id"]] = best
+        if best != row["same_as"]:
+            store.conn.execute("UPDATE review_findings SET same_as = ? WHERE id = ?", (best, row["id"]))
+    store.conn.commit()
+    return out
 
 
 def set_fate(store: "Store", ids: Iterable[int], fate: str, *, reason: str = "", ref: str = "",
@@ -339,7 +373,7 @@ def link(store: "Store", fid, same_as) -> None:
             if not row:
                 raise ReviewError(f"находки F{cur} нет")
             cur = row["same_as"]
-    store.conn.execute("UPDATE review_findings SET same_as = ? WHERE id = ?", (target, fid))
+    store.conn.execute("UPDATE review_findings SET same_as = ?, link_manual = 1 WHERE id = ?", (target, fid))
     store.conn.commit()
 
 
@@ -615,7 +649,8 @@ def history(store: "Store", pr: PRRef, max_chars: int = MAX_CHARS) -> dict:
             chunk.append(f"- … {'; '.join(tails)}")
         budget -= len(title) + 2
         body += chunk
-    md = "\n".join(head + body)
+    title, _blank, *info = head
+    md = "\n".join([title, ""] + [f"- {x}" for x in info] + body)
     findings = [{"id": i.last["id"], "state": i.state, "level": i.level, "text": i.last["text"],
                  "file": i.last["file"], "line": i.last["line"], "side": i.last["side"],
                  "label": i.last["label"], "times": len(i.members)} for i in found]

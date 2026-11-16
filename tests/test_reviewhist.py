@@ -210,3 +210,28 @@ def test_service_imports_addon_rounds(store, monkeypatch):
     assert svc._import_review_sources(PR, comments) == 0
     out = rh.history(store, PR)
     assert "external ci-review" in out["markdown"] and "external alice" in out["markdown"]
+
+
+def test_round_imported_late_joins_chain(store):
+    late = rh.add_round(store, PR, side="external", label="bot", ts="2026-01-03T10:00:00+00:00",
+                        findings=[{"level": "critical", "text": "галка sendPassword превращается в false при сохранении"}])
+    early = rh.add_round(store, PR, side="external", label="bot", ts="2026-01-01T10:00:00+00:00",
+                         findings=[{"level": "critical", "text": "отмеченная галка sendPassword при сохранении превращается в false"}])
+    [late_id] = _ids(store, late["round_id"])
+    [early_id] = _ids(store, early["round_id"])
+    assert early["matched"] == []                       # ранний круг — начало цепочки
+    row = store.conn.execute("SELECT same_as FROM review_findings WHERE id = ?", (late_id,)).fetchone()
+    assert row["same_as"] == early_id
+    found, _ = rh.issues(store, PR)
+    assert len(found) == 1 and found[0].state == "open"
+
+
+def test_manual_link_survives_relink(store):
+    r = rh.add_round(store, PR, side="local", label="a", ts="2026-01-01T10:00:00+00:00",
+                     findings=[{"text": "кеш не учитывает арендатора"}])
+    r2 = rh.add_round(store, PR, side="local", label="a", ts="2026-01-02T10:00:00+00:00",
+                      findings=[{"text": "совсем другое про логи сервиса"}])
+    a, b = _ids(store, r["round_id"])[0], _ids(store, r2["round_id"])[0]
+    rh.link(store, b, a)
+    rh.add_round(store, PR, side="local", label="a", ts="2026-01-03T10:00:00+00:00", findings=[{"text": "x y z"}])
+    assert store.conn.execute("SELECT same_as FROM review_findings WHERE id = ?", (b,)).fetchone()["same_as"] == a
