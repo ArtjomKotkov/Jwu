@@ -44,9 +44,19 @@ DEFAULT_WORKSPACE_NAME = "Работа"
 WORKSPACE_SCOPED_TABLES = (
     "sync_runs", "issue_snapshots", "pr_snapshots",
     "notes", "mentions", "mention_scans", "workspace_rules", "jobs", "pending_changes",
+    "ssh_grants",
 )
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS ssh_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS workspaces (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     slug              TEXT NOT NULL UNIQUE,

@@ -53,6 +53,23 @@ def test_export_writes_json_without_secrets_or_snapshots(tmp_path):
     assert jobs[0]["records"][0]["commit"] == "c1" and jobs[0]["prs"][0]["pr_id"] == 5
 
 
+def test_ssh_access_stays_local(tmp_path):
+    policy = "ssh.access.test/logs/docker/api"
+    dest = tmp_path / "memory"
+    with Store(tmp_path / "state.db") as store:
+        wid = store.workspace_id
+        store.set_workspace_settings(wid, {policy: "local deny"})
+        memory.export_memory(store, dest)
+        index_file = dest / "workspaces.json"
+        index = json.loads(index_file.read_text())
+        settings = index["workspaces"][0]["settings"]
+        assert policy not in settings
+        settings[policy] = "remote allow"
+        index_file.write_text(json.dumps(index))
+        memory.import_memory(store, dest)
+        assert store.workspace_settings(wid)[policy] == "local deny"
+
+
 def test_import_into_fresh_db_and_repeat_is_idempotent(tmp_path):
     src = _populated(tmp_path)
     memory.export_memory(src, tmp_path / "mem")

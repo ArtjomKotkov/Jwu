@@ -5726,9 +5726,70 @@ def ssh_list(json_out: bool = typer.Option(False, "--json", help="Вывести
             console.print(f"    {s['description']}")
         if s["allowed_remote_paths"]:
             console.print(f"    [dim]SFTP: {', '.join(s['allowed_remote_paths'])}[/dim]")
-    console.print(f"[dim]MCP: {info['mcp_server']} · конфиг: "
+    console.print("[dim]Встроенный MCP: jwu_ssh · права: jwu ssh policy <стенд>[/dim]")
+    console.print(f"[dim]Прежний MCP: {info['mcp_server']} · конфиг: "
                   f"{info['config'] if info['config_exists'] else 'ещё не выдан (jwu ssh install)'} · "
                   f"ssh-mcp: {info['binary'] or 'не найден'}[/dim]")
+
+
+def _ssh_require_terminal() -> None:
+    import sys
+
+    if not sys.stdin.isatty():
+        err.print("Политику SSH и допуски меняет пользователь из своего терминала.")
+        raise typer.Exit(code=2)
+
+
+@ssh_app.command("policy")
+def ssh_policy(
+    name: str = typer.Argument(..., help="Имя стенда."),
+    action: Optional[str] = typer.Argument(None, help="logs или status."),
+    kind: Optional[str] = typer.Argument(None, help="systemd или docker."),
+    target: Optional[str] = typer.Argument(None, help="Точное имя юнита или контейнера."),
+    level: Optional[str] = typer.Argument(None, help="allow, ask, grant или deny."),
+) -> None:
+    """Посмотреть или настроить доступ через встроенный jwu_ssh."""
+    from ..core import ssh, sshops
+
+    if level is not None:
+        _ssh_require_terminal()
+    store, ws = _store_and_ws()
+    with store:
+        try:
+            server = ssh.get_server(store, ws.id, name)
+            if action is not None and kind is not None and target is not None and level is not None:
+                sshops.set_rule(store, server, action, kind, target, level)
+            elif any(arg is not None for arg in (action, kind, target, level)):
+                raise ssh.SshError("Укажи все аргументы: <стенд> <действие> <тип> <цель> <уровень>.")
+            rows = sshops.describe_rules(store, server)
+        except ssh.SshError as exc:
+            err.print(str(exc), markup=False)
+            raise typer.Exit(code=1)
+    for row in rows:
+        console.print(f"{row['action']} {row['kind']} {row['target']} → {row['level']}", markup=False)
+    console.print("Остальные действия → deny")
+
+
+@ssh_app.command("grant")
+def ssh_grant(
+    grant_id: int = typer.Argument(..., help="Номер запроса из jwu_ssh."),
+    deny: bool = typer.Option(False, "--deny", help="Отклонить запрос."),
+) -> None:
+    """Выдать одноразовый SSH-допуск или отклонить запрос."""
+    from ..core import ssh, sshops
+
+    _ssh_require_terminal()
+    store, _ = _store_and_ws()
+    with store:
+        try:
+            console.print(sshops.grant_description(store, grant_id), markup=False)
+            if not deny and not typer.confirm("Выдать одноразовый допуск на 10 минут?", default=False):
+                raise typer.Exit(code=1)
+            status = sshops.answer_grant(store, grant_id, allow=not deny)
+        except ssh.SshError as exc:
+            err.print(str(exc), markup=False)
+            raise typer.Exit(code=1)
+    console.print(f"SSH #{grant_id} → {status}")
 
 
 @ssh_app.command("rm")

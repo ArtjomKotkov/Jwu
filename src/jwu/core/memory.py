@@ -80,7 +80,8 @@ class ExportReport:
 
 # Настройки воркспейса, которые НЕ выгружаем: секретов там нет, но «где чей токен лежал»
 # и служебные счётчики — не память, а локальное устройство этой машины.
-_SKIP_SETTING_PREFIXES = ("features.seq",)
+_LOCAL_SSH_ACCESS_PREFIX = "ssh.access."
+_SKIP_SETTING_PREFIXES = ("features.seq", _LOCAL_SSH_ACCESS_PREFIX)
 
 
 def _all_notes(store: "Store") -> list[dict]:
@@ -214,7 +215,8 @@ def _import_workspace_meta(store: "Store", meta: dict, report: ImportReport) -> 
             report.bump(report.added, "paths")
     settings = meta.get("settings") or {}
     current = store.workspace_settings(ws.id)
-    fresh = {k: v for k, v in settings.items() if current.get(k) != v}
+    fresh = {k: v for k, v in settings.items()
+             if not k.startswith(_LOCAL_SSH_ACCESS_PREFIX) and current.get(k) != v}
     if fresh:
         if not report.dry_run:
             store.set_workspace_settings(ws.id, fresh)

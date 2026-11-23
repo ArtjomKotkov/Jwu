@@ -11,7 +11,8 @@ Deny-маски Claude Code (``Bash(git push:*)``) обходятся ``git -C x
 - пишущий git (всё, кроме чтения из :data:`READ_SUBCOMMANDS`) — в папках воркспейсов, где
   ``guard`` политики включён; вне воркспейсов jwu хук git не трогает;
 - везде — то, что меняет саму политику или выдаёт допуск (``jwu git policy edit/init/import``,
-  ``jwu git grant``, ``jwu git repo/rule …``), ``jwu job push`` (в обход вопроса MCP) и
+  ``jwu git grant``, ``jwu git repo/rule …``), изменения политики SSH и ``jwu ssh grant``,
+  ``jwu job push`` (в обход вопроса MCP) и
   ``sqlite3`` по базе jwu: политику, которую агент может переписать, незачем и заводить.
 
 Это страховка от случайности и самодеятельности агента, не песочница: окончательный замок —
@@ -292,6 +293,8 @@ def _jwu_verdict(argv: list[str]) -> Optional[Verdict]:
             return Verdict(True)
         return Verdict(False, "Политику git и допуски меняет только пользователь в своём терминале "
                               f"(`jwu git {' '.join(words[1:3])}` из сессии агента запрещён). Спроси пользователя.")
+    if words[:2] == ["ssh", "grant"] or (words[:2] == ["ssh", "policy"] and len(words) > 3):
+        return Verdict(False, "Политику SSH и допуски меняет только пользователь в своём терминале.")
     if words[:2] == ["job", "push"]:
         return Verdict(False, "Пуш работы — через MCP jwu_git_push(job_id=…) (под политикой и с вопросом), не через CLI.")
     if words[:2] == ["workspace", "setting"] and len(words) > 2 and words[2].startswith(("git.", "push.")):
