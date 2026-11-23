@@ -49,24 +49,47 @@ jwu zephyr rules docs/test-case-rules.md             # регламент тес
 допуску пользователя, в master/main — никогда. Остальной пишущий git агент делает через
 `jwu_git_*`, голый git из Bash режет хук. Подробно — [git.md](git.md).
 
-## SSH-стенды (ssh-mcp)
+## SSH-стенды
 
-Стенды — серверы, где смотрят логи и состояние. jwu хранит их описания в воркспейсе, а
-выполнять команды даёт агенту через [ssh-mcp](https://github.com/overklassniy/ssh-mcp)
-(`go install github.com/overklassniy/ssh-mcp/cmd/ssh-mcp@latest`).
+`jwu_ssh` в основном MCP jwu читает логи и статус systemd-юнитов и Docker-контейнеров.
+Стенды и настроенные права показывает `jwu_ssh_servers`. Для нового инструмента
+установи свежий jwu и перезапусти клиент с основным MCP jwu. Рабочий контур
+определяется по папке сессии или по `JWU_WORKSPACE` при запуске MCP.
 
 ```bash
-jwu ssh add test --host test.example.com --user deploy --key ~/.ssh/id_ed25519 \
-    --remote-path /var/log/app --tag backend --desc "логи приложения в /var/log/app"
-jwu ssh list                  # стенды, вход, политика, состояние интеграции
-jwu ssh install [--dry-run]   # конфиг ssh-mcp + MCP ssh-<воркспейс> в папках воркспейса
-jwu ssh rm test | jwu ssh config [--print] | jwu ssh uninstall
+jwu ssh add test --host test.example.com --user deploy --key ~/.ssh/id_ed25519
+jwu ssh policy test logs systemd api.service allow
+jwu ssh policy test status docker api ask
+jwu ssh policy test logs docker api grant
+jwu ssh policy test
 ```
 
-- По умолчанию политика `readonly`: разрешён просмотр (`tail`, `grep`, `journalctl`,
-  `systemctl status`, `docker logs` …), запрещены цепочки, перенаправления, `sudo`,
-  `find -exec`. `--policy none` снимает пресет, `--allow`/`--deny` добавляют свои regex.
-- MCP регистрируется в папках воркспейса: стенды рабочего контура не видны в личном.
-- Пароль и passphrase лежат в секретах воркспейса и в синк памяти не уходят. Конфиг ssh-mcp
-  (`~/.local/share/jwu/ssh/<воркспейс>.toml`) пишется с правами 600. Лучше ключ или `--agent`.
-- ssh-mcp не проверяет host key сервера — подключай только свои стенды.
+Правило действует на одну комбинацию стенда, действия, типа цели и точного имени.
+Правила SSH настраиваются из своего терминала и хранятся локально на этой машине.
+По умолчанию действует `deny`. `allow` выполняется сразу, `ask` требует подтверждения
+в чате, а `grant` — одноразового допуска через `jwu -W <воркспейс> ssh grant <номер>`.
+Допуск действует 10 минут и привязан к параметрам исходного запроса. Встроенный
+инструмент также учитывает whitelist и blacklist стенда. После смены адреса, способа
+входа или списков команд права для новой конфигурации нужно задать заново.
+SSH-политика действует в MCP jwu. Для изоляции агента с доступом к shell нужны
+ограничения клиента на запись в БД jwu и прямой SSH. Хук Claude Code блокирует
+вызовы CLI для выдачи допусков и редактирования политики.
+
+Встроенное подключение использует OpenSSH, ключ или ssh-agent и проверяет ключ
+сервера по `known_hosts`. Для ключа с passphrase загрузи ключ в агент. Стенды с входом
+по паролю и операции SFTP по-прежнему доступны через отдельный ssh-mcp. Его политика
+настраивается флагами `jwu ssh add --policy/--allow/--deny`, её следует учитывать, если
+он зарегистрирован у клиента вместе с основным MCP jwu.
+
+```bash
+jwu ssh list
+jwu ssh rm test
+jwu ssh install [--dry-run]   # прежняя интеграция ssh-mcp для Claude Code
+jwu ssh config [--print]
+jwu ssh uninstall
+```
+
+- В прежней интеграции `readonly` включает пресет просмотра, а `--policy none` снимает его.
+- Пароль и passphrase хранятся в секретах воркспейса. Конфиг ssh-mcp
+  (`~/.local/share/jwu/ssh/<воркспейс>.toml`) сохраняется с правами 600.
+- ssh-mcp не проверяет ключ сервера.

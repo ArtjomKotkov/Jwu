@@ -42,7 +42,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -617,24 +617,51 @@ async def jwu_voice_collect(days: int = 180, workspace: Optional[str] = None) ->
 
 @mcp.tool()
 async def jwu_ssh_servers(workspace: Optional[str] = None) -> dict:
-    """SSH-стенды воркспейса (без секретов) и как до них достучаться через ssh-mcp.
+    """SSH-стенды воркспейса без секретов. Для логов и статуса используй jwu_ssh.
 
-    Сам jwu по SSH не ходит: команды на стенде выполняют инструменты MCP-сервера
-    `mcp_server` (префикс `tools_prefix`, напр. `mcp__ssh-<slug>__execute-command` с
-    `connectionName=<имя стенда>`). Если таких инструментов в сессии нет — стенды не
-    выданы: `jwu ssh install` и перезапуск сессии. `tag` стенда — тег папки воркспейса,
-    к которой он относится; `policy=readonly` — разрешён только просмотр (whitelist/blacklist
-    в ответе). Логи смотри в `allowed_remote_paths` и `description`. Добавлять стенды —
-    `jwu ssh add` (секреты вводит пользователь сам, не проси их в чат).
-
-    workspace — воркспейс jwu; по умолчанию определяется по рабочей папке (текущий
-    можно узнать через jwu_workspace_current).
+    access перечисляет действия и точные цели, настроенные пользователем через
+    jwu ssh policy. Для остальных действует default_access. Секреты пользователь
+    вводит в CLI. Поля mcp_server и tools_prefix описывают прежнюю интеграцию ssh-mcp.
     """
     from .core import ssh as ssh_mod
 
     ws = _resolve(workspace)
     store = _store_only(workspace)
     return _stamp(ssh_mod.describe(store, ws.id, ws.slug), ws)
+
+
+@mcp.tool()
+async def jwu_ssh(server: str, action: Literal["logs", "status"], kind: Literal["systemd", "docker"],
+                  target: str, lines: Optional[int] = None, user_approved: bool = False,
+                  grant_id: Optional[int] = None, workspace: Optional[str] = None) -> dict:
+    """Посмотреть логи или статус конкретного systemd-юнита или Docker-контейнера на SSH-стенде.
+
+    Имена стендов и разрешённые цели — jwu_ssh_servers. Для logs параметр lines от 1 до 1000
+    (по умолчанию 100). При blocked=ask покажи команду пользователю и после его «да»
+    повтори вызов с user_approved=True. При blocked=grant и status=requested попроси пользователя
+    выполнить jwu -W <workspace> ssh grant <grant_id>, затем повтори тот же вызов с grant_id.
+    denied, expired и used завершают запрос. blocked=deny запрещает действие.
+    Стенд должен быть в воркспейсе папки сессии или заданном при запуске MCP JWU_WORKSPACE.
+    """
+    from .core import sshops
+    from .core.ssh import SshError
+
+    registry = _registry()
+    try:
+        ws_mod.migrate_legacy_config(registry)
+        context = ws_mod.resolve(registry)
+    except ws_mod.WorkspaceError as exc:
+        return {"ok": False, "error": str(exc)}
+    ws = context.workspace
+    requested = ws_mod.find_workspace(registry, workspace) if workspace else ws
+    if context.source not in ("cwd", "env") or requested is None or requested.id != ws.id:
+        return _stamp({"ok": False, "error": "Для SSH нужен воркспейс папки сессии или JWU_WORKSPACE."}, ws)
+    try:
+        result = await sshops.execute(_store_only(ws.slug), server, action, kind, target, lines,
+                                      user_approved=user_approved, grant_id=grant_id)
+    except SshError as exc:
+        result = {"ok": False, "error": str(exc)}
+    return _stamp(result, ws)
 
 
 @mcp.tool()

@@ -218,15 +218,16 @@ def test_mcp_ssh_servers(tmp_path, monkeypatch):
 
 
 def test_doctor_check_ssh(store, tmp_path, monkeypatch):
-    from jwu.core import doctor
+    from jwu.core import doctor, sshops
 
     ws = store.get_workspace_by_slug("work")
+    monkeypatch.setattr(doctor.shutil, "which", lambda _: "/usr/bin/ssh")
     assert doctor.check_ssh(store, ws)[0].status == "skip"
-    ssh_mod.save_server(store, ws.id, _server())
+    server = ssh_mod.save_server(store, ws.id, _server())
     monkeypatch.setattr(ssh_mod, "find_binary", lambda: None)
-    assert doctor.check_ssh(store, ws)[0].status == "fail"
-    monkeypatch.setattr(ssh_mod, "find_binary", lambda: "/bin/ssh-mcp")
-    assert doctor.check_ssh(store, ws)[0].status == "warn"  # конфиг не выдан
+    assert [check.status for check in doctor.check_ssh(store, ws)] == ["warn"]
+    sshops.set_rule(store, server, "logs", "docker", "api", "allow")
+    assert [check.status for check in doctor.check_ssh(store, ws)] == ["ok"]
     ssh_mod.write_config(store, ws.id, ws.slug)
     folder = str(tmp_path / "proj")
     store.add_workspace_path(ws.id, folder)
@@ -234,9 +235,11 @@ def test_doctor_check_ssh(store, tmp_path, monkeypatch):
     claude_json = tmp_path / "claude.json"
     monkeypatch.setenv("CLAUDE_CONFIG_PATH", str(claude_json))
     claude_json.write_text(json.dumps({"projects": {}}))
-    assert doctor.check_ssh(store, ws)[0].status == "warn"
+    assert [check.status for check in doctor.check_ssh(store, ws)] == ["ok"]
     claude_json.write_text(json.dumps({"projects": {folder: {"mcpServers": {"ssh-work": {}}}}}))
-    assert doctor.check_ssh(store, ws)[0].status == "ok"
+    assert [check.status for check in doctor.check_ssh(store, ws)] == ["ok", "fail"]
+    monkeypatch.setattr(ssh_mod, "find_binary", lambda: "/bin/ssh-mcp")
+    assert [check.status for check in doctor.check_ssh(store, ws)] == ["ok", "ok"]
 
 
 def test_detail_rows_full_and_compact():

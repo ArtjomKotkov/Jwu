@@ -77,6 +77,7 @@ def test_guard_off_for_repo(env):
 @pytest.mark.parametrize("cmd", [
     "jwu git grant 3", "jwu git policy edit", "jwu git policy init", "jwu -W work git rule add --op push=allow",
     "jwu git repo set proj/app --op push=allow", "jwu job push 5 -y", "jwu workspace setting git.x 1",
+    "jwu ssh grant 3", "jwu -W work ssh policy test logs docker api allow",
     "sqlite3 {db} 'update git_policy set guard=0'",
 ])
 def test_policy_changes_blocked_everywhere(env, cmd):
@@ -85,7 +86,7 @@ def test_policy_changes_blocked_everywhere(env, cmd):
 
 
 @pytest.mark.parametrize("cmd", ["jwu git policy show", "jwu git policy check push --branch x", "jwu git log",
-                                 "jwu git repo list", "jwu todo", "sqlite3 other.db .tables"])
+                                 "jwu git repo list", "jwu ssh policy test", "jwu todo", "sqlite3 other.db .tables"])
 def test_jwu_reads_allowed(env, cmd):
     store, _, outside, db = env
     assert gg.check(cmd, outside, store, [db]).allow, cmd

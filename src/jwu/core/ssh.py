@@ -169,8 +169,12 @@ def save_server(store: "Store", workspace_id: int, server: SshServer, *,
 
 
 def remove_server(store: "Store", workspace_id: int, name: str) -> None:
+    from .sshops import RULE_PREFIX
+
     get_server(store, workspace_id, name)
-    store.delete_workspace_settings(workspace_id, [SETTING_PREFIX + name])
+    keys = [key for key in store.workspace_settings(workspace_id)
+            if key.startswith(f"{RULE_PREFIX}{name}/")]
+    store.delete_workspace_settings(workspace_id, [SETTING_PREFIX + name, *keys])
     for kind in SECRET_SLOTS:
         store.delete_workspace_secret(workspace_id, _secret_slot(name, kind))
 
@@ -375,8 +379,13 @@ def detail_rows(server: SshServer, has_pw: bool = False, *,
 
 def describe(store: "Store", workspace_id: int, slug: str) -> dict:
     """Что знает jwu о стендах контура — для MCP и скиллов (без секретов)."""
+    from .sshops import describe_rules
+
     servers = list_servers(store, workspace_id)
+    settings = store.workspace_settings(workspace_id)
     return {
+        "native_tool": "jwu_ssh",
+        "default_access": "deny",
         "mcp_server": mcp_name(slug),
         "tools_prefix": f"mcp__{mcp_name(slug)}__",
         "config": str(config_path(slug)),
@@ -385,6 +394,7 @@ def describe(store: "Store", workspace_id: int, slug: str) -> dict:
         "servers": [
             {**s.as_dict(),
              "whitelist": s.effective_whitelist(), "blacklist": s.effective_blacklist(),
+             "access": describe_rules(store, s, settings),
              "auth": ("key" if s.private_key else "agent" if s.agent else "password"),
              "has_password": has_password(store, workspace_id, s.name)}
             for s in servers
