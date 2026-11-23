@@ -9,7 +9,8 @@
 1. явное указание — флаг ``-W/--workspace`` (slug или id);
 2. переменная окружения ``JWU_WORKSPACE``;
 3. текущая папка внутри зарегистрированной папки воркспейса (побеждает самое
-   длинное совпадение — так вложенные воркспейсы работают корректно);
+   длинное совпадение — так вложенные воркспейсы работают корректно) или внутри его
+   папки копий работ (``jobs.dir``); одна ``jobs.dir`` на несколько воркспейсов — ошибка;
 4. последний выбранный вручную (``meta['active_workspace']``);
 5. единственный воркспейс в БД;
 6. иначе — ``WorkspaceNotSelected`` (CLI печатает подсказку, TUI показывает экран выбора).
@@ -34,6 +35,7 @@ from . import secrets as secrets_mod
 from .config import Config, _apply_raw, addon_sections, apply_env_overrides, load_config
 from .models import WORKSPACE_PROVIDERS, Workspace
 from .store import DEFAULT_WORKSPACE_SLUG as DEFAULT_SLUG, Store
+from .jobspace import JOBS_DIR_SETTING
 
 ACTIVE_META_KEY = "active_workspace"
 ENV_VAR = "JWU_WORKSPACE"
@@ -97,23 +99,54 @@ def find_workspace(store: Store, ref: str) -> Workspace | None:
     return None
 
 
-def workspace_for_path(store: Store, path: str | Path) -> tuple[Workspace, str] | None:
-    """Воркспейс, которому принадлежит папка: самое длинное совпадение по пути."""
+def workspace_for_path(
+    store: Store, path: str | Path, *, strict: bool = False,
+) -> tuple[Workspace, str] | None:
+    """Воркспейс, которому принадлежит папка: самое длинное совпадение по пути.
+
+    Кроме привязанных папок смотрим и папку копий работ воркспейса (``jobs.dir``):
+    рабочая копия работы лежит там, а не в привязанной папке, и без этого jwu из неё
+    молча уходил в «последний выбранный» воркспейс. Привязанная папка при равной глубине
+    важнее. Одна ``jobs.dir`` у нескольких воркспейсов — неоднозначно: ``strict`` —
+    ошибка с подсказкой, иначе считаем папку непривязанной.
+    """
     try:
         cur = Path(normalize_path(path))
     except OSError:  # папки может уже не быть
         return None
-    best: tuple[int, str, int] | None = None  # (глубина, путь, workspace_id)
+    # (глубина, привязанная ли, путь, workspace_id)
+    cands: list[tuple[int, int, str, int]] = []
     for row in store.all_workspace_paths():
         root = Path(row.path)
         if cur == root or _is_relative_to(cur, root):
-            depth = len(root.parts)
-            if best is None or depth > best[0]:
-                best = (depth, row.path, row.workspace_id)
-    if best is None:
+            cands.append((len(root.parts), 1, row.path, row.workspace_id))
+    for ws in store.list_workspaces():
+        raw = (store.workspace_settings(ws.id).get(JOBS_DIR_SETTING) or "").strip()
+        if not raw:
+            continue
+        try:
+            root = Path(normalize_path(raw))
+        except OSError:
+            continue
+        if cur == root or _is_relative_to(cur, root):
+            cands.append((len(root.parts), 0, str(root), ws.id))
+    if not cands:
         return None
-    ws = store.get_workspace(best[2])
-    return (ws, best[1]) if ws else None
+    best = max(c[:2] for c in cands)
+    top = [c for c in cands if c[:2] == best]
+    owners = {c[3] for c in top}
+    if len(owners) > 1:
+        if strict:
+            names = ", ".join(sorted(
+                (w.slug if (w := store.get_workspace(i)) else str(i)) for i in owners))
+            raise WorkspaceError(
+                f"Папка {cur} лежит в папке копий работ ({top[0][2]}), общей для воркспейсов: "
+                f"{names}. Укажи воркспейс явно (-W <slug> / {ENV_VAR}) или разведи "
+                "папки: jwu workspace jobs-dir ~/jwu-jobs/<воркспейс>"
+            )
+        return None
+    ws = store.get_workspace(top[0][3])
+    return (ws, top[0][2]) if ws else None
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -153,7 +186,7 @@ def resolve(
         return Resolution(ws, "env")
 
     def by_cwd() -> Resolution | None:
-        match = workspace_for_path(store, cwd or Path.cwd())
+        match = workspace_for_path(store, cwd or Path.cwd(), strict=True)
         if match is None:
             return None
         ws, path = match

@@ -306,6 +306,52 @@ def test_nested_paths_pick_the_deepest_workspace(resolve_env, tmp_path):
     assert workspaces.resolve(store, cwd=deep).workspace.slug == "home"
 
 
+def test_job_copy_folder_resolves_to_its_workspace(resolve_env, tmp_path):
+    """Копия работы лежит в jobs.dir, а не в привязанной папке — и всё равно своя."""
+    from jwu.core import jobspace
+
+    store, home = resolve_env
+    work = store.get_workspace_by_slug("work")
+    workspaces.add_path(store, home, tmp_path / "home-repos")
+    jobspace.set_jobs_dir(store, work.id, str(tmp_path / "jobs" / "work"))
+    copy = tmp_path / "jobs" / "work" / "backend-job562-X-1"
+    copy.mkdir(parents=True)
+
+    workspaces.set_active(store, home)  # «последний выбранный» — чужой
+    res = workspaces.resolve(store, cwd=copy)
+    assert (res.workspace.slug, res.source) == ("work", "cwd")
+    assert workspaces.workspace_for_path(store, copy)[0].slug == "work"
+
+
+def test_bound_folder_inside_jobs_dir_wins(resolve_env, tmp_path):
+    from jwu.core import jobspace
+
+    store, home = resolve_env
+    work = store.get_workspace_by_slug("work")
+    jobspace.set_jobs_dir(store, work.id, str(tmp_path / "jobs"))
+    inner = tmp_path / "jobs" / "pet"
+    inner.mkdir(parents=True)
+    workspaces.add_path(store, home, inner)
+    assert workspaces.resolve(store, cwd=inner).workspace.slug == "home"
+
+
+def test_shared_jobs_dir_is_an_error_not_a_silent_guess(resolve_env, tmp_path):
+    from jwu.core import jobspace
+
+    store, home = resolve_env
+    work = store.get_workspace_by_slug("work")
+    shared = tmp_path / "jobs"
+    jobspace.set_jobs_dir(store, work.id, str(shared))
+    jobspace.set_jobs_dir(store, home.id, str(shared))
+    copy = shared / "repo-job1"
+    copy.mkdir()
+    workspaces.set_active(store, home)
+
+    with pytest.raises(workspaces.WorkspaceError, match="общей"):
+        workspaces.resolve(store, cwd=copy)
+    assert workspaces.workspace_for_path(store, copy) is None  # статуслайн/guard не падают
+
+
 def test_path_cannot_belong_to_two_workspaces(resolve_env, tmp_path):
     store, home = resolve_env
     work = store.get_workspace_by_slug("work")
