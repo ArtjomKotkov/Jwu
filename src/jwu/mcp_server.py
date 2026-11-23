@@ -42,7 +42,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -2745,14 +2745,18 @@ async def jwu_job_close(job_id: int, summary: str, cleanup: bool = True,
     store = _store_only(workspace)
     if store.get_job(job_id) is None:
         raise ValueError(f"Работа #{job_id} не найдена")
-    report = jobspace.cleanup(store, job_id) if cleanup else None
+    def finish(report=None):
+        if report is not None and report.removed:
+            store.add_job_record(job_id, "Уборка: " + "; ".join(report.removed)[:900], kind="note")
+        store.add_job_record(job_id, summary.strip(), kind="summary")
+        store.set_job_status(job_id, "done")
+
+    report = jobspace.cleanup(store, job_id, on_success=finish) if cleanup else None
+    if report is None:
+        finish()
     if report is not None and (report.blocked or report.errors):
         return _stamp({"ok": False, "job_id": job_id, "closed": False, "cleanup": report.to_dict()},
                       _resolve(workspace))
-    if report is not None and report.removed:
-        store.add_job_record(job_id, "Уборка: " + "; ".join(report.removed)[:900], kind="note")
-    store.add_job_record(job_id, summary.strip(), kind="summary")
-    store.set_job_status(job_id, "done")
     job = store.get_job(job_id)
     keys = handoff.save_context_notes(store, handoff.collect(store, job, offline=True))
     return _stamp({"ok": True, "job_id": job_id, "closed": True, "context_notes": keys,
@@ -2855,6 +2859,31 @@ async def jwu_job_ports(job_id: int, names: list[str], workspace: Optional[str] 
     except jobspace.JobSpaceError as exc:
         raise ValueError(str(exc)) from exc
     return _stamp({"ports": ports, "docker": jobspace.docker_names(job)}, _resolve(workspace))
+
+
+@mcp.tool()
+async def jwu_job_testenv(job_id: int, action: Literal["up", "down"], minio: bool = False,
+                          low_disk_ok: bool = False, workspace: Optional[str] = None) -> dict:
+    """Поднять (up) или убрать (down) локальные зависимости django-chat по ID работы.
+
+    Up возвращает хост и порты готовых PostgreSQL и Redis. minio=True добавляет S3.
+    Для PostgreSQL пользователь, пароль и база postgres, для S3 ключ и пароль minioadmin.
+    Вызывай после согласования тестов. Down убирает контейнеры, тома и порты этого стенда.
+    low_disk_ok=True требует разрешения пользователя обойти мягкий порог места.
+    """
+    from .core import jobspace, testenv
+
+    ws = _resolve(workspace)
+
+    def run():
+        with Store(str(db_path()), ws.id) as store:
+            return testenv.manage(store, job_id, action, minio=minio, low_disk_ok=low_disk_ok)
+
+    try:
+        result = await asyncio.to_thread(run)
+    except jobspace.JobSpaceError as exc:
+        raise ValueError(str(exc)) from exc
+    return _stamp(result, ws)
 
 
 @mcp.tool()

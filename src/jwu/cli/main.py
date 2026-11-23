@@ -4295,15 +4295,19 @@ def job_done(
         if job is None:
             err.print(f"[red]Работа #{job_id} не найдена.[/red]")
             raise typer.Exit(code=1)
+        def finish(_report=None):
+            if summary and summary.strip():
+                store.add_job_record(job_id, summary.strip(), kind="summary")
+            store.set_job_status(job_id, "done")
+
         if cleanup_opt:
-            report = jobspace.cleanup(store, job_id)
+            report = jobspace.cleanup(store, job_id, on_success=finish)
             _print_cleanup(report)
             if report.blocked or report.errors:
                 err.print("[red]Работа не закрыта:[/red] уборка не закончена — разберись с тем, что выше.")
                 raise typer.Exit(code=1)
-        if summary and summary.strip():
-            store.add_job_record(job_id, summary.strip(), kind="summary")
-        store.set_job_status(job_id, "done")
+        else:
+            finish()
         keys: list[str] = []
         if not no_note:
             job = store.get_job(job_id) or job
@@ -4338,12 +4342,11 @@ def job_delete(
             raise typer.Exit(code=1)
         from ..core import jobspace
 
-        report = jobspace.cleanup(store, job_id, force=force)
+        report = jobspace.cleanup(store, job_id, force=force, on_success=lambda _: store.delete_job(job_id))
         _print_cleanup(report)
         if report.blocked or report.errors:
             err.print("[red]Работа не удалена:[/red] уборка не закончена. --force — удалить копии с потерей правок.")
             raise typer.Exit(code=1)
-        store.delete_job(job_id)
     console.print(f"[red]Работа #{job_id}[/red] удалена")
 
 
@@ -4446,6 +4449,25 @@ def job_resources_cmd(
         console.print(f"  {r['kind']:<9} {r['ref']}", markup=False, highlight=False)
     if not items:
         console.print("[dim]Записанных ресурсов нет.[/dim]")
+
+
+@job_app.command("testenv")
+def job_testenv(
+    job_id: int = typer.Argument(..., help="ID работы."),
+    action: str = typer.Argument(..., click_type=click.Choice(["up", "down"])),
+    minio: bool = typer.Option(False, "--minio", help="Добавить MinIO к PostgreSQL и Redis."),
+    low_disk_ok: bool = typer.Option(False, "--low-disk-ok", help="Разрешён обход мягкого порога места."),
+) -> None:
+    """Поднять готовые зависимости django-chat или убрать стенд этой работы."""
+    from ..core import jobspace, testenv
+
+    with _store() as store:
+        try:
+            result = testenv.manage(store, job_id, action, minio=minio, low_disk_ok=low_disk_ok)
+        except jobspace.JobSpaceError as exc:
+            err.print(str(exc), markup=False)
+            raise typer.Exit(code=1) from exc
+    _emit_json(result)
 
 
 @job_app.command("ports")

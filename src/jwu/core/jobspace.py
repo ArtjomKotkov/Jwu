@@ -416,16 +416,28 @@ _DOCKER_RM = {"container": ["docker", "rm", "-f"], "volume": ["docker", "volume"
 
 
 def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool = False,
-            runner: Runner = _run, uid: Optional[int] = None) -> CleanupReport:
+            runner: Runner = _run, uid: Optional[int] = None,
+            on_success: Optional[Callable[[CleanupReport], None]] = None) -> CleanupReport:
     """Снести всё, что создала работа: стенд, контейнеры, вольюмы, сети, образы, кеш, копии.
 
     Порядок: контейнеры → сети → вольюмы → образы (иначе занятое не удалится), потом
     каталоги и рабочие копии. Копию с незакоммиченным/незапушенным не трогает без ``force``
     — она попадает в ``kept`` с причиной. ``dry_run`` — только показать, что будет удалено.
     """
-    report = CleanupReport(dry_run=dry_run)
-    # uid без номера — docker работы, которой уже нет (sweep: orphan_docker)
+    from . import testenv
+
     uid = uid if uid is not None else (store.job_uid(job_id) or 0)
+    with testenv.lock(store, uid):
+        report = CleanupReport(dry_run=dry_run)
+        managed = testenv.cleanup_locked(store, job_id, uid, runner, report) if job_id else {}
+        if not report.errors:
+            _cleanup_remaining(store, job_id, uid, dry_run, force, runner, report, managed)
+        if on_success is not None and not (dry_run or report.errors or report.blocked):
+            on_success(report)
+        return report
+
+
+def _cleanup_remaining(store, job_id, uid, dry_run, force, runner, report, managed):
     resources = store.job_resources(job_id) if job_id else []
     docker_ok = runner(["docker", "info", "--format", "{{.ServerVersion}}"])[0] == 0
 
@@ -452,6 +464,8 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
         for kind in ("container", "network", "volume", "image"):
             ids = set(_docker_ids(kind, uid, runner)) if uid else set()
             named = {r["ref"]: r for r in resources if r["kind"] == kind}
+            if dry_run:
+                ids = {ref for ref in ids if ref[:12] not in managed.get(kind, ())}
             for ref in list(ids) + [n for n in named if n not in ids]:
                 if dry_run:
                     done(None, f"{kind} {ref}")
@@ -465,7 +479,7 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
     elif any(r["kind"] in ("container", "volume", "network", "image") for r in resources):
         report.errors.append("docker недоступен — docker-ресурсы не убраны")
 
-    for res in [r for r in resources if r["kind"] == "port"]:
+    for res in [r for r in resources if r["kind"] == "port" and not r["meta"].get("testenv")]:
         done(res["id"], f"порт {res['ref']} ({res['meta'].get('name', '')})")
 
     for res in [r for r in resources if r["kind"] == "path"]:
@@ -511,4 +525,3 @@ def cleanup(store: "Store", job_id: int, *, dry_run: bool = False, force: bool =
             done(res["id"], f"копия {path}")
         else:
             report.errors.append(f"копия {path}: {out[-200:]}")
-    return report

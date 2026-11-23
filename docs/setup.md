@@ -126,6 +126,20 @@ jwu job cleanup <id> [--dry-run] [--force]   # убрать стенд, docker, 
 jwu job done <id> --summary "что сделано" --cleanup
 ```
 
+**Локальные зависимости django-chat в Codex.** После согласования тестов вызови
+`jwu_job_testenv(job_id=ID, action="up", workspace="work")`. В CLI это
+`jwu job testenv ID up`. Ответ содержит адрес `127.0.0.1` и порты `db` и `redis`.
+Передай их настройкам тестов. Имя базы, пользователь и пароль PostgreSQL — `postgres`.
+Для тестов S3 передай `minio=True` (CLI `--minio`). Порт придёт под ключом `s3`.
+Ключ и пароль MinIO — `minioadmin`. Сервисы каждого стенда используют свою Docker-сеть и публикуют порты на loopback.
+Бакеты MinIO создаёт тестовый раннер согласно своему сценарию.
+
+Повторный `up` возвращает готовые сервисы той же работы. Вызови `action="down"`
+(CLI `jwu job testenv ID down`), чтобы убрать зависимости и освободить порты.
+Обычное закрытие работы с уборкой тоже удаляет стенд. MCP-процессу или CLI нужен доступ
+к локальному Unix-сокету Docker и базе jwu. После обновления jwu перезапусти MCP-клиент, чтобы он
+увидел новый инструмент.
+
 **Пороги «давно»** для дневного анализа:
 `jwu workspace thresholds --stale-pr 14 --approval-wait 7 --review-wait 3 --testing 5`.
 
