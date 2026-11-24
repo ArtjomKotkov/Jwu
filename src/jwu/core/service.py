@@ -2213,6 +2213,7 @@ class Service:
             nonlocal count
             pr = self._require_prs().pr(ref[0], ref[1], ref[2])
             if pr.project and pr.repository:
+                self._fill_merge_status(pr)
                 self._fill_builds(pr)
                 self._fill_tasks(pr)
             views = self.store.latest_views(pr=ref)

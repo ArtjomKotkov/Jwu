@@ -34,6 +34,7 @@ telegram = "jwu.builtin.telegram"
 packages = [{include = "jwu", from = "src"}]
 include = [
     { path = "src/jwu/skills/**/*.md", format = ["sdist", "wheel"] },
+    { path = "src/jwu/skills/jwu-hermes-orchestrator/**", format = ["sdist", "wheel"] },
     { path = "src/jwu/agents/*.md", format = ["sdist", "wheel"] },
 ]
 

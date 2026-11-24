@@ -790,7 +790,10 @@ class PR(BaseModel):
         """
         mergeable = raw.get("mergeable")
         state = (raw.get("mergeable_state", "") or "").lower()
-        if mergeable is None and not state:
+        if "mergeable" not in raw and not state:
+            return
+        if mergeable is None and state != "dirty":
+            self.conflicted = self.can_merge = None
             return
         self.conflicted = state == "dirty" or mergeable is False
         self.can_merge = bool(mergeable) and state in ("clean", "has_hooks", "unstable", "")
