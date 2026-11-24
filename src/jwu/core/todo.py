@@ -286,8 +286,10 @@ def build(store: "Store", workspace_id: int, login: str, *, session: str = "",
         if qa:
             review.append(f"QA: {issue.status}")
         tech = []
-        if pr.conflicted:
+        if pr.conflicted is True:
             tech.append("конфликт")
+        elif pr.conflicted is None:
+            tech.append("конфликт: неизвестно — jwu pr")
         if pr.build_state == "FAILED":
             tech.append(BUILD_RED)
         elif tests_red(pr):
@@ -476,7 +478,7 @@ def _extra_groups(store: "Store", workspace_id: int, login: str, items: list, li
         ref = _pr_ref(pr)
         if ref in listed or not pr.reviewers or not all(r.approved for r in pr.reviewers):
             continue
-        if pr.conflicted or pr.build_state == "FAILED" or tests_red(pr) or pr.tasks_open:
+        if pr.conflicted is not False or pr.build_state == "FAILED" or tests_red(pr) or pr.tasks_open:
             continue
         expected = expects_build(pr)
         if expected and not pr.build_state and not pr.tests_pending:

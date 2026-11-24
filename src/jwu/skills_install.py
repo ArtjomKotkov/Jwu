@@ -25,6 +25,8 @@ EXPECTED_SKILLS = {
     "jwu-zephyr-testcase",
     "jwu-cleanup",
     "jwu-orchestrator",
+    "jwu-hermes-orchestrator",
+    "jwu-hermes-role-samples",
     "jwu-job-review",
     "jwu-commit-message",
     "jwu-task-create",
@@ -107,6 +109,11 @@ def install_skills(dest: Path) -> list[tuple[str, str]]:
         action = "обновлён" if (target_dir / "SKILL.md").exists() else "добавлен"
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "SKILL.md").write_text(content, encoding="utf-8")
+        skill_root = Path(str(entry))
+        for sub in ("scripts", "references"):
+            src = skill_root / sub
+            if src.is_dir():
+                shutil.copytree(src, target_dir / sub, dirs_exist_ok=True)
         results.append((name, action))
     results.extend(_install_addon_skills(dest))
     results.extend(_remove_retired(dest))

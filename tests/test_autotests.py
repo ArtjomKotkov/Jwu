@@ -81,10 +81,11 @@ def test_run_without_capable_addon_or_with_error(monkeypatch):
 
 def test_board_waits_for_queued_tests_and_flags_failed(store):
     store.set_workspace_settings(store.workspace_id, {todo.BUILD_REQUIRED_SETTING: "*"})
-    base = dict(project="P", repository="app", state="OPEN", title="t", source_branch="b")
-    queued = PR(id=1, **base, autotests=Autotests(state="queued", queued_since=1, server_time=2 * H))
-    idle = PR(id=2, **base, autotests=Autotests(state="not_started"))
-    red = PR(id=3, **base, builds=[BuildStatus(state="SUCCESSFUL", key="t")], autotests=Autotests(state="failed"))
+    base = PR(id=0, project="P", repository="app", state="OPEN", title="t", source_branch="b", conflicted=False)
+    queued = base.model_copy(update={"id": 1, "autotests": Autotests(state="queued", queued_since=1, server_time=2 * H)})
+    idle = base.model_copy(update={"id": 2, "autotests": Autotests(state="not_started")})
+    red = base.model_copy(update={"id": 3, "autotests": Autotests(state="failed"),
+                                  "builds": [BuildStatus(state="SUCCESSFUL", key="t")]})
     run = store.start_sync_run(["prs:mine"])
     for pr in (queued, idle, red):
         store.save_pr_snapshot(run, pr, ["mine"])

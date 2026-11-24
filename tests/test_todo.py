@@ -213,6 +213,7 @@ def test_board_move_reply_close_groups(store):
     run = store.start_sync_run(["mine", "prs:mine"])
     store.save_issue_snapshot(run, Issue(key="AB-8", summary="Апрувнуто", status="In Review", priority="Major"), ["mine"])
     store.save_pr_snapshot(run, PR(id=8, title="AB-8: готово", project="P", repository="r", state="OPEN",
+                                   conflicted=False,
                                    reviewers=[Reviewer(name="x", approved=True, status="APPROVED")]), ["mine"])
     store.finish_sync_run(run, {"tasks:mine": 1, "prs:mine": 1})
     store.add_mentions([Mention(task_key="AB-9", comment_id="1", author="Петя", text="[~me] глянь?",
@@ -237,9 +238,22 @@ def test_render_shows_only_live_sessions():
     assert "Z" not in text and "молчит" not in text and "освободи" not in text
 
 
-def _approved_pr(pr_id, repo="r", **kw):
+def _approved_pr(pr_id, repo="r", *, conflicted: bool | None = False, **kw):
     return PR(id=pr_id, title=f"AB-{pr_id}: готово", project="P", repository=repo, state="OPEN",
-              reviewers=[Reviewer(name="x", approved=True, status="APPROVED")], **kw)
+              conflicted=conflicted, reviewers=[Reviewer(name="x", approved=True, status="APPROVED")], **kw)
+
+
+def test_approved_pr_unknown_conflict_not_in_move(store):
+    """Апрувы есть, но merge неизвестен — не «двигать», а simple с пометкой."""
+    run = store.start_sync_run(["mine", "prs:mine"])
+    store.save_issue_snapshot(run, Issue(key="AB-9", summary="готово", status="In Review"), ["mine"])
+    store.save_pr_snapshot(run, _approved_pr(9, conflicted=None), ["mine"])
+    store.finish_sync_run(run, {"tasks:mine": 1, "prs:mine": 1})
+    board = todo.build(store, store.workspace_id, "me")
+    by_pr = {i.pr["id"]: i for i in board.items if i.pr}
+    assert by_pr[9].group == "simple"
+    assert "конфликт: неизвестно" in ", ".join(by_pr[9].problems)
+    assert [i for i in board.items if i.group == "move" and i.pr and i.pr["id"] == 9] == []
 
 
 def test_board_build_gate_like_conflict(store):
@@ -414,7 +428,7 @@ def test_task_in_unknown_status_not_lost(store):
     assert "backlog" in board.to_dict()["statuses"]["todo"]
 
 
-def test_point_refresh_after_jwu_action(store):
+def test_point_refresh_after_jwu_action(store, monkeypatch):
     """jwu запушил мерж — PR с конфликтом дотягивается точечно: доска видит снятый конфликт сразу,
     пункт помечен «обновлено jwu», а дельта следующего синка считается от настоящего синка."""
     from types import SimpleNamespace
@@ -430,15 +444,23 @@ def test_point_refresh_after_jwu_action(store):
     assert len(todo.dirty(store)) == 2
     fixed = _pr(1, "AB-1: конфликт")                                        # конфликт снят, сборка зелёная
     fixed.builds = [BuildStatus(state="SUCCESSFUL", key="b", name="b", url="")]
-    fake = SimpleNamespace(store=store, tasks_client=None,
-                           _require_prs=lambda: SimpleNamespace(pr=lambda p, r, i: fixed.model_copy()),
-                           _fill_builds=lambda pr: None, _fill_tasks=lambda pr: None)
-    res = todo.refresh_dirty(store, SimpleNamespace(refresh_points=lambda items: Service.refresh_points(fake, items)))
+    svc = Service.__new__(Service)
+    svc.store = store
+    svc.tasks_client = None
+    client = SimpleNamespace(
+        pr=lambda p, r, i: fixed.model_copy(update={"conflicted": None}),
+        merge_status=lambda p, r, i: {"conflicted": False, "canMerge": True},
+    )
+    monkeypatch.setattr(svc, "pr_client", client, raising=False)
+    svc._fill_builds = lambda pr: None
+    svc._fill_tasks = lambda pr: None
+    res = todo.refresh_dirty(store, svc)
     assert res["refreshed"] == ["P/r#1"] and todo.dirty(store) == []
     board = todo.build(store, store.workspace_id, "me")
     assert not any(i.key == "P/r#1" and i.group == "simple" for i in board.items)
     # PR больше не на доске как проблема — но в составе «моих» остался (состав не трогаем)
-    assert any(p.id == 1 for p in store.latest_prs("mine"))
+    [refreshed] = [p for p in store.latest_prs("mine") if p.id == 1]
+    assert refreshed.conflicted is False and refreshed.can_merge is True
     # дельты: следующий синк сравнивает с прошлым НАСТОЯЩИМ снапшотом, а не с точечным
     run = store.start_sync_run(["prs:mine"])
     store.save_pr_snapshot(run, fixed, ["mine"])

@@ -6,7 +6,7 @@ import respx
 
 from jwu.core.config import Config
 from jwu.core.github import GitHubClient, GitHubError, parse_actions_url
-from jwu.core.models import BuildStatus, gh_ms, github_key, parse_github_key
+from jwu.core.models import BuildStatus, PR, gh_ms, github_key, parse_github_key
 from jwu.core.service import Service
 from jwu.core.store import Store
 
@@ -39,7 +39,7 @@ def gh_issue_raw(number=42, title="Колода не сохраняется", st
     }
 
 
-def gh_pr_raw(number=7, state="open", merged_at=None, mergeable=True,
+def gh_pr_raw(number=7, state="open", merged_at=None, mergeable: bool | None = True,
               mergeable_state="clean", head="42-fix-save", base="main"):
     repo = {"name": REPO, "owner": {"login": OWNER}}
     return {
@@ -236,6 +236,29 @@ def test_pr_conflict_detected_from_mergeable_state():
     with _client() as gh:
         pr = gh.pr(OWNER, REPO, 7)
     assert pr.conflicted is True and pr.can_merge is False
+
+
+@pytest.mark.parametrize("state", ["unknown", ""])
+def test_pr_pending_github_merge_status_is_unknown(state):
+    raw = gh_pr_raw(mergeable=None, mergeable_state=state)
+    pr = PR.from_github(raw)
+    assert pr.conflicted is None and pr.can_merge is None
+
+    pr.apply_github_merge(gh_pr_raw())
+    assert pr.conflicted is False and pr.can_merge is True
+
+    pr.apply_github_merge(raw)
+    assert pr.conflicted is None and pr.can_merge is None
+
+
+@pytest.mark.parametrize(("mergeable", "state", "expected_conflict"), [
+    (None, "dirty", True),
+    (False, "unknown", True),
+    (True, "blocked", False),
+])
+def test_pr_explicit_github_merge_information_is_retained(mergeable, state, expected_conflict):
+    pr = PR.from_github(gh_pr_raw(mergeable=mergeable, mergeable_state=state))
+    assert pr.conflicted is expected_conflict and pr.can_merge is False
 
 
 @respx.mock
