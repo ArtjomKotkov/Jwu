@@ -1,5 +1,6 @@
 """Keep the Hermes project skill catalog in step with the bundled catalog."""
 
+import json
 import re
 from pathlib import Path
 
@@ -59,6 +60,49 @@ def test_native_role_samples_install_with_all_references(tmp_path):
         ref = f"references/{role}.md"
         assert ref in (installed / "SKILL.md").read_text(encoding="utf-8")
         assert (installed / ref).read_bytes() == (project / ref).read_bytes()
+
+
+def test_documented_desktop_handoff_checks_worker_before_sending():
+    doc = (BUNDLED_SKILLS / "jwu-hermes-orchestrator/references/install.md").read_text()
+    assert "--create-only" in doc and "--brief-file" not in doc
+    assert doc.index("--create-only") < doc.index("worker_relay.py send")
+    before_create = doc.split("--create-only", 1)[0]
+    assert "Совместимость шлюза" in before_create and "Совместимость Python payload" in before_create
+    assert "Canary" in before_create and "MailboxRepository.worker_parent" in before_create
+    assert '--key' not in doc[doc.index('"$S/run_with_gateway.sh" "$S/worker_relay.py" send'):].split('```', 1)[0]
+
+
+def test_desktop_mail_examples_keep_routing_out_of_text():
+    skill = HERMES_SKILLS / "jwu-hermes-orchestrator" / "SKILL.md"
+    mail = skill.read_text().split("## Пассивная почта", 1)[1].split("## Архив", 1)[0]
+    report, question, reply = [json.loads(line) for line in mail.splitlines() if line.startswith('{"action"')]
+    assert [message["kind"] for message in (report, question, reply)] == ["report", "question", "reply"]
+    assert {message["action"] for message in (report, question, reply)} == {"send"}
+    assert report["recipient"] == question["recipient"] == "MAIN_ID"
+    assert reply["recipient"] == "WORKER_ID" and reply["reply_to"] == "QUESTION_ID"
+    assert len({message["request_id"] for message in (report, question, reply)}) == 3
+    for message in (report, question, reply):
+        assert set(message) <= {"action", "kind", "recipient", "request_id", "text", "reply_to"}
+        assert message["recipient"] not in message["text"]
+        assert message["request_id"] not in message["text"]
+    assert "`prompt.submit`" in mail and "без запасного маршрута" in mail
+
+
+def test_desktop_orchestration_has_no_automatic_archive_route():
+    for root in (HERMES_SKILLS, BUNDLED_SKILLS):
+        skill = (root / "jwu-orchestrator" / "SKILL.md").read_text()
+        assert 'session_mailbox' in skill
+        assert 'Автоматического маршрута нет' in skill
+        assert 'вручную в Hermes Desktop' in skill
+        close = (root / "jwu-close-job" / "SKILL.md").read_text()
+        assert 'вручную в Hermes Desktop' in close
+        assert 'просьбу архивировать' not in close
+
+
+def test_install_checks_mailbox_availability_in_each_chat():
+    doc = (BUNDLED_SKILLS / "jwu-hermes-orchestrator/references/install.md").read_text()
+    assert 'отдельно в Main и отдельно в чате воркера' in doc
+    assert 'без запасного маршрута' in doc
 
 
 def test_native_review_and_voice_callers_do_not_require_a_private_role_catalog():

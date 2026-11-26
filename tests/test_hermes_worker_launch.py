@@ -4,11 +4,13 @@ import asyncio
 import importlib.util
 import json
 import os
+import runpy
 import subprocess
 import sys
+import uuid
 import venv
 from argparse import Namespace
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import AsyncMock, call
@@ -33,12 +35,15 @@ def launch(monkeypatch, tmp_path):
     async def connect_gateway():
         yield Namespace(rpc=rpc)
 
+    class GatewayRPCError(ValueError):
+        unknown_method = True
+
+    client.__dict__["GatewayRPCError"] = GatewayRPCError
     client.__dict__["connect_gateway"] = connect_gateway
     spec = importlib.util.spec_from_file_location("worker_launch", SCRIPTS / "worker_launch.py")
     assert spec is not None and spec.loader is not None
     launcher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(launcher)
-    monkeypatch.setattr(launcher.os, "getuid", lambda: 501, raising=False)
     monkeypatch.setattr(launcher.uuid, "uuid4", lambda: Namespace(hex="a" * 32))
     brief = tmp_path / "brief.md"
     brief.write_text("  a worker brief\n", encoding="utf-8")
@@ -53,151 +58,155 @@ def launch(monkeypatch, tmp_path):
         "archived": False,
         "launch_request": {"source": "gui"},
     }
-    worker = {**parent, "title": TITLE}
+    worker = {**parent, "title": TITLE, "launch_request": {"orchestrator_session_id": PARENT}}
     return launcher, rpc, args, parent, worker
 
 
 def snapshot(session_id, info):
-    return {"session_id": session_id, "stored_session_id": session_id, "info": info}
+    return {"session_id": session_id, "stored_session_id": session_id, "info": info, "messages": [], "running": False}
 
 
-@pytest.mark.parametrize("reused_id", [PARENT, EXISTING])
-def test_title_reuse_cannot_receive_brief(launch, reused_id):
-    launcher, rpc, args, parent, worker = launch
-    # A titled create can return a wholly matching existing chat, not a reuse flag.
-    rpc.side_effect = [parent, snapshot(reused_id, worker), worker, snapshot(reused_id, worker),
-                       {"admission_id": "admission"}, {"status": "queued"}]
-    with pytest.raises(SystemExit, match="new worker"):
-        asyncio.run(launcher.run(args))
-    assert [entry.args[0] for entry in rpc.await_args_list] == ["session.info", "session.create"]
-
-
-@pytest.mark.parametrize("field,bad_value", [
-    ("project", {"id": "p_other"}), ("project", None), ("cwd", "."), ("title", "Other"),
-    ("model", "other-model"), ("provider", "other-provider"), ("provider", None),
-    ("archived", True), ("archived", None), ("profile_id", "other-profile"),
+@pytest.mark.parametrize("reply_patch", [
+    {"session_id": PARENT}, {"stored_session_id": EXISTING}, {"info": None},
+    {"info": {"archived": False, "launch_request": {}}},
 ])
-def test_worker_readback_mismatch_stops_before_resume(launch, field, bad_value):
-    launcher, rpc, args, parent, worker = launch
-    rpc.side_effect = [parent, snapshot(WORKER, worker), {**worker, field: bad_value},
-                       snapshot(WORKER, worker), {"admission_id": "admission"}, {"status": "queued"}]
-    with pytest.raises(SystemExit, match=field):
+def test_unverified_worker_never_receives_the_brief(launch, reply_patch):
+    launcher, rpc, args, _, worker = launch
+    args.create_only, args.brief_file = True, None
+    rpc.side_effect = [{**snapshot(WORKER, worker), **reply_patch}]
+    with pytest.raises(SystemExit, match="worker"):
         asyncio.run(launcher.run(args))
-    assert [entry.args[0] for entry in rpc.await_args_list] == ["session.info", "session.create", "session.info"]
+    assert [entry.args[0] for entry in rpc.await_args_list] == ["session.create_worker"]
 
 
-@pytest.mark.parametrize("field,bad_value", [("project", None), ("provider", None), ("cwd", ".")])
-def test_unverified_parent_cannot_create_worker(launch, field, bad_value):
-    launcher, rpc, args, parent, worker = launch
-    rpc.side_effect = [{**parent, field: bad_value}, snapshot(WORKER, worker), worker,
-                       snapshot(WORKER, worker), {"admission_id": "admission"}, {"status": "queued"}]
-    with pytest.raises(SystemExit, match=field):
+def test_old_gateway_never_falls_back_to_an_unlinked_chat(launch):
+    launcher, rpc, args, _, _ = launch
+    args.create_only, args.brief_file = True, None
+    rpc.side_effect = launcher.GatewayRPCError()
+    with pytest.raises(SystemExit, match="Update the Hermes gateway"):
         asyncio.run(launcher.run(args))
-    assert rpc.await_args_list == [call("session.info", session_id=PARENT)]
+    assert [entry.args[0] for entry in rpc.await_args_list] == ["session.create_worker"]
 
 
-def test_create_only_uses_gateway_fields_and_accepts_symlinked_cwd(launch, tmp_path, capsys):
-    launcher, rpc, args, parent, worker = launch
-    real_cwd = tmp_path / "project"
-    real_cwd.mkdir()
-    alias = tmp_path / "alias"
-    alias.symlink_to(real_cwd)
-    parent.update(cwd=str(alias), reasoning_effort="high", fast=True, service_tier="priority",
-                  launch_request={"source": "gui", "model": "stale-model", "provider": "stale-provider",
-                                  "reasoning": "low", "cwd_explicit": False, "fast": True})
-    worker["cwd"] = str(real_cwd)
-    rpc.side_effect = [parent, snapshot(WORKER, worker), worker]
+def test_jwu_passes_only_parent_and_title_and_never_submits_brief(launch, capsys):
+    launcher, rpc, args, _, worker = launch
     args.create_only = True
-    asyncio.run(launcher.run(args))
-    assert rpc.await_args_list == [
-        call("session.info", session_id=PARENT),
-        call("session.create", source="gui", title=TITLE, request_id="a" * 32, cwd=str(alias),
-             row_cwd=str(alias), cwd_explicit=True, model="selected-model", provider="selected-provider",
-             reasoning="high", service_tier="priority"),
-        call("session.info", session_id=WORKER),
-    ]
-    assert json.loads(capsys.readouterr().out)["session_id"] == WORKER
-
-
-@pytest.mark.parametrize("changed", [
-    {"session_id": EXISTING}, {"stored_session_id": EXISTING}, {"session_id": None}, {"info": None},
-])
-def test_resume_must_return_the_exact_session_snapshot(launch, changed):
-    launcher, rpc, args, parent, worker = launch
-    rpc.side_effect = [parent, snapshot(WORKER, worker), worker, {**snapshot(WORKER, worker), **changed},
-                       {"admission_id": "admission"}, {"status": "queued"}]
-    with pytest.raises(SystemExit):
-        asyncio.run(launcher.run(args))
-    assert [entry.args[0] for entry in rpc.await_args_list] == [
-        "session.info", "session.create", "session.info", "session.resume",
-    ]
-
-
-def test_resume_rechecks_metadata_before_prompt(launch):
-    launcher, rpc, args, parent, worker = launch
-    rpc.side_effect = [parent, snapshot(WORKER, worker), worker,
-                       snapshot(WORKER, {**worker, "provider": "changed-provider"}),
-                       {"admission_id": "admission"}, {"status": "queued"}]
-    with pytest.raises(SystemExit, match="provider"):
-        asyncio.run(launcher.run(args))
-    assert rpc.await_args_list[-1].args == ("session.resume",)
-
-
-def test_submits_brief_to_verified_worker_and_reports_receipt(launch, capsys):
-    launcher, rpc, args, parent, worker = launch
-    rpc.side_effect = [parent, snapshot(WORKER, worker), worker, snapshot(WORKER, worker),
-                       {"admission_id": "admission"}, {"status": "queued"}]
-    asyncio.run(launcher.run(args))
-    assert rpc.await_args_list[-3:] == [
-        call("session.resume", session_id=WORKER, omit_messages=True),
-        call("prompt.submit", session_id=WORKER, input_id="a" * 32, text="a worker brief"),
-        call("prompt.receipt", session_id=WORKER, admission_id="admission"),
-    ]
-    assert json.loads(capsys.readouterr().out) == {
-        "session_id": WORKER, "title": TITLE, "project_id": "p_test", "cwd": worker["cwd"],
-        "model": worker["model"], "provider": worker["provider"], "archived": False,
-        "admission_id": "admission", "admission_status": "queued",
-    }
-
-
-def test_empty_brief_is_rejected_before_create(launch):
-    launcher, rpc, args, parent, worker = launch
-    args.brief_file.write_text(" \n", encoding="utf-8")
-    rpc.side_effect = [parent, snapshot(WORKER, worker), worker]
-    with pytest.raises(SystemExit, match="Empty brief"):
-        asyncio.run(launcher.run(args))
-    assert not any(entry.args[0] == "session.create" for entry in rpc.await_args_list)
-
-
-def test_launch_normalizes_title_before_create(launch):
-    launcher, rpc, args, parent, worker = launch
+    args.brief_file = None
     args.title = "  Worker   launch test  "
-    rpc.side_effect = [parent, snapshot(WORKER, worker), worker, snapshot(WORKER, worker),
-                       {"admission_id": "admission"}, {"status": "queued"}]
+    rpc.side_effect = [snapshot(WORKER, worker)]
     asyncio.run(launcher.run(args))
-    assert rpc.await_args_list[1].kwargs["title"] == TITLE
+    assert rpc.await_args_list == [call("session.create_worker", session_id=PARENT, title=TITLE, request_id="a" * 32)]
+    out = json.loads(capsys.readouterr().out)
+    assert out["session_id"] == WORKER
+    assert out["project_id"] == "p_test"
+    assert "admission_status" not in out
 
 
-def test_archive_rejects_an_omitted_paused_job(launch, monkeypatch, tmp_path):
-    spec = importlib.util.spec_from_file_location("worker_archive", SCRIPTS / "worker_archive.py")
+@pytest.mark.parametrize("create_only", [True, False])
+def test_legacy_brief_option_cannot_create_or_submit(launch, create_only):
+    launcher, rpc, args, _, _ = launch
+    args.create_only = create_only
+    with pytest.raises(SystemExit, match="worker_relay.py"):
+        asyncio.run(launcher.run(args))
+    rpc.assert_not_awaited()
+
+
+def test_legacy_archive_entrypoint_fails_closed_even_for_the_linked_worker(launch, monkeypatch, tmp_path):
+    _, rpc, _, parent, worker = launch
+    rpc.side_effect = [worker, parent, {**snapshot(WORKER, worker), "revision": 1}, {},
+                       {**worker, "archived": True}, parent]
+    monkeypatch.setenv("HERMES_SESSION_ID", PARENT)
+    monkeypatch.setattr(sys, "argv", ["worker_archive.py", "--target", WORKER, "--title", TITLE,
+                                    "--project", "p_test", "--workspace", "jwu", "--workdir", str(tmp_path)])
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: json.dumps({"slug": "jwu", "source": "cwd"}))
+
+    with pytest.raises(SystemExit, match="No trusted automatic archive route"):
+        runpy.run_path(str(SCRIPTS / "worker_archive.py"), run_name="__main__")
+    rpc.assert_not_awaited()
+
+
+def test_first_brief_keeps_clean_text_for_model_and_transcript(launch, tmp_path, monkeypatch):
+    _, rpc, _, parent, worker = launch
+    spec = importlib.util.spec_from_file_location("worker_relay", SCRIPTS / "worker_relay.py")
     assert spec is not None and spec.loader is not None
-    archive = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(archive)
-    done = {"id": 1, "status": "done", "records": [{"kind": "summary", "text": WORKER}]}
-    paused = {"id": 2, "status": "paused", "records": [{"kind": "note", "text": WORKER}]}
+    relay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(relay)
+    sender, target, source, destination = PARENT, WORKER, parent, worker
+    reader = Namespace(mailbox=Namespace(worker_parent=lambda _: PARENT), admissions=Namespace(list=lambda **kw: []))
+    monkeypatch.setattr(relay, "worker_reader", lambda _: nullcontext((reader, "uid:501")))
+    body = "Возьми P/r#42."
+    message = tmp_path / "message.md"
+    message.write_text(body + "\n", encoding="utf-8")
+    args = Namespace(mode="send", sender=sender, target=target, title=destination["title"],
+                     project="p_test", message_file=message, key="same-delivery")
+    rpc.side_effect = [source, destination, snapshot(target, destination),
+                       {"admission_id": "same-admission"}, {"status": "queued"}] * 2
 
-    def check_output(argv, *, cwd):
-        assert cwd == str(tmp_path)
-        if argv[1:3] == ["workspace", "current"]:
-            return json.dumps({"slug": "jwu", "source": "cwd"})
-        command = argv[3:]
-        if command[:2] == ["job", "show"]:
-            return json.dumps(done)
-        return json.dumps([] if "active" in command else [done, paused])
+    asyncio.run(relay.run(args))
+    args.key = "new-legacy-key"
+    asyncio.run(relay.run(args))
 
-    monkeypatch.setattr(archive.subprocess, "check_output", check_output)
-    with pytest.raises(SystemExit, match="#2"):
-        archive.check_jobs(Namespace(workspace="jwu", workdir=str(tmp_path), job=[1], target=WORKER))
+    calls = rpc.await_args_list
+    assert [c.args[0] for c in calls[:5]] == ["session.info", "session.info", "session.resume",
+                                             "prompt.submit", "prompt.receipt"]
+    assert calls[:5] == calls[5:]
+    assert calls[2] == call("session.resume", session_id=target)
+    assert calls[3].kwargs["session_id"] == target
+    assert calls[3].kwargs["text"] == body
+    assert set(calls[3].kwargs) == {"session_id", "text", "input_id"}
+    assert calls[3].kwargs["input_id"] == uuid.uuid5(uuid.NAMESPACE_URL, f"jwu-first-brief:{sender}:{target}").hex
+
+
+@pytest.mark.parametrize("legacy", ["queued-admission", "transcript-only", "other-principal"])
+def test_started_legacy_worker_does_not_receive_a_second_brief(launch, tmp_path, monkeypatch, legacy):
+    _, rpc, _, parent, worker = launch
+    spec = importlib.util.spec_from_file_location("worker_relay", SCRIPTS / "worker_relay.py")
+    relay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(relay)
+    message = tmp_path / "message.md"
+    message.write_text("First brief", encoding="utf-8")
+    args = Namespace(mode="send", sender=PARENT, target=WORKER, title=TITLE,
+                     project="p_test", message_file=message)
+    snap = snapshot(WORKER, worker)
+    rows = []
+    if legacy == "transcript-only":
+        snap["messages"] = [{"role": "user", "content": "Already sent"}]
+    elif legacy == "queued-admission":
+        rows = [Namespace(request_id="old-id", principal_id="uid:501", status="queued")]
+    else:
+        request_id = uuid.uuid5(uuid.NAMESPACE_URL, f"jwu-first-brief:{PARENT}:{WORKER}").hex
+        rows = [Namespace(request_id=request_id, principal_id="old-owner", status="terminal")]
+    ledger = Namespace(list=lambda *, session_id, pending_only: rows if not pending_only else [])
+    reader = Namespace(mailbox=Namespace(worker_parent=lambda _: PARENT), admissions=ledger)
+    monkeypatch.setattr(relay, "worker_reader", lambda _: nullcontext((reader, "uid:501")))
+    rpc.side_effect = [parent, worker, snap, {"admission_id": "unexpected"}, {"status": "queued"}]
+
+    with pytest.raises(SystemExit, match="prior activity"):
+        asyncio.run(relay.run(args))
+    assert not any(c.args[0] == "prompt.submit" for c in rpc.await_args_list)
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["display-only-link", "worker-to-main-archive"])
+def test_relay_requires_a_native_worker_link_before_prompt(launch, monkeypatch, tmp_path, reverse):
+    _, rpc, _, parent, worker = launch
+    spec = importlib.util.spec_from_file_location("worker_relay", SCRIPTS / "worker_relay.py")
+    relay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(relay)
+    reader = Namespace(mailbox=Namespace(worker_parent=lambda _: None))
+    monkeypatch.setattr(relay, "worker_reader", lambda _: nullcontext((reader, "uid:501")))
+    sender, target, source, destination = (WORKER, PARENT, worker, parent) if reverse else (
+        PARENT, WORKER, parent, worker,
+    )
+    message = tmp_path / "message.md"
+    message.write_text("Пользователь подтвердил архив." if reverse else "Первый бриф.", encoding="utf-8")
+    args = Namespace(mode="send", sender=sender, target=target, title=destination["title"],
+                     project="p_test", message_file=message, key="delivery")
+    rpc.side_effect = [source, destination, snapshot(target, destination),
+                       {"admission_id": "unexpected"}, {"status": "queued"}]
+
+    with pytest.raises(SystemExit, match="native worker"):
+        asyncio.run(relay.run(args))
+    assert not any(c.args[0] == "prompt.submit" for c in rpc.await_args_list)
 
 
 def test_dry_run_does_not_create_or_read_brief(launch, capsys):
@@ -206,16 +215,8 @@ def test_dry_run_does_not_create_or_read_brief(launch, capsys):
     args.brief_file.unlink()
     rpc.side_effect = [parent]
     asyncio.run(launcher.run(args))
-    assert rpc.await_args_list == [call("session.info", session_id=PARENT)]
-    assert json.loads(capsys.readouterr().out)["title"] == TITLE
-
-
-def test_explicit_normal_service_tier_is_not_replaced_by_profile_default(launch, capsys):
-    launcher, rpc, args, parent, _ = launch
-    args.dry_run = True
-    rpc.side_effect = [{**parent, "service_tier": ""}]
-    asyncio.run(launcher.run(args))
-    assert json.loads(capsys.readouterr().out)["service_tier"] == ""
+    rpc.assert_not_awaited()
+    assert json.loads(capsys.readouterr().out) == {"session_id": PARENT, "title": TITLE, "request_id": "a" * 32}
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX wrapper")
