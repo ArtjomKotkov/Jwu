@@ -1,6 +1,6 @@
 [project]
 name = "jwu"
-version = "3.4.7"
+version = "3.4.8"
 description = "CLI для Jira Server + Bitbucket Server с памятью, для интеграции с Claude Code"
 authors = [
     {name = "Artem Kotkov", email = "ArtjomKotkov@users.noreply.github.com"}
@@ -33,8 +33,7 @@ telegram = "jwu.builtin.telegram"
 [tool.poetry]
 packages = [{include = "jwu", from = "src"}]
 include = [
-    { path = "src/jwu/skills/**/*.md", format = ["sdist", "wheel"] },
-    { path = "src/jwu/skills/jwu-hermes-orchestrator/**", format = ["sdist", "wheel"] },
+    { path = "src/jwu/skill_bundles/**", format = ["sdist", "wheel"] },
     { path = "src/jwu/agents/*.md", format = ["sdist", "wheel"] },
 ]
 

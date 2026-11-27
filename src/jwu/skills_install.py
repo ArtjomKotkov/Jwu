@@ -1,10 +1,4 @@
-"""Установка jwu-скиллов и субагентов (Claude Code) из пакета.
-
-Скиллы лежат внутри пакета (``jwu/skills/<name>/SKILL.md``), субагенты —
-``jwu/agents/<name>.md``. Едут вместе с wheel/pipx. ``install_skills`` и
-``install_agents`` копируют их в целевые каталоги (по умолчанию
-``~/.claude/skills`` и ``~/.claude/agents``), перезаписывая существующие.
-"""
+"""Установка клиентских скиллов и субагентов из ресурсов jwu."""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Ожидаемые скиллы (для проверок/тестов; фактически ставится всё, что лежит в пакете).
+# Штатные скиллы Claude Code (проверки doctor и исключения из backup).
 EXPECTED_SKILLS = {
     "jwu-start-job",
     "jwu-continue-job",
@@ -25,8 +19,6 @@ EXPECTED_SKILLS = {
     "jwu-zephyr-testcase",
     "jwu-cleanup",
     "jwu-orchestrator",
-    "jwu-hermes-orchestrator",
-    "jwu-hermes-role-samples",
     "jwu-job-review",
     "jwu-commit-message",
     "jwu-task-create",
@@ -89,34 +81,62 @@ def default_agents_dest() -> Path:
     return Path.home() / ".claude" / "agents"
 
 
-def install_skills(dest: Path) -> list[tuple[str, str]]:
-    """Развернуть забандленные скиллы в ``dest``. Перезаписывает существующие.
+TARGETS = ("claude", "cursor", "codex", "jwu-hermes")
 
-    Возвращает список (имя_скилла, действие), где действие — "добавлен" | "обновлён",
-    отсортированный по имени.
-    """
-    root = resources.files("jwu") / "skills"
-    results: list[tuple[str, str]] = []
-    for entry in root.iterdir():
-        if not entry.is_dir():
+
+def skill_bundle(target: str):
+    """Ресурсы ровно одного клиента; отсутствующий комплект — ошибка."""
+    if target not in TARGETS:
+        raise ValueError(f"Неизвестный клиент: {target}")
+    root = resources.files("jwu") / "skill_bundles" / target
+    if not root.is_dir():
+        raise FileNotFoundError(f"Нет пакета скиллов {target}")
+    return root
+
+
+def hermes_skills_dest() -> Path:
+    profile = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+    return profile / "skills" / "jwu-hermes"
+
+
+def _skill_files(source, target: Path):
+    for child in source.iterdir():
+        if child.name == "__pycache__":
             continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.is_file():
-            continue
-        name = entry.name
-        content = skill_md.read_text(encoding="utf-8")
-        target_dir = dest / name
-        action = "обновлён" if (target_dir / "SKILL.md").exists() else "добавлен"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        (target_dir / "SKILL.md").write_text(content, encoding="utf-8")
-        skill_root = Path(str(entry))
-        for sub in ("scripts", "references"):
-            src = skill_root / sub
-            if src.is_dir():
-                shutil.copytree(src, target_dir / sub, dirs_exist_ok=True)
-        results.append((name, action))
-    results.extend(_install_addon_skills(dest))
-    results.extend(_remove_retired(dest))
+        dest = target / child.name
+        if child.is_dir():
+            yield from _skill_files(child, dest)
+        elif child.is_file():
+            yield child, dest
+
+
+def install_skills(dest: Path, *, target: str = "claude") -> list[tuple[str, str]]:
+    """Скопировать скиллы одного клиента, включая их ресурсы."""
+    root = skill_bundle(target)
+    entries = [entry for entry in root.iterdir() if (entry / "SKILL.md").is_file()]
+    if not entries:
+        raise FileNotFoundError(f"Пакет скиллов {target} пуст")
+    files = [(source, path) for entry in entries
+             for source, path in _skill_files(entry, dest / entry.name)]
+    # Hermes не пишет через ссылки в старый профиль, private skills или checkout.
+    if target == "jwu-hermes":
+        for _, path in files:
+            for candidate in (path, *path.parents):
+                if candidate.is_symlink():
+                    raise ValueError(f"Символическая ссылка в каталоге установки: {candidate}")
+                if candidate == dest.parent:
+                    break
+    results = [(entry.name, "обновлён" if (dest / entry.name / "SKILL.md").exists()
+                else "добавлен") for entry in entries]
+    for source, path in files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with resources.as_file(source) as source_path:
+            shutil.copy2(source_path, path)
+        if path.suffix == ".sh" and path.parent.name == "scripts":
+            path.chmod(path.stat().st_mode | 0o100)
+    if target != "jwu-hermes":
+        results.extend(_install_addon_skills(dest))
+        results.extend(_remove_retired(dest))
     return sorted(results)
 
 
@@ -156,9 +176,6 @@ def _remove_retired(dest: Path) -> list[tuple[str, str]]:
 
 # Куда ставить под каждого клиента. Cursor (2.4+) понимает те же SKILL.md и те же
 # markdown-субагенты, что Claude Code, но ищет их в своих каталогах.
-TARGETS = ("claude", "cursor", "codex")
-
-
 def cursor_skills_dest() -> Path:
     return Path.home() / ".cursor" / "skills"
 

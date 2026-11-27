@@ -4,7 +4,6 @@ import asyncio
 import importlib.util
 import json
 import os
-import runpy
 import subprocess
 import sys
 import uuid
@@ -17,7 +16,9 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "src/jwu/skills/jwu-hermes-orchestrator/scripts"
+from jwu.skills_install import skill_bundle
+
+SCRIPTS = skill_bundle("jwu-hermes") / "jwu-orchestrator/scripts"
 PARENT = "local-" + "0" * 64
 # Canonical ID from the installed Hermes bindings for test-profile / uid:501 / a*32.
 WORKER = "local-311891f9b72bc664eccc8e532583ff9b0b1bf2a8358c5724483d724a137e2787"
@@ -111,18 +112,21 @@ def test_legacy_brief_option_cannot_create_or_submit(launch, create_only):
     rpc.assert_not_awaited()
 
 
-def test_legacy_archive_entrypoint_fails_closed_even_for_the_linked_worker(launch, monkeypatch, tmp_path):
+def test_archive_readback_only_reads_the_linked_worker(launch, monkeypatch, capsys):
     _, rpc, _, parent, worker = launch
-    rpc.side_effect = [worker, parent, {**snapshot(WORKER, worker), "revision": 1}, {},
-                       {**worker, "archived": True}, parent]
-    monkeypatch.setenv("HERMES_SESSION_ID", PARENT)
-    monkeypatch.setattr(sys, "argv", ["worker_archive.py", "--target", WORKER, "--title", TITLE,
-                                    "--project", "p_test", "--workspace", "jwu", "--workdir", str(tmp_path)])
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: json.dumps({"slug": "jwu", "source": "cwd"}))
-
-    with pytest.raises(SystemExit, match="No trusted automatic archive route"):
-        runpy.run_path(str(SCRIPTS / "worker_archive.py"), run_name="__main__")
-    rpc.assert_not_awaited()
+    spec = importlib.util.spec_from_file_location("worker_relay", SCRIPTS / "worker_relay.py")
+    assert spec is not None and spec.loader is not None
+    relay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(relay)
+    reader = Namespace(mailbox=Namespace(worker_parent=lambda _: PARENT))
+    monkeypatch.setattr(relay, "worker_reader", lambda _: nullcontext((reader, "uid:501")))
+    rpc.side_effect = [parent, {**worker, "archived": True}]
+    args = Namespace(sender=PARENT, target=WORKER, title=TITLE, project="p_test", mode="check")
+    asyncio.run(relay.run(args))
+    result = json.loads(capsys.readouterr().out)
+    assert result["target_id"] == WORKER and result["target_archived"] is True
+    assert rpc.await_args_list == [call("session.info", session_id=PARENT),
+                                   call("session.info", session_id=WORKER)]
 
 
 def test_first_brief_keeps_clean_text_for_model_and_transcript(launch, tmp_path, monkeypatch):

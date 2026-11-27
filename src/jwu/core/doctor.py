@@ -25,7 +25,7 @@ from . import daemon, memory, workspaces as ws_mod
 from .config import db_path
 from .maintenance import warn_if_cloud_path
 from .. import __version__
-from ..skills_install import EXPECTED_AGENTS, EXPECTED_SKILLS, default_agents_dest, default_dest
+from ..skills_install import EXPECTED_AGENTS, EXPECTED_SKILLS, default_agents_dest, default_dest, skill_bundle
 
 if TYPE_CHECKING:
     from .store import Store
@@ -362,7 +362,7 @@ def check_codex() -> list[Check]:
     if not codex_home().exists():
         return []  # Codex не ставился — молчим
     out: list[Check] = []
-    root = resources.files("jwu") / "skills"
+    root = skill_bundle("codex")
     names = [e.name for e in root.iterdir() if (e / "SKILL.md").is_file()]
     missing = [n for n in names if not (codex_skills_dest() / n / "SKILL.md").exists()]
     stale = [n for n in names if n not in missing and
@@ -400,7 +400,7 @@ def check_codex() -> list[Check]:
 def check_skills() -> list[Check]:
     out: list[Check] = []
     dest = default_dest()
-    root = resources.files("jwu") / "skills"
+    root = skill_bundle("claude")
     missing: list[str] = []
     stale: list[str] = []
     for name in sorted(EXPECTED_SKILLS):
