@@ -70,6 +70,21 @@ def test_documented_desktop_handoff_checks_worker_before_sending():
     assert '--key' not in doc[doc.index('"$S/run_with_gateway.sh" "$S/worker_relay.py" send'):].split('```', 1)[0]
 
 
+def test_delegated_look_is_tracked_work_even_without_code_changes():
+    # These are executable agent instructions: both the entry and the handoff
+    # must teach the same interpretation, even when read independently.
+    for path in (ENTRY / "SKILL.md", ENTRY / "references/hermes-worker-handoff.md"):
+        text = path.read_text(encoding="utf-8")
+        assert re.search(r"[«\"]Глянь PROJ-123, отдай воркеру[»\"]", text), path
+        assert "Возьми PROJ-123 в работу через Jwu" in text, path
+        assert "без подтверждённого `job_id` не приступай к разбору" in text, path
+        assert "«Без правок» не означает «без работы Jwu»" in text, path
+    start = (HERMES_SKILLS / "jwu-start-job/SKILL.md").read_text(encoding="utf-8")
+    assert "прямого запроса без делегирования" in start
+    assert "без подтверждённого `job_id` не приступай к разбору" in start
+    assert "Просьба только посмотреть или объяснить не требует взятия" not in start
+
+
 def test_worker_handoff_uses_typed_mailbox_actions_in_order():
     handoff = (ENTRY / "references/hermes-worker-handoff.md").read_text()
     commands = [json.loads(line) for line in handoff.splitlines() if line.startswith('{"action"')]
