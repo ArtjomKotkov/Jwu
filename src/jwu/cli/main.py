@@ -727,15 +727,25 @@ def configure_import(
 @app.command("install")
 def install(
     target: str = typer.Option("claude", "--for",
-                               click_type=click.Choice(["claude", "cursor", "codex", "both", "all"]),
+                               click_type=click.Choice(["claude", "cursor", "codex", "jwu-hermes", "both", "all"]),
                                help="Куда ставить: Claude Code, Cursor, Codex; both — Claude Code и Cursor; "
-                                    "all — все три."),
+                                    "all — все три; jwu-hermes — только скиллы для нашей сборки Hermes."),
     skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Не регистрировать MCP-сервер jwu."),
     git_guard: bool = typer.Option(True, "--git-guard/--no-git-guard",
                                    help="Хук Claude Code: пишущий git из Bash — только через jwu_git_* (политика)."),
 ) -> None:
-    """Поставить jwu в агента: скиллы, субагенты, MCP-сервер и хук политики git (Claude Code, Cursor, Codex)."""
+    """Поставить jwu в агента; для jwu-hermes — только скиллы."""
     from .. import skills_install as si
+
+    if target == "jwu-hermes":
+        dest = si.hermes_skills_dest()
+        try:
+            skills = install_skills(dest, target=target)
+        except (OSError, ValueError) as exc:
+            err.print(f"[red]jwu-hermes: не удалось поставить:[/red] {exc}")
+            raise typer.Exit(code=1)
+        console.print(f"[b]jwu-hermes[/b]: скиллов {len(skills)} → {dest}")
+        return
 
     targets = {"both": ("claude", "cursor"), "all": ("claude", "cursor", "codex")}.get(target, (target,))
     for tgt in targets:
@@ -746,7 +756,7 @@ def install(
                       "codex": si.codex_agents_dest()}[tgt]
         title = {"claude": "Claude Code", "cursor": "Cursor", "codex": "Codex"}[tgt]
         try:
-            skills = install_skills(skills_dir)
+            skills = install_skills(skills_dir, target=tgt)
             agents = install_agents(agents_dir, cursor=(tgt == "cursor"), codex=(tgt == "codex"))
         except Exception as exc:  # noqa: BLE001
             err.print(f"[red]{title}: не удалось поставить:[/red] {exc}")

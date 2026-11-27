@@ -3,6 +3,7 @@ from jwu.skills_install import (
     EXPECTED_SKILLS,
     install_agents,
     install_skills,
+    skill_bundle,
 )
 
 
@@ -150,7 +151,7 @@ def test_copyable_texts_in_code_block_and_no_promises():
     root = files("jwu")
     voice = (root / "agents" / "voice-writer-sample.md").read_text(encoding="utf-8")
     assert "```text" in voice and "Никаких обещаний от имени пользователя" in voice
-    for d in (root / "skills").iterdir():
+    for d in skill_bundle("claude").iterdir():
         md = d / "SKILL.md"
         text = md.read_text(encoding="utf-8") if md.is_file() else ""
         if "## Текст от имени пользователя (голос)" in text:
@@ -166,7 +167,7 @@ def test_voice_agent_rewrites_draft_not_writes_from_facts():
     assert "`draft`" in voice and "Что ушло при сжатии" in voice and "Содержание — из черновика" in voice
     filt = (root / "agents" / "review-filter-sample.md").read_text(encoding="utf-8")
     assert "Черновик:" in filt
-    for d in (root / "skills").iterdir():
+    for d in skill_bundle("claude").iterdir():
         md = d / "SKILL.md"
         text = md.read_text(encoding="utf-8") if md.is_file() else ""
         if "## Текст от имени пользователя (голос)" in text:
