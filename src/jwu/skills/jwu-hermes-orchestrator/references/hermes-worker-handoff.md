@@ -1,42 +1,30 @@
-# Hermes worker handoff (orchestrator)
+# Передача поручения воркеру в Hermes Desktop
 
-Checklist for assigning jwu todo numbers to separate Desktop chats. Domain rules (approvals, journals) stay in **jwu-orchestrator** / **jwu-todo**; this file is Hermes-only mechanics.
+Здесь — проверка маршрута. Как выбрать пункт, вести журнал и согласовать действия — в **jwu-orchestrator** и **jwu-todo**.
 
-## Main: identify the assignment without taking it
+## Main: выбрать и передать, не брать
 
-Use the exact KEY/PR or resolve the selected number against the board session the user saw. Never reinterpret it on a refreshed board. Keep the user's grouping. Main may read Jwu to disambiguate, but never creates or changes a job, claim, owner, journal or closure. A failed launch or pending delivery leaves nothing for Main to reserve, release or close.
+Используй точный ключ задачи или полный PR. Номер сверяй со снимком, который видел пользователь, а не с обновлённой доской. Сохрани порядок и число воркеров. Main может читать работы, но не создаёт, не берёт, не освобождает и не закрывает их за воркера, не меняет владельца и не пишет в журнал. Неудачный запуск этого не меняет.
 
-## Launch (Hermes gateway)
+Короткий бриф: «Разбери WEBIM/django-chat#918 из раздела review. Только черновик» (последняя фраза — только если так попросил пользователь). Не добавляй номер строки, имя сессии доски Main, ID работы, план или догадки.
 
-| Step | Action |
-|------|--------|
-| Preflight | Before creating a chat, verify the local gateway build and the Python payload selected by `scripts/run_with_gateway.sh` independently (see [install.md](install.md#до-создания-чата)). Do not proceed on the current stock Canary or an unverified build. |
-| Create | `scripts/worker_launch.py --create-only --title …` from orchestrator (`HERMES_SESSION_ID` set) |
-| Model | Hermes `session.create_worker` inherits the model, provider and workspace from the parent. Jwu does not reconstruct the launch settings. |
-| Verify | The creation snapshot must describe the exact active worker and confirm its parent before sending. Check model/provider, project and cwd, then use `worker_relay.py send` on that exact chat for the first brief only. Relay requires the native worker link from the local gateway’s read-only store, not just display metadata. On an uncertain retry, resend only the identical text: the native pair fixes the input ID; changed text conflicts at the gateway. Do not reuse this route for a chat already started by a legacy sender, or mix manual/legacy input with the first relay. |
-| List | The worker appears below its parent in the Desktop project tree before its first message. |
+## Запуск и проверка
 
-## Debugging failed worker turns
+1. [До создания чата](install.md#до-создания-чата) независимо проверь сборку локального шлюза и Python payload, который выбирает `scripts/run_with_gateway.sh`. Если совместимость не подтверждена, не создавай чат.
+2. В проверенном Main (`HERMES_SESSION_ID`) создай один связанный чат без первого сообщения: `scripts/run_with_gateway.sh scripts/worker_launch.py --create-only --title …`. Заголовок должен быть уникальным; добавь дату. Не используй старый чат с тем же заголовком. Hermes наследует рабочую папку и модель от Main; не собирай настройки запуска вручную.
+3. Сверь `session.info` по точному ID: родитель, проект, `cwd`, фактические `model`/`provider`. Заголовок и запись в боковом меню не доказывают связь. Передай первый бриф только через `worker_relay.py send` в этот же чат: relay требует нативную связь в локальном хранилище, открытом на чтение. Если проверка не прошла, остановись.
+4. Проверь точный текст в истории воркера. `queued` — только очередь. При неизвестном результате допустим лишь точный повтор того же текста в тот же чат: `input_id` один на пару Main–воркер, другой текст даёт `admission_conflict`. Не используй новый relay после ручного или старого запуска, не смешивай маршруты и не создавай второй чат. Доставка ещё не взятие: сообщай о взятии только после проверки владельца работы или подтверждения воркера.
+5. Перед `jwu` в том же shell убери `PYTHONPATH` (`unset PYTHONPATH`).
 
-- For Composer via CLIProxyAPI, correlate `incomplete tool result batch` with dropped-call warnings. Matching IDs in the rewritten request are not enough: `auth-cursor` expects a result for each originally announced ID. A protocol fix must acknowledge suppressed IDs without re-executing side-effecting calls.
-- For missing `clarify` buttons, inspect the call arguments and delivery result (`outcome`, `notice`, `error`). A valid call can submit even when batched with other tools; submission does not establish what the UI rendered before it.
-- Timestamp owner-resolution errors against archiving. An archived row observed later cannot explain a warning captured before archive.
+## Воркер: принять и отчитаться
 
-## Title uniqueness
+1. Пройди **jwu-session-init** в назначенной папке и сверь `source=cwd`, `cwd`, `slug` и правила. На своей доске найди точный ключ в указанном разделе. Если ключ или раздел изменился либо есть чужая бронь, остановись по этому пункту, не заводи дубль.
+2. Для поручения «взять» продолжи свою подходящую работу или возьми свободный пункт сам; перечитай ключ, раздел и владельца по результату. Для простого осмотра не бери и не создавай работу. Проверь живой PR: конфликт не отменяет ревью, но мешает передаче в тестирование.
+3. Решения (`clarify` в своём чате), журнал, проверки и закрытие остаются у воркера. После первого брифа — только встроенный `session_mailbox` для обычных итогов, вопросов и ответов связанному чату. Отдельно проверь доступность в Main и воркере. Маршрут указывай в полях, не в тексте. Почта не запускает ход и не отвечает на `clarify`. Если почта недоступна, назови причину, не используй промпт, CLI, запись в БД или наблюдателя.
+4. Оставь чат открытым. Не запрашивай архив после итога или при закрытии работы. Если пользователь сам спросил, укажи «Архивировать» в меню именно этого чата в Hermes Desktop. Архив — только вручную; не передавай запрос и не используй скрипт.
 
-Day-prefix worker titles; archived title reuse resurrects old sessions.
+## Если что-то не сработало
 
-## Shell hygiene
-
-After gateway scripts, `unset PYTHONPATH` before `jwu` CLI in the same shell.
-
-## Short brief
-
-Example: «Разбери WEBIM/django-chat#918 из раздела review. Только черновик» (последняя фраза — только если так попросил пользователь). Do not add the Main board session/row, a job ID, a plan or an inferred restriction.
-
-## Worker: entry and accounting after delivery
-
-1. Run `jwu-session-init` in the assigned workdir; verify `source=cwd`, workspace, rules and the relevant domain skill. Find the exact assigned key and section on the worker’s own board snapshot and verify ownership. On changed identity or a live competing claim, stop rather than opening a duplicate.
-2. For tracked work, resume the matching assignment or take the verified free item yourself and read back its job and anchor. For inspection only, do not claim or create a job. Check live PR state yourself: a conflicted review remains a review; a conflict blocks a move to testing.
-3. Keep approvals (`clarify` in the worker chat), journal, results and closure with the worker. Check `session_mailbox` availability separately in Main and worker. Use it for ordinary reports, questions and replies with the directly linked chat. It does not start a turn or answer `clarify`. Put routing fields outside `text`; no fallback if mail is unavailable.
-4. There is no trusted automatic archive route. Leave the worker chat open. After explicit consent, tell the user to use Archive on that exact worker chat in Hermes Desktop. Do not pass archive requests via prompt or mailbox; client-supplied author fields are not authentication.
+- Composer через CLIProxyAPI: сопоставь `incomplete tool result batch` с предупреждениями о пропущенных вызовах. `auth-cursor` ждёт результат для каждого исходного ID, а не только для ID в переписанном запросе. Исправление протокола должно отмечать пропущенные ID, не повторяя вызовы с записью.
+- Не открылись кнопки `clarify`: проверь аргументы и `outcome`, `notice`, `error`. Принятый вызов ещё не доказывает, что форма была видна пользователю.
+- Ошибка определения владельца: сверь время ошибки со временем архива. Более поздний архив не объясняет более раннее предупреждение.
